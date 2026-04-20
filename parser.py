@@ -15,7 +15,7 @@ from telethon.tl.types import InputPeerChannel
 from telethon.tl.types import Message
 
 from database import Database
-from config import Settings, _load_settings
+from config import Settings, load_settings
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,19 @@ T = TypeVar("T")
 
 
 def _build_telethon_proxy(proxy_url: str | None) -> dict[str, Any] | None:
+    """Build a Telethon-compatible proxy configuration from a URL string.
+
+    Args:
+        proxy_url: Proxy URL from settings, or `None` to disable proxying.
+
+    Returns:
+        A dictionary with Telethon proxy fields when a valid proxy URL is
+        provided, otherwise `None`.
+
+    Raises:
+        ValueError: If the URL is malformed or uses an unsupported scheme.
+    """
+
     if not proxy_url:
         return None
 
@@ -61,6 +74,24 @@ async def _with_telethon_retries(
     network_retries: int,
     base_delay_s: float,
 ) -> T:
+    """Execute a Telethon operation with retry and FloodWait handling.
+
+    Args:
+        op_name: Human-readable operation name for log messages.
+        fn: Sync or async callable that performs the target operation.
+        network_retries: Maximum retry attempts for transient network errors.
+        base_delay_s: Base delay in seconds for exponential backoff.
+
+    Returns:
+        The result produced by the callable `fn`.
+
+    Raises:
+        RPCError: Re-raised for non-network Telethon RPC failures.
+        OSError: Re-raised when transient network retries are exhausted.
+        asyncio.TimeoutError: Re-raised when retries are exhausted.
+        ConnectionError: Re-raised when retries are exhausted.
+    """
+
     attempt = 0
 
     while True:
@@ -105,6 +136,15 @@ async def _with_telethon_retries(
 
 
 def _normalize_username(username: str | None) -> str | None:
+    """Normalize a Telegram username by removing a leading at-sign.
+
+    Args:
+        username: Raw username string, potentially with a leading `@`.
+
+    Returns:
+        Username without a leading `@`, or `None` when no username is provided.
+    """
+
     if not username:
         return None
 
@@ -112,6 +152,15 @@ def _normalize_username(username: str | None) -> str | None:
 
 
 def _message_reactions_count(message: Message) -> int | None:
+    """Calculate total reactions count for a message.
+
+    Args:
+        message: Telethon message object to inspect.
+
+    Returns:
+        Sum of all reaction counters if available, otherwise `None`.
+    """
+
     reactions = getattr(message, "reactions", None)
 
     if not reactions or not getattr(reactions, "results", None):
@@ -129,6 +178,15 @@ def _message_reactions_count(message: Message) -> int | None:
 
 
 def _message_comments_count(message: Message) -> int | None:
+    """Extract comments count from a message replies metadata.
+
+    Args:
+        message: Telethon message object to inspect.
+
+    Returns:
+        Number of replies/comments when present, otherwise `None`.
+    """
+
     replies = getattr(message, "replies", None)
     count = getattr(replies, "replies", None) if replies else None
 
@@ -143,6 +201,20 @@ async def _fetch_avatar_path(
     network_retries: int,
     base_delay_s: float,
 ) -> str | None:
+    """Download and return a channel avatar path.
+
+    Args:
+        client: Initialized Telethon client instance.
+        entity: Telegram channel entity used as avatar source.
+        avatars_dir: Directory where avatar files are stored.
+        network_retries: Maximum retry attempts for transient network failures.
+        base_delay_s: Base delay in seconds for exponential retry backoff.
+
+    Returns:
+        Absolute or relative file path returned by Telethon if avatar download
+        succeeds, otherwise `None`.
+    """
+
     avatars_dir.mkdir(parents=True, exist_ok=True)
 
     target_file = avatars_dir / f"{entity.id}.jpg"
@@ -179,6 +251,19 @@ async def _parse_single_channel(
     settings: Settings,
     sem: asyncio.Semaphore,
 ) -> None:
+    """Fetch, normalize, and persist one channel with its recent posts.
+
+    Args:
+        client: Connected Telethon client used for Telegram API calls.
+        db: Database gateway used to upsert channels and posts.
+        channel_ref: Channel username/link/id reference from settings.
+        settings: Runtime settings containing limits and retry configuration.
+        sem: Concurrency semaphore to limit parallel channel parsing tasks.
+
+    Returns:
+        `None`. All parsed data is persisted through side effects in `db`.
+    """
+
     async with sem:
         logger.info("Start channel parse: %s", channel_ref)
 
@@ -299,7 +384,9 @@ async def _parse_single_channel(
 
 
 async def main() -> None:
-    settings = _load_settings()
+    """Run parser entrypoint: connect, parse configured channels, and shutdown."""
+
+    settings = load_settings()
     logger.info(
         "Parser starting (channels=%s posts=%s concurrency=%s)",
         len(settings.channels),
