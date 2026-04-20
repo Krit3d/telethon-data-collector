@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgres:17
+    container_name: tg_parser_db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-tg_parser}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-tg_parser}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg_parser_app
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL}
+      POSTS_LIMIT: ${POSTS_LIMIT:-10}
+      CONCURRENCY: ${CONCURRENCY:-10}
+      SESSION_NAME: ${SESSION_NAME:-telethon}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NETWORK_RETRIES: ${NETWORK_RETRIES:-5}
+      NETWORK_RETRY_BASE_DELAY_S: ${NETWORK_RETRY_BASE_DELAY_S:-1.0}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres_data:
