@@ -2,12 +2,23 @@
 .venv/
 venv/
 env/
+bin/
+lib/
 
 # Python
-__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Environment variables
+# Ignoring secrets
 .env
+*.session
+*.session-journal
 
-# Database
+# Channels list
+channels.txt
+
+# Other data
+avatars/
 *.db
