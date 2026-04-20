@@ -8,6 +8,22 @@ from dotenv import load_dotenv
 
 @dataclass(frozen=True)
 class Settings:
+    """Immutable runtime configuration for the parser.
+
+    Attributes:
+        api_id: Telegram API identifier from Telegram developer settings.
+        api_hash: Telegram API hash paired with `api_id`.
+        db_url: Database connection URL.
+        session_name: Telethon session file base name.
+        channels: Normalized list of Telegram channel references to parse.
+        posts_limit: Maximum number of posts to fetch per channel.
+        concurrency: Maximum number of channels parsed in parallel.
+        network_retries: Retry count for transient network failures.
+        network_retry_base_delay_s: Base delay in seconds for retry backoff.
+        proxy_url: Optional proxy URL for Telegram connections.
+        avatars_dir: Directory where downloaded channel avatars are stored.
+    """
+
     api_id: int
     api_hash: str
     db_url: str
@@ -22,13 +38,25 @@ class Settings:
 
 
 def _setup_logging(level: str) -> None:
+    """Configure global logging with a normalized log level."""
+
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
 
-def _load_settings() -> Settings:
+def load_settings() -> Settings:
+    """Load parser settings from environment variables and CLI overrides.
+
+    Returns:
+        A fully validated `Settings` instance for parser runtime.
+
+    Raises:
+        SystemExit: If required environment variables are missing or no channels
+            are provided.
+    """
+
     load_dotenv()
 
     parser = argparse.ArgumentParser(
@@ -118,6 +146,15 @@ def _load_settings() -> Settings:
 
 
 def _load_channels_from_file(path: Path) -> list[str]:
+    """Read and normalize channel references from a text file.
+
+    Args:
+        path: Path to file containing channels separated by lines or commas.
+
+    Returns:
+        A normalized channel list, or an empty list if the file does not exist.
+    """
+
     if not path.exists():
         return []
 
@@ -127,6 +164,15 @@ def _load_channels_from_file(path: Path) -> list[str]:
 
 
 def _parse_channels_env(value: str | None) -> list[str]:
+    """Parse channels text into a deduplicated, normalized channel list.
+
+    Args:
+        value: Raw channels value from env/file with comma or newline separators.
+
+    Returns:
+        Ordered list of unique channel references without `@` or full t.me URL.
+    """
+
     if not value:
         return []
 
