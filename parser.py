@@ -3,12 +3,15 @@ import logging
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from python_socks import ProxyType
 from telethon import TelegramClient
 from telethon.errors import RPCError
 from telethon.errors.rpcerrorlist import FloodWaitError
+from telethon.network.connection.tcpmtproxy import (
+    ConnectionTcpMTProxyRandomizedIntermediate,
+)
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import Channel as TlChannel
 from telethon.tl.types import InputPeerChannel
@@ -42,7 +45,7 @@ def _build_telethon_proxy(proxy_url: str | None) -> dict[str, Any] | None:
     parsed = urlparse(proxy_url)
     if not parsed.scheme or not parsed.hostname or not parsed.port:
         raise ValueError(
-            "Invalid PROXY_URL. Use e.g. socks5://user:pass@ip:port or http://ip:port"
+            "Invalid PROXY_URL. Use e.g. socks5://user:pass@ip:port, http://ip:port, or mtproxy://secret@ip:port"
         )
 
     scheme = parsed.scheme.lower()
@@ -52,9 +55,33 @@ def _build_telethon_proxy(proxy_url: str | None) -> dict[str, Any] | None:
         proxy_type = ProxyType.SOCKS4
     elif scheme in {"http", "https"}:
         proxy_type = ProxyType.HTTP
+    elif scheme in {"mtproxy", "mtproto"}:
+        query_secret = parse_qs(parsed.query).get("secret", [None])[0]
+        mtproxy_secret = (
+            parsed.username
+            or parsed.password
+            or parsed.path.strip("/")
+            or query_secret
+        )
+
+        if not mtproxy_secret:
+            raise ValueError(
+                "MTProxy requires a secret. Use mtproxy://secret@ip:port or mtproxy://ip:port?secret=..."
+            )
+
+        return {
+            "addr": parsed.hostname,
+            "port": parsed.port,
+            "secret": mtproxy_secret,
+            "is_mtproxy": True,
+        }
+    elif scheme == "vless":
+        raise ValueError(
+            "Telethon does not support VLESS directly. Run a local sing-box/xray client and set PROXY_URL to its local SOCKS endpoint (e.g. socks5://127.0.0.1:1080)."
+        )
     else:
         raise ValueError(
-            "Unsupported proxy scheme in PROXY_URL. Supported: socks5, socks5h, socks4, http, https"
+            "Unsupported proxy scheme in PROXY_URL. Supported: socks5, socks5h, socks4, http, https, mtproxy, mtproto. For VLESS use a local bridge and point PROXY_URL to socks5://127.0.0.1:1080."
         )
 
     return {
@@ -399,15 +426,30 @@ async def main() -> None:
 
     sem = asyncio.Semaphore(settings.concurrency)
     proxy = _build_telethon_proxy(settings.proxy_url)
+    client_kwargs: dict[str, Any] = {
+        "request_retries": settings.network_retries,
+        "connection_retries": settings.network_retries,
+        "retry_delay": settings.network_retry_base_delay_s,
+    }
+
+    if proxy:
+        if proxy.pop("is_mtproxy", False):
+            client_kwargs["connection"] = (
+                ConnectionTcpMTProxyRandomizedIntermediate
+            )
+            client_kwargs["proxy"] = (
+                proxy["addr"],
+                proxy["port"],
+                proxy["secret"],
+            )
+        else:
+            client_kwargs["proxy"] = proxy
 
     client = TelegramClient(
         settings.session_name,
         settings.api_id,
         settings.api_hash,
-        request_retries=settings.network_retries,
-        connection_retries=settings.network_retries,
-        retry_delay=settings.network_retry_base_delay_s,
-        proxy=proxy,
+        **client_kwargs,
     )
     try:
         if settings.proxy_url:
