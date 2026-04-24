@@ -1,44 +1,105 @@
 import argparse
 import logging
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from dotenv import load_dotenv
+
+from pydantic import (
+    Field,
+    ValidationError,
+)
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-@dataclass(frozen=True)
-class Settings:
+class Settings(BaseSettings):
     """Immutable runtime configuration for the parser.
 
-    Attributes:
-        api_id: Telegram API identifier from Telegram developer settings.
-        api_hash: Telegram API hash paired with `api_id`.
-        db_url: Database connection URL.
-        session_name: Telethon session file base name.
-        channels: Normalized list of Telegram channel references to parse.
-        posts_limit: Maximum number of posts to fetch per channel.
-        concurrency: Maximum number of channels parsed in parallel.
-        network_retries: Retry count for transient network failures.
-        network_retry_base_delay_s: Base delay in seconds for retry backoff.
-        proxy_url: Optional proxy URL for Telegram connections.
-        avatars_dir: Directory where downloaded channel avatars are stored.
+    All values can be supplied via environment variables or an ``.env`` file.
+    CLI arguments are handled by the surrounding ``load_settings()`` function
+    and are passed as keyword overrides.
     """
 
-    api_id: int
-    api_hash: str
-    db_url: str
-    session_name: str
-    channels: list[str]
-    posts_limit: int
-    concurrency: int
-    network_retries: int
-    network_retry_base_delay_s: float
-    proxy_url: str | None
-    avatars_dir: Path
+    model_config = SettingsConfigDict(
+        env_file="src/config/.env",
+        env_file_encoding="utf-8",
+        frozen=True,  # immutable, like the original @dataclass(frozen=True)
+        extra="ignore",  # ignore extra env vars / inputs
+    )
+
+    # ---- Mandatory Telegram credentials ----
+    api_id: int = Field(..., description="Telegram API ID")
+    api_hash: str = Field(..., description="Telegram API hash")
+    db_url: str = Field(..., description="Database connection URL")
+
+    # ---- Optional general settings ----
+    session_dir: Path = Field(
+        default=Path("sessions"),
+        description="Directory for storing sessions",
+    )
+    avatars_dir: Path = Field(
+        default=Path("avatars"),
+        description="Directory for downloaded channel avatars",
+    )
+    posts_limit: int = Field(
+        default=10,
+        description="Maximum number of posts to fetch per channel",
+    )
+    concurrency: int = Field(
+        default=10,
+        description="Maximum number of channels parsed in parallel",
+    )
+    network_retries: int = Field(
+        default=5,
+        description="Retry count for transient network failures",
+    )
+    network_retry_base_delay_s: float = Field(
+        default=1.0,
+        description="Base delay in seconds for retry backoff",
+    )
+    proxy_url: str | None = Field(
+        default=None,
+        description="Optional proxy URL for Telegram connections",
+    )
+    log_level: str = Field(
+        default="INFO",
+        description="Logging level",
+    )
+
+    # ---- Channel sourcing ----
+    channels_file: Path = Field(
+        default=Path("channels.txt"),
+        description="Path to file with channel list",
+    )
+    channels_limit: int | None = Field(
+        default=None,
+        description="Limit the number of channels to parse",
+    )
+    # Raw string from CHANNELS env var; if set, it overrides the file.
+    channels_env_raw: str | None = Field(
+        default=None,
+        validation_alias="CHANNELS",
+        description="Comma/newline separated list of channels (env overrides file)",
+    )
+
+    @property
+    def channels(self) -> list[str]:
+        """Final normalised list of channels to parse."""
+
+        if self.channels_env_raw:
+            c = _parse_channels_env(self.channels_env_raw)
+        else:
+            c = _load_channels_from_file(self.channels_file)
+
+        if self.channels_limit is not None:
+            c = c[: max(0, self.channels_limit)]
+
+        return c
+
+
+# ----- Helper functions -----
 
 
 def _setup_logging(level: str) -> None:
-    """Configure global logging with a normalized log level."""
+    """Configure global logging with a normalised log level."""
 
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -46,18 +107,65 @@ def _setup_logging(level: str) -> None:
     )
 
 
+def _load_channels_from_file(path: Path) -> list[str]:
+    """Read and normalise channel references from a text file."""
+
+    if not path.exists():
+        return []
+
+    content = path.read_text(encoding="utf-8")
+
+    return _parse_channels_env(content)
+
+
+def _parse_channels_env(value: str | None) -> list[str]:
+    """Parse channels text into a deduplicated, normalised channel list."""
+
+    if not value:
+        return []
+
+    raw = value.replace("\r\n", "\n").replace("\r", "\n")
+    parts: list[str] = []
+
+    for token in raw.replace(",", "\n").split("\n"):
+        t = token.strip()
+
+        if not t:
+            continue
+        if t.startswith("https://t.me/"):
+            t = t.removeprefix("https://t.me/").strip("/")
+        elif t.startswith("@"):
+            t = t[1:]
+
+        parts.append(t)
+
+    # Preserve order, remove duplicates
+    seen: set[str] = set()
+    out: list[str] = []
+
+    for ch in parts:
+        if ch in seen:
+            continue
+
+        seen.add(ch)
+        out.append(ch)
+
+    return out
+
+
+# ----- Public entry point -----
+
+
 def load_settings() -> Settings:
-    """Load parser settings from environment variables and CLI overrides.
+    """Load parser settings from environment, .env file, and CLI overrides.
 
     Returns:
-        A fully validated `Settings` instance for parser runtime.
+        Fully validated ``Settings`` instance.
 
     Raises:
         SystemExit: If required environment variables are missing or no channels
             are provided.
     """
-
-    load_dotenv()
 
     parser = argparse.ArgumentParser(
         description="Telegram channels parser (Telethon)"
@@ -86,120 +194,32 @@ def load_settings() -> Settings:
         default=os.getenv("LOG_LEVEL", "INFO"),
         help="Logging level",
     )
-
     args = parser.parse_args()
     _setup_logging(args.log_level)
 
-    api_id_raw = os.getenv("API_ID")
-    api_hash = os.getenv("API_HASH")
-    db_url = os.getenv("DB_URL")
-    session_name = os.getenv("SESSION_NAME", "telethon")
+    # Collect CLI overrides – only non‑None values are forwarded so that
+    # environment variables (and defaults) can still act as fallbacks.
+    overrides: dict = {}
 
-    if not api_id_raw or not api_hash or not db_url:
-        raise SystemExit(
-            "Missing env vars. Required: API_ID, API_HASH, DB_URL (see .env.example)"
-        )
+    if args.posts is not None:
+        overrides["posts_limit"] = args.posts
+    if args.concurrency is not None:
+        overrides["concurrency"] = args.concurrency
+    if args.channels_limit is not None:
+        overrides["channels_limit"] = args.channels_limit
 
-    channels = _load_channels_from_file(Path(args.channels_file))
-    channels_env = _parse_channels_env(os.getenv("CHANNELS"))
+    # channels_file is always provided by argparse (default or env), we pass it.
+    overrides["channels_file"] = Path(args.channels_file)
 
-    if channels_env:
-        # env has priority
-        channels = channels_env
+    try:
+        settings = Settings(**overrides)
+    except ValidationError as exc:
+        # Mimic the original "Missing env vars" behaviour.
+        raise SystemExit(str(exc)) from exc
 
-    if not channels:
+    if not settings.channels:
         raise SystemExit(
             "No channels provided. Set CHANNELS env var or create channels.txt"
         )
 
-    if args.channels_limit is not None:
-        channels = channels[: max(0, args.channels_limit)]
-
-    posts_limit = int(
-        args.posts if args.posts is not None else os.getenv("POSTS_LIMIT", 10)
-    )
-    concurrency = int(
-        args.concurrency
-        if args.concurrency is not None
-        else os.getenv("CONCURRENCY", 10)
-    )
-    network_retries = int(os.getenv("NETWORK_RETRIES", 5))
-    network_retry_base_delay_s = float(
-        os.getenv("NETWORK_RETRY_BASE_DELAY_S", 1.0)
-    )
-    proxy_url = os.getenv("PROXY_URL", "").strip() or None
-    avatars_dir = Path(os.getenv("AVATARS_DIR", "avatars"))
-
-    return Settings(
-        api_id=int(api_id_raw),
-        api_hash=api_hash,
-        db_url=db_url,
-        session_name=session_name,
-        channels=channels,
-        posts_limit=posts_limit,
-        concurrency=max(1, concurrency),
-        network_retries=max(0, network_retries),
-        network_retry_base_delay_s=max(0.1, network_retry_base_delay_s),
-        proxy_url=proxy_url,
-        avatars_dir=avatars_dir,
-    )
-
-
-def _load_channels_from_file(path: Path) -> list[str]:
-    """Read and normalize channel references from a text file.
-
-    Args:
-        path: Path to file containing channels separated by lines or commas.
-
-    Returns:
-        A normalized channel list, or an empty list if the file does not exist.
-    """
-
-    if not path.exists():
-        return []
-
-    content = path.read_text(encoding="utf-8")
-
-    return _parse_channels_env(content)
-
-
-def _parse_channels_env(value: str | None) -> list[str]:
-    """Parse channels text into a deduplicated, normalized channel list.
-
-    Args:
-        value: Raw channels value from env/file with comma or newline separators.
-
-    Returns:
-        Ordered list of unique channel references without `@` or full t.me URL.
-    """
-
-    if not value:
-        return []
-
-    raw = value.replace("\r\n", "\n").replace("\r", "\n")
-    parts: list[str] = []
-
-    for token in raw.replace(",", "\n").split("\n"):
-        t = token.strip()
-
-        if not t:
-            continue
-        elif t.startswith("https://t.me/"):
-            t = t.removeprefix("https://t.me/").strip("/")
-        elif t.startswith("@"):
-            t = t[1:]
-
-        parts.append(t)
-
-    # preserve order, remove duplicates
-    seen: set[str] = set()
-    out: list[str] = []
-
-    for ch in parts:
-        if ch in seen:
-            continue
-
-        seen.add(ch)
-        out.append(ch)
-
-    return out
+    return settings
