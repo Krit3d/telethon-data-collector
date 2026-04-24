@@ -4,7 +4,7 @@ services:
     container_name: tg_parser_db
     restart: always
     env_file:
-      - .env
+      - ../.env
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -24,11 +24,11 @@ services:
 
   parser:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     container_name: tg_parser_app
     env_file:
-      - .env
+      - ../.env
     environment:
       DB_URL: ${DB_URL}
       POSTS_LIMIT: ${POSTS_LIMIT:-10}
@@ -41,7 +41,7 @@ services:
       db:
         condition: service_healthy
     volumes:
-      - ./:/app
+      - ../:/app
     stdin_open: true
     tty: true
 

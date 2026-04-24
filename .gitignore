@@ -12,6 +12,7 @@ lib/
 *.pyd
 
 # Ignoring secrets
+sessions/
 .env
 *.session
 *.session-journal

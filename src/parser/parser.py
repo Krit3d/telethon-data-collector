@@ -17,8 +17,8 @@ from telethon.tl.types import Channel as TlChannel
 from telethon.tl.types import InputPeerChannel
 from telethon.tl.types import Message
 
-from database import Database
-from config import Settings, load_settings
+from src.db.database import Database
+from src.config.config import Settings, load_settings
 
 logger = logging.getLogger(__name__)
 
@@ -424,6 +424,9 @@ async def main() -> None:
     db = Database(settings.db_url)
     await db.init_db()
 
+    settings.session_dir.mkdir(parents=True, exist_ok=True)
+    session_path = str(settings.session_dir / "telethon")
+
     sem = asyncio.Semaphore(settings.concurrency)
     proxy = _build_telethon_proxy(settings.proxy_url)
     client_kwargs: dict[str, Any] = {
@@ -446,7 +449,7 @@ async def main() -> None:
             client_kwargs["proxy"] = proxy
 
     client = TelegramClient(
-        settings.session_name,
+        session_path,
         settings.api_id,
         settings.api_hash,
         **client_kwargs,
