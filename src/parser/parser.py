@@ -17,8 +17,8 @@ from telethon.tl.types import Channel as TlChannel
 from telethon.tl.types import InputPeerChannel
 from telethon.tl.types import Message
 
-from database import Database
-from config import Settings, load_settings
+from src.db.database import Database
+from src.config.config import Settings, load_settings
 
 logger = logging.getLogger(__name__)
 

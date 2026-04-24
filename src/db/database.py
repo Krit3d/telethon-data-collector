@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from models import Base, Channel, Post
+from src.db.models import Base, Channel, Post
 
 logger = logging.getLogger(__name__)
 
