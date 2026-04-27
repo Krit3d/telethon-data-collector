@@ -36,8 +36,12 @@ class Settings(BaseSettings):
     # ---- Optional vector search settings ----
     # Qdrant vector database for semantic search of posts
     qdrant_url: str = Field(
-        default="http://localhost:6333",
+        ...,
         description="Qdrant HTTP API URL",
+    )
+    qdrant_grpc_url: str | None = Field(
+        default=None,
+        description="Qdrant gRPC URL (optional, for faster operations)",
     )
     qdrant_collection_name: str = Field(
         default="telegram_posts",
@@ -46,6 +50,18 @@ class Settings(BaseSettings):
     embedding_model_name: str = Field(
         default="sentence-transformers/all-MiniLM-L6-v2",
         description="HuggingFace sentence-transformer model name for generating embeddings",
+    )
+    qdrant_batch_size: int = Field(
+        default=100,
+        description="Batch size for Qdrant upsert operations",
+    )
+    qdrant_timeout: float = Field(
+        default=30.0,
+        description="Qdrant request timeout in seconds",
+    )
+    qdrant_retries: int = Field(
+        default=3,
+        description="Number of retries for failed Qdrant operations",
     )
 
     # ---- Optional general settings ----
