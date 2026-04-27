@@ -4,3 +4,6 @@ Telethon==1.43.1
 python-socks==2.8.1
 pydantic==2.13.3
 pydantic-settings==2.14.0
+qdrant-client==1.17.1
+sentence-transformers==5.4.1
+    
