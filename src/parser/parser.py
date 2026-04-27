@@ -18,6 +18,7 @@ from telethon.tl.types import InputPeerChannel
 from telethon.tl.types import Message
 
 from src.db.database import Database
+from src.embeddings.qdrant_service import QdrantService
 from src.config.config import Settings, load_settings
 
 logger = logging.getLogger(__name__)
@@ -244,12 +245,11 @@ async def _fetch_avatar_path(
 
     avatars_dir.mkdir(parents=True, exist_ok=True)
 
-    target_file = avatars_dir / f"{entity.id}.jpg"
-
     async def _dl() -> str | None:
         # Telethon may return None if no photo / cannot download
+        # Pass directory to let Telethon determine correct file extension
         result = await client.download_profile_photo(
-            entity, file=str(target_file)
+            entity, file=str(avatars_dir)
         )
 
         if result is None:
@@ -274,6 +274,7 @@ async def _fetch_avatar_path(
 async def _parse_single_channel(
     client: TelegramClient,
     db: Database,
+    qdrant: QdrantService,
     channel_ref: str,
     settings: Settings,
     sem: asyncio.Semaphore,
@@ -283,6 +284,7 @@ async def _parse_single_channel(
     Args:
         client: Connected Telethon client used for Telegram API calls.
         db: Database gateway used to upsert channels and posts.
+        qdrant: Service for embedding generation
         channel_ref: Channel username/link/id reference from settings.
         settings: Runtime settings containing limits and retry configuration.
         sem: Concurrency semaphore to limit parallel channel parsing tasks.
@@ -380,8 +382,24 @@ async def _parse_single_channel(
                     "reactions_count": _message_reactions_count(msg),
                 }
 
-                await db.upsert_post(post_data)
+                post = await db.upsert_post(post_data)
                 posts_saved += 1
+
+                # Safely upsert embedding to Qdrant
+                if post and post.id and post.content:
+                    try:
+                        await qdrant.upsert_post_embedding(
+                            post_id=int(post.id),
+                            text=post.content,
+                            channel_id=int(entity.id),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to upsert embedding for post %s: %s",
+                            post.id,
+                            e,
+                            exc_info=True,
+                        )
 
             logger.info(
                 "Done channel: %s (posts saved: %s)", channel_ref, posts_saved
@@ -470,9 +488,12 @@ async def main() -> None:
         else:
             logger.info("Session already authorized")
 
+        qdrant = QdrantService(settings)
+        await qdrant.initialize()
+
         tasks = [
             asyncio.create_task(
-                _parse_single_channel(client, db, ch, settings, sem)
+                _parse_single_channel(client, db, qdrant, ch, settings, sem)
             )
             for ch in settings.channels
         ]
@@ -481,6 +502,7 @@ async def main() -> None:
         await client.disconnect()
 
     await db.close()
+    await qdrant.close()
     logger.info("Parser finished")
 
 
