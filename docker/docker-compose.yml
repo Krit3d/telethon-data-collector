@@ -21,9 +21,11 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
+    networks:
+      - parser_network
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.17.1
     container_name: tg_parser_qdrant
     restart: always
     ports:
@@ -33,12 +35,15 @@ services:
       - qdrant_data:/qdrant/storage
     environment:
       - QDRANT__SERVICE__HTTP_PORT=6333
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    # healthcheck:
+    #   test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:6333/health" ]
+    #   interval: 5s
+    #   timeout: 5s
+    #   retries: 10
+    #   start_period: 5s
+    networks:
+      - parser_network
 
   parser:
     build:
@@ -48,7 +53,10 @@ services:
     env_file:
       - ../.env
     environment:
-      DB_URL: ${DB_URL}
+      HUGGINGFACE_HUB_CACHE: /app/.cache/huggingface
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME:-telegram_posts}
       POSTS_LIMIT: ${POSTS_LIMIT:-10}
       CONCURRENCY: ${CONCURRENCY:-10}
       SESSION_NAME: ${SESSION_NAME:-telethon}
@@ -58,11 +66,21 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     volumes:
       - ../:/app
+      - hf_cache:/app/.cache/huggingface
     stdin_open: true
     tty: true
+    networks:
+      - parser_network
+
+networks:
+  parser_network:
+    driver: bridge
 
 volumes:
   postgres_data:
   qdrant_data:
+  hf_cache:
