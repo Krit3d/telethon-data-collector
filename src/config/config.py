@@ -28,7 +28,25 @@ class Settings(BaseSettings):
     # ---- Mandatory Telegram credentials ----
     api_id: int = Field(..., description="Telegram API ID")
     api_hash: str = Field(..., description="Telegram API hash")
-    db_url: str = Field(..., description="Database connection URL")
+    db_url: str = Field(
+        ...,
+        description="PostgreSQL connection URL",
+    )
+
+    # ---- Optional vector search settings ----
+    # Qdrant vector database for semantic search of posts
+    qdrant_url: str = Field(
+        default="http://localhost:6333",
+        description="Qdrant HTTP API URL",
+    )
+    qdrant_collection_name: str = Field(
+        default="telegram_posts",
+        description="Qdrant collection name for post embeddings",
+    )
+    embedding_model_name: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        description="HuggingFace sentence-transformer model name for generating embeddings",
+    )
 
     # ---- Optional general settings ----
     session_dir: Path = Field(
