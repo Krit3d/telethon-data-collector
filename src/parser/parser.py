@@ -242,14 +242,22 @@ async def _fetch_avatar_path(
         Absolute or relative file path returned by Telethon if avatar download
         succeeds, otherwise `None`.
     """
+    entity_id = getattr(entity, "id", None) or getattr(
+        entity, "channel_id", "unknown"
+    )
+
+    if not getattr(entity, "photo", None):
+        logger.info("Channel %s has no profile photo, skipping", entity_id)
+        return None
 
     avatars_dir.mkdir(parents=True, exist_ok=True)
+    target_file = avatars_dir / f"{entity_id}.jpg"
 
     async def _dl() -> str | None:
         # Telethon may return None if no photo / cannot download
         # Pass directory to let Telethon determine correct file extension
         result = await client.download_profile_photo(
-            entity, file=str(avatars_dir)
+            entity, file=str(target_file)
         )
 
         if result is None:
