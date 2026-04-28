@@ -1,3 +1,10 @@
+"""Telegram channel parser for scraping and storing channel data.
+
+This module provides functionality to parse Telegram channels, extract
+channel metadata and posts, and store them in a database with vector
+embeddings for semantic search.
+"""
+
 import asyncio
 import logging
 from datetime import timezone
@@ -14,6 +21,7 @@ from telethon.network.connection.tcpmtproxy import (
 )
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import Channel as TlChannel
+from telethon.tl.types import InputChannel
 from telethon.tl.types import InputPeerChannel
 from telethon.tl.types import Message
 
@@ -46,7 +54,8 @@ def _build_telethon_proxy(proxy_url: str | None) -> dict[str, Any] | None:
     parsed = urlparse(proxy_url)
     if not parsed.scheme or not parsed.hostname or not parsed.port:
         raise ValueError(
-            "Invalid PROXY_URL. Use e.g. socks5://user:pass@ip:port, http://ip:port, or mtproxy://secret@ip:port"
+            "Invalid PROXY_URL. Use e.g. socks5://user:pass@ip:port, "
+            "http://ip:port, or mtproxy://secret@ip:port"
         )
 
     scheme = parsed.scheme.lower()
@@ -67,7 +76,8 @@ def _build_telethon_proxy(proxy_url: str | None) -> dict[str, Any] | None:
 
         if not mtproxy_secret:
             raise ValueError(
-                "MTProxy requires a secret. Use mtproxy://secret@ip:port or mtproxy://ip:port?secret=..."
+                "MTProxy requires a secret. Use mtproxy://secret@ip:port "
+                "or mtproxy://ip:port?secret=..."
             )
 
         return {
@@ -78,11 +88,15 @@ def _build_telethon_proxy(proxy_url: str | None) -> dict[str, Any] | None:
         }
     elif scheme == "vless":
         raise ValueError(
-            "Telethon does not support VLESS directly. Run a local sing-box/xray client and set PROXY_URL to its local SOCKS endpoint (e.g. socks5://127.0.0.1:1080)."
+            "Telethon does not support VLESS directly. Run a local "
+            "sing-box/xray client and set PROXY_URL to its local SOCKS "
+            "endpoint (e.g. socks5://127.0.0.1:2080)."
         )
     else:
         raise ValueError(
-            "Unsupported proxy scheme in PROXY_URL. Supported: socks5, socks5h, socks4, http, https, mtproxy, mtproto. For VLESS use a local bridge and point PROXY_URL to socks5://127.0.0.1:1080."
+            "Unsupported proxy scheme in PROXY_URL. Supported: socks5, "
+            "socks5h, socks4, http, https, mtproxy, mtproto. For VLESS use "
+            "a local bridge and point PROXY_URL to socks5://127.0.0.1:2080."
         )
 
     return {
@@ -242,6 +256,7 @@ async def _fetch_avatar_path(
         Absolute or relative file path returned by Telethon if avatar download
         succeeds, otherwise `None`.
     """
+
     entity_id = getattr(entity, "id", None) or getattr(
         entity, "channel_id", "unknown"
     )
@@ -272,11 +287,166 @@ async def _fetch_avatar_path(
             network_retries=network_retries,
             base_delay_s=base_delay_s,
         )
-
     except Exception:
         logger.exception("Failed to download avatar")
+        return None
+
+
+async def _extract_channel_metadata(
+    client: TelegramClient,
+    channel_ref: str,
+    settings: Settings,
+) -> tuple[dict[str, Any], TlChannel] | None:
+    """Fetch and extract channel metadata and entity.
+
+    Args:
+        client: Connected Telethon client.
+        channel_ref: Channel reference string.
+        settings: Runtime settings with retry configuration.
+
+    Returns:
+        Tuple of (channel_data dict, channel entity) or None if skipped.
+    """
+
+    entity = await _with_telethon_retries(
+        f"get_entity({channel_ref})",
+        lambda: client.get_entity(channel_ref),
+        network_retries=settings.network_retries,
+        base_delay_s=settings.network_retry_base_delay_s,
+    )
+
+    if not isinstance(entity, TlChannel):
+        logger.warning(
+            "Skipping non-channel entity: %s (%s)",
+            channel_ref,
+            type(entity).__name__,
+        )
 
         return None
+
+    if entity.access_hash is None:
+        full = None
+    else:
+        channel_id = entity.id
+        access_hash = entity.access_hash
+        full = await _with_telethon_retries(
+            f"GetFullChannelRequest({channel_ref})",
+            lambda: client(
+                GetFullChannelRequest(InputChannel(channel_id, access_hash))
+            ),
+            network_retries=settings.network_retries,
+            base_delay_s=settings.network_retry_base_delay_s,
+        )
+
+    subscribers_count = getattr(
+        getattr(full, "full_chat", None), "participants_count", None
+    )
+    if not isinstance(subscribers_count, int):
+        subscribers_count = None
+
+    avatar_path = await _fetch_avatar_path(
+        client,
+        entity,
+        settings.avatars_dir,
+        network_retries=settings.network_retries,
+        base_delay_s=settings.network_retry_base_delay_s,
+    )
+
+    channel_data: dict[str, Any] = {
+        "id": int(entity.id),
+        "username": _normalize_username(getattr(entity, "username", None)),
+        "title": getattr(entity, "title", "") or "",
+        "description": getattr(getattr(full, "full_chat", None), "about", None),
+        "subscribers_count": subscribers_count,
+        "avatar_url": avatar_path,
+    }
+
+    return channel_data, entity
+
+
+async def _upsert_embedding_batch(
+    qdrant: QdrantService,
+    embedding_batch: list[tuple[int, str, int]],
+) -> None:
+    """Upsert embedding batch to Qdrant with fallback to individual upserts.
+
+    Args:
+        qdrant: Qdrant service instance.
+        embedding_batch: List of (post_id, text, channel_id) tuples.
+    """
+
+    try:
+        await qdrant.upsert_batch(embedding_batch)
+    except Exception:
+        logger.error(
+            "Failed to upsert batch, falling back to individual upserts",
+            exc_info=True,
+        )
+
+        for post_id, text, channel_id in embedding_batch:
+            try:
+                await qdrant.upsert_post_embedding(post_id, text, channel_id)
+            except Exception:
+                logger.exception(
+                    "Failed to upsert embedding for post %s",
+                    post_id,
+                )
+
+
+async def _process_message(
+    msg: Message,
+    entity: TlChannel,
+    db: Database,
+    qdrant: QdrantService,
+) -> int | None:
+    """Process a single message: upsert to DB and embedding.
+
+    Args:
+        msg: Telethon message object.
+        entity: Channel entity.
+        db: Database service.
+        qdrant: Qdrant service.
+
+    Returns:
+        Post ID if successfully processed, None otherwise.
+    """
+
+    if msg.id is None or msg.date is None:
+        return None
+
+    published_at = msg.date
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=timezone.utc)
+
+    post_data: dict[str, Any] = {
+        "channel_id": int(entity.id),
+        "message_id": int(msg.id),
+        "content": getattr(msg, "message", None),
+        "published_at": published_at,
+        "views": getattr(msg, "views", None),
+        "comments_count": _message_comments_count(msg),
+        "shares_count": getattr(msg, "forwards", None),
+        "reactions_count": _message_reactions_count(msg),
+    }
+
+    post = await db.upsert_post(post_data)
+    if not (post and post.id and post.content):
+        return None
+
+    try:
+        await qdrant.upsert_post_embedding(
+            post_id=int(post.id),
+            text=post.content,
+            channel_id=int(entity.id),
+        )
+    except Exception:
+        logger.warning(
+            "Failed to upsert embedding for post %s",
+            post.id,
+            exc_info=True,
+        )
+
+    return int(post.id)
 
 
 async def _parse_single_channel(
@@ -285,7 +455,6 @@ async def _parse_single_channel(
     qdrant: QdrantService,
     channel_ref: str,
     settings: Settings,
-    sem: asyncio.Semaphore,
 ) -> None:
     """Fetch, normalize, and persist one channel with its recent posts.
 
@@ -295,145 +464,75 @@ async def _parse_single_channel(
         qdrant: Service for embedding generation
         channel_ref: Channel username/link/id reference from settings.
         settings: Runtime settings containing limits and retry configuration.
-        sem: Concurrency semaphore to limit parallel channel parsing tasks.
-
-    Returns:
-        `None`. All parsed data is persisted through side effects in `db`.
     """
 
-    async with sem:
-        logger.info("Start channel parse: %s", channel_ref)
+    logger.info("Start channel parse: %s", channel_ref)
 
-        try:
-            entity = await _with_telethon_retries(
-                f"get_entity({channel_ref})",
-                lambda: client.get_entity(channel_ref),
-                network_retries=settings.network_retries,
-                base_delay_s=settings.network_retry_base_delay_s,
-            )
+    try:
+        result = await _extract_channel_metadata(client, channel_ref, settings)
+        if result is None:
+            return
 
-            if not isinstance(entity, TlChannel):
-                logger.warning(
-                    "Skipping non-channel entity: %s (%s)",
-                    channel_ref,
-                    type(entity).__name__,
-                )
+        channel_data, entity = result
 
-                return
+        await db.upsert_channel(channel_data)
 
-            full = await _with_telethon_retries(
-                f"GetFullChannelRequest({channel_ref})",
-                lambda: client(GetFullChannelRequest(entity)),
-                network_retries=settings.network_retries,
-                base_delay_s=settings.network_retry_base_delay_s,
-            )
+        logger.info(
+            "Channel saved: id=%s username=%s title=%s",
+            channel_data["id"],
+            channel_data["username"],
+            channel_data["title"],
+        )
 
-            subscribers_count = getattr(
-                getattr(full, "full_chat", None), "participants_count", None
-            )
-            if not isinstance(subscribers_count, int):
-                subscribers_count = None
+        posts_saved = 0
+        embedding_batch: list[tuple[int, str, int]] = []
+        batch_size = settings.qdrant_batch_size
 
-            avatar_path = await _fetch_avatar_path(
-                client,
-                entity,
-                settings.avatars_dir,
-                network_retries=settings.network_retries,
-                base_delay_s=settings.network_retry_base_delay_s,
-            )
+        async for msg in client.iter_messages(
+            entity, limit=settings.posts_limit
+        ):
+            if not isinstance(msg, Message):
+                continue
 
-            channel_data: dict[str, Any] = {
-                "id": int(entity.id),
-                "username": _normalize_username(
-                    getattr(entity, "username", None)
-                ),
-                "title": getattr(entity, "title", "") or "",
-                "description": getattr(
-                    getattr(full, "full_chat", None), "about", None
-                ),
-                "subscribers_count": subscribers_count,
-                "avatar_url": avatar_path,
-            }
+            post_id = await _process_message(msg, entity, db, qdrant)
+            if post_id is None:
+                continue
 
-            await db.upsert_channel(channel_data)
+            posts_saved += 1
+            embedding_batch.append((post_id, msg.message, int(entity.id)))
 
-            logger.info(
-                "Channel saved: id=%s username=%s title=%s",
-                channel_data["id"],
-                channel_data["username"],
-                channel_data["title"],
-            )
+            if len(embedding_batch) >= batch_size:
+                await _upsert_embedding_batch(qdrant, embedding_batch)
+                embedding_batch.clear()
 
-            posts_saved = 0
+        if embedding_batch:
+            await _upsert_embedding_batch(qdrant, embedding_batch)
 
-            async for msg in client.iter_messages(
-                entity, limit=settings.posts_limit
-            ):
-                if not isinstance(msg, Message):
-                    continue
+        logger.info(
+            "Done channel: %s (posts saved: %s)", channel_ref, posts_saved
+        )
 
-                if msg.id is None or msg.date is None:
-                    continue
+    except FloodWaitError as e:
+        delay = int(getattr(e, "seconds", 0)) or 1
+        logger.warning(
+            "Channel %s: FloodWaitError, sleeping %ss", channel_ref, delay
+        )
+        await asyncio.sleep(delay)
 
-                published_at = msg.date
-                if published_at.tzinfo is None:
-                    published_at = published_at.replace(tzinfo=timezone.utc)
+    except (OSError, asyncio.TimeoutError, ConnectionError) as e:
+        logger.exception(
+            "Channel %s: network error (%s)", channel_ref, type(e).__name__
+        )
 
-                post_data: dict[str, Any] = {
-                    "channel_id": int(entity.id),
-                    "message_id": int(msg.id),
-                    "content": getattr(msg, "message", None),
-                    "published_at": published_at,
-                    "views": getattr(msg, "views", None),
-                    "comments_count": _message_comments_count(msg),
-                    "shares_count": getattr(msg, "forwards", None),
-                    "reactions_count": _message_reactions_count(msg),
-                }
+    except RPCError as e:
+        logger.exception(
+            "Channel %s: Telethon RPCError (%s)",
+            channel_ref,
+            type(e).__name__,
+        )
 
-                post = await db.upsert_post(post_data)
-                posts_saved += 1
-
-                # Safely upsert embedding to Qdrant
-                if post and post.id and post.content:
-                    try:
-                        await qdrant.upsert_post_embedding(
-                            post_id=int(post.id),
-                            text=post.content,
-                            channel_id=int(entity.id),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to upsert embedding for post %s: %s",
-                            post.id,
-                            e,
-                            exc_info=True,
-                        )
-
-            logger.info(
-                "Done channel: %s (posts saved: %s)", channel_ref, posts_saved
-            )
-
-        except FloodWaitError as e:
-            delay = int(getattr(e, "seconds", 0)) or 1
-            logger.warning(
-                "Channel %s: FloodWaitError, sleeping %ss", channel_ref, delay
-            )
-            await asyncio.sleep(delay)
-
-        except (OSError, asyncio.TimeoutError, ConnectionError) as e:
-            logger.exception(
-                "Channel %s: network error (%s)", channel_ref, type(e).__name__
-            )
-
-        except RPCError as e:
-            logger.exception(
-                "Channel %s: Telethon RPCError (%s)",
-                channel_ref,
-                type(e).__name__,
-            )
-
-        except Exception:
-            logger.exception("Channel %s: unexpected error", channel_ref)
+    except Exception:
+        logger.exception("Channel %s: unexpected error", channel_ref)
 
 
 async def main() -> None:
@@ -491,7 +590,7 @@ async def main() -> None:
 
         if not await client.is_user_authorized():
             logger.info("Session is not authorized, starting interactive login")
-            await client.start()
+            await client.start()  # type: ignore
             logger.info("Interactive login completed")
         else:
             logger.info("Session already authorized")
@@ -499,15 +598,17 @@ async def main() -> None:
         qdrant = QdrantService(settings)
         await qdrant.initialize()
 
+        async def parse_channel_with_semaphore(ch: str) -> None:
+            async with sem:
+                await _parse_single_channel(client, db, qdrant, ch, settings)
+
         tasks = [
-            asyncio.create_task(
-                _parse_single_channel(client, db, qdrant, ch, settings, sem)
-            )
+            asyncio.create_task(parse_channel_with_semaphore(ch))
             for ch in settings.channels
         ]
         await asyncio.gather(*tasks)
     finally:
-        await client.disconnect()
+        await client.disconnect()  # type: ignore
 
     await db.close()
     await qdrant.close()

@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Final
 
+import numpy as np
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.models import (
     Distance,
-    # FieldCondition,
-    # Filter,
-    # MatchValue,
+    PayloadSchemaType,
     PointStruct,
     VectorParams,
 )
@@ -38,10 +38,15 @@ class QdrantService:
         """
 
         self.settings = settings
-        self.client = AsyncQdrantClient(url=settings.qdrant_url)
+        self.client = AsyncQdrantClient(
+            url=settings.qdrant_url,
+            timeout=settings.qdrant_timeout,
+            # For gRPC (faster):
+            # grpc_port=settings.qdrant_grpc_port if settings.qdrant_grpc_url else None,
+        )
         self.collection_name = settings.qdrant_collection_name
         self.embedding_model = SentenceTransformer(
-            settings.embedding_model_name
+            settings.embedding_model_name, device="cpu"  # Explicitly set device
         )
         self._initialized = False
 
@@ -97,6 +102,12 @@ class QdrantService:
                         size=EMBEDDING_DIM, distance=EMBEDDING_METRIC
                     ),
                 )
+                # Create payload indexes for faster filtering
+                await self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name="channel_id",
+                    field_schema=PayloadSchemaType.INTEGER,
+                )
                 logger.info(
                     "Qdrant collection created successfully",
                     extra={"collection": self.collection_name},
@@ -112,6 +123,142 @@ class QdrantService:
                 "Failed to ensure Qdrant collection",
                 exc_info=e,
                 extra={"collection": self.collection_name},
+            )
+            raise
+
+    async def _generate_embeddings_batch(
+        self,
+        texts: list[str],
+        *,
+        batch_size: int | None = None,
+        show_progress: bool = False,
+    ) -> np.ndarray:
+        """Generate embeddings for a list of texts using a separate thread.
+
+        Args:
+            texts: List of text strings to generate embeddings for.
+            batch_size: Optional batch size for processing large text lists.
+                    If None, processes all texts in a single batch.
+            show_progress: Whether to show a progress bar (requires tqdm).
+
+        Returns:
+            numpy.ndarray: Array of embeddings with shape (len(texts), EMBEDDING_DIM).
+
+        Raises:
+            ValueError: If texts list is empty or contains invalid entries.
+            RuntimeError: If embedding generation fails.
+        """
+
+        if not texts:
+            logger.warning("Empty texts list provided for embedding generation")
+            
+            return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+
+        # Validate texts
+        valid_texts = [text for text in texts if text and text.strip()]
+        if len(valid_texts) != len(texts):
+            logger.warning(
+                "Filtered out empty texts from embedding batch",
+                extra={"total": len(texts), "valid": len(valid_texts)},
+            )
+
+        if not valid_texts:
+            logger.warning("No valid texts to generate embeddings for")
+
+            return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+
+        try:
+            # Process in chunks if batch_size is specified
+            if batch_size and batch_size > 0:
+                all_embeddings = []
+
+                for i in range(0, len(valid_texts), batch_size):
+                    batch = valid_texts[i : i + batch_size]
+                    batch_embeddings = await asyncio.to_thread(
+                        self.embedding_model.encode,
+                        batch,
+                        convert_to_numpy=True,
+                        show_progress_bar=show_progress and (i == 0),
+                    )
+
+                    all_embeddings.append(batch_embeddings)
+
+                embeddings = np.vstack(all_embeddings)
+            else:
+                embeddings = await asyncio.to_thread(
+                    self.embedding_model.encode,
+                    valid_texts,
+                    convert_to_numpy=True,
+                    show_progress_bar=show_progress,
+                )
+
+            logger.debug(
+                "Generated embeddings batch",
+                extra={
+                    "requested": len(texts),
+                    "valid": len(valid_texts),
+                    "embedding_shape": embeddings.shape,
+                },
+            )
+
+            return embeddings
+
+        except Exception as e:
+            logger.error(
+                "Failed to generate embeddings batch",
+                exc_info=e,
+                extra={
+                    "text_count": len(texts),
+                    "valid_count": (
+                        len(valid_texts) if "valid_texts" in locals() else 0
+                    ),
+                },
+            )
+            raise RuntimeError(f"Embedding generation failed: {e}") from e
+
+    async def upsert_batch(self, points: list[tuple[int, str, int]]) -> None:
+        """Upsert multiple post embeddings in a single batch.
+
+        Args:
+            points: List of (post_id, text, channel_id) tuples.
+        """
+
+        if not points:
+            return
+
+        try:
+            # Generate embeddings in parallel
+            texts = [p[1] for p in points]
+            embeddings = await self._generate_embeddings_batch(texts)
+
+            point_structs = [
+                PointStruct(
+                    id=post_id,
+                    vector=embedding.tolist(),
+                    payload={"channel_id": channel_id, "text": text},
+                )
+
+                for (post_id, text, channel_id), embedding in zip(
+                    points, embeddings
+                )
+            ]
+
+            await self.client.upsert(
+                collection_name=self.collection_name,
+                points=point_structs,
+                wait=True,  # Wait for indexing
+            )
+
+            logger.debug(
+                "Batch upserted %d embeddings",
+                len(points),
+                extra={"collection": self.collection_name},
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to batch upsert embeddings",
+                exc_info=e,
+                extra={"batch_size": len(points)},
             )
             raise
 
@@ -142,7 +289,9 @@ class QdrantService:
             )
 
         try:
-            embedding = self.embedding_model.encode(text, convert_to_numpy=True)
+            embedding = await asyncio.to_thread(
+                self.embedding_model.encode, text, convert_to_numpy=True
+            )
 
             point = PointStruct(
                 id=post_id,

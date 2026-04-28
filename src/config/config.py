@@ -55,8 +55,8 @@ class Settings(BaseSettings):
         default=100,
         description="Batch size for Qdrant upsert operations",
     )
-    qdrant_timeout: float = Field(
-        default=30.0,
+    qdrant_timeout: int = Field(
+        default=30,
         description="Qdrant request timeout in seconds",
     )
     qdrant_retries: int = Field(
