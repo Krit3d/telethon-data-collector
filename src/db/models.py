@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     ForeignKey,
     String,
     Text,
@@ -49,6 +50,20 @@ class Channel(Base):
     )
     avatar_url: Mapped[str | None] = mapped_column(
         String(512), nullable=True, comment="URL to channel avatar"
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="pending",
+        server_default="pending",
+        nullable=False,
+        index=True,  # index for faster search of pending channels
+        comment="Lifecycle status: pending, processing, parsed, rejected",
+    )
+    is_author_blog: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        comment="True if channel has video notes or author keywords",
     )
 
     created_at: Mapped[datetime] = mapped_column(

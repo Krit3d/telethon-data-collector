@@ -76,6 +76,31 @@ services:
     networks:
       - parser_network
 
+  crawler:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: tg_parser_crawler
+    env_file:
+      - ../.env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      CRAWLER_DELAY_MIN: ${CRAWLER_DELAY_MIN:-45}
+      CRAWLER_DELAY_MAX: ${CRAWLER_DELAY_MAX:-120}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_ID: ${API_ID}
+      API_HASH: ${API_HASH}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.crawler
+    volumes:
+      - ../:/app
+      - ../sessions:/app/sessions
+      - ../proxies.txt:/app/proxies.txt
+    networks:
+      - parser_network
+
 networks:
   parser_network:
     driver: bridge

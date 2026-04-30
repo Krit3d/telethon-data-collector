@@ -5,7 +5,7 @@ Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
 import logging
 from typing import Any, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -76,6 +76,8 @@ class Database:
             "description": stmt.excluded.description,
             "subscribers_count": stmt.excluded.subscribers_count,
             "avatar_url": stmt.excluded.avatar_url,
+            "status": stmt.excluded.status,
+            "is_author_blog": stmt.excluded.is_author_blog,
             "updated_at": stmt.excluded.updated_at,
         }
         stmt = stmt.on_conflict_do_update(
@@ -185,3 +187,130 @@ class Database:
             channels = result.scalars().all()
 
             return {ch.id: ch for ch in channels}
+
+    async def get_random_pending_channel(self) -> Channel | None:
+        """
+        Fetch a random channel with status='pending' and mark it as 'processing'.
+
+        Uses FOR UPDATE SKIP LOCKED to avoid race conditions between workers.
+        After marking, the transaction is committed so the channel is immediately
+        visible to other workers as 'processing'.
+
+        Returns:
+            The selected Channel entity, or None if no pending channels exist.
+        """
+
+        async with self.async_session() as session:
+            # Start transaction with row-level lock
+            async with session.begin():
+                # Get random pending channel and lock it
+                stmt = (
+                    select(Channel)
+                    .where(Channel.status == "pending")
+                    .order_by(func.random())
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                result = await session.execute(stmt)
+                channel = result.scalar_one_or_none()
+
+                if channel is not None:
+                    channel.status = "processing"
+                    logger.debug(
+                        "Claimed channel id=%s username=%s for processing",
+                        channel.id,
+                        channel.username,
+                    )
+                else:
+                    logger.debug("No pending channels available")
+
+                return channel
+
+    async def mark_channel_processed(self, channel_id: int) -> None:
+        """
+        Mark a channel as successfully processed (status='parsed').
+
+        Args:
+            channel_id: Telegram channel ID.
+        """
+
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    select(Channel)
+                    .where(Channel.id == channel_id)
+                    .with_for_update()
+                )
+                result = await session.execute(stmt)
+                channel = result.scalar_one_or_none()
+
+                if channel is not None:
+                    channel.status = "ready_for_parsing"
+                    logger.debug("Marked channel id=%s as parsed", channel_id)
+
+    async def mark_channel_rejected(self, channel_id: int) -> None:
+        """
+        Mark a channel as rejected (status='rejected').
+
+        Args:
+            channel_id: Telegram channel ID.
+        """
+
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    select(Channel)
+                    .where(Channel.id == channel_id)
+                    .with_for_update()
+                )
+                result = await session.execute(stmt)
+                channel = result.scalar_one_or_none()
+
+                if channel is not None:
+                    channel.status = "rejected"
+                    logger.debug("Marked channel id=%s as rejected", channel_id)
+
+    async def get_channel_for_parsing(self) -> Channel | None:
+        """Fetch a channel ready for POST PARSING and mark as processing."""
+
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    select(Channel)
+                    .where(Channel.status == "ready_for_parsing")
+                    .where(Channel.is_author_blog == True)
+                    .order_by(func.random())
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                result = await session.execute(stmt)
+                channel = result.scalar_one_or_none()
+
+                if channel:
+                    channel.status = "processing"
+                    logger.debug(
+                        "Parser claimed channel id=%s username=%s",
+                        channel.id,
+                        channel.username,
+                    )
+
+                return channel
+
+    async def mark_channel_parsed(self, channel_id: int) -> None:
+        """Mark a channel as completely parsed (posts are saved)."""
+
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    select(Channel)
+                    .where(Channel.id == channel_id)
+                    .with_for_update()
+                )
+                result = await session.execute(stmt)
+                channel = result.scalar_one_or_none()
+
+                if channel is not None:
+                    channel.status = "parsed"
+                    logger.debug(
+                        "Marked channel id=%s as COMPLETELY PARSED", channel_id
+                    )

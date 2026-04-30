@@ -1,49 +1,39 @@
-"""Autonomous Telegram channel crawler using Telethon.
+"""Distributed Telegram channel crawler using multiple sessions.
 
 This crawler discovers new channels based on recommendations from known channels.
-It applies filters for subscriber count and author-generated content, and
-appends qualifying channels to channels.txt.
-
-Safety features:
-- Strict random delays (15-30s) between all Telegram API calls.
-- FloodWaitError handling with mandatory extra 10s wait.
-- Single account usage with optional proxy support.
-- BFS traversal with automatic restart on dead ends.
+It uses multiple Telegram sessions (from sessions/ directory) with individual proxies
+to parallelize the discovery process. Qualifying channels are saved to PostgreSQL
+with authorship detection.
 """
 
 import asyncio
 import logging
 import random
 import re
-from collections import deque
 from pathlib import Path
-from typing import Any, Awaitable, Callable, TypeVar, cast
+from typing import Any, cast
+from urllib.parse import parse_qs, urlparse
 
-from dotenv import load_dotenv
-
-load_dotenv()
-from pydantic import ValidationError
+from python_socks import ProxyType
+from sqlalchemy import select
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.functions.channels import (
     GetChannelRecommendationsRequest,
     GetFullChannelRequest,
 )
-from telethon.tl.types import Channel, InputChannel, Message, messages
-
-
-# Proxy support (copied from parser.py to maintain consistency)
-from python_socks import ProxyType
-from urllib.parse import parse_qs, urlparse
-from telethon.network.connection.tcpmtproxy import (
-    ConnectionTcpMTProxyRandomizedIntermediate,
+from telethon.tl.types import (
+    Channel,
+    InputChannel,
+    Message,
+    messages as MessagesTypes,
 )
 
-
 from src.config.config import Settings, load_settings
+from src.db.database import Database
+from src.db.models import Channel as ChannelModel
 
 logger = logging.getLogger(__name__)
-T = TypeVar("T")
 
 # Regex for first-person pronouns (Russian)
 FIRST_PERSON_REGEX = re.compile(
@@ -115,142 +105,317 @@ def _build_telethon_proxy(proxy_url: str | None) -> dict[str, Any] | None:
     }
 
 
-class SafeCrawler:
-    """Autonomous BFS crawler for Telegram channel discovery."""
+class Worker:
+    """Async worker that processes channels using a single Telegram session."""
 
     def __init__(
         self,
-        client: TelegramClient,
-        channels_file: Path,
-        min_subscribers: int = 3000,
-        posts_to_check: int = 15,
+        worker_id: int,
+        session_path: Path,
+        proxy_url: str | None,
+        db: Database,
+        settings: Settings,
+        min_subscribers: int,
+        delay_min: float,
+        delay_max: float,
     ):
-        self.client = client
-        self.channels_file = channels_file
+        self.worker_id = worker_id
+        self.session_path = session_path
+        self.proxy_url = proxy_url
+        self.db = db
+        self.settings = settings
         self.min_subscribers = min_subscribers
-        self.posts_to_check = posts_to_check
+        self.delay_min = delay_min
+        self.delay_max = delay_max
+        self.client: TelegramClient | None = None
 
-        # Persistent set of all known good usernames, without duplicates
-        self.known_usernames: set[str] = set()
-        self._load_channels()
-
-        if not self.known_usernames:
-            logger.warning("No seed channels found in %s.", self.channels_file)
-
-        # BFS queue and sets for current session
-        self.queue: deque[Channel] = deque()
-        self.visited_ids: set[int] = set()
-        self.queued_ids: set[int] = set()
-        self.rejected_ids: set[int] = set()  # memory for filter garbage
-
-        # List for safe restart (strings from file)
-        self.seed_usernames: list[str] = list(self.known_usernames)
-
+    async def _random_delay(self) -> None:
+        """Sleep for a random duration within configured range."""
+        delay = random.uniform(self.delay_min, self.delay_max)
         logger.info(
-            "Crawler initialized with %d seed channels",
-            len(self.seed_usernames),
+            "Worker %d: sleeping for %.1f seconds", self.worker_id, delay
+        )
+        await asyncio.sleep(delay)
+
+    async def _call_api(self, operation: Any) -> Any:
+        """Execute a Telethon API call with random delay and error handling."""
+        await self._random_delay()
+
+        try:
+            return await operation()
+        except FloodWaitError as e:
+            delay = int(getattr(e, "seconds", 0)) or 1
+
+            logger.warning(
+                "Worker %d: FloodWaitError, sleeping %ds + 10s",
+                self.worker_id,
+                delay,
+            )
+
+            await asyncio.sleep(delay + 10)
+            raise
+        except (OSError, asyncio.TimeoutError, ConnectionError) as e:
+            logger.warning(
+                "Worker %d: Network error (%s), retrying after backoff",
+                self.worker_id,
+                type(e).__name__,
+            )
+
+            await asyncio.sleep(5)
+            raise
+        except RPCError as e:
+            logger.error("Worker %d: RPC error: %s", self.worker_id, e)
+            raise
+
+    async def _get_channel_entity_safe(
+        self, channel_id: int | str
+    ) -> Channel | None:
+        """Safely get channel entity by ID or username."""
+        if not self.client:
+            raise RuntimeError("Telegram client is not initialized")
+
+        client = self.client
+
+        try:
+            entity = await self._call_api(lambda: client.get_entity(channel_id))
+
+            if isinstance(entity, Channel) and getattr(
+                entity, "broadcast", False
+            ):
+                return entity
+        except Exception as e:
+            logger.warning(
+                "Worker %d: Failed to resolve channel %s: %s",
+                self.worker_id,
+                channel_id,
+                e,
+            )
+
+        return None
+
+    async def _get_full_channel_info(
+        self, entity: Channel
+    ) -> tuple[int | None, str | None]:
+        """Get subscriber count and description for a channel."""
+        if not self.client:
+            raise RuntimeError("Telegram client is not initialized")
+
+        client = self.client
+
+        try:
+            if entity.access_hash is None:
+                return None, None
+
+            input_channel = InputChannel(entity.id, entity.access_hash)
+            full = await self._call_api(
+                lambda: client(GetFullChannelRequest(input_channel))
+            )
+            participants_count = getattr(
+                getattr(full, "full_chat", None), "participants_count", None
+            )
+            description = getattr(
+                getattr(full, "full_chat", None), "about", None
+            )
+
+            if not isinstance(participants_count, int):
+                participants_count = None
+
+            return participants_count, description
+        except Exception as e:
+            logger.warning(
+                "Worker %d: Error getting full channel for %s: %s",
+                self.worker_id,
+                getattr(entity, "username", "unknown"),
+                e,
+            )
+
+            return None, None
+
+    async def _check_author_content(
+        self, entity: Channel, posts_to_check: int = 15
+    ) -> bool:
+        """Check if channel contains author-generated content (video notes or first-person text)."""
+        if not self.client:
+            raise RuntimeError("Telegram client is not initialized")
+
+        client = self.client
+
+        try:
+            if entity.access_hash is None:
+                return False
+
+            input_channel = InputChannel(entity.id, entity.access_hash)
+            msgs = await self._call_api(
+                lambda: client.get_messages(input_channel, limit=posts_to_check)
+            )
+
+            if msgs is None:
+                return False
+
+            # Ensure messages is always a list
+            if isinstance(msgs, Message):
+                msgs = [msgs]
+
+            # Check for video notes
+            for msg in msgs:
+                if getattr(msg, "video_note", None):
+                    logger.info(
+                        "Worker %d: Channel %s has video note content",
+                        self.worker_id,
+                        getattr(entity, "username", "unknown"),
+                    )
+
+                    return True
+
+            # Check first-person pronouns
+            total_matches = 0
+            for msg in msgs:
+                text = getattr(msg, "message", None) or ""
+                total_matches += len(FIRST_PERSON_REGEX.findall(text))
+
+            if total_matches >= 3:
+                logger.info(
+                    "Worker %d: Channel %s has first-person content (%d matches)",
+                    self.worker_id,
+                    getattr(entity, "username", "unknown"),
+                    total_matches,
+                )
+
+                return True
+
+            return False
+        except Exception as e:
+            logger.warning(
+                "Worker %d: Error checking author content for %s: %s",
+                self.worker_id,
+                getattr(entity, "username", "unknown"),
+                e,
+            )
+
+            return False
+
+    async def _save_channel_to_db(
+        self,
+        channel_id: int,
+        username: str | None,
+        title: str,
+        description: str | None,
+        subscribers_count: int | None,
+        is_author_blog: bool,
+    ) -> None:
+        """Save or update channel in database."""
+        channel_data = {
+            "id": channel_id,
+            "username": username,
+            "title": title,
+            "description": description,
+            "subscribers_count": subscribers_count,
+            "avatar_url": None,  # Avatar fetching not needed for recommendations
+            "status": "pending",
+            "is_author_blog": is_author_blog,
+        }
+
+        await self.db.upsert_channel(channel_data)
+        logger.info(
+            "Worker %d: Saved channel %s (id=%s, author=%s, subs=%s)",
+            self.worker_id,
+            username or channel_id,
+            channel_id,
+            is_author_blog,
+            subscribers_count or "hidden",
         )
 
-    def _normalize(self, username: str) -> str:
-        """Normalize a channel reference to a lowercase username without @ or URL."""
-        username = username.strip()
-
-        if username.startswith("@"):
-            username = username[1:]
-        if username.startswith("https://t.me/"):
-            username = username.split("/")[-1]
-
-        return username.lower()
-
-    def _load_channels(self) -> None:
-        """Load known channels from file."""
-        if not self.channels_file.exists():
-            return
-
-        with open(self.channels_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-
-                norm = self._normalize(line)
-                if norm:
-                    self.known_usernames.add(norm)
-
-    def _append_channel(self, channel: str) -> None:
-        """Append a new channel to the channels file (normalized, without @)."""
-        with open(self.channels_file, "a", encoding="utf-8") as f:
-            f.write(channel + "\n")
-
-    async def _call_api(self, operation: Callable[[], Awaitable[T]]) -> T:
-        """Execute a Telethon API call with random delay and robust error handling.
-
-        Adds a random 15-30 second delay before each attempt.
-        Handles FloodWaitError by sleeping specified time + 10 seconds (retries indefinitely).
-        Retries network errors with exponential backoff (max 5 attempts).
+    async def _process_recommendation(self, rec_channel: Channel) -> bool:
         """
-        max_retries = 5
-        attempt = 0
+        Process a recommended channel: check filters and save to DB.
 
-        while True:
-            try:
-                # Mandatory random delay before ANY API request
-                await asyncio.sleep(random.uniform(15, 30))
+        Returns True if channel was saved, False otherwise.
+        """
+        channel_name = rec_channel.username or str(rec_channel.id)
 
-                return await operation()
-            except FloodWaitError as e:
-                delay = int(getattr(e, "seconds", 0)) or 1
-                logger.warning("⏳ FloodWaitError: sleeping %ds + 10s", delay)
-                await asyncio.sleep(delay + 10)
-                # retry indefinitely after FloodWait
-            except (OSError, asyncio.TimeoutError, ConnectionError) as e:
-                if attempt >= max_retries:
-                    logger.error(
-                        "❌ Max retries exceeded for network error: %s", e
-                    )
-                    raise
+        # Check if channel already exists in DB
+        async with self.db.async_session() as session:
+            stmt = select(ChannelModel).where(ChannelModel.id == rec_channel.id)
+            result = await session.execute(stmt)
+            existing = result.scalar_one_or_none()
 
-                attempt += 1
-                backoff = 2**attempt * 5
-
-                logger.warning(
-                    "🌐 Network error (%s): retry %d/%d in %.1fs",
-                    type(e).__name__,
-                    attempt,
-                    max_retries,
-                    backoff,
+            if existing is not None:
+                logger.debug(
+                    "Worker %d: Channel %s already in DB, skipping",
+                    self.worker_id,
+                    channel_name,
                 )
-                await asyncio.sleep(backoff)
-            except RPCError as e:
-                logger.error("❌ RPC error: %s", e)
-                raise
 
-    async def _get_recommendations(
-        self, channel_entity: Channel
-    ) -> list[Channel]:
+                return False
+
+        # Get full channel info for subscriber count
+        subscribers_count, description = await self._get_full_channel_info(
+            rec_channel
+        )
+
+        if subscribers_count is None:
+            logger.info(
+                "Worker %d: Channel %s has no subscriber count, skipping",
+                self.worker_id,
+                channel_name,
+            )
+
+            return False
+
+        if subscribers_count < self.min_subscribers:
+            logger.info(
+                "Worker %d: Channel %s has %d subscribers (<%d), skipping",
+                self.worker_id,
+                channel_name,
+                subscribers_count,
+                self.min_subscribers,
+            )
+
+            return False
+
+        # Check for author content
+        is_author = await self._check_author_content(rec_channel)
+
+        # Save to DB
+        await self._save_channel_to_db(
+            channel_id=rec_channel.id,
+            username=rec_channel.username,
+            title=getattr(rec_channel, "title", ""),
+            description=description,
+            subscribers_count=subscribers_count,
+            is_author_blog=is_author,
+        )
+
+        return True
+
+    async def _get_recommendations(self, entity: Channel) -> list[Channel]:
         """Fetch channel recommendations for a given channel."""
+        if not self.client:
+            raise RuntimeError("Telegram client is not initialized")
+
+        client = self.client
+
         try:
-            # Build input channel - handle None access_hash
-            access_hash = channel_entity.access_hash
-            if access_hash is None:
+            if entity.access_hash is None:
                 logger.warning(
-                    "⚠️ Channel %s has no access_hash, cannot get recommendations",
-                    getattr(channel_entity, "username", "unknown"),
+                    "Worker %d: Channel %s has no access_hash, cannot get recommendations",
+                    self.worker_id,
+                    getattr(entity, "username", "unknown"),
                 )
 
                 return []
 
-            input_channel = InputChannel(channel_entity.id, access_hash)
+            input_channel = InputChannel(entity.id, entity.access_hash)
             result = await self._call_api(
-                lambda: self.client(
+                lambda: client(
                     GetChannelRecommendationsRequest(channel=input_channel)
                 )
             )
-            result = cast(messages.Chats, result)
+
+            result = cast(MessagesTypes.Chats, result)
 
             recommended_channels: list[Channel] = []
 
-            # The result structure: channels are in result.chats
             if result.chats:
                 for chat in result.chats:
                     if (
@@ -261,331 +426,292 @@ class SafeCrawler:
                         recommended_channels.append(chat)
 
             logger.info(
-                "📈 Got %d recommendations for %s",
+                "Worker %d: Got %d recommendations for %s",
+                self.worker_id,
                 len(recommended_channels),
-                getattr(channel_entity, "username", "unknown"),
+                getattr(entity, "username", "unknown"),
             )
 
             return recommended_channels
         except Exception as e:
             logger.error(
-                "❌ Failed to get recommendations for %s: %s",
-                getattr(channel_entity, "username", "unknown"),
+                "Worker %d: Failed to get recommendations for %s: %s",
+                self.worker_id,
+                getattr(entity, "username", "unknown"),
                 e,
             )
 
             return []
 
-    async def _passes_filters(self, entity: Channel) -> bool:
-        """Apply filters directly to a Channel entity. Returns True if channel qualifies."""
-        channel_name = entity.username or str(entity.id)
+    async def _claim_channel(self) -> ChannelModel | None:
+        """
+        Claim a random pending channel from the database for processing.
 
-        if not entity.access_hash:
-            return False
+        Marks the channel as 'processing' to prevent other workers from
+        claiming it simultaneously.
+        """
+        channel = await self.db.get_random_pending_channel()
+        if channel is None:
+            return None
 
-        # Filter 1: Subscriber count >= 3000
-        try:
-            access_hash = entity.access_hash
-            if access_hash is None:
-                logger.info("Channel %s has no access_hash", channel_name)
-
-                return False
-
-            input_channel = InputChannel(entity.id, access_hash)
-            full = await self._call_api(
-                lambda: self.client(GetFullChannelRequest(input_channel))
-            )
-            participants_count = getattr(
-                getattr(full, "full_chat", None), "participants_count", None
-            )
-
-            if not isinstance(participants_count, int):
-                logger.info("Channel %s has no participant count", channel_name)
-
-                return False
-            if participants_count < self.min_subscribers:
-                logger.info(
-                    "⏭️ Channel %s has %d subscribers (<%d)",
-                    channel_name,
-                    participants_count,
-                    self.min_subscribers,
-                )
-
-                return False
-
-            logger.info(
-                "✅ Size filter passed: %s (%d subs)",
-                channel_name,
-                participants_count,
-            )
-        except Exception as e:
-            logger.error(
-                "❌ Error getting full channel for %s: %s", channel_name, e
-            )
-
-            return False
-
-        # Filter 2: Author content check (video notes or first-person text)
-        try:
-            msgs = await self._call_api(
-                lambda: self.client.get_messages(
-                    input_channel, limit=self.posts_to_check
-                )
-            )
-
-            if msgs is None:
-                logger.info("Channel %s returned no messages", channel_name)
-
-                return False
-
-            # Ensure messages is always a list (get_messages can return a single Message)
-            if isinstance(msgs, Message):
-                msgs = [msgs]
-
-            # Check for video notes
-            for msg in msgs:
-                if getattr(msg, "video_note", None):
-                    logger.info(
-                        "🎥 Channel %s has video note content", channel_name
-                    )
-
-                    return True
-
-            # Check first-person pronouns
-            total_matches = 0
-
-            for msg in msgs:
-                text = getattr(msg, "message", None) or ""
-                total_matches += len(FIRST_PERSON_REGEX.findall(text))
-
-                if total_matches >= 3:
-                    logger.info(
-                        "✍️ Channel %s has first-person content (%d matches)",
-                        channel_name,
-                        total_matches,
-                    )
-
-                    return True
-
-            logger.info(
-                "⏭️ Channel %s lacks author content (video notes: no, pronouns: %d)",
-                channel_name,
-                total_matches,
-            )
-
-            return False
-        except Exception as e:
-            logger.error(
-                "❌ Error getting messages for %s: %s", channel_name, e
-            )
-
-            return False
-
-    async def _seed_queue_with_random(self) -> bool:
-        """Resolves a random known channel to start/restart the BFS."""
-        if not self.seed_usernames:
-            return False
-
-        random.shuffle(self.seed_usernames)
-
-        for username in self.seed_usernames:
-            try:
-                entity = await self._call_api(
-                    lambda: self.client.get_entity(username)
-                )
-
-                if isinstance(entity, Channel) and getattr(
-                    entity, "broadcast", False
-                ):
-                    if entity.id in self.visited_ids:
-                        continue
-
-                    self.queue.append(entity)
-                    self.queued_ids.add(entity.id)
-                    logger.info("🔄 Seeded queue with channel: %s", username)
-
-                    return True
-            except Exception as e:
-                logger.warning("⚠️ Failed to resolve seed %s: %s", username, e)
-
-        return False
-
-    async def crawl(self) -> None:
-        """Main infinite BFS loop."""
         logger.info(
-            "🚀 Starting crawler. Known channels: %d", len(self.known_usernames)
+            "Worker %d: Claimed channel id=%s username=%s for processing",
+            self.worker_id,
+            channel.id,
+            channel.username,
         )
 
-        if not await self._seed_queue_with_random():
-            logger.error("❌ Could not resolve any seed channels. Exiting.")
-            return
+        return channel
 
-        while True:
+    async def _mark_processed(self, channel_id: int) -> None:
+        """Mark a channel as successfully processed."""
+        await self.db.mark_channel_processed(channel_id)
+
+    async def _mark_rejected(self, channel_id: int) -> None:
+        """Mark a channel as rejected (could not be processed)."""
+        await self.db.mark_channel_rejected(channel_id)
+
+    async def run(self) -> None:
+        """Main worker loop: claim channels, get recommendations, process them."""
+        # Build proxy configuration
+        proxy_config = None
+
+        if self.proxy_url:
             try:
-                if not self.queue:
-                    logger.info(
-                        "🚧 Queue is empty (dead end). Restarting from a random seed..."
-                    )
+                proxy_config = _build_telethon_proxy(self.proxy_url)
+            except ValueError as e:
+                logger.error(
+                    "Worker %d: Invalid proxy URL %s: %s",
+                    self.worker_id,
+                    self.proxy_url,
+                    e,
+                )
+                return
 
-                    if not await self._seed_queue_with_random():
-                        logger.error("❌ Cannot restart, seeds exhausted.")
-                        break
+        # Create Telethon client
+        client_kwargs: dict[str, Any] = {}
 
-                    continue
-
-                current_channel = self.queue.popleft()
-
-                if current_channel.id in self.visited_ids:
-                    continue
-
-                self.visited_ids.add(current_channel.id)
-                logger.info(
-                    "📍 Processing channel: %s (queue size: %d)",
-                    current_channel.username,
-                    len(self.queue),
+        if proxy_config:
+            if proxy_config.pop("is_mtproxy", False):
+                from telethon.network.connection.tcpmtproxy import (
+                    ConnectionTcpMTProxyRandomizedIntermediate,
                 )
 
-                recs = await self._get_recommendations(current_channel)
+                client_kwargs["connection"] = (
+                    ConnectionTcpMTProxyRandomizedIntermediate
+                )
+                client_kwargs["proxy"] = (
+                    proxy_config["addr"],
+                    proxy_config["port"],
+                    proxy_config["secret"],
+                )
+            else:
+                client_kwargs["proxy"] = proxy_config
 
-                for rec_channel in recs:
-                    if not rec_channel.username:
+        self.client = TelegramClient(
+            str(self.session_path),
+            self.settings.api_id,
+            self.settings.api_hash,
+            **client_kwargs,
+        )
+
+        try:
+            await self.client.connect()
+
+            if not await self.client.is_user_authorized():
+                logger.info(
+                    "Worker %d: Session not authorized, starting interactive login...",
+                    self.worker_id,
+                )
+                await self.client.start()  # type: ignore
+                logger.info("Worker %d: Login successful", self.worker_id)
+            else:
+                logger.info(
+                    "Worker %d: Session already authorized", self.worker_id
+                )
+
+            logger.info("Worker %d: Starting processing loop", self.worker_id)
+
+            while True:
+                try:
+                    # Claim a random pending channel
+                    channel = await self._claim_channel()
+
+                    if channel is None:
+                        logger.info(
+                            "Worker %d: No pending channels available, waiting...",
+                            self.worker_id,
+                        )
+                        await asyncio.sleep(30)
                         continue
 
-                    if (
-                        rec_channel.id in self.visited_ids
-                        or rec_channel.id in self.rejected_ids
-                    ):
+                    # Get channel entity
+                    identifier = (
+                        channel.username if channel.username else channel.id
+                    )
+                    entity = await self._get_channel_entity_safe(identifier)
+
+                    if entity is None:
+                        logger.warning(
+                            "Worker %d: Could not resolve channel id=%s, marking as rejected",
+                            self.worker_id,
+                            channel.id,
+                        )
+                        await self._mark_rejected(channel.id)
                         continue
 
-                    norm_username = self._normalize(rec_channel.username)
+                    # Get recommendations
+                    recommendations = await self._get_recommendations(entity)
 
-                    if norm_username not in self.known_usernames:
-                        if await self._passes_filters(rec_channel):
-                            self.known_usernames.add(norm_username)
-                            self._append_channel(norm_username)
+                    # Process each recommendation
+                    saved_count = 0
 
-                            logger.info(
-                                "🌟 SUCCESS! Added new author channel: %s",
-                                norm_username,
+                    for rec_channel in recommendations:
+                        try:
+                            saved = await self._process_recommendation(
+                                rec_channel
+                            )
+                            if saved:
+                                saved_count += 1
+                        except Exception as e:
+                            logger.error(
+                                "Worker %d: Error processing recommendation %s: %s",
+                                self.worker_id,
+                                getattr(rec_channel, "username", "unknown"),
+                                e,
                             )
 
-                            if rec_channel.id not in self.queued_ids:
-                                self.queue.append(rec_channel)
-                                self.queued_ids.add(rec_channel.id)
-                        else:
-                            self.rejected_ids.add(rec_channel.id)
-                    else:
-                        if rec_channel.id not in self.queued_ids:
-                            self.queue.append(rec_channel)
-                            self.queued_ids.add(rec_channel.id)
+                    logger.info(
+                        "Worker %d: Processed channel id=%s, saved %d new channels",
+                        self.worker_id,
+                        channel.id,
+                        saved_count,
+                    )
 
-            except FloodWaitError as e:
-                delay = int(getattr(e, "seconds", 0)) or 1
-                logger.warning(
-                    "🌊 Global FloodWaitError: sleeping %ds + 10s", delay
-                )
-                await asyncio.sleep(delay + 10)
-            except Exception as e:
-                logger.error(
-                    "❌ Unexpected error in crawl loop: %s", e, exc_info=True
-                )
-                await asyncio.sleep(30)
+                    # Mark original channel as processed
+                    await self._mark_processed(channel.id)
+
+                except FloodWaitError as e:
+                    delay = int(getattr(e, "seconds", 0)) or 1
+                    logger.warning(
+                        "Worker %d: FloodWaitError, sleeping %ds + 10s",
+                        self.worker_id,
+                        delay,
+                    )
+                    await asyncio.sleep(delay + 10)
+                except Exception as e:
+                    logger.error(
+                        "Worker %d: Unexpected error in loop: %s",
+                        self.worker_id,
+                        e,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(30)
+
+        except KeyboardInterrupt:
+            logger.info("Worker %d: Stopped by user", self.worker_id)
+        except Exception as e:
+            logger.exception("Worker %d: Fatal error: %s", self.worker_id, e)
+        finally:
+            if self.client:
+                await self.client.disconnect()  # type: ignore
+                logger.info("Worker %d: Disconnected", self.worker_id)
 
 
 async def main() -> None:
-    """Entry point for the crawler."""
+    """Entry point: discover sessions, read proxies, spawn worker tasks."""
 
-    print("Скрипт запущен, проверяю настройки...")  # Прямой принт в консоль
-    try:
-        settings = load_settings()
-        print("Настройки загружены успешно!")
-    except Exception as e:
-        print(f"Ошибка при загрузке настроек: {e}")
-        return
-
-    # Load configuration from environment, .env file, and CLI arguments
-    try:
-        settings = load_settings()
-    except SystemExit:
-        # load_settings() calls sys.exit on validation errors or missing channels
-        return
-
-    # Configure logging (already configured by load_settings, but ensure it's set)
+    global settings
+    settings = load_settings()
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     logger = logging.getLogger(__name__)
 
-    # Use settings
-    API_ID = settings.api_id
-    API_HASH = settings.api_hash
-    CHANNELS_FILE = settings.channels_file
-    SESSION_DIR = settings.session_dir
-    PROXY_URL = settings.proxy_url
-
-    # Ensure session directory exists
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    session_path = SESSION_DIR / "crawler.session"
-
-    # Build proxy configuration if needed
-    proxy_config: dict[str, Any] | None = None
-
-    if PROXY_URL:
-        try:
-            proxy_config = _build_telethon_proxy(PROXY_URL)
-        except ValueError as e:
-            logger.error("❌ Invalid PROXY_URL: %s", e)
-            return
-
-    # Create Telethon client
-    client_kwargs: dict[str, Any] = {}
-
-    if proxy_config:
-        if proxy_config.pop("is_mtproxy", False):
-            client_kwargs["connection"] = (
-                ConnectionTcpMTProxyRandomizedIntermediate
-            )
-            client_kwargs["proxy"] = (
-                proxy_config["addr"],
-                proxy_config["port"],
-                proxy_config["secret"],
-            )
-        else:
-            client_kwargs["proxy"] = proxy_config
-
-    client = TelegramClient(
-        str(session_path), API_ID, API_HASH, **client_kwargs
+    logger.info(
+        "Starting distributed crawler (delay=%d-%ds, min_subscribers=%d)",
+        settings.crawler_delay_min,
+        settings.crawler_delay_max,
+        3000,
     )
 
+    # Initialize database
+    db = Database(settings.db_url)
+    await db.init_db()
+
+    # Scan sessions directory
+    sessions_dir = settings.session_dir
+    if not sessions_dir.exists():
+        logger.error("Sessions directory %s does not exist", sessions_dir)
+        return
+
+    session_files = list(sessions_dir.glob("*.session"))
+    if not session_files:
+        logger.error("No .session files found in %s", sessions_dir)
+        return
+
+    logger.info(
+        "Found %d session files: %s",
+        len(session_files),
+        [f.name for f in session_files],
+    )
+
+    # Read proxies from file
+    proxies_file = Path("proxies.txt")
+    proxies: list[str | None] = []
+
+    if proxies_file.exists():
+        lines = proxies_file.read_text(encoding="utf-8").strip().split("\n")
+        proxies = [line.strip() for line in lines if line.strip()]
+        logger.info("Loaded %d proxies from %s", len(proxies), proxies_file)
+    else:
+        logger.warning(
+            "proxies.txt not found, all workers will run without proxy"
+        )
+        proxies = []
+
+    # Map sessions to proxies (1:1, cycle proxies if fewer than sessions)
+    worker_configs: list[tuple[Path, str | None]] = []
+
+    for i, session_file in enumerate(session_files):
+        proxy = proxies[i % len(proxies)] if proxies else None
+
+        worker_configs.append((session_file, proxy))
+
+    # Create and spawn workers
+    workers: list[Worker] = []
+
+    for i, (session_path, proxy_url) in enumerate(worker_configs):
+        worker = Worker(
+            worker_id=i,
+            session_path=session_path,
+            proxy_url=proxy_url,
+            db=db,
+            settings=settings,
+            min_subscribers=3000,
+            delay_min=settings.crawler_delay_min,
+            delay_max=settings.crawler_delay_max,
+        )
+        workers.append(worker)
+
+    logger.info("Spawning %d workers", len(workers))
+
+    # Run all workers concurrently
+    tasks = [asyncio.create_task(worker.run()) for worker in workers]
+
     try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            logger.info(
-                "🔐 Session not authorized. Starting interactive login..."
-            )
-            await client.start()  # type: ignore
-            logger.info("✅ Login successful")
-        else:
-            logger.info("✅ Session already authorized")
-
-        logger.info("🚀 Starting autonomous crawler")
-        crawler = SafeCrawler(client, CHANNELS_FILE)
-
-        if not crawler.known_usernames:
-            logger.error(
-                "❌ No seed channels available. Please add channels to channels.txt"
-            )
-            return
-
-        await crawler.crawl()
+        await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        logger.info("🛑 Crawler stopped by user")
-    except Exception as e:
-        logger.exception("❌ Fatal error: %s", e)
+        logger.info("Received interrupt signal, stopping workers...")
+
+        for task in tasks:
+            task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        await client.disconnect()  # type: ignore
-        logger.info("👋 Client disconnected")
+        await db.close()
+        logger.info("Database connections closed")
 
 
 if __name__ == "__main__":

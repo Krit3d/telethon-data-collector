@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     )
 
     # ---- Optional vector search settings ----
+
     # Qdrant vector database for semantic search of posts
     qdrant_url: str = Field(
         ...,
@@ -62,6 +63,16 @@ class Settings(BaseSettings):
     qdrant_retries: int = Field(
         default=3,
         description="Number of retries for failed Qdrant operations",
+    )
+
+    # Crawler settings
+    crawler_delay_min: int = Field(
+        default=45,
+        description="Minimum delay between Telegram API calls",
+    )
+    crawler_delay_max: int = Field(
+        default=120,
+        description="Maximum delay between Telegram API calls",
     )
 
     # ---- Optional general settings ----

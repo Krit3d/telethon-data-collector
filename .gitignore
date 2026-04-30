@@ -17,8 +17,9 @@ sessions/
 *.session
 *.session-journal
 
-# Channels list
+# TXT docs with data
 channels.txt
+proxies.txt
 
 # Other data
 avatars/
