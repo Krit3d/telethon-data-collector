@@ -194,6 +194,15 @@ class Database:
             channels = result.scalars().all()
 
             return {ch.id: ch for ch in channels}
+    
+    async def get_recent_posts(self, limit: int = 100) -> list[Post]:
+        """Fetch recent posts from the database for indexing."""
+        
+        async with self.async_session() as session:
+            stmt = select(Post).order_by(Post.id.desc()).limit(limit)
+            result = await session.execute(stmt)
+            
+            return list(result.scalars().all())
 
     async def get_random_pending_channel(self, require_hash: bool = False) -> Channel | None:
         """
