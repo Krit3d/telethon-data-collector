@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:17
+    container_name: tg_parser_db
+    restart: always
+    env_file:
+      - ../../.env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-tg_parser}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-tg_parser}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+      networks:
+        - parser_network
+
+  crawler:
+    build:
+      context: ../../..
+      dockerfile: docker/scraper/Dockerfile
+    container_name: tg_parser_crawler
+    restart: always
+    env_file:
+      - ../../.env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      CRAWLER_DELAY_MIN: ${CRAWLER_DELAY_MIN:-45}
+      CRAWLER_DELAY_MAX: ${CRAWLER_DELAY_MAX:-120}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SESSION_DIR: /app/sessions/crawler
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.crawler
+    volumes:
+      - ../../:/app
+      - ../../sessions:/app/sessions
+      - ../../proxies.txt:/app/proxies.txt
+    networks:
+      - parser_network
+
+networks:
+  parser_network:
+    driver: bridge
+
+volumes:
+  postgres_data:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Final
+from typing import Any, Final
 
 import numpy as np
 from qdrant_client import AsyncQdrantClient
@@ -318,6 +318,83 @@ class QdrantService:
             raise RuntimeError(
                 f"Failed to upsert embedding for post {post_id}: {e}"
             ) from e
+
+    async def search_posts(
+        self, query: str, limit: int = 10, score_threshold: float = 0.5
+    ) -> list[dict[str, Any]]:
+        """Search for posts by semantic similarity.
+
+        Args:
+            query: Search query text.
+            limit: Maximum number of results to return.
+            score_threshold: Minimum similarity score threshold (0-1).
+
+        Returns:
+            List of dictionaries containing post_id, score, text, and channel_id.
+
+        Raises:
+            RuntimeError: If service is not initialized or search fails.
+        """
+
+        if not self._initialized:
+            raise RuntimeError(
+                "QdrantService not initialized. Call initialize() first."
+            )
+
+        # Ensure collection name is set (type narrowing)
+        assert self.collection_name is not None, "Collection name must be set"
+
+        if not query or not query.strip():
+            logger.warning("Empty query provided for search")
+            return []
+
+        try:
+            # Generate embedding for the query
+            query_embedding = await asyncio.to_thread(
+                self.embedding_model.encode,
+                query,
+                convert_to_numpy=True,
+            )
+
+            # Perform search
+            search_result = await self.client.search(
+                collection_name=self.collection_name,
+                query_vector=query_embedding.tolist(),
+                limit=limit,
+                score_threshold=score_threshold,
+                with_payload=True,
+            )
+
+            # Transform results
+            results = [
+                {
+                    "post_id": point.id,
+                    "score": point.score,
+                    "text": point.payload.get("text", ""),
+                    "channel_id": point.payload.get("channel_id", 0),
+                }
+                for point in search_result.points
+            ]
+
+            logger.info(
+                "Search completed",
+                extra={
+                    "query": query,
+                    "results_count": len(results),
+                    "limit": limit,
+                    "score_threshold": score_threshold,
+                },
+            )
+
+            return results
+
+        except Exception as e:
+            logger.error(
+                "Search failed",
+                exc_info=e,
+                extra={"query": query, "limit": limit},
+            )
+            raise RuntimeError(f"Search failed: {e}") from e
 
     async def close(self) -> None:
         """Close the Qdrant client connection."""

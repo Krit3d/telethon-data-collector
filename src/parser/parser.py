@@ -1,8 +1,7 @@
 """Telegram channel parser for scraping and storing channel data.
 
 This module provides functionality to parse Telegram channels, extract
-channel metadata and posts, and store them in a database with vector
-embeddings for semantic search.
+channel metadata and posts, and store them in a database.
 """
 
 import asyncio
@@ -10,12 +9,14 @@ import logging
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
-from urllib.parse import parse_qs, urlparse
 
-from python_socks import ProxyType
 from telethon import TelegramClient
 from telethon.errors import RPCError
+from telethon.errors import AuthKeyError, ChannelPrivateError, SessionRevokedError, UserDeactivatedError
 from telethon.errors.rpcerrorlist import FloodWaitError
+from telethon.network.connection.tcpintermediate import (
+    ConnectionTcpIntermediate,
+)
 from telethon.network.connection.tcpmtproxy import (
     ConnectionTcpMTProxyRandomizedIntermediate,
 )
@@ -26,87 +27,13 @@ from telethon.tl.types import InputPeerChannel
 from telethon.tl.types import Message
 
 from src.db.database import Database
-from src.embeddings.qdrant_service import QdrantService
+from src.db.models import Channel
 from src.config.config import Settings, load_settings
+from src.utils.proxy import build_telethon_proxy
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-
-
-def _build_telethon_proxy(proxy_url: str | None) -> dict[str, Any] | None:
-    """Build a Telethon-compatible proxy configuration from a URL string.
-
-    Args:
-        proxy_url: Proxy URL from settings, or `None` to disable proxying.
-
-    Returns:
-        A dictionary with Telethon proxy fields when a valid proxy URL is
-        provided, otherwise `None`.
-
-    Raises:
-        ValueError: If the URL is malformed or uses an unsupported scheme.
-    """
-
-    if not proxy_url:
-        return None
-
-    parsed = urlparse(proxy_url)
-    if not parsed.scheme or not parsed.hostname or not parsed.port:
-        raise ValueError(
-            "Invalid PROXY_URL. Use e.g. socks5://user:pass@ip:port, "
-            "http://ip:port, or mtproxy://secret@ip:port"
-        )
-
-    scheme = parsed.scheme.lower()
-    if scheme in {"socks5", "socks5h"}:
-        proxy_type = ProxyType.SOCKS5
-    elif scheme == "socks4":
-        proxy_type = ProxyType.SOCKS4
-    elif scheme in {"http", "https"}:
-        proxy_type = ProxyType.HTTP
-    elif scheme in {"mtproxy", "mtproto"}:
-        query_secret = parse_qs(parsed.query).get("secret", [None])[0]
-        mtproxy_secret = (
-            parsed.username
-            or parsed.password
-            or parsed.path.strip("/")
-            or query_secret
-        )
-
-        if not mtproxy_secret:
-            raise ValueError(
-                "MTProxy requires a secret. Use mtproxy://secret@ip:port "
-                "or mtproxy://ip:port?secret=..."
-            )
-
-        return {
-            "addr": parsed.hostname,
-            "port": parsed.port,
-            "secret": mtproxy_secret,
-            "is_mtproxy": True,
-        }
-    elif scheme == "vless":
-        raise ValueError(
-            "Telethon does not support VLESS directly. Run a local "
-            "sing-box/xray client and set PROXY_URL to its local SOCKS "
-            "endpoint (e.g. socks5://127.0.0.1:2080)."
-        )
-    else:
-        raise ValueError(
-            "Unsupported proxy scheme in PROXY_URL. Supported: socks5, "
-            "socks5h, socks4, http, https, mtproxy, mtproto. For VLESS use "
-            "a local bridge and point PROXY_URL to socks5://127.0.0.1:2080."
-        )
-
-    return {
-        "proxy_type": proxy_type,
-        "addr": parsed.hostname,
-        "port": parsed.port,
-        "username": parsed.username,
-        "password": parsed.password,
-        "rdns": scheme == "socks5h",
-    }
 
 
 async def _with_telethon_retries(
@@ -170,11 +97,24 @@ async def _with_telethon_retries(
             )
 
             await asyncio.sleep(delay)
+            await asyncio.sleep(10)
 
         except RPCError:
             # Non-network Telethon errors: log and bubble up (channel-specific handler will catch)
             logger.exception("%s: Telethon RPCError", op_name)
             raise
+
+
+def format_tg_id(channel_id: int) -> int:
+    """Ensures that the channel ID is prefixed with -100 if this is not the case."""
+    s_id = str(channel_id)
+
+    if not s_id.startswith("-100"):
+        clean_id = s_id.lstrip("-")
+
+        return int(f"-100{clean_id}")
+
+    return channel_id
 
 
 def _normalize_username(username: str | None) -> str | None:
@@ -269,8 +209,6 @@ async def _fetch_avatar_path(
     target_file = avatars_dir / f"{entity_id}.jpg"
 
     async def _dl() -> str | None:
-        # Telethon may return None if no photo / cannot download
-        # Pass directory to let Telethon determine correct file extension
         result = await client.download_profile_photo(
             entity, file=str(target_file)
         )
@@ -294,31 +232,44 @@ async def _fetch_avatar_path(
 
 async def _extract_channel_metadata(
     client: TelegramClient,
-    channel_ref: str,
+    channel: Channel,
+    db: Database,
     settings: Settings,
 ) -> tuple[dict[str, Any], TlChannel] | None:
     """Fetch and extract channel metadata and entity.
 
     Args:
         client: Connected Telethon client.
-        channel_ref: Channel reference string.
+        channel: Channel object from database with id and username.
+        db: Database gateway for marking rejected channels.
         settings: Runtime settings with retry configuration.
 
     Returns:
         Tuple of (channel_data dict, channel entity) or None if skipped.
     """
 
-    entity = await _with_telethon_retries(
-        f"get_entity({channel_ref})",
-        lambda: client.get_entity(channel_ref),
-        network_retries=settings.network_retries,
-        base_delay_s=settings.network_retry_base_delay_s,
-    )
+    channel_id = channel.id
+    formatted_id = format_tg_id(channel_id)
+
+    try:
+        # Use username if available, otherwise fall back to formatted numeric ID
+        identifier = channel.username if channel.username else formatted_id
+
+        entity = await _with_telethon_retries(
+            f"get_entity({formatted_id})",
+            lambda: client.get_entity(identifier),
+            network_retries=settings.network_retries,
+            base_delay_s=settings.network_retry_base_delay_s,
+        )
+    except ValueError as e:
+        logger.error(f"Could not find entity for {channel.id}: {e}")
+        await db.mark_channel_rejected(channel.id)
+        return None
 
     if not isinstance(entity, TlChannel):
         logger.warning(
             "Skipping non-channel entity: %s (%s)",
-            channel_ref,
+            channel_id,
             type(entity).__name__,
         )
 
@@ -327,12 +278,12 @@ async def _extract_channel_metadata(
     if entity.access_hash is None:
         full = None
     else:
-        channel_id = entity.id
+        channel_id_val = entity.id
         access_hash = entity.access_hash
         full = await _with_telethon_retries(
-            f"GetFullChannelRequest({channel_ref})",
+            f"GetFullChannelRequest({channel_id})",
             lambda: client(
-                GetFullChannelRequest(InputChannel(channel_id, access_hash))
+                GetFullChannelRequest(InputChannel(channel_id_val, access_hash))
             ),
             network_retries=settings.network_retries,
             base_delay_s=settings.network_retry_base_delay_s,
@@ -364,48 +315,17 @@ async def _extract_channel_metadata(
     return channel_data, entity
 
 
-async def _upsert_embedding_batch(
-    qdrant: QdrantService,
-    embedding_batch: list[tuple[int, str, int]],
-) -> None:
-    """Upsert embedding batch to Qdrant with fallback to individual upserts.
-
-    Args:
-        qdrant: Qdrant service instance.
-        embedding_batch: List of (post_id, text, channel_id) tuples.
-    """
-
-    try:
-        await qdrant.upsert_batch(embedding_batch)
-    except Exception:
-        logger.error(
-            "Failed to upsert batch, falling back to individual upserts",
-            exc_info=True,
-        )
-
-        for post_id, text, channel_id in embedding_batch:
-            try:
-                await qdrant.upsert_post_embedding(post_id, text, channel_id)
-            except Exception:
-                logger.exception(
-                    "Failed to upsert embedding for post %s",
-                    post_id,
-                )
-
-
 async def _process_message(
     msg: Message,
     entity: TlChannel,
     db: Database,
-    qdrant: QdrantService,
 ) -> int | None:
-    """Process a single message: upsert to DB and embedding.
+    """Process a single message: save to PostgreSQL and return its ID.
 
     Args:
         msg: Telethon message object.
         entity: Channel entity.
         db: Database service.
-        qdrant: Qdrant service.
 
     Returns:
         Post ID if successfully processed, None otherwise.
@@ -433,27 +353,13 @@ async def _process_message(
     if not (post and post.id and post.content):
         return None
 
-    try:
-        await qdrant.upsert_post_embedding(
-            post_id=int(post.id),
-            text=post.content,
-            channel_id=int(entity.id),
-        )
-    except Exception:
-        logger.warning(
-            "Failed to upsert embedding for post %s",
-            post.id,
-            exc_info=True,
-        )
-
     return int(post.id)
 
 
 async def _parse_single_channel(
     client: TelegramClient,
     db: Database,
-    qdrant: QdrantService,
-    channel_ref: str,
+    channel: Channel,
     settings: Settings,
 ) -> None:
     """Fetch, normalize, and persist one channel with its recent posts.
@@ -461,16 +367,19 @@ async def _parse_single_channel(
     Args:
         client: Connected Telethon client used for Telegram API calls.
         db: Database gateway used to upsert channels and posts.
-        qdrant: Service for embedding generation
-        channel_ref: Channel username/link/id reference from settings.
+        channel: Channel object from database with id and username.
         settings: Runtime settings containing limits and retry configuration.
     """
 
-    logger.info("Start channel parse: %s", channel_ref)
+    channel_id = channel.id
+    logger.info(
+        "Start channel parse: id=%s username=%s", channel_id, channel.username
+    )
 
     try:
-        result = await _extract_channel_metadata(client, channel_ref, settings)
+        result = await _extract_channel_metadata(client, channel, db, settings)
         if result is None:
+            await db.mark_channel_rejected(channel_id)
             return
 
         channel_data, entity = result
@@ -485,8 +394,6 @@ async def _parse_single_channel(
         )
 
         posts_saved = 0
-        embedding_batch: list[tuple[int, str, int]] = []
-        batch_size = settings.qdrant_batch_size
 
         async for msg in client.iter_messages(
             entity, limit=settings.posts_limit
@@ -494,125 +401,384 @@ async def _parse_single_channel(
             if not isinstance(msg, Message):
                 continue
 
-            post_id = await _process_message(msg, entity, db, qdrant)
+            post_id = await _process_message(msg, entity, db)
             if post_id is None:
                 continue
 
             posts_saved += 1
-            embedding_batch.append((post_id, msg.message, int(entity.id)))
 
-            if len(embedding_batch) >= batch_size:
-                await _upsert_embedding_batch(qdrant, embedding_batch)
-                embedding_batch.clear()
-
-        if embedding_batch:
-            await _upsert_embedding_batch(qdrant, embedding_batch)
+        await db.mark_channel_parsed(channel_id)
 
         logger.info(
-            "Done channel: %s (posts saved: %s)", channel_ref, posts_saved
+            "Done channel: id=%s username=%s (posts saved: %s)",
+            channel_id,
+            channel.username,
+            posts_saved,
         )
 
     except FloodWaitError as e:
         delay = int(getattr(e, "seconds", 0)) or 1
+        total_delay = delay + 10  # Add 10 seconds safety margin
+
         logger.warning(
-            "Channel %s: FloodWaitError, sleeping %ss", channel_ref, delay
+            "Channel %s: FloodWaitError, sleeping %ss (+10s safety)",
+            channel_id,
+            total_delay,
         )
-        await asyncio.sleep(delay)
+
+        await asyncio.sleep(total_delay)
+        # After FloodWait, mark as parsed to avoid getting stuck
+        await db.mark_channel_parsed(channel_id)
+
+    except (ChannelPrivateError, UserDeactivatedError) as e:
+        logger.warning(
+            "Channel %s: access denied (%s), marking as rejected",
+            channel_id,
+            type(e).__name__,
+        )
+        await db.mark_channel_rejected(channel_id)
 
     except (OSError, asyncio.TimeoutError, ConnectionError) as e:
         logger.exception(
-            "Channel %s: network error (%s)", channel_ref, type(e).__name__
+            "Channel %s: network error (%s)", channel_id, type(e).__name__
         )
+        await db.mark_channel_processed(channel_id)
 
     except RPCError as e:
         logger.exception(
             "Channel %s: Telethon RPCError (%s)",
-            channel_ref,
+            channel_id,
             type(e).__name__,
         )
+        await db.mark_channel_processed(channel_id)
 
     except Exception:
-        logger.exception("Channel %s: unexpected error", channel_ref)
+        logger.exception("Channel %s: unexpected error", channel_id)
+        await db.mark_channel_processed(channel_id)
+
+
+class ParserWorker:
+    """Async worker that processes channels using a single Telegram session."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        session_path: Path,
+        db: Database,
+        settings: Settings,
+        api_id: int,
+        api_hash: str,
+        proxy_url: str | None = None,
+        device_model: str = "PC 64bit",
+        system_version: str = "Windows 10",
+        app_version: str = "4.16.8",
+        lang_code: str = "en",
+        system_lang_code: str = "en-US",
+    ):
+        self.worker_id = worker_id
+        self.session_path = session_path
+        self.db = db
+        self.settings = settings
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.proxy_url = proxy_url
+        self.device_model = device_model
+        self.system_version = system_version
+        self.app_version = app_version
+        self.lang_code = lang_code
+        self.system_lang_code = system_lang_code
+        self.client: TelegramClient | None = None
+
+    async def run(self) -> None:
+        """Main worker loop: continuously fetch and parse channels from DB queue."""
+
+        # Build proxy configuration
+        proxy_config = None
+
+        if self.proxy_url:
+            try:
+                proxy_config = build_telethon_proxy(self.proxy_url)
+            except ValueError as e:
+                logger.error(
+                    "Worker %d: Invalid proxy URL %s: %s",
+                    self.worker_id,
+                    self.proxy_url,
+                    e,
+                )
+                return
+
+        # Create Telethon client with device parameters from session JSON
+        client_kwargs: dict[str, Any] = {
+            "device_model": self.device_model,
+            "system_version": self.system_version,
+            "app_version": self.app_version,
+            "lang_code": self.lang_code,
+            "system_lang_code": self.system_lang_code,
+            "use_ipv6": False,
+            "timeout": 60,
+            "connection": ConnectionTcpIntermediate,
+            "request_retries": self.settings.network_retries,
+            "connection_retries": self.settings.network_retries,
+            "retry_delay": self.settings.network_retry_base_delay_s,
+        }
+
+        if proxy_config:
+            if proxy_config.pop("is_mtproxy", False):
+                client_kwargs["connection"] = (
+                    ConnectionTcpMTProxyRandomizedIntermediate
+                )
+                client_kwargs["proxy"] = (
+                    proxy_config["addr"],
+                    proxy_config["port"],
+                    proxy_config["secret"],
+                )
+            else:
+                client_kwargs["proxy"] = proxy_config
+
+        # Log absolute session path for debugging
+        session_abs_path = self.session_path.with_suffix("").absolute()
+        logger.info(
+            "Worker %d: Attempting to load session from: %s",
+            self.worker_id,
+            session_abs_path,
+        )
+
+        self.client = TelegramClient(
+            str(session_abs_path),
+            self.api_id,
+            self.api_hash,
+            **client_kwargs,
+        )
+
+        try:
+            # Log MTProxy connection if applicable
+            if proxy_config and proxy_config.get("is_mtproxy"):
+                logger.info(
+                    "Worker %d: Connecting to MTProxy %s:%d",
+                    self.worker_id,
+                    proxy_config["addr"],
+                    proxy_config["port"],
+                )
+
+            await self.client.connect()
+
+            if self.proxy_url:
+                logger.info(
+                    "Worker %d: Connecting to Telegram via proxy",
+                    self.worker_id,
+                )
+            else:
+                logger.info(
+                    "Worker %d: Connecting to Telegram directly (no proxy)",
+                    self.worker_id,
+                )
+
+            if not await self.client.is_user_authorized():
+                logger.critical(
+                    "Worker %d: SESSION UNAUTHORIZED. Path: %s. "
+                    "Interactive login is impossible in Docker. Check your session files!",
+                    self.worker_id, self.session_path
+                )
+                return
+
+            logger.info("Worker %d: Starting parser loop", self.worker_id)
+
+            while True:
+                try:
+                    channel = await self.db.get_channel_for_parsing()
+
+                    if channel is None:
+                        logger.debug(
+                            "Worker %d: No channels ready for parsing, sleeping 30s",
+                            self.worker_id,
+                        )
+                        await asyncio.sleep(30)
+                        continue
+
+                    logger.info(
+                        "Worker %d: Processing channel id=%s username=%s",
+                        self.worker_id,
+                        channel.id,
+                        channel.username,
+                    )
+
+                    await _parse_single_channel(
+                        self.client, self.db, channel, self.settings
+                    )
+
+                except FloodWaitError as e:
+                    delay = int(getattr(e, "seconds", 0)) or 1
+                    total_delay = delay + 10
+                    logger.warning(
+                        "Worker %d: FloodWaitError, sleeping %ds (+10s safety)",
+                        self.worker_id,
+                        total_delay,
+                    )
+                    await asyncio.sleep(total_delay)
+                except Exception as e:
+                    logger.error(
+                        "Worker %d: Unexpected error in loop: %s",
+                        self.worker_id,
+                        e,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(30)
+
+        except (AuthKeyError, UserDeactivatedError, SessionRevokedError) as e:
+            logger.critical(
+                f"Worker {self.worker_id}: SESSION DEAD. Error: {type(e).__name__}. File: {self.session_path}"
+            )
+            return
+
+        except KeyboardInterrupt:
+            logger.info("Worker %d: Stopped by user", self.worker_id)
+        except Exception as e:
+            logger.exception("Worker %d: Fatal error: %s", self.worker_id, e)
+        finally:
+            if self.client:
+                await self.client.disconnect()  # type: ignore
+                logger.info("Worker %d: Disconnected", self.worker_id)
 
 
 async def main() -> None:
-    """Run parser entrypoint: connect, parse configured channels, and shutdown."""
+    """Entry point: discover sessions, read individual configs, spawn worker tasks."""
 
     settings = load_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    logger = logging.getLogger(__name__)
+
     logger.info(
-        "Parser starting (channels=%s posts=%s concurrency=%s)",
-        len(settings.channels),
+        "Starting parser (posts_limit=%d, concurrency from session count)",
         settings.posts_limit,
-        settings.concurrency,
     )
 
+    # Initialize database
     db = Database(settings.db_url)
     await db.init_db()
 
-    settings.session_dir.mkdir(parents=True, exist_ok=True)
-    session_path = str(settings.session_dir / "telethon")
+    # Scan sessions directory
+    sessions_dir = settings.session_dir
+    if not sessions_dir.exists():
+        logger.error("Sessions directory %s does not exist", sessions_dir)
+        return
 
-    sem = asyncio.Semaphore(settings.concurrency)
-    proxy = _build_telethon_proxy(settings.proxy_url)
-    client_kwargs: dict[str, Any] = {
-        "request_retries": settings.network_retries,
-        "connection_retries": settings.network_retries,
-        "retry_delay": settings.network_retry_base_delay_s,
-    }
+    session_files = sorted(sessions_dir.glob("*.session"))
+    if not session_files:
+        logger.error("No .session files found in %s", sessions_dir)
+        return
 
-    if proxy:
-        if proxy.pop("is_mtproxy", False):
-            client_kwargs["connection"] = (
-                ConnectionTcpMTProxyRandomizedIntermediate
-            )
-            client_kwargs["proxy"] = (
-                proxy["addr"],
-                proxy["port"],
-                proxy["secret"],
-            )
-        else:
-            client_kwargs["proxy"] = proxy
-
-    client = TelegramClient(
-        session_path,
-        settings.api_id,
-        settings.api_hash,
-        **client_kwargs,
+    logger.info(
+        "Found %d session files: %s",
+        len(session_files),
+        [f.name for f in session_files],
     )
+
+    # Create and spawn workers
+    workers: list[ParserWorker] = []
+
+    for i, session_path in enumerate(session_files):
+        # Look for accompanying .json config file
+        json_path = session_path.with_suffix(".json")
+
+        api_id = settings.api_id
+        api_hash = settings.api_hash
+        proxy_url = settings.proxy_url
+        device_model = "PC 64bit"
+        system_version = "Windows 10"
+        app_version = "4.16.8"
+        lang_code = "en"
+        system_lang_code = "en-US"
+
+        if json_path.exists():
+            try:
+                import json
+
+                with json_path.open(encoding="utf-8") as f:
+                    config = json.load(f)
+
+                api_id = config.get("api_id") or config.get("app_id") or settings.api_id
+                api_hash = config.get("api_hash") or config.get("app_hash") or settings.api_hash
+                proxy_url = config.get("proxy_url") if "proxy_url" in config else settings.proxy_url
+                device_model = config.get("device_model") or config.get("device") or device_model
+                system_version = config.get("system_version") or config.get("sdk") or system_version
+                app_version = config.get("app_version", app_version)
+                lang_code = config.get("lang_code", lang_code)
+                system_lang_code = config.get(
+                    "system_lang_code", system_lang_code
+                )
+
+                try:
+                    api_id = int(api_id)
+                except (ValueError, TypeError):
+                    api_id = settings.api_id
+                if not isinstance(api_hash, str):
+                    api_hash = settings.api_hash
+
+                logger.info(
+                    "Loaded config for %s from %s (api_id=%s, proxy=%s, device=%s)",
+                    session_path.name,
+                    json_path.name,
+                    api_id if api_id else "default",
+                    "yes" if proxy_url else "no",
+                    device_model,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to read %s: %s, using global settings",
+                    json_path.name,
+                    e,
+                )
+        else:
+            logger.debug(
+                "No config file for %s, using global settings",
+                session_path.name,
+            )
+
+        worker = ParserWorker(
+            worker_id=i,
+            session_path=session_path,
+            db=db,
+            settings=settings,
+            api_id=api_id,
+            api_hash=api_hash,
+            proxy_url=proxy_url,
+            device_model=device_model,
+            system_version=system_version,
+            app_version=app_version,
+            lang_code=lang_code,
+            system_lang_code=system_lang_code,
+        )
+        workers.append(worker)
+
+    logger.info("Spawning %d parser workers", len(workers))
+
+    # Run all workers concurrently
+    tasks = [asyncio.create_task(worker.run()) for worker in workers]
+    
+    if not tasks:
+        logger.error("No workers to run. Check your session directory.")
+        await db.close()
+        logger.info("Database connections closed")
+        
+        return
+
     try:
-        if settings.proxy_url:
-            logger.info("Connecting to Telegram via proxy")
-        else:
-            logger.info("Connecting to Telegram directly (no proxy)")
-
-        await client.connect()
-        logger.info("Connected to Telegram")
-
-        if not await client.is_user_authorized():
-            logger.info("Session is not authorized, starting interactive login")
-            await client.start()  # type: ignore
-            logger.info("Interactive login completed")
-        else:
-            logger.info("Session already authorized")
-
-        qdrant = QdrantService(settings)
-        await qdrant.initialize()
-
-        async def parse_channel_with_semaphore(ch: str) -> None:
-            async with sem:
-                await _parse_single_channel(client, db, qdrant, ch, settings)
-
-        tasks = [
-            asyncio.create_task(parse_channel_with_semaphore(ch))
-            for ch in settings.channels
-        ]
         await asyncio.gather(*tasks)
-    finally:
-        await client.disconnect()  # type: ignore
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal, stopping workers...")
 
-    await db.close()
-    await qdrant.close()
-    logger.info("Parser finished")
+        for task in tasks:
+            task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        logger.error("Global error in gather: %s", e, exc_info=True)
+    finally:
+        await db.close()
+        logger.info("Database connections closed")
 
 
 if __name__ == "__main__":

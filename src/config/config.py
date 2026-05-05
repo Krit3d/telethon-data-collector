@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file="src/config/.env",
+        env_file=".env",
         env_file_encoding="utf-8",
         frozen=True,  # immutable, like the original @dataclass(frozen=True)
         extra="ignore",  # ignore extra env vars / inputs
@@ -36,32 +36,32 @@ class Settings(BaseSettings):
     # ---- Optional vector search settings ----
 
     # Qdrant vector database for semantic search of posts
-    qdrant_url: str = Field(
-        ...,
-        description="Qdrant HTTP API URL",
+    qdrant_url: str | None = Field(
+        default=None,
+        description="Qdrant HTTP API URL (optional, for data collection node)",
     )
     qdrant_grpc_url: str | None = Field(
         default=None,
         description="Qdrant gRPC URL (optional, for faster operations)",
     )
-    qdrant_collection_name: str = Field(
-        default="telegram_posts",
+    qdrant_collection_name: str | None = Field(
+        default=None,
         description="Qdrant collection name for post embeddings",
     )
-    embedding_model_name: str = Field(
-        default="sentence-transformers/all-MiniLM-L6-v2",
+    embedding_model_name: str | None = Field(
+        default=None,
         description="HuggingFace sentence-transformer model name for generating embeddings",
     )
-    qdrant_batch_size: int = Field(
-        default=100,
+    qdrant_batch_size: int | None = Field(
+        default=None,
         description="Batch size for Qdrant upsert operations",
     )
-    qdrant_timeout: int = Field(
-        default=30,
+    qdrant_timeout: int | None = Field(
+        default=None,
         description="Qdrant request timeout in seconds",
     )
-    qdrant_retries: int = Field(
-        default=3,
+    qdrant_retries: int | None = Field(
+        default=None,
         description="Number of retries for failed Qdrant operations",
     )
 
@@ -107,6 +107,16 @@ class Settings(BaseSettings):
     log_level: str = Field(
         default="INFO",
         description="Logging level",
+    )
+
+    # ---- API server settings ----
+    api_host: str = Field(
+        default="0.0.0.0",
+        description="FastAPI server host",
+    )
+    api_port: int = Field(
+        default=8000,
+        description="FastAPI server port",
     )
 
     # ---- Channel sourcing ----

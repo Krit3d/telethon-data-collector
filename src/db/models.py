@@ -51,6 +51,9 @@ class Channel(Base):
     avatar_url: Mapped[str | None] = mapped_column(
         String(512), nullable=True, comment="URL to channel avatar"
     )
+    access_hash: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="Telegram access_hash for direct entity resolving"
+    )
 
     status: Mapped[str] = mapped_column(
         String(50),

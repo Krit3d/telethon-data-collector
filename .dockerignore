@@ -13,6 +13,7 @@ lib/
 
 # Ignoring secrets
 sessions/
+raw_sessions/
 .env
 *.session
 *.session-journal

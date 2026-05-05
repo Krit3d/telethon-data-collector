@@ -5,7 +5,7 @@ Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
 import logging
 from typing import Any, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -61,6 +61,7 @@ class Database:
 
         Conflict is detected on the id field (Telegram channel_id).
         On conflict, all mutable fields except the primary key are updated.
+        Status is preserved if it's already 'parsed' or 'ready_for_parsing'.
 
         Args:
             channel_data: Dictionary with fields matching the Channel model.
@@ -76,9 +77,16 @@ class Database:
             "description": stmt.excluded.description,
             "subscribers_count": stmt.excluded.subscribers_count,
             "avatar_url": stmt.excluded.avatar_url,
-            "status": stmt.excluded.status,
+            "access_hash": stmt.excluded.access_hash,
             "is_author_blog": stmt.excluded.is_author_blog,
             "updated_at": stmt.excluded.updated_at,
+            "status": case(
+                (
+                    Channel.status.in_(["parsed", "ready_for_parsing"]),
+                    Channel.status,
+                ),
+                else_=stmt.excluded.status,
+            ),
         }
         stmt = stmt.on_conflict_do_update(
             index_elements=["id"],
@@ -106,7 +114,8 @@ class Database:
         Insert or update a post record.
 
         Conflict is detected on the composite unique key (channel_id, message_id).
-        On conflict, content, metrics, and publication date are updated.
+        On conflict, only metrics (views, comments, shares, reactions) are updated.
+        Content and published_at are preserved to avoid overwriting existing data.
 
         Args:
             post_data: Dictionary with fields matching the Post model.
@@ -118,8 +127,6 @@ class Database:
         stmt = insert(Post).values(**post_data)
 
         update_columns = {
-            "content": stmt.excluded.content,
-            "published_at": stmt.excluded.published_at,
             "views": stmt.excluded.views,
             "comments_count": stmt.excluded.comments_count,
             "shares_count": stmt.excluded.shares_count,
@@ -188,13 +195,18 @@ class Database:
 
             return {ch.id: ch for ch in channels}
 
-    async def get_random_pending_channel(self) -> Channel | None:
+    async def get_random_pending_channel(self, require_hash: bool = False) -> Channel | None:
         """
         Fetch a random channel with status='pending' and mark it as 'processing'.
 
         Uses FOR UPDATE SKIP LOCKED to avoid race conditions between workers.
         After marking, the transaction is committed so the channel is immediately
         visible to other workers as 'processing'.
+
+        Args:
+            require_hash: If True, only return channels with non-null access_hash.
+                This allows "weak" accounts to fetch only channels that can be
+                accessed directly without global search.
 
         Returns:
             The selected Channel entity, or None if no pending channels exist.
@@ -203,14 +215,13 @@ class Database:
         async with self.async_session() as session:
             # Start transaction with row-level lock
             async with session.begin():
+                # Build query with optional hash requirement
+                stmt = select(Channel).where(Channel.status == "pending")
+                if require_hash:
+                    stmt = stmt.where(Channel.access_hash.is_not(None))
+
                 # Get random pending channel and lock it
-                stmt = (
-                    select(Channel)
-                    .where(Channel.status == "pending")
-                    .order_by(func.random())
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
-                )
+                stmt = stmt.order_by(func.random()).limit(1).with_for_update(skip_locked=True)
                 result = await session.execute(stmt)
                 channel = result.scalar_one_or_none()
 
@@ -313,4 +324,25 @@ class Database:
                     channel.status = "parsed"
                     logger.debug(
                         "Marked channel id=%s as COMPLETELY PARSED", channel_id
+                    )
+
+    async def mark_channel_pending(self, channel_id: int) -> None:
+        """
+        Return a channel to pending status (e.g., if a worker failed due to a shadowban).
+        """
+        
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    select(Channel)
+                    .where(Channel.id == channel_id)
+                    .with_for_update()
+                )
+                result = await session.execute(stmt)
+                channel = result.scalar_one_or_none()
+
+                if channel is not None:
+                    channel.status = "pending"
+                    logger.debug(
+                        "Returned channel id=%s to pending state", channel_id
                     )

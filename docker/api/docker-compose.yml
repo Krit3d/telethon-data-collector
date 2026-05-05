@@ -1,0 +1,40 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: tg_parser_qdrant
+    restart: always
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - api_network
+
+  api:
+    build:
+      context: ../../..
+      dockerfile: docker/api/Dockerfile
+    container_name: tg_parser_api
+    restart: always
+    env_file:
+      - ../../.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - qdrant
+    environment:
+      DB_URL: ${DB_URL}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME:-telegram_posts}
+      QDRANT_BATCH_SIZE: ${QDRANT_BATCH_SIZE:-100}
+      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT:-30.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - api_network
+
+networks:
+  api_network:
+    driver: bridge
+
+volumes:
+  qdrant_data:

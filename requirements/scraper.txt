@@ -1,0 +1,4 @@
+-r base.txt
+Telethon==1.43.1
+python-socks==2.8.1
+opentele==1.15.1
