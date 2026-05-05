@@ -84,6 +84,9 @@ class QdrantService:
     async def _ensure_collection(self) -> None:
         """Check if collection exists and create it if missing."""
 
+        if not self.collection_name:
+            raise ValueError("QDRANT_COLLECTION_NAME is not configured")
+
         try:
             collections = await self.client.get_collections()
             collection_names = [c.name for c in collections.collections]
@@ -151,7 +154,7 @@ class QdrantService:
 
         if not texts:
             logger.warning("Empty texts list provided for embedding generation")
-            
+
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
         # Validate texts
@@ -226,6 +229,9 @@ class QdrantService:
         if not points:
             return
 
+        if not self.collection_name:
+            raise ValueError("QDRANT_COLLECTION_NAME is not configured")
+
         try:
             # Generate embeddings in parallel
             texts = [p[1] for p in points]
@@ -237,13 +243,12 @@ class QdrantService:
                     vector=embedding.tolist(),
                     payload={"channel_id": channel_id, "text": text},
                 )
-
                 for (post_id, text, channel_id), embedding in zip(
                     points, embeddings
                 )
             ]
 
-            await self.client.upsert(
+            await self.client.upsert(  # type: ignore[attr-defined]
                 collection_name=self.collection_name,
                 points=point_structs,
                 wait=True,  # Wait for indexing
@@ -288,6 +293,9 @@ class QdrantService:
                 "QdrantService not initialized. Call initialize() first."
             )
 
+        if not self.collection_name:
+            raise ValueError("QDRANT_COLLECTION_NAME is not configured")
+
         try:
             embedding = await asyncio.to_thread(
                 self.embedding_model.encode, text, convert_to_numpy=True
@@ -299,7 +307,7 @@ class QdrantService:
                 payload={"channel_id": channel_id, "text": text},
             )
 
-            await self.client.upsert(
+            await self.client.upsert(  # type: ignore[attr-defined]
                 collection_name=self.collection_name, points=[point]
             )
 
@@ -341,8 +349,8 @@ class QdrantService:
                 "QdrantService not initialized. Call initialize() first."
             )
 
-        # Ensure collection name is set (type narrowing)
-        assert self.collection_name is not None, "Collection name must be set"
+        if not self.collection_name:
+            raise ValueError("QDRANT_COLLECTION_NAME is not configured")
 
         if not query or not query.strip():
             logger.warning("Empty query provided for search")
@@ -357,7 +365,7 @@ class QdrantService:
             )
 
             # Perform search
-            search_result = await self.client.search(
+            search_result = await self.client.search(  # type: ignore[attr-defined]
                 collection_name=self.collection_name,
                 query_vector=query_embedding.tolist(),
                 limit=limit,
