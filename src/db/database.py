@@ -42,7 +42,6 @@ class Database:
 
     async def init_db(self) -> None:
         """Create all tables defined in the models (if they don't exist)."""
-
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
@@ -50,9 +49,7 @@ class Database:
 
     async def close(self) -> None:
         """Close all database connections."""
-
         await self.engine.dispose()
-
         logger.info("Database connections closed")
 
     async def upsert_channel(self, channel_data: dict[str, Any]) -> Channel:
@@ -155,19 +152,16 @@ class Database:
                     await session.flush()
 
                 logger.debug("Upserted post: %s", post)
-
                 return post
 
     async def _get_post_by_unique(
         self, session: AsyncSession, channel_id: int, message_id: int
     ) -> Post | None:
         """Helper method to fetch a post by its composite natural key."""
-
         stmt = select(Post).where(
             Post.channel_id == channel_id, Post.message_id == message_id
         )
         result = await session.execute(stmt)
-
         return result.scalar_one_or_none()
 
     async def get_channels_batch(
@@ -192,19 +186,18 @@ class Database:
             stmt = select(Channel).where(Channel.id.in_(channel_ids))
             result = await session.execute(stmt)
             channels = result.scalars().all()
-
             return {ch.id: ch for ch in channels}
-    
+
     async def get_recent_posts(self, limit: int = 100) -> list[Post]:
         """Fetch recent posts from the database for indexing."""
-        
         async with self.async_session() as session:
             stmt = select(Post).order_by(Post.id.desc()).limit(limit)
             result = await session.execute(stmt)
-            
             return list(result.scalars().all())
 
-    async def get_random_pending_channel(self, require_hash: bool = False) -> Channel | None:
+    async def get_random_pending_channel(
+        self, require_hash: bool = False
+    ) -> Channel | None:
         """
         Fetch a random channel with status='pending' and mark it as 'processing'.
 
@@ -230,7 +223,11 @@ class Database:
                     stmt = stmt.where(Channel.access_hash.is_not(None))
 
                 # Get random pending channel and lock it
-                stmt = stmt.order_by(func.random()).limit(1).with_for_update(skip_locked=True)
+                stmt = (
+                    stmt.order_by(func.random())
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
                 result = await session.execute(stmt)
                 channel = result.scalar_one_or_none()
 
@@ -247,13 +244,7 @@ class Database:
                 return channel
 
     async def mark_channel_processed(self, channel_id: int) -> None:
-        """
-        Mark a channel as successfully processed (status='parsed').
-
-        Args:
-            channel_id: Telegram channel ID.
-        """
-
+        """Mark a channel as successfully processed (status='parsed')."""
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
@@ -269,13 +260,7 @@ class Database:
                     logger.debug("Marked channel id=%s as parsed", channel_id)
 
     async def mark_channel_rejected(self, channel_id: int) -> None:
-        """
-        Mark a channel as rejected (status='rejected').
-
-        Args:
-            channel_id: Telegram channel ID.
-        """
-
+        """Mark a channel as rejected (status='rejected')."""
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
@@ -292,7 +277,6 @@ class Database:
 
     async def get_channel_for_parsing(self) -> Channel | None:
         """Fetch a channel ready for POST PARSING and mark as processing."""
-
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
@@ -318,7 +302,6 @@ class Database:
 
     async def mark_channel_parsed(self, channel_id: int) -> None:
         """Mark a channel as completely parsed (posts are saved)."""
-
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
@@ -336,10 +319,7 @@ class Database:
                     )
 
     async def mark_channel_pending(self, channel_id: int) -> None:
-        """
-        Return a channel to pending status (e.g., if a worker failed due to a shadowban).
-        """
-        
+        """Return a channel to pending status (e.g., if a worker failed due to a shadowban)."""
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
