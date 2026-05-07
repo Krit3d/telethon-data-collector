@@ -48,9 +48,16 @@ class Settings(BaseSettings):
         default=None,
         description="Qdrant collection name for post embeddings",
     )
-    embedding_model_name: str = Field(
-        default="all-MiniLM-L6-v2",
-        description="HuggingFace sentence-transformer model name for generating embeddings",
+    embedding_api_url: str = Field(
+        ...,
+        description="URL for the external embedding API",
+    )
+    embedding_api_key: str = Field(
+        ...,
+        description="API key or token for embeddings",
+    )
+    embedding_model: str = Field(
+        default="bge-m3", description="Model name for the API payload"
     )
     qdrant_batch_size: int | None = Field(
         default=None,

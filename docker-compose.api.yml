@@ -9,6 +9,17 @@ services:
       - qdrant_data:/qdrant/storage
     networks:
       - api_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   api:
     build:
@@ -21,16 +32,29 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
       DB_URL: ${DB_URL}
-      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
-      QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME:-telegram_posts}
-      QDRANT_BATCH_SIZE: ${QDRANT_BATCH_SIZE:-100}
-      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT:-30.0}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      QDRANT_URL: ${QDRANT_URL}
+      QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME}
+      QDRANT_BATCH_SIZE: ${QDRANT_BATCH_SIZE}
+      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT}
+      LOG_LEVEL: ${LOG_LEVEL}
     networks:
       - api_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
 
 networks:
   api_network:

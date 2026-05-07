@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Final
 
+import httpx
 import numpy as np
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.models import (
@@ -14,11 +14,12 @@ from qdrant_client.http.models import (
     PointStruct,
     VectorParams,
 )
-from sentence_transformers import SentenceTransformer
 
 from src.config.config import Settings
 
 logger = logging.getLogger(__name__)
+
+EMBEDDING_DIM: Final[int] = 1024
 
 EMBEDDING_DIM: Final[int] = 384
 EMBEDDING_METRIC: Final[Distance] = Distance.COSINE
@@ -52,7 +53,8 @@ class QdrantService:
         )
         self.collection_name = settings.qdrant_collection_name
         self.embedding_model = SentenceTransformer(
-            settings.embedding_model_name, device="cpu"  # Explicitly set device
+            settings.embedding_model_name,
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
         self._initialized = False
 

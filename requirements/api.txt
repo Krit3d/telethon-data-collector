@@ -2,6 +2,4 @@
 fastapi==0.136.1
 uvicorn[standard]==0.46.0
 qdrant-client==1.17.1
-sentence-transformers==5.4.1
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.11.0+cpu
+httpx==0.28.1
