@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Final
+from typing import Final
 
 import httpx
 import numpy as np
@@ -20,8 +20,6 @@ from src.config.config import Settings
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM: Final[int] = 1024
-
-EMBEDDING_DIM: Final[int] = 384
 EMBEDDING_METRIC: Final[Distance] = Distance.COSINE
 
 
@@ -32,29 +30,33 @@ class QdrantService:
         """Initialize Qdrant client and ensure collection exists.
 
         Args:
-            settings: Application settings containing Qdrant configuration.
+            settings: Application settings containing Qdrant and embedding API configuration.
 
         Raises:
+            ValueError: If required settings are missing.
             RuntimeError: If Qdrant connection or collection creation fails.
         """
 
         self.settings = settings
 
-        if not settings.embedding_model_name:
+        if not settings.embedding_api_url:
             raise ValueError(
-                "EMBEDDING_MODEL_NAME must be set in settings/environment"
+                "EMBEDDING_API_URL must be set in settings/environment"
+            )
+
+        if not settings.embedding_api_key:
+            raise ValueError(
+                "EMBEDDING_API_KEY must be set in settings/environment"
             )
 
         self.client = AsyncQdrantClient(
             url=settings.qdrant_url,
             timeout=settings.qdrant_timeout,
-            # For gRPC (faster):
-            # grpc_port=settings.qdrant_grpc_port if settings.qdrant_grpc_url else None,
         )
         self.collection_name = settings.qdrant_collection_name
-        self.embedding_model = SentenceTransformer(
-            settings.embedding_model_name,
-            device="cuda" if torch.cuda.is_available() else "cpu",
+        self.http_client = httpx.AsyncClient(
+            timeout=30.0,
+            headers={"Authorization": f"Bearer {settings.embedding_api_key}"}
         )
         self._initialized = False
 
@@ -140,17 +142,11 @@ class QdrantService:
     async def _generate_embeddings_batch(
         self,
         texts: list[str],
-        *,
-        batch_size: int | None = None,
-        show_progress: bool = False,
     ) -> np.ndarray:
-        """Generate embeddings for a list of texts using a separate thread.
+        """Generate embeddings for a list of texts using external API.
 
         Args:
             texts: List of text strings to generate embeddings for.
-            batch_size: Optional batch size for processing large text lists.
-                    If None, processes all texts in a single batch.
-            show_progress: Whether to show a progress bar (requires tqdm).
 
         Returns:
             numpy.ndarray: Array of embeddings with shape (len(texts), EMBEDDING_DIM).
@@ -162,7 +158,6 @@ class QdrantService:
 
         if not texts:
             logger.warning("Empty texts list provided for embedding generation")
-
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
         # Validate texts
@@ -175,54 +170,64 @@ class QdrantService:
 
         if not valid_texts:
             logger.warning("No valid texts to generate embeddings for")
-
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
         try:
-            # Process in chunks if batch_size is specified
-            if batch_size and batch_size > 0:
-                all_embeddings = []
+            # Make API request
+            payload = {
+                "input": valid_texts,
+                "model": self.settings.embedding_model,
+            }
+            response = await self.http_client.post(
+                self.settings.embedding_api_url,
+                json=payload
+            )
+            response.raise_for_status()
 
-                for i in range(0, len(valid_texts), batch_size):
-                    batch = valid_texts[i : i + batch_size]
-                    batch_embeddings = await asyncio.to_thread(
-                        self.embedding_model.encode,
-                        batch,
-                        convert_to_numpy=True,
-                        show_progress_bar=show_progress and (i == 0),
-                    )
+            # Parse response
+            response_data = response.json()
+            embeddings = [
+                item["embedding"] for item in response_data["data"]
+            ]
 
-                    all_embeddings.append(batch_embeddings)
-
-                embeddings = np.vstack(all_embeddings)
-            else:
-                embeddings = await asyncio.to_thread(
-                    self.embedding_model.encode,
-                    valid_texts,
-                    convert_to_numpy=True,
-                    show_progress_bar=show_progress,
-                )
+            result = np.array(embeddings, dtype=np.float32)
 
             logger.debug(
                 "Generated embeddings batch",
                 extra={
                     "requested": len(texts),
                     "valid": len(valid_texts),
-                    "embedding_shape": embeddings.shape,
+                    "embedding_shape": result.shape,
                 },
             )
 
-            return embeddings
+            return result
 
+        except httpx.HTTPError as e:
+            logger.error(
+                "HTTP error during embedding generation",
+                exc_info=e,
+                extra={
+                    "text_count": len(texts),
+                    "valid_count": len(valid_texts),
+                    "api_url": self.settings.embedding_api_url,
+                },
+            )
+            raise RuntimeError(f"Embedding API request failed: {e}") from e
+        except KeyError as e:
+            logger.error(
+                "Invalid response format from embedding API",
+                exc_info=e,
+                extra={"response_keys": list(response_data.keys()) if 'response_data' in locals() else None},
+            )
+            raise RuntimeError(f"Invalid embedding API response format: {e}") from e
         except Exception as e:
             logger.error(
                 "Failed to generate embeddings batch",
                 exc_info=e,
                 extra={
                     "text_count": len(texts),
-                    "valid_count": (
-                        len(valid_texts) if "valid_texts" in locals() else 0
-                    ),
+                    "valid_count": len(valid_texts),
                 },
             )
             raise RuntimeError(f"Embedding generation failed: {e}") from e
@@ -305,9 +310,8 @@ class QdrantService:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
 
         try:
-            embedding = await asyncio.to_thread(
-                self.embedding_model.encode, text, convert_to_numpy=True
-            )
+            embedding_array = await self._generate_embeddings_batch([text])
+            embedding = embedding_array[0]
 
             point = PointStruct(
                 id=post_id,
@@ -330,7 +334,6 @@ class QdrantService:
                 exc_info=e,
                 extra={"post_id": post_id, "channel_id": channel_id},
             )
-
             raise RuntimeError(
                 f"Failed to upsert embedding for post {post_id}: {e}"
             ) from e
@@ -364,11 +367,8 @@ class QdrantService:
 
         try:
             # Generate embedding for the query
-            query_embedding = await asyncio.to_thread(
-                self.embedding_model.encode,
-                query,
-                convert_to_numpy=True,
-            )
+            embedding_array = await self._generate_embeddings_batch([query])
+            query_embedding = embedding_array[0]
 
             # Use modern query_points instead of deprecated search
             response = await self.client.query_points(
@@ -411,15 +411,14 @@ class QdrantService:
             raise RuntimeError(f"Search failed: {e}") from e
 
     async def close(self) -> None:
-        """Close the Qdrant client connection."""
+        """Close the Qdrant client connection and HTTP client."""
 
         try:
             await self.client.close()
-
-            logger.debug("Qdrant client closed")
-
+            await self.http_client.aclose()
+            logger.debug("Qdrant client and HTTP client closed")
         except Exception as e:
-            logger.warning("Error closing Qdrant client", exc_info=e)
+            logger.warning("Error closing clients", exc_info=e)
 
     async def __aenter__(self) -> QdrantService:
         """Async context manager entry."""
