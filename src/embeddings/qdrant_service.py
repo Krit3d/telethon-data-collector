@@ -38,6 +38,12 @@ class QdrantService:
         """
 
         self.settings = settings
+
+        if not settings.embedding_model_name:
+            raise ValueError(
+                "EMBEDDING_MODEL_NAME must be set in settings/environment"
+            )
+
         self.client = AsyncQdrantClient(
             url=settings.qdrant_url,
             timeout=settings.qdrant_timeout,
@@ -328,9 +334,9 @@ class QdrantService:
             ) from e
 
     async def search_posts(
-        self, query: str, limit: int = 10, score_threshold: float = 0.5
-    ) -> list[dict[str, Any]]:
-        """Search for posts by semantic similarity.
+        self, query: str, limit: int = 10, score_threshold: float = 0.35
+    ) -> list[dict]:
+        """Search for posts using the unified query API.
 
         Args:
             query: Search query text.
@@ -345,9 +351,7 @@ class QdrantService:
         """
 
         if not self._initialized:
-            raise RuntimeError(
-                "QdrantService not initialized. Call initialize() first."
-            )
+            await self.initialize()
 
         if not self.collection_name:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
@@ -364,10 +368,10 @@ class QdrantService:
                 convert_to_numpy=True,
             )
 
-            # Perform search
-            search_result = await self.client.search(  # type: ignore[attr-defined]
+            # Use modern query_points instead of deprecated search
+            response = await self.client.query_points(
                 collection_name=self.collection_name,
-                query_vector=query_embedding.tolist(),
+                query=query_embedding.tolist(),
                 limit=limit,
                 score_threshold=score_threshold,
                 with_payload=True,
@@ -376,16 +380,16 @@ class QdrantService:
             # Transform results
             results = [
                 {
-                    "post_id": point.id,
-                    "score": point.score,
-                    "text": point.payload.get("text", ""),
-                    "channel_id": point.payload.get("channel_id", 0),
+                    "post_id": hit.id,
+                    "score": hit.score,
+                    "text": hit.payload.get("text", "") if hit.payload else "",
+                    "channel_id": hit.payload.get("channel_id", 0) if hit.payload else 0,
                 }
-                for point in search_result.points
+                for hit in response.points
             ]
 
-            logger.info(
-                "Search completed",
+            logger.debug(
+                "Query successful",
                 extra={
                     "query": query,
                     "results_count": len(results),
@@ -398,7 +402,7 @@ class QdrantService:
 
         except Exception as e:
             logger.error(
-                "Search failed",
+                "Error during Qdrant query_points",
                 exc_info=e,
                 extra={"query": query, "limit": limit},
             )

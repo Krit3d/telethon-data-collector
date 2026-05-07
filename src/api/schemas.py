@@ -1,4 +1,6 @@
+from datetime import datetime
 from pydantic import BaseModel, Field
+from typing import Optional
 
 
 class SearchRequest(BaseModel):
@@ -14,6 +16,8 @@ class SearchResultItem(BaseModel):
     channel_id: int
     text: str
     score: float
+    created_at: datetime
+    url: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
