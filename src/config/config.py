@@ -48,8 +48,8 @@ class Settings(BaseSettings):
         default=None,
         description="Qdrant collection name for post embeddings",
     )
-    embedding_model_name: str | None = Field(
-        default=None,
+    embedding_model_name: str = Field(
+        default="all-MiniLM-L6-v2",
         description="HuggingFace sentence-transformer model name for generating embeddings",
     )
     qdrant_batch_size: int | None = Field(
@@ -249,7 +249,7 @@ def load_settings() -> Settings:
         default=os.getenv("LOG_LEVEL", "INFO"),
         help="Logging level",
     )
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
     _setup_logging(args.log_level)
 
     # Collect CLI overrides – only non‑None values are forwarded so that
@@ -273,8 +273,9 @@ def load_settings() -> Settings:
         raise SystemExit(str(exc)) from exc
 
     if not settings.channels:
-        raise SystemExit(
-            "No channels provided. Set CHANNELS env var or create channels.txt"
+        logging.warning(
+            "No channels provided. Set CHANNELS env var or create channels.txt. "
+            "The API will start without channel parsing capability."
         )
 
     return settings

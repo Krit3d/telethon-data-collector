@@ -14,5 +14,5 @@ rsync -avz --delete \
     --exclude='*.pyc' --exclude='avatars/' --exclude='sessions/' \
     ./ "$SSH_USER@$SSH_HOST:$REMOTE_DIR"
 
-ssh "$SSH_USER@$SSH_HOST" "cd $REMOTE_DIR && docker compose -f docker/scraper/docker-compose.yml up -d --build"
+ssh "$SSH_USER@$SSH_HOST" "cd $REMOTE_DIR && docker compose -f docker-compose.scraper.yml up -d --build db"
 echo "Scraper deployed!"

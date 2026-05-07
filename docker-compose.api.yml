@@ -12,12 +12,12 @@ services:
 
   api:
     build:
-      context: ../../..
+      context: .
       dockerfile: docker/api/Dockerfile
     container_name: tg_parser_api
     restart: always
     env_file:
-      - ../../.env
+      - .env
     ports:
       - "8000:8000"
     depends_on:
