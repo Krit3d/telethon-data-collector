@@ -17,7 +17,7 @@ class SearchResultItem(BaseModel):
     text: str
     score: float
     created_at: datetime
-    url: Optional[str] = None
+    url: str | None = None
 
 
 class SearchResponse(BaseModel):
