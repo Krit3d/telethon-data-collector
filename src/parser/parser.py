@@ -6,13 +6,19 @@ channel metadata and posts, and store them in a database.
 
 import asyncio
 import logging
+import random
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from telethon import TelegramClient
 from telethon.errors import RPCError
-from telethon.errors import AuthKeyError, ChannelPrivateError, SessionRevokedError, UserDeactivatedError
+from telethon.errors import (
+    AuthKeyError,
+    ChannelPrivateError,
+    SessionRevokedError,
+    UserDeactivatedError,
+)
 from telethon.errors.rpcerrorlist import FloodWaitError
 from telethon.network.connection.tcpintermediate import (
     ConnectionTcpIntermediate,
@@ -236,58 +242,76 @@ async def _extract_channel_metadata(
     db: Database,
     settings: Settings,
 ) -> tuple[dict[str, Any], TlChannel] | None:
-    """Fetch and extract channel metadata and entity.
-
-    Args:
-        client: Connected Telethon client.
-        channel: Channel object from database with id and username.
-        db: Database gateway for marking rejected channels.
-        settings: Runtime settings with retry configuration.
-
-    Returns:
-        Tuple of (channel_data dict, channel entity) or None if skipped.
-    """
+    """Extract channel metadata using username fallback or direct peer resolution."""
 
     channel_id = channel.id
-    formatted_id = format_tg_id(channel_id)
+    entity = None
 
-    try:
-        # Use username if available, otherwise fall back to formatted numeric ID
-        identifier = channel.username if channel.username else formatted_id
+    # Attempt 1: Resolve by username (safest, populates session cache)
+    username = _normalize_username(channel.username)
+    
+    if username:
+        try:
+            entity = await _with_telethon_retries(
+                f"get_entity({username})",
+                lambda: client.get_entity(username),
+                network_retries=settings.network_retries,
+                base_delay_s=settings.network_retry_base_delay_s,
+            )
+        except FloodWaitError as e:
+            delay = int(getattr(e, "seconds", 0)) or 1
+            logger.warning("Channel %s: FloodWaitError on username resolve, sleeping %ds", channel_id, delay)
+            await db.mark_channel_pending(channel_id)
+            await asyncio.sleep(delay)
+            return None
+        except Exception as e:
+            logger.warning("Channel %s: Failed to resolve by username %s: %s", channel_id, username, e)
 
-        entity = await _with_telethon_retries(
-            f"get_entity({formatted_id})",
-            lambda: client.get_entity(identifier),
-            network_retries=settings.network_retries,
-            base_delay_s=settings.network_retry_base_delay_s,
-        )
-    except ValueError as e:
-        logger.error(f"Could not find entity for {channel.id}: {e}")
-        await db.mark_channel_rejected(channel.id)
-        return None
+    # Attempt 2: Resolve by InputPeerChannel if username failed or missing
+    if entity is None and channel.access_hash:
+        bare_id = channel.id
+        if str(bare_id).startswith("-100"):
+            bare_id = int(str(bare_id)[4:])
+        
+        try:
+            peer = InputPeerChannel(bare_id, channel.access_hash)
+            entity = await _with_telethon_retries(
+                f"get_entity({bare_id})",
+                lambda: client.get_entity(peer),
+                network_retries=settings.network_retries,
+                base_delay_s=settings.network_retry_base_delay_s,
+            )
+        except FloodWaitError as e:
+            delay = int(getattr(e, "seconds", 0)) or 1
+            logger.warning("Channel %s: FloodWaitError on hash resolve, sleeping %ds", channel_id, delay)
+            await db.mark_channel_pending(channel_id)
+            await asyncio.sleep(delay)
+            return None
+        except Exception as e:
+            logger.error("Channel %s: Failed to resolve by hash: %s", channel_id, e)
 
     if not isinstance(entity, TlChannel):
-        logger.warning(
-            "Skipping non-channel entity: %s (%s)",
-            channel_id,
-            type(entity).__name__,
-        )
-
+        logger.error("Channel %s: Could not resolve valid channel entity by any method", channel_id)
+        await db.mark_channel_rejected(channel_id)
+        await asyncio.sleep(random.uniform(10, 20))
         return None
 
     if entity.access_hash is None:
-        full = None
-    else:
-        channel_id_val = entity.id
-        access_hash = entity.access_hash
-        full = await _with_telethon_retries(
-            f"GetFullChannelRequest({channel_id})",
-            lambda: client(
-                GetFullChannelRequest(InputChannel(channel_id_val, access_hash))
-            ),
-            network_retries=settings.network_retries,
-            base_delay_s=settings.network_retry_base_delay_s,
-        )
+        logger.error("Channel %s: Entity has no access_hash", channel_id)
+        await db.mark_channel_rejected(channel_id)
+        await asyncio.sleep(random.uniform(10, 20))
+        return None
+
+    channel_id_val = entity.id
+    access_hash = entity.access_hash
+    full = await _with_telethon_retries(
+        f"GetFullChannelRequest({channel_id})",
+        lambda: client(
+            GetFullChannelRequest(InputChannel(channel_id_val, access_hash))
+        ),
+        network_retries=settings.network_retries,
+        base_delay_s=settings.network_retry_base_delay_s,
+    )
 
     subscribers_count = getattr(
         getattr(full, "full_chat", None), "participants_count", None
@@ -416,6 +440,9 @@ async def _parse_single_channel(
             posts_saved,
         )
 
+        # Random delay between channels to avoid rate limits
+        await asyncio.sleep(random.uniform(5, 15))
+
     except FloodWaitError as e:
         delay = int(getattr(e, "seconds", 0)) or 1
         total_delay = delay + 10  # Add 10 seconds safety margin
@@ -426,9 +453,8 @@ async def _parse_single_channel(
             total_delay,
         )
 
+        await db.mark_channel_pending(channel_id)
         await asyncio.sleep(total_delay)
-        # After FloodWait, mark as parsed to avoid getting stuck
-        await db.mark_channel_parsed(channel_id)
 
     except (ChannelPrivateError, UserDeactivatedError) as e:
         logger.warning(
@@ -439,22 +465,16 @@ async def _parse_single_channel(
         await db.mark_channel_rejected(channel_id)
 
     except (OSError, asyncio.TimeoutError, ConnectionError) as e:
-        logger.exception(
-            "Channel %s: network error (%s)", channel_id, type(e).__name__
-        )
-        await db.mark_channel_processed(channel_id)
+        logger.exception("Channel %s: network error (%s)", channel_id, type(e).__name__)
+        await db.mark_channel_pending(channel_id)  # Return to queue
 
     except RPCError as e:
-        logger.exception(
-            "Channel %s: Telethon RPCError (%s)",
-            channel_id,
-            type(e).__name__,
-        )
-        await db.mark_channel_processed(channel_id)
+        logger.exception("Channel %s: Telethon RPCError (%s)", channel_id, type(e).__name__)
+        await db.mark_channel_rejected(channel_id)  # Permanently block
 
     except Exception:
         logger.exception("Channel %s: unexpected error", channel_id)
-        await db.mark_channel_processed(channel_id)
+        await db.mark_channel_rejected(channel_id)  # Permanently block
 
 
 class ParserWorker:
@@ -577,7 +597,8 @@ class ParserWorker:
                 logger.critical(
                     "Worker %d: SESSION UNAUTHORIZED. Path: %s. "
                     "Interactive login is impossible in Docker. Check your session files!",
-                    self.worker_id, self.session_path
+                    self.worker_id,
+                    self.session_path,
                 )
                 return
 
@@ -699,11 +720,31 @@ async def main() -> None:
                 with json_path.open(encoding="utf-8") as f:
                     config = json.load(f)
 
-                api_id = config.get("api_id") or config.get("app_id") or settings.api_id
-                api_hash = config.get("api_hash") or config.get("app_hash") or settings.api_hash
-                proxy_url = config.get("proxy_url") if "proxy_url" in config else settings.proxy_url
-                device_model = config.get("device_model") or config.get("device") or device_model
-                system_version = config.get("system_version") or config.get("sdk") or system_version
+                api_id = (
+                    config.get("api_id")
+                    or config.get("app_id")
+                    or settings.api_id
+                )
+                api_hash = (
+                    config.get("api_hash")
+                    or config.get("app_hash")
+                    or settings.api_hash
+                )
+                proxy_url = (
+                    config.get("proxy_url")
+                    if "proxy_url" in config
+                    else settings.proxy_url
+                )
+                device_model = (
+                    config.get("device_model")
+                    or config.get("device")
+                    or device_model
+                )
+                system_version = (
+                    config.get("system_version")
+                    or config.get("sdk")
+                    or system_version
+                )
                 app_version = config.get("app_version", app_version)
                 lang_code = config.get("lang_code", lang_code)
                 system_lang_code = config.get(
@@ -757,12 +798,12 @@ async def main() -> None:
 
     # Run all workers concurrently
     tasks = [asyncio.create_task(worker.run()) for worker in workers]
-    
+
     if not tasks:
         logger.error("No workers to run. Check your session directory.")
         await db.close()
         logger.info("Database connections closed")
-        
+
         return
 
     try:

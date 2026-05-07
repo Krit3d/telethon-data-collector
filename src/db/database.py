@@ -5,7 +5,7 @@ Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
 import logging
 from typing import Any, Sequence
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -46,6 +46,29 @@ class Database:
             await conn.run_sync(Base.metadata.create_all)
 
         logger.info("Database tables created (if not exist)")
+
+    async def reset_orphaned_processing_channels(self) -> None:
+        """Reset all channels with status='processing' back to 'pending'.
+
+        This recovers from crashes/restarts where channels were left in processing state.
+        """
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    update(Channel)
+                    .where(Channel.status == "processing")
+                    .values(status="pending")
+                )
+                result = await session.execute(stmt)
+                count = result.rowcount  # type: ignore[attr-defined]
+
+                if count > 0:
+                    logger.info(
+                        "Reset orphaned processing channels back to pending: %d channels",
+                        count,
+                    )
+                else:
+                    logger.debug("No orphaned processing channels found")
 
     async def close(self) -> None:
         """Close all database connections."""
@@ -188,6 +211,25 @@ class Database:
             channels = result.scalars().all()
             return {ch.id: ch for ch in channels}
 
+    async def get_posts_by_ids(self, post_ids: list[int]) -> dict[int, Post]:
+        """
+        Fetch posts by a list of post IDs.
+
+        Args:
+            post_ids: List of PostgreSQL post IDs (primary keys).
+
+        Returns:
+            Dictionary mapping post_id to Post object for efficient lookup.
+        """
+        if not post_ids:
+            return {}
+
+        async with self.async_session() as session:
+            stmt = select(Post).where(Post.id.in_(post_ids))
+            result = await session.execute(stmt)
+            posts = result.scalars().all()
+            return {post.id: post for post in posts}
+
     async def get_recent_posts(self, limit: int = 100) -> list[Post]:
         """Fetch recent posts from the database for indexing."""
         async with self.async_session() as session:
@@ -276,13 +318,18 @@ class Database:
                     logger.debug("Marked channel id=%s as rejected", channel_id)
 
     async def get_channel_for_parsing(self) -> Channel | None:
-        """Fetch a channel ready for POST PARSING and mark as processing."""
+        """Fetch a channel ready for POST PARSING and mark as processing.
+
+        Only returns channels that have an access_hash to avoid global search
+        rate limits and potential account bans.
+        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
                     select(Channel)
                     .where(Channel.status == "ready_for_parsing")
                     .where(Channel.is_author_blog == True)
+                    .where(Channel.access_hash.is_not(None))
                     .order_by(func.random())
                     .limit(1)
                     .with_for_update(skip_locked=True)
@@ -293,7 +340,7 @@ class Database:
                 if channel:
                     channel.status = "processing"
                     logger.debug(
-                        "Parser claimed channel id=%s username=%s",
+                        "Parser claimed channel id=%s username=%s (has access_hash)",
                         channel.id,
                         channel.username,
                     )

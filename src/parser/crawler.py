@@ -15,7 +15,14 @@ from typing import Any, Literal, cast
 
 from sqlalchemy import select
 from telethon import TelegramClient
-from telethon.errors import AuthKeyError, FloodWaitError, RPCError, SessionRevokedError, UserDeactivatedError
+from telethon.errors import (
+    AuthKeyError,
+    ChannelInvalidError,
+    FloodWaitError,
+    RPCError,
+    SessionRevokedError,
+    UserDeactivatedError,
+)
 from telethon.network.connection.tcpintermediate import (
     ConnectionTcpIntermediate,
 )
@@ -45,6 +52,11 @@ FIRST_PERSON_REGEX = re.compile(
     r"\b(я|мне|меня|мое|мой|моя|думаю|считаю|пишу|рассказываю|сделал|запустил|работаю|разрабатываю|заметил|поделился)\b",
     re.IGNORECASE | re.UNICODE,
 )
+
+
+class ChannelTaskRejected(Exception):
+    """Exception raised when a channel task should be rejected due to invalid channel."""
+    pass
 
 
 class Worker:
@@ -402,7 +414,9 @@ class Worker:
 
         return True
 
-    async def _get_recommendations(self, entity: Channel | InputChannel) -> list[Channel]:
+    async def _get_recommendations(
+        self, entity: Channel | InputChannel, channel_id: int | None = None
+    ) -> list[Channel]:
         """Fetch channel recommendations for a given channel."""
         if not self.client:
             raise RuntimeError("Telegram client is not initialized")
@@ -419,15 +433,34 @@ class Worker:
                     self.worker_id,
                     getattr(entity, "username", "unknown"),
                 )
-
                 return []
             else:
                 input_channel = InputChannel(entity.id, entity.access_hash)
-            result = await self._call_api(
-                lambda: client(
-                    GetChannelRecommendationsRequest(channel=input_channel)
+
+            # Wrap the API call specifically for Telethon errors
+            try:
+                result = await self._call_api(
+                    lambda: client(
+                        GetChannelRecommendationsRequest(channel=input_channel)
+                    )
                 )
-            )
+            except ChannelInvalidError:
+                logger.warning(
+                    "Worker %d: Channel id=%s is invalid (ChannelInvalidError), rejecting task",
+                    self.worker_id,
+                    channel_id,
+                )
+                raise ChannelTaskRejected(f"Channel {channel_id} is invalid")
+            except RPCError as e:
+                if "Invalid channel" in str(e):
+                    logger.warning(
+                        "Worker %d: Channel id=%s is invalid (RPCError: Invalid channel), rejecting task",
+                        self.worker_id,
+                        channel_id,
+                    )
+                    raise ChannelTaskRejected(f"Channel {channel_id} is invalid")
+                # Re-raise other RPC errors
+                raise
 
             result = cast(MessagesTypes.Chats, result)
 
@@ -450,10 +483,13 @@ class Worker:
             )
 
             return recommended_channels
+
         except Exception as e:
             error_text = str(e)
             if "method that is not available for frozen accounts" in error_text:
-                logger.critical(f"Worker {self.worker_id}: ACCOUNT FROZEN by Telegram. Disconnecting.")
+                logger.critical(
+                    f"Worker {self.worker_id}: ACCOUNT FROZEN by Telegram. Disconnecting."
+                )
                 self.is_frozen = True
                 if self.client and self.client.is_connected():
                     await self.client.disconnect()  # type: ignore
@@ -461,13 +497,14 @@ class Worker:
             logger.error(
                 "Worker %d: Failed to get recommendations for %s: %s",
                 self.worker_id,
-                getattr(entity, "username", "unknown"),
+                getattr(entity, "username", "unknown") or channel_id,
                 e,
             )
+            raise
 
-            return []
-
-    async def _claim_channel(self, require_hash: bool = False) -> ChannelModel | None:
+    async def _claim_channel(
+        self, require_hash: bool = False
+    ) -> ChannelModel | None:
         """
         Claim a random pending channel from the database for processing.
 
@@ -477,7 +514,9 @@ class Worker:
         Args:
             require_hash: If True, only claim channels with non-null access_hash.
         """
-        channel = await self.db.get_random_pending_channel(require_hash=require_hash)
+        channel = await self.db.get_random_pending_channel(
+            require_hash=require_hash
+        )
         if channel is None:
             return None
 
@@ -581,13 +620,15 @@ class Worker:
             logger.info("Worker %d: Starting processing loop", self.worker_id)
 
             while True:
-                if getattr(self, 'is_frozen', False):
+                if getattr(self, "is_frozen", False):
                     return
                 channel = None
 
                 try:
                     # Claim a random pending channel
-                    channel = await self._claim_channel(require_hash=self.safe_mode)
+                    channel = await self._claim_channel(
+                        require_hash=self.safe_mode
+                    )
 
                     if channel is None:
                         logger.info(
@@ -602,10 +643,13 @@ class Worker:
                     if channel.access_hash is not None:
                         # Ideal scenario: we have hash, create InputChannel without network calls!
                         from telethon.tl.types import InputChannel
+
                         entity = InputChannel(channel.id, channel.access_hash)
                     else:
                         # Fallback: if no hash (e.g., seed channels), resolve by username or ID
-                        identifier = channel.username if channel.username else channel.id
+                        identifier = (
+                            channel.username if channel.username else channel.id
+                        )
                         entity = await self._get_channel_entity_safe(identifier)
 
                     if entity == "SHADOWBANNED":
@@ -659,7 +703,17 @@ class Worker:
                         continue
 
                     # Get recommendations
-                    recommendations = await self._get_recommendations(entity)
+                    try:
+                        recommendations = await self._get_recommendations(entity, channel.id)
+                    except ChannelTaskRejected as e:
+                        # Mark channel as rejected and skip to next
+                        await self._mark_rejected(channel.id)
+                        logger.info(
+                            "Worker %d: Channel id=%s rejected, skipping",
+                            self.worker_id,
+                            channel.id,
+                        )
+                        continue
 
                     # Process each recommendation
                     saved_count = 0
@@ -749,6 +803,7 @@ async def main() -> None:
     # Initialize database
     db = Database(settings.db_url)
     await db.init_db()
+    await db.reset_orphaned_processing_channels()
 
     # Scan sessions directory
     sessions_dir = settings.session_dir
@@ -790,11 +845,31 @@ async def main() -> None:
                 with json_path.open(encoding="utf-8") as f:
                     config = json.load(f)
 
-                api_id = config.get("api_id") or config.get("app_id") or settings.api_id
-                api_hash = config.get("api_hash") or config.get("app_hash") or settings.api_hash
-                proxy_url = config.get("proxy_url") if "proxy_url" in config else settings.proxy_url
-                device_model = config.get("device_model") or config.get("device") or device_model
-                system_version = config.get("system_version") or config.get("sdk") or system_version
+                api_id = (
+                    config.get("api_id")
+                    or config.get("app_id")
+                    or settings.api_id
+                )
+                api_hash = (
+                    config.get("api_hash")
+                    or config.get("app_hash")
+                    or settings.api_hash
+                )
+                proxy_url = (
+                    config.get("proxy_url")
+                    if "proxy_url" in config
+                    else settings.proxy_url
+                )
+                device_model = (
+                    config.get("device_model")
+                    or config.get("device")
+                    or device_model
+                )
+                system_version = (
+                    config.get("system_version")
+                    or config.get("sdk")
+                    or system_version
+                )
                 app_version = config.get("app_version", app_version)
                 lang_code = config.get("lang_code", lang_code)
                 system_lang_code = config.get(
@@ -851,12 +926,11 @@ async def main() -> None:
 
     # Run all workers concurrently
     tasks = [asyncio.create_task(worker.run()) for worker in workers]
-    
+
     if not tasks:
         logger.error("No workers to run. Check your session directory.")
         await db.close()
         logger.info("Database connections closed")
-        
         return
 
     try:
