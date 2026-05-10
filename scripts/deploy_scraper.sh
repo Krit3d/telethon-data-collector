@@ -12,6 +12,7 @@ echo "Deploying SCRAPER to $SSH_USER@$SSH_HOST..."
 rsync -avz --delete \
     --exclude='.git/' --exclude='__pycache__/' --exclude='.venv/' \
     --exclude='*.pyc' --exclude='avatars/' --exclude='sessions/' \
+	--exclude='.env' \
     ./ "$SSH_USER@$SSH_HOST:$REMOTE_DIR"
 
 ssh "$SSH_USER@$SSH_HOST" "cd $REMOTE_DIR && docker compose -f docker-compose.scraper.yml up -d --build db"
