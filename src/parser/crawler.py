@@ -99,6 +99,8 @@ class Worker:
         self.consecutive_shadowbans = 0
         self.safe_mode = False
         self.is_frozen = False
+        self.processed_count = 0
+        self.DAILY_LIMIT = 850
 
     async def _random_delay(self) -> None:
         """Sleep for a random duration within configured range."""
@@ -622,6 +624,9 @@ class Worker:
             while True:
                 if getattr(self, "is_frozen", False):
                     return
+                if self.processed_count >= self.DAILY_LIMIT:
+                    logger.info("Worker %d reached daily limit of %d channels. Stopping worker to protect session.", self.worker_id, self.DAILY_LIMIT)
+                    return
                 channel = None
 
                 try:
@@ -631,89 +636,87 @@ class Worker:
                     )
 
                     if channel is None:
-                        logger.info(
-                            "Worker %d: No pending channels available, waiting...",
-                            self.worker_id,
-                        )
-                        await asyncio.sleep(30)
+                        if self.safe_mode:
+                            logger.info(
+                                "Worker %d: Safe mode cooldown - sleeping for 300 seconds",
+                                self.worker_id,
+                            )
+                            await asyncio.sleep(300)
+                            self.safe_mode = False
+                        else:
+                            logger.info(
+                                "Worker %d: No pending channels available, waiting...",
+                                self.worker_id,
+                            )
+                            await asyncio.sleep(30)
                         continue
 
-                    # Get channel entity - use InputChannel if we have access_hash
+                    # Try to resolve entity and get recommendations with fallback
                     entity = None
-                    if channel.access_hash is not None:
-                        # Ideal scenario: we have hash, create InputChannel without network calls!
-                        from telethon.tl.types import InputChannel
+                    recommendations = []
+                    used_optimistic = False
 
+                    if channel.access_hash is not None:
+                        from telethon.tl.types import InputChannel
                         entity = InputChannel(channel.id, channel.access_hash)
+                        used_optimistic = True
                     else:
-                        # Fallback: if no hash (e.g., seed channels), resolve by username or ID
-                        identifier = (
-                            channel.username if channel.username else channel.id
-                        )
+                        identifier = channel.username if channel.username else channel.id
                         entity = await self._get_channel_entity_safe(identifier)
 
                     if entity == "SHADOWBANNED":
-                        # Return channel back
                         await self.db.mark_channel_pending(channel.id)
                         self.consecutive_shadowbans += 1
-
-                        # Enable safe mode to only process channels with access_hash
                         if not self.safe_mode:
                             self.safe_mode = True
-                            logger.warning(
-                                "Worker %d switched to SAFE MODE. Will only process channels with access_hash.",
-                                self.worker_id,
-                            )
-
+                            logger.warning("Worker %d switched to SAFE MODE.", self.worker_id)
                         if self.consecutive_shadowbans >= 3:
-                            logger.error(
-                                "Worker %d is SHADOWBANNED. Suspending for 3 hours to protect DB.",
-                                self.worker_id,
-                            )
-                            await asyncio.sleep(10800)  # Sleeping for 3 hours
-                            self.consecutive_shadowbans = (
-                                0  # Try again after sleep
-                            )
+                            logger.error("Worker %d is SHADOWBANNED. Suspending for 3 hours.", self.worker_id)
+                            await asyncio.sleep(10800)
+                            self.consecutive_shadowbans = 0
                         else:
-                            await asyncio.sleep(
-                                60
-                            )  # Small pause before next try
+                            await asyncio.sleep(60)
                         continue
 
-                    # Reset counter for any successful resolving (even if entity is None, but not banned)
                     self.consecutive_shadowbans = 0
 
-                    # Safety check: if safe_mode is on but channel has no access_hash, skip it
                     if self.safe_mode and channel.access_hash is None:
-                        logger.warning(
-                            "Worker %d: Channel id=%s has no access_hash in safe mode, returning to pending",
-                            self.worker_id,
-                            channel.id,
-                        )
                         await self.db.mark_channel_pending(channel.id)
                         continue
 
                     if entity is None:
-                        logger.warning(
-                            "Worker %d: Could not resolve channel id=%s, marking as rejected",
-                            self.worker_id,
-                            channel.id,
-                        )
-                        await self._mark_rejected(channel.id)
+                        await self._mark_processed(channel.id)
                         continue
 
-                    # Get recommendations
                     try:
                         recommendations = await self._get_recommendations(entity, channel.id)
-                    except ChannelTaskRejected as e:
-                        # Mark channel as rejected and skip to next
-                        await self._mark_rejected(channel.id)
-                        logger.info(
-                            "Worker %d: Channel id=%s rejected, skipping",
-                            self.worker_id,
-                            channel.id,
-                        )
-                        continue
+                    except ChannelTaskRejected:
+                        if used_optimistic and channel.username:
+                            logger.info("Worker %d: access_hash rejected for %s, falling back to resolve by username", self.worker_id, channel.username)
+                            entity = await self._get_channel_entity_safe(channel.username)
+                            
+                            if entity == "SHADOWBANNED":
+                                await self.db.mark_channel_pending(channel.id)
+                                self.consecutive_shadowbans += 1
+                                await asyncio.sleep(60)
+                                continue
+                                
+                            self.consecutive_shadowbans = 0
+                            
+                            if entity:
+                                try:
+                                    recommendations = await self._get_recommendations(entity, channel.id)
+                                except ChannelTaskRejected:
+                                    logger.warning("Worker %d: Fallback failed for %s, moving to ready_for_parsing", self.worker_id, channel.username)
+                                    await self._mark_processed(channel.id)
+                                    continue
+                            else:
+                                await self._mark_processed(channel.id)
+                                continue
+                        else:
+                            logger.info("Worker %d: Task rejected for id=%s, moving to ready_for_parsing", self.worker_id, channel.id)
+                            await self._mark_processed(channel.id)
+                            continue
 
                     # Process each recommendation
                     saved_count = 0
@@ -742,6 +745,7 @@ class Worker:
 
                     # Mark original channel as processed
                     await self._mark_processed(channel.id)
+                    self.processed_count += 1
 
                 except FloodWaitError as e:
                     if channel:
