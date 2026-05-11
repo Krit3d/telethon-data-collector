@@ -1,6 +1,9 @@
 """Indexing router for batch indexing operations."""
 
-from fastapi import APIRouter, Depends
+from __future__ import annotations
+
+import asyncio
+from fastapi import APIRouter, Depends, BackgroundTasks
 import logging
 
 from src.api.schemas import IndexRequest, IndexResponse
@@ -11,46 +14,109 @@ from src.api.dependencies import get_db, get_qdrant
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/index", tags=["Indexing"])
 
+# Batch size for processing posts to avoid memory spikes
+BATCH_SIZE = 50
 
-@router.post("", response_model=IndexResponse)
+
+def _chunk_list(items: list, chunk_size: int) -> list[list]:
+    """Split a list into chunks of specified size."""
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+async def _run_indexing(limit: int, db: Database, qdrant: QdrantService) -> None:
+    """Background task to index posts in batches.
+
+    Args:
+        limit: Maximum number of posts to index.
+        db: Database instance.
+        qdrant: Qdrant service instance.
+    """
+    logger.info(f"Starting background indexing task for up to {limit} posts")
+
+    try:
+        # Fetch all recent posts
+        logger.info(f"Fetching {limit} recent posts from database")
+        posts = await db.get_recent_posts(limit=limit)
+
+        if not posts:
+            logger.warning("No posts found in database for indexing")
+            return
+
+        # Prepare valid points
+        points: list[tuple[int, str, int]] = []
+        for p in posts:
+            if p.content and p.content.strip():
+                points.append((p.id, p.content, p.channel_id))
+
+        if not points:
+            logger.warning("No valid text content found in posts for indexing")
+            return
+
+        logger.info(f"Prepared {len(points)} valid points for indexing")
+
+        # Process in batches
+        chunks = _chunk_list(points, BATCH_SIZE)
+        total_indexed = 0
+
+        logger.info(f"Processing {len(chunks)} batches (batch size: {BATCH_SIZE})")
+
+        for batch_idx, batch in enumerate(chunks, 1):
+            try:
+                logger.info(
+                    f"Processing batch {batch_idx}/{len(chunks)} with {len(batch)} points"
+                )
+                await qdrant.upsert_batch(batch)
+                total_indexed += len(batch)
+                logger.info(
+                    f"Completed batch {batch_idx}/{len(chunks)}. Total indexed so far: {total_indexed}"
+                )
+                # Yield control to event loop to prevent CPU hogging
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(
+                    f"Failed to index batch {batch_idx}/{len(chunks)}: {e}",
+                    exc_info=e,
+                )
+                # Continue with next batch instead of crashing
+                continue
+
+        logger.info(
+            f"Indexing completed. Successfully indexed {total_indexed}/{len(points)} points."
+        )
+
+    except Exception as e:
+        logger.error(f"Background indexing task failed with fatal error: {e}", exc_info=e)
+
+
+@router.post("", response_model=IndexResponse, status_code=202)
 async def index_recent_posts(
     payload: IndexRequest,
+    background_tasks: BackgroundTasks,
     db: Database = Depends(get_db),
     qdrant: QdrantService = Depends(get_qdrant),
 ) -> IndexResponse:
     """Index recent posts from the database into Qdrant.
 
+    This endpoint triggers a background task to index posts, returning immediately
+    with a 202 Accepted status to avoid timeouts on large datasets.
+
     Args:
         payload: Index request with limit of posts to index.
+        background_tasks: FastAPI background tasks manager.
         db: Database instance (injected).
         qdrant: Qdrant service instance (injected).
 
     Returns:
-        IndexResponse with count of indexed posts and message.
+        IndexResponse with confirmation message and estimated count.
     """
+    # Add the indexing task to background
+    background_tasks.add_task(_run_indexing, payload.limit, db, qdrant)
 
-    posts = await db.get_recent_posts(limit=payload.limit)
-
-    if not posts:
-        return IndexResponse(
-            indexed_count=0, message="No posts found in database."
-        )
-
-    points = []
-
-    for p in posts:
-        if p.content and p.content.strip():
-            points.append((p.id, p.content, p.channel_id))
-
-    if not points:
-        return IndexResponse(
-            indexed_count=0, message="No valid text content found in posts."
-        )
-
-    await qdrant.upsert_batch(points)
+    logger.info(f"Indexing task queued for {payload.limit} posts")
 
     return IndexResponse(
-        indexed_count=len(points), message="Successfully indexed."
+        indexed_count=0,
+        message=f"Indexing of {payload.limit} posts started in the background.",
     )
 
 

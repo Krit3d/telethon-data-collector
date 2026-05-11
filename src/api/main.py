@@ -3,6 +3,7 @@
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from src.config.config import load_settings
 from src.db.database import Database
@@ -36,6 +37,15 @@ app = FastAPI(
     title="Telegram Semantic Search API",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# Add CORS middleware for internal production APIs
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # API v1 routing
