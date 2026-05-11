@@ -11,7 +11,9 @@ logger = logging.getLogger(__name__)
 class KnowledgeExtractor:
     """Extracts knowledge triples (nodes and edges) from text content."""
 
-    async def extract_triplets(self, text: str, author_id: int) -> ExtractionResult:
+    async def extract_triplets(
+        self, text: str, author_id: int
+    ) -> ExtractionResult:
         """
         Extract knowledge triples from the given text.
 
@@ -26,6 +28,7 @@ class KnowledgeExtractor:
         Returns:
             ExtractionResult containing extracted nodes and edges.
         """
+
         logger.debug("Extracting triples from text: %s", text[:100])
 
         # Mock extraction logic: look for family-related keywords
@@ -67,7 +70,9 @@ class KnowledgeExtractor:
                 child_node.properties.get("name"),
             )
 
-            return ExtractionResult(nodes=[author_node, child_node], edges=[edge])
+            return ExtractionResult(
+                nodes=[author_node, child_node], edges=[edge]
+            )
 
         # No extraction found
         logger.debug("No relevant keywords found, returning empty result")
@@ -85,6 +90,7 @@ class KnowledgeExtractor:
             author_id: Telegram user ID of the post author.
             db: Database instance for persistence operations.
         """
+
         logger.info("Processing post id=%s for knowledge extraction", post_id)
 
         # Extract triples from text
