@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Final
 
-import httpx
 import numpy as np
+from fastembed import TextEmbedding
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.models import (
     Distance,
@@ -24,13 +24,13 @@ EMBEDDING_METRIC: Final[Distance] = Distance.COSINE
 
 
 class QdrantService:
-    """Service for managing post embeddings in Qdrant."""
+    """Service for managing post embeddings in Qdrant using local fastembed."""
 
     def __init__(self, settings: Settings) -> None:
         """Initialize Qdrant client and ensure collection exists.
 
         Args:
-            settings: Application settings containing Qdrant and embedding API configuration.
+            settings: Application settings containing Qdrant and embedding configuration.
 
         Raises:
             ValueError: If required settings are missing.
@@ -38,25 +38,18 @@ class QdrantService:
         """
 
         self.settings = settings
+        self.collection_name = settings.qdrant_collection_name
 
-        if not settings.embedding_api_url:
-            raise ValueError(
-                "EMBEDDING_API_URL must be set in settings/environment"
-            )
-
-        if not settings.embedding_api_key:
-            raise ValueError(
-                "EMBEDDING_API_KEY must be set in settings/environment"
-            )
+        # Initialize fastembed model with limited threads to control CPU usage
+        self.model = TextEmbedding(
+            model_name=settings.embedding_model_name,
+            threads=settings.embedding_threads,
+        )
 
         self.client = AsyncQdrantClient(
             url=settings.qdrant_url,
             timeout=settings.qdrant_timeout,
-        )
-        self.collection_name = settings.qdrant_collection_name
-        self.http_client = httpx.AsyncClient(
-            timeout=30.0,
-            headers={"Authorization": f"Bearer {settings.embedding_api_key}"}
+            api_key=settings.qdrant_api_key,
         )
         self._initialized = False
 
@@ -77,6 +70,7 @@ class QdrantService:
                 extra={
                     "collection": self.collection_name,
                     "url": self.settings.qdrant_url,
+                    "model": self.settings.embedding_model_name,
                 },
             )
 
@@ -143,7 +137,7 @@ class QdrantService:
         self,
         texts: list[str],
     ) -> np.ndarray:
-        """Generate embeddings for a list of texts using external API.
+        """Generate embeddings for a list of texts using local fastembed model.
 
         Args:
             texts: List of text strings to generate embeddings for.
@@ -173,24 +167,11 @@ class QdrantService:
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
         try:
-            # Make API request
-            payload = {
-                "input": valid_texts,
-                "model": self.settings.embedding_model,
-            }
-            response = await self.http_client.post(
-                self.settings.embedding_api_url,
-                json=payload
-            )
-            response.raise_for_status()
+            # Generate embeddings using fastembed
+            embeddings = self.model.embed(valid_texts)
 
-            # Parse response
-            response_data = response.json()
-            embeddings = [
-                item["embedding"] for item in response_data["data"]
-            ]
-
-            result = np.array(embeddings, dtype=np.float32)
+            # Convert generator to numpy array
+            result = np.array(list(embeddings), dtype=np.float32)
 
             logger.debug(
                 "Generated embeddings batch",
@@ -203,24 +184,6 @@ class QdrantService:
 
             return result
 
-        except httpx.HTTPError as e:
-            logger.error(
-                "HTTP error during embedding generation",
-                exc_info=e,
-                extra={
-                    "text_count": len(texts),
-                    "valid_count": len(valid_texts),
-                    "api_url": self.settings.embedding_api_url,
-                },
-            )
-            raise RuntimeError(f"Embedding API request failed: {e}") from e
-        except KeyError as e:
-            logger.error(
-                "Invalid response format from embedding API",
-                exc_info=e,
-                extra={"response_keys": list(response_data.keys()) if 'response_data' in locals() else None},
-            )
-            raise RuntimeError(f"Invalid embedding API response format: {e}") from e
         except Exception as e:
             logger.error(
                 "Failed to generate embeddings batch",
@@ -411,14 +374,13 @@ class QdrantService:
             raise RuntimeError(f"Search failed: {e}") from e
 
     async def close(self) -> None:
-        """Close the Qdrant client connection and HTTP client."""
+        """Close the Qdrant client connection."""
 
         try:
             await self.client.close()
-            await self.http_client.aclose()
-            logger.debug("Qdrant client and HTTP client closed")
+            logger.debug("Qdrant client closed")
         except Exception as e:
-            logger.warning("Error closing clients", exc_info=e)
+            logger.warning("Error closing Qdrant client", exc_info=e)
 
     async def __aenter__(self) -> QdrantService:
         """Async context manager entry."""

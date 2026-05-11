@@ -7,6 +7,8 @@ services:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
     networks:
       - api_network
     logging:
@@ -14,13 +16,6 @@ services:
       options:
         max-size: "20m"
         max-file: "3"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
   api:
     build:
       context: .
@@ -31,23 +26,19 @@ services:
       - .env
     ports:
       - "8000:8000"
-    depends_on:
-      qdrant:
-        condition: service_healthy
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    volumes:
+      - fastembed_cache:/app/model_cache
     environment:
       DB_URL: ${DB_URL}
       QDRANT_URL: ${QDRANT_URL}
       QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME}
       QDRANT_BATCH_SIZE: ${QDRANT_BATCH_SIZE}
       QDRANT_TIMEOUT: ${QDRANT_TIMEOUT}
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
       LOG_LEVEL: ${LOG_LEVEL}
+      FASTEMBED_CACHE_PATH: /app/model_cache
+    depends_on:
+      - qdrant
     networks:
       - api_network
     logging:
@@ -62,3 +53,4 @@ networks:
 
 volumes:
   qdrant_data:
+  fastembed_cache:

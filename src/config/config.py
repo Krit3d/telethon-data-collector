@@ -48,16 +48,20 @@ class Settings(BaseSettings):
         default=None,
         description="Qdrant collection name for post embeddings",
     )
-    embedding_api_url: str = Field(
-        ...,
-        description="URL for the external embedding API",
+    qdrant_api_key: str | None = Field(
+        default=None,
+        description="API key for Qdrant authentication",
     )
-    embedding_api_key: str = Field(
-        ...,
-        description="API key or token for embeddings",
+    embedding_model_name: str = Field(
+        default="intfloat/multilingual-e5-large",
+        description="Name of the fastembed model to use for local embeddings",
     )
     embedding_model: str = Field(
         default="bge-m3", description="Model name for the API payload"
+    )
+    embedding_threads: int = Field(
+        default=3,
+        description="Number of threads to use for embedding generation",
     )
     qdrant_batch_size: int | None = Field(
         default=None,
