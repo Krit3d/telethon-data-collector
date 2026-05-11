@@ -2,6 +2,7 @@
 Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
 """
 
+import json
 import logging
 from typing import Any, Sequence
 
@@ -45,7 +46,7 @@ class Database:
             try:
                 cursor = dbapi_connection.cursor()
                 cursor.execute("LOAD 'age';")
-                cursor.execute("SET search_path = ag_catalog, \"$user\", public;")
+                cursor.execute('SET search_path = ag_catalog, "$user", public;')
                 cursor.close()
             except Exception as e:
                 logger.warning("Failed to set AGE search_path: %s", e)
@@ -67,11 +68,13 @@ class Database:
                 await conn.execute(text("LOAD 'age';"))
                 # Set search path for AGE
                 await conn.execute(
-                    text("SET search_path = ag_catalog, \"$user\", public;")
+                    text('SET search_path = ag_catalog, "$user", public;')
                 )
                 # Create the base graph (ignore if already exists)
                 await conn.execute(
-                    text("SELECT create_graph('telegram_graph') WHERE NOT EXISTS (SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');")
+                    text(
+                        "SELECT create_graph('telegram_graph') WHERE NOT EXISTS (SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');"
+                    )
                 )
                 logger.info("Apache AGE extension and graph initialized")
             except Exception as e:
@@ -429,7 +432,83 @@ class Database:
         Returns:
             Raw query result (will be refined when graph queries are implemented).
         """
+
         async with self.async_session() as session:
             async with session.begin():
                 result = await session.execute(text(query))
                 return result.scalars().all()
+
+    async def upsert_graph_node(
+        self, label: str, properties: dict, merge_key: str = "id"
+    ) -> None:
+        """
+        Upsert a node in the Apache AGE graph.
+
+        Uses MERGE to create or update a node with the given label and properties.
+        The node is matched on the merge_key (default: 'id').
+
+        Args:
+            label: Graph node label (e.g., 'Channel', 'Post').
+            properties: Dictionary of node properties.
+            merge_key: Property name to use for MERGE matching (default: 'id').
+        """
+
+        params_json = json.dumps(properties)
+        query = f"""
+            SELECT * FROM cypher('telegram_graph', $$
+                MERGE (n:{label} {{{merge_key}: $props.{merge_key}}})
+                SET n += $props
+                RETURN n
+            $$, :params) AS (v agtype);
+        """
+        stmt = text(query).bindparams(params=params_json)
+        async with self.async_session() as session:
+            async with session.begin():
+                await session.execute(stmt)
+
+    async def upsert_graph_edge(
+        self,
+        start_label: str,
+        start_merge_key: str,
+        start_merge_val: Any,
+        edge_label: str,
+        end_label: str,
+        end_merge_key: str,
+        end_merge_val: Any,
+        edge_properties: dict | None = None,
+    ) -> None:
+        """
+        Upsert an edge in the Apache AGE graph.
+
+        Matches start and end nodes by label and merge keys, then MERGEs the edge.
+        Edge properties are set using the += operator (overwrites if edge exists).
+
+        Args:
+            start_label: Label of the start node.
+            start_merge_key: Property name to match start node.
+            start_merge_val: Value for start node matching.
+            edge_label: Relationship type label.
+            end_label: Label of the end node.
+            end_merge_key: Property name to match end node.
+            end_merge_val: Value for end node matching.
+            edge_properties: Optional dictionary of edge properties.
+        """
+
+        params_dict = {
+            "start_val": start_merge_val,
+            "end_val": end_merge_val,
+            "props": edge_properties or {},
+        }
+        query = f"""
+            SELECT * FROM cypher('telegram_graph', $$
+                MATCH (a:{start_label} {{{start_merge_key}: $start_val}})
+                MATCH (b:{end_label} {{{end_merge_key}: $end_val}})
+                MERGE (a)-[r:{edge_label}]->(b)
+                SET r += $props
+                RETURN r
+            $$, :params) AS (v agtype);
+        """
+        stmt = text(query).bindparams(params=json.dumps(params_dict))
+        async with self.async_session() as session:
+            async with session.begin():
+                await session.execute(stmt)
