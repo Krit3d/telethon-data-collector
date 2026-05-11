@@ -5,13 +5,14 @@ Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
 import logging
 from typing import Any, Sequence
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, func, select, update, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy import event
 
 from src.db.models import Base, Channel, Post
 
@@ -36,6 +37,19 @@ class Database:
             pool_size=10,
             max_overflow=20,
         )
+
+        # Configure AGE settings for every new connection
+        @event.listens_for(self.engine.sync_engine, "connect")
+        def set_age_search_path(dbapi_connection, connection_record):
+            """Set search_path for Apache AGE on each new connection."""
+            try:
+                cursor = dbapi_connection.cursor()
+                cursor.execute("LOAD 'age';")
+                cursor.execute("SET search_path = ag_catalog, \"$user\", public;")
+                cursor.close()
+            except Exception as e:
+                logger.warning("Failed to set AGE search_path: %s", e)
+
         self.async_session = async_sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
         )
@@ -44,6 +58,25 @@ class Database:
         """Create all tables defined in the models (if they don't exist)."""
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+            # Initialize Apache AGE extension and graph
+            try:
+                # Create extension if not exists
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
+                # Load AGE library
+                await conn.execute(text("LOAD 'age';"))
+                # Set search path for AGE
+                await conn.execute(
+                    text("SET search_path = ag_catalog, \"$user\", public;")
+                )
+                # Create the base graph (ignore if already exists)
+                await conn.execute(
+                    text("SELECT create_graph('telegram_graph') WHERE NOT EXISTS (SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');")
+                )
+                logger.info("Apache AGE extension and graph initialized")
+            except Exception as e:
+                logger.error("Failed to initialize Apache AGE: %s", e)
+                raise
 
         logger.info("Database tables created (if not exist)")
 
@@ -382,3 +415,21 @@ class Database:
                     logger.debug(
                         "Returned channel id=%s to pending state", channel_id
                     )
+
+    async def execute_cypher(self, query: str) -> Any:
+        """
+        Execute a raw Cypher query against the Apache AGE graph.
+
+        This is a placeholder method for future graph operations.
+        The query will be executed in the context of the telegram_graph.
+
+        Args:
+            query: Cypher query string (e.g., "SELECT * FROM cypher('telegram_graph', $$ MATCH (n) RETURN n $$) AS (n agtype);")
+
+        Returns:
+            Raw query result (will be refined when graph queries are implemented).
+        """
+        async with self.async_session() as session:
+            async with session.begin():
+                result = await session.execute(text(query))
+                return result.scalars().all()
