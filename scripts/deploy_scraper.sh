@@ -15,5 +15,5 @@ rsync -avz --delete \
 	--exclude='.env' \
     ./ "$SSH_USER@$SSH_HOST:$REMOTE_DIR"
 
-ssh "$SSH_USER@$SSH_HOST" "cd $REMOTE_DIR && docker compose -f docker-compose.scraper.yml up -d --build db"
+ssh "$SSH_USER@$SSH_HOST" "cd $REMOTE_DIR && docker compose -f docker-compose.scraper.yml up -d --build db llm_proxy"
 echo "Scraper deployed!"
