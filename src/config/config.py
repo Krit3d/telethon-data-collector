@@ -116,7 +116,7 @@ class Settings(BaseSettings):
         default=None,
         description="Optional proxy URL for Telegram connections",
     )
-    
+
     # ---- Natparsing stealth settings ----
     use_natural_delays: bool = Field(
         default=False,
@@ -188,8 +188,9 @@ class JsonFormatter(logging.Formatter):
         }
 
         # Include worker_id if present in the log record
-        if hasattr(record, "worker_id"):
-            log_object["worker_id"] = record.worker_id
+        worker_id = getattr(record, "worker_id", None)
+        if worker_id is not None:
+            log_object["worker_id"] = str(worker_id)
 
         # Include exception info if present
         if record.exc_info:
