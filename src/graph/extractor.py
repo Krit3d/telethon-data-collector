@@ -3,6 +3,7 @@
 import logging
 
 from src.db.database import Database
+from src.embeddings.qdrant_service import QdrantService
 from src.graph.schema import ExtractionResult, SPGEdge, SPGNode
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,12 @@ class KnowledgeExtractor:
         return ExtractionResult(nodes=[], edges=[])
 
     async def process_post(
-        self, post_id: int, text: str, author_id: int, db: Database
+        self,
+        post_id: int,
+        text: str,
+        author_id: int,
+        db: Database,
+        qdrant: QdrantService | None = None,
     ) -> None:
         """
         Process a single post: extract knowledge triples and persist to AGE graph.
@@ -89,6 +95,7 @@ class KnowledgeExtractor:
             text: Text content of the post.
             author_id: Telegram user ID of the post author.
             db: Database instance for persistence operations.
+            qdrant: Optional QdrantService for syncing entities to vector store.
         """
 
         logger.info("Processing post id=%s for knowledge extraction", post_id)
@@ -149,6 +156,19 @@ class KnowledgeExtractor:
                     e,
                 )
                 raise
+
+        # Sync entities to Qdrant (if service is available)
+        if qdrant is not None:
+            try:
+                await qdrant.upsert_entities(result.nodes)
+            except Exception as e:
+                logger.error(
+                    "Failed to sync entities to Qdrant (post_id=%s): %s",
+                    post_id,
+                    e,
+                    exc_info=True,
+                )
+                # Do not raise - Qdrant failure should not crash the pipeline
 
         logger.info(
             "Completed processing post id=%s: %d nodes, %d edges",

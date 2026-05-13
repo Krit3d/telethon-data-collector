@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Final
 
 import numpy as np
@@ -16,15 +17,20 @@ from qdrant_client.http.models import (
 )
 
 from src.config.config import Settings
+from src.graph.schema import SPGNode
 
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM: Final[int] = 1024
 EMBEDDING_METRIC: Final[Distance] = Distance.COSINE
 
+# Collection names
+POSTS_COLLECTION: Final[str] = "posts"
+ENTITIES_COLLECTION: Final[str] = "telegram_entities"
+
 
 class QdrantService:
-    """Service for managing post embeddings in Qdrant using local fastembed."""
+    """Service for managing post and entity embeddings in Qdrant using local fastembed."""
 
     def __init__(self, settings: Settings) -> None:
         """Initialize Qdrant client and ensure collection exists.
@@ -38,7 +44,7 @@ class QdrantService:
         """
 
         self.settings = settings
-        self.collection_name = settings.qdrant_collection_name
+        self.collection_name = settings.qdrant_collection_name or POSTS_COLLECTION
 
         # Initialize fastembed model with limited threads to control CPU usage
         self.model = TextEmbedding(
@@ -86,7 +92,7 @@ class QdrantService:
             raise RuntimeError(f"Qdrant initialization failed: {e}") from e
 
     async def _ensure_collection(self) -> None:
-        """Check if collection exists and create it if missing."""
+        """Check if collections exist and create them if missing."""
 
         if not self.collection_name:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
@@ -95,39 +101,72 @@ class QdrantService:
             collections = await self.client.get_collections()
             collection_names = [c.name for c in collections.collections]
 
-            if self.collection_name not in collection_names:
+            # Ensure posts collection (default collection for post embeddings)
+            posts_collection = self.collection_name
+            if posts_collection not in collection_names:
                 logger.info(
-                    "Creating Qdrant collection",
+                    "Creating Qdrant posts collection",
                     extra={
-                        "collection": self.collection_name,
+                        "collection": posts_collection,
                         "dimension": EMBEDDING_DIM,
                     },
                 )
                 await self.client.create_collection(
-                    collection_name=self.collection_name,
+                    collection_name=posts_collection,
                     vectors_config=VectorParams(
                         size=EMBEDDING_DIM, distance=EMBEDDING_METRIC
                     ),
                 )
-                # Create payload indexes for faster filtering
                 await self.client.create_payload_index(
-                    collection_name=self.collection_name,
+                    collection_name=posts_collection,
                     field_name="channel_id",
                     field_schema=PayloadSchemaType.INTEGER,
                 )
                 logger.info(
-                    "Qdrant collection created successfully",
-                    extra={"collection": self.collection_name},
+                    "Qdrant posts collection created successfully",
+                    extra={"collection": posts_collection},
                 )
             else:
                 logger.debug(
-                    "Qdrant collection already exists",
-                    extra={"collection": self.collection_name},
+                    "Qdrant posts collection already exists",
+                    extra={"collection": posts_collection},
+                )
+
+            # Ensure telegram_entities collection (for graph nodes)
+            entities_collection = ENTITIES_COLLECTION
+            if entities_collection not in collection_names:
+                logger.info(
+                    "Creating Qdrant entities collection",
+                    extra={
+                        "collection": entities_collection,
+                        "dimension": EMBEDDING_DIM,
+                    },
+                )
+                await self.client.create_collection(
+                    collection_name=entities_collection,
+                    vectors_config=VectorParams(
+                        size=EMBEDDING_DIM, distance=EMBEDDING_METRIC
+                    ),
+                )
+                # Create payload indexes for entities collection
+                await self.client.create_payload_index(
+                    collection_name=entities_collection,
+                    field_name="label",
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+                logger.info(
+                    "Qdrant entities collection created successfully",
+                    extra={"collection": entities_collection},
+                )
+            else:
+                logger.debug(
+                    "Qdrant entities collection already exists",
+                    extra={"collection": entities_collection},
                 )
 
         except Exception as e:
             logger.error(
-                "Failed to ensure Qdrant collection",
+                "Failed to ensure Qdrant collections",
                 exc_info=e,
                 extra={"collection": self.collection_name},
             )
@@ -242,6 +281,110 @@ class QdrantService:
                 extra={"batch_size": len(points)},
             )
             raise
+
+    async def upsert_entities(self, nodes: list[SPGNode]) -> None:
+        """Upsert graph entity nodes into the telegram_entities collection.
+
+        Args:
+            nodes: List of SPGNode objects to upsert.
+
+        Raises:
+            RuntimeError: If service is not initialized or upsert fails.
+        """
+
+        if not nodes:
+            logger.debug("No entities to upsert")
+            return
+
+        if not self._initialized:
+            logger.warning("QdrantService not initialized, skipping entity upsert")
+            return
+
+        try:
+            # Construct textual representations for embedding generation
+            texts = []
+            node_ids = []
+            labels = []
+            original_ids = []
+
+            for node in nodes:
+                node_id = node.properties.get("id")
+                if not node_id:
+                    logger.warning(
+                        "Skipping node with missing 'id' property",
+                        extra={"label": node.label},
+                    )
+                    continue
+
+                # Build text representation: "Label: name. description"
+                name = node.properties.get("name", "")
+                description = node.properties.get("description", "")
+                text_parts = [node.label]
+                if name:
+                    text_parts.append(f": {name}")
+                if description:
+                    text_parts.append(f". {description}")
+                text = "".join(text_parts)
+
+                if not text.strip():
+                    logger.warning(
+                        "Skipping node with empty text representation",
+                        extra={"id": node_id, "label": node.label},
+                    )
+                    continue
+
+                texts.append(text)
+                node_ids.append(node)
+                labels.append(node.label)
+                original_ids.append(str(node_id))
+
+            if not texts:
+                logger.debug("No valid entities to upsert after filtering")
+                return
+
+            # Generate embeddings
+            embeddings = await self._generate_embeddings_batch(texts)
+
+            # Create point structs with deterministic UUIDs
+            point_structs = []
+            for node, embedding, label, orig_id in zip(
+                node_ids, embeddings, labels, original_ids
+            ):
+                # Convert string ID to deterministic UUID
+                point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, orig_id))
+
+                point_structs.append(
+                    PointStruct(
+                        id=point_id,
+                        vector=embedding.tolist(),
+                        payload={
+                            "original_id": orig_id,
+                            "label": label,
+                            "properties": node.properties,
+                        },
+                    )
+                )
+
+            # Upsert to telegram_entities collection
+            await self.client.upsert(  # type: ignore[attr-defined]
+                collection_name=ENTITIES_COLLECTION,
+                points=point_structs,
+                wait=True,
+            )
+
+            logger.info(
+                "Upserted %d entity embeddings to Qdrant",
+                len(point_structs),
+                extra={"collection": ENTITIES_COLLECTION},
+            )
+
+        except Exception as e:
+            logger.error(
+                "Failed to upsert entity embeddings",
+                exc_info=e,
+                extra={"node_count": len(nodes)},
+            )
+            raise RuntimeError(f"Entity upsert failed: {e}") from e
 
     async def upsert_post_embedding(
         self, post_id: int, text: str, channel_id: int

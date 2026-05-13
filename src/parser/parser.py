@@ -26,6 +26,7 @@ from telethon.tl.types import Message
 from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.models import Channel
+from src.embeddings.qdrant_service import QdrantService
 from src.graph.extractor import KnowledgeExtractor
 from src.parser.core.runner import start_workers
 from src.parser.core.worker_base import BaseTelegramWorker
@@ -197,12 +198,22 @@ class ParserWorker(BaseTelegramWorker):
             lang_code=lang_code,
             system_lang_code=system_lang_code,
         )
+        self.qdrant: QdrantService | None = None
 
     async def run(self) -> None:
         """Main worker loop: continuously fetch and parse channels from DB queue."""
         await self.connect()
 
         logger.info("Worker %d: Starting parser loop", self.worker_id)
+
+        # Initialize Qdrant service
+        try:
+            self.qdrant = QdrantService(self.settings)
+            await self.qdrant.initialize()
+            logger.info("Worker %d: Qdrant service initialized", self.worker_id)
+        except Exception as e:
+            logger.error("Worker %d: Failed to initialize Qdrant: %s", self.worker_id, e)
+            self.qdrant = None
 
         while True:
             if not self.is_alive:
@@ -307,6 +318,7 @@ class ParserWorker(BaseTelegramWorker):
                             text=msg.message,
                             author_id=channel_id,
                             db=self.db,
+                            qdrant=self.qdrant,
                         )
                 except Exception as e:
                     logger.error(
