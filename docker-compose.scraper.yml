@@ -1,6 +1,6 @@
 services:
   db:
-    image: apache/age:PG16_latest
+    image: apache/age@sha256:4241e2d8bb86a6b2ea44e9ad06c73856e12b209de295124603a599dd7feb70eb
     container_name: tg_parser_db
     restart: always
     env_file:
@@ -13,10 +13,10 @@ services:
     command: >
       postgres -c shared_preload_libraries=age
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
       - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test:
         - CMD-SHELL
@@ -27,6 +27,11 @@ services:
       start_period: 5s
     networks:
       - scraper_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   crawler:
     build:
@@ -41,6 +46,7 @@ services:
       CRAWLER_DELAY_MIN: ${CRAWLER_DELAY_MIN:-45}
       CRAWLER_DELAY_MAX: ${CRAWLER_DELAY_MAX:-120}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       SESSION_DIR: /app/sessions/crawler
     depends_on:
       db:
@@ -52,6 +58,11 @@ services:
       - ./proxies.txt:/app/proxies.txt
     networks:
       - scraper_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   parser:
     build:
@@ -66,6 +77,7 @@ services:
       POSTS_LIMIT: ${POSTS_LIMIT:-10}
       CONCURRENCY: ${CONCURRENCY:-10}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       SESSION_DIR: /app/sessions/parser
     depends_on:
       db:
@@ -76,6 +88,11 @@ services:
       - ./proxies.txt:/app/proxies.txt
     networks:
       - scraper_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 networks:
   scraper_network:
@@ -83,5 +100,4 @@ networks:
 
 volumes:
   postgres_data:
-    external: true
-    name: docker_postgres_data
+    name: tg_parser_pg18_final

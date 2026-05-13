@@ -9,7 +9,19 @@ from src.db.database import Database
 
 async def main():
     settings = load_settings()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    
+    # Clear existing handlers to prevent duplicate logs and override library defaults
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True
+    )
     logger = logging.getLogger(__name__)
 
     if not settings.channels:

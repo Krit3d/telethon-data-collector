@@ -14,7 +14,7 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "20m"
+        max-size: "50m"
         max-file: "3"
   api:
     build:
@@ -36,6 +36,7 @@ services:
       QDRANT_TIMEOUT: ${QDRANT_TIMEOUT}
       QDRANT_API_KEY: ${QDRANT_API_KEY}
       LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
     depends_on:
       - qdrant
@@ -44,7 +45,7 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "20m"
+        max-size: "50m"
         max-file: "3"
 
 networks:

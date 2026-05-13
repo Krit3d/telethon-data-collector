@@ -39,9 +39,17 @@ SYSTEM_LANG_CODE = "en-US"
 
 def setup_logging(level: str = "INFO") -> None:
     """Configure logging with a consistent format."""
+    # Clear existing handlers to prevent duplicate logs and override library defaults
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True
     )
 
 

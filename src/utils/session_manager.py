@@ -290,9 +290,17 @@ def main() -> None:
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
+    # Clear existing handlers to prevent duplicate logs and override library defaults
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True
     )
 
     raw_dir = Path(args.raw_folder).resolve()
