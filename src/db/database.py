@@ -37,19 +37,12 @@ class Database:
             echo=echo,
             pool_size=10,
             max_overflow=20,
+            connect_args={
+                "server_settings": {
+                    "search_path": "ag_catalog, \"$user\", public"
+                }
+            }
         )
-
-        # Configure AGE settings for every new connection
-        @event.listens_for(self.engine.sync_engine, "connect")
-        def set_age_search_path(dbapi_connection, connection_record):
-            """Set search_path for Apache AGE on each new connection."""
-            try:
-                cursor = dbapi_connection.cursor()
-                cursor.execute("LOAD 'age';")
-                cursor.execute('SET search_path = ag_catalog, "$user", public;')
-                cursor.close()
-            except Exception as e:
-                logger.warning("Failed to set AGE search_path: %s", e)
 
         self.async_session = async_sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
@@ -527,7 +520,7 @@ class Database:
                                type(r) as rel_type,
                                b.id as b_id, b.label as b_label, b.name as b_name
                     $$,
-                    :params
+                    :params::agtype
                 ) AS (
                     a_id agtype,
                     a_label agtype,
@@ -544,7 +537,7 @@ class Database:
                     result = await session.execute(
                         text(query).bindparams(params=params_json)
                     )
-                    rows = result.scalars().all()
+                    rows = result.all()
 
             # Parse agtype results into dictionaries
             edges = []
@@ -635,7 +628,7 @@ class Database:
                 MERGE (n:{label} {{{merge_key}: $props.{merge_key}}})
                 SET n += $props
                 RETURN n
-            $$, :params) AS (v agtype);
+            $$, :params::agtype) AS (v agtype);
         """
         stmt = text(query).bindparams(params=params_json)
         async with self.async_session() as session:
@@ -682,7 +675,7 @@ class Database:
                 MERGE (a)-[r:{edge_label}]->(b)
                 SET r += $props
                 RETURN r
-            $$, :params) AS (v agtype);
+            $$, :params::agtype) AS (v agtype);
         """
         stmt = text(query).bindparams(params=json.dumps(params_dict))
         async with self.async_session() as session:

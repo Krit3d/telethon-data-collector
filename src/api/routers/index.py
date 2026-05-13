@@ -109,6 +109,7 @@ async def index_recent_posts(
     Returns:
         IndexResponse with confirmation message and estimated count.
     """
+    
     # Add the indexing task to background
     background_tasks.add_task(_run_indexing, payload.limit, db, qdrant)
 

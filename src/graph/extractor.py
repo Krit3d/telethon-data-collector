@@ -12,11 +12,11 @@ from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.schema import (
     ExtractionResult,
-    LLMEdge,
-    LLMExtractionResult,
-    LLMNode,
+    OpenSPGExtractionResult,
     SPGEdge,
     SPGNode,
+    get_open_spg_llm_prompt,
+    open_spg_result_to_extraction_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,29 +53,8 @@ class KnowledgeExtractor:
         if self._session is None:
             self._session = aiohttp.ClientSession()
 
-        # Construct the prompt for OpenSPG-style extraction
-        prompt = f"""Extract entities and relationships from the following text in OpenSPG format.
-
-Text: {text}
-
-Instructions:
-1. Identify all entities (people, organizations, locations, etc.) and assign them a unique ID.
-2. For each entity, provide: id (unique string), label (type), name (display name), description.
-3. Identify relationships between entities. For each relationship, provide: source_id (ID of source entity), relation_type (relationship type), target_id (ID of target entity).
-4. If the text mentions the author (Telegram user ID: {author_id}), create a Person node for them with id "person_{author_id}" and name "Author {author_id}".
-5. Return strictly a JSON object with two arrays: "nodes" and "edges".
-6. Do not include any text outside the JSON response.
-
-Example format:
-{{
-  "nodes": [
-    {{"id": "person_123", "label": "Person", "name": "John Doe", "description": "Example person"}},
-    {{"id": "org_456", "label": "Organization", "name": "Acme Corp", "description": "Example company"}}
-  ],
-  "edges": [
-    {{"source_id": "person_123", "relation_type": "WORKS_AT", "target_id": "org_456", "properties": {{}}}}
-  ]
-}}"""
+        # Construct the OpenSPG prompt
+        prompt = get_open_spg_llm_prompt(text, author_id)
 
         try:
             async with self._session.post(
@@ -108,44 +87,26 @@ Example format:
 
                 data = await response.json()
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                
+
                 if not content:
                     logger.warning("LLM returned empty content")
                     return ExtractionResult(nodes=[], edges=[])
 
-                # Parse the JSON response
+                # Parse the JSON response as OpenSPG format
                 try:
-                    llm_result = LLMExtractionResult.model_validate_json(content)
+                    open_spg_result = OpenSPGExtractionResult.model_validate_json(content)
                 except ValidationError as e:
                     logger.error(
-                        "Failed to parse LLM response as LLMExtractionResult: %s\nResponse: %s",
+                        "Failed to parse LLM response as OpenSPGExtractionResult: %s\nResponse: %s",
                         e,
                         content[:500],
                     )
                     return ExtractionResult(nodes=[], edges=[])
 
-                # Convert LLM models to SPG models
-                nodes: list[SPGNode] = []
-                for llm_node in llm_result.nodes:
-                    spg_node = SPGNode(
-                        label=llm_node.label,
-                        properties={
-                            "id": llm_node.id,
-                            "name": llm_node.name,
-                            "description": llm_node.description,
-                        },
-                    )
-                    nodes.append(spg_node)
-
-                edges: list[SPGEdge] = []
-                for llm_edge in llm_result.edges:
-                    spg_edge = SPGEdge(
-                        start_node_id=llm_edge.source_id,
-                        edge_label=llm_edge.relation_type,
-                        end_node_id=llm_edge.target_id,
-                        properties=llm_edge.properties or {},
-                    )
-                    edges.append(spg_edge)
+                # Convert OpenSPG result to legacy ExtractionResult for backward compatibility
+                extraction_result = open_spg_result_to_extraction_result(open_spg_result)
+                nodes = extraction_result.nodes
+                edges = extraction_result.edges
 
                 logger.info(
                     "LLM extraction successful: %d nodes, %d edges",

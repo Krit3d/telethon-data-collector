@@ -34,3 +34,12 @@ class GraphEdge(BaseModel):
 class SearchResponse(BaseModel):
     results: list[SearchResultItem]
     graph_context: list[GraphEdge] = Field(default_factory=list)
+
+
+class IndexRequest(BaseModel):
+    limit: int = Field(default=100, ge=1, le=1000, description="Maximum number of posts to index")
+
+
+class IndexResponse(BaseModel):
+    indexed_count: int
+    message: str
