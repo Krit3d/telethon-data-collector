@@ -8,10 +8,9 @@ with authorship detection.
 
 import asyncio
 import logging
-import random
 import re
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from sqlalchemy import select
 from telethon import TelegramClient
@@ -31,7 +30,6 @@ from telethon.network.connection.tcpmtproxy import (
 )
 from telethon.tl.functions.channels import (
     GetChannelRecommendationsRequest,
-    GetFullChannelRequest,
 )
 from telethon.tl.types import (
     Channel,
@@ -43,7 +41,17 @@ from telethon.tl.types import (
 from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.models import Channel as ChannelModel
+from src.parser.core.utils import (
+    get_full_channel_info,
+)
+from src.parser.core.worker_base import BaseTelegramWorker
+from src.parser.core.runner import start_workers
 from src.utils.proxy import build_telethon_proxy
+from src.parser.core.exceptions import (
+    ChannelTaskRejected,
+    SessionExpiredError,
+    WorkerError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +62,13 @@ FIRST_PERSON_REGEX = re.compile(
 )
 
 
-class ChannelTaskRejected(Exception):
-    """Exception raised when a channel task should be rejected due to invalid channel."""
-    pass
+class Worker(BaseTelegramWorker):
+    """Distributed Telegram channel crawler worker.
 
-
-class Worker:
-    """Async worker that processes channels using a single Telegram session."""
+    Discovers new channels based on recommendations from known channels.
+    Processes channels in parallel using multiple sessions with individual proxies.
+    Qualifying channels are saved to database with authorship detection.
+    """
 
     def __init__(
         self,
@@ -80,161 +88,25 @@ class Worker:
         lang_code: str = "en",
         system_lang_code: str = "en-US",
     ):
-        self.worker_id = worker_id
-        self.session_path = session_path
-        self.db = db
-        self.settings = settings
+        super().__init__(
+            worker_id=worker_id,
+            session_path=session_path,
+            db=db,
+            settings=settings,
+            api_id=api_id,
+            api_hash=api_hash,
+            proxy_url=proxy_url,
+            device_model=device_model,
+            system_version=system_version,
+            app_version=app_version,
+            lang_code=lang_code,
+            system_lang_code=system_lang_code,
+        )
         self.min_subscribers = min_subscribers
         self.delay_min = delay_min
         self.delay_max = delay_max
-        self.api_id = api_id
-        self.api_hash = api_hash
-        self.proxy_url = proxy_url
-        self.device_model = device_model
-        self.system_version = system_version
-        self.app_version = app_version
-        self.lang_code = lang_code
-        self.system_lang_code = system_lang_code
-        self.client: TelegramClient | None = None
-        self.consecutive_shadowbans = 0
-        self.safe_mode = False
-        self.is_frozen = False
         self.processed_count = 0
         self.DAILY_LIMIT = 850
-
-    async def _random_delay(self) -> None:
-        """Sleep for a random duration within configured range."""
-        delay = random.uniform(self.delay_min, self.delay_max)
-        logger.info(
-            "Worker %d: sleeping for %.1f seconds", self.worker_id, delay
-        )
-        await asyncio.sleep(delay)
-
-    async def _call_api(self, operation: Any) -> Any:
-        """Execute a Telethon API call with random delay and error handling."""
-        if self.client and not self.client.is_connected():
-            logger.warning(
-                "Worker %d: Client disconnected. Reconnecting...",
-                self.worker_id,
-            )
-            await self.client.connect()
-
-        await self._random_delay()
-
-        try:
-            return await operation()
-        except FloodWaitError as e:
-            delay = int(getattr(e, "seconds", 0)) or 1
-
-            logger.warning(
-                "Worker %d: FloodWaitError, sleeping %ds + 10s",
-                self.worker_id,
-                delay,
-            )
-
-            await asyncio.sleep(delay + 10)
-            raise
-        except (OSError, asyncio.TimeoutError, ConnectionError) as e:
-            logger.warning(
-                "Worker %d: Network error (%s), retrying after backoff",
-                self.worker_id,
-                type(e).__name__,
-            )
-
-            await asyncio.sleep(10)
-            raise
-        except RPCError as e:
-            logger.error("Worker %d: RPC error: %s", self.worker_id, e)
-            raise
-
-    async def _get_channel_entity_safe(
-        self, channel_id: int | str
-    ) -> Channel | Literal["SHADOWBANNED"] | None:
-        """Safely get channel entity by ID or username."""
-        if not self.client:
-            raise RuntimeError("Telegram client is not initialized")
-
-        client = self.client
-
-        try:
-            entity = await self._call_api(lambda: client.get_entity(channel_id))
-
-            if isinstance(entity, Channel) and getattr(
-                entity, "broadcast", False
-            ):
-                return entity
-
-        except ValueError as e:
-            if "No user has" in str(e):
-                logger.warning(
-                    "Worker %d: Shadowban suspected for global search. Target: %s",
-                    self.worker_id,
-                    channel_id,
-                )
-                return "SHADOWBANNED"
-
-            logger.warning(
-                "Worker %d: ValueError resolving %s: %s",
-                self.worker_id,
-                channel_id,
-                e,
-            )
-
-        except Exception as e:
-            if "disconnected" in str(e).lower() or isinstance(
-                e, (ConnectionError, OSError)
-            ):
-                raise
-
-            logger.warning(
-                "Worker %d: Failed to resolve channel %s: %s",
-                self.worker_id,
-                channel_id,
-                e,
-            )
-
-        return None
-
-    async def _get_full_channel_info(
-        self, entity: Channel | InputChannel
-    ) -> tuple[int | None, str | None]:
-        """Get subscriber count and description for a channel."""
-        if not self.client:
-            raise RuntimeError("Telegram client is not initialized")
-
-        client = self.client
-
-        try:
-            # If already an InputChannel, use it directly; otherwise create one
-            if isinstance(entity, InputChannel):
-                input_channel = entity
-            elif entity.access_hash is None:
-                return None, None
-            else:
-                input_channel = InputChannel(entity.id, entity.access_hash)
-            full = await self._call_api(
-                lambda: client(GetFullChannelRequest(input_channel))
-            )
-            participants_count = getattr(
-                getattr(full, "full_chat", None), "participants_count", None
-            )
-            description = getattr(
-                getattr(full, "full_chat", None), "about", None
-            )
-
-            if not isinstance(participants_count, int):
-                participants_count = None
-
-            return participants_count, description
-        except Exception as e:
-            logger.warning(
-                "Worker %d: Error getting full channel for %s: %s",
-                self.worker_id,
-                getattr(entity, "username", "unknown"),
-                e,
-            )
-
-            return None, None
 
     async def _check_author_content(
         self,
@@ -268,8 +140,11 @@ class Worker:
                 return False
             else:
                 input_channel = InputChannel(entity.id, entity.access_hash)
-            msgs = await self._call_api(
-                lambda: client.get_messages(input_channel, limit=posts_to_check)
+            msgs = await self.safe_api_call(
+                f"get_messages(limit={posts_to_check})",
+                lambda: client.get_messages(
+                    input_channel, limit=posts_to_check
+                ),
             )
 
             if msgs is None:
@@ -308,13 +183,17 @@ class Worker:
 
             return False
         except Exception as e:
+            # Re-raise critical errors
+            if isinstance(
+                e, (WorkerError, asyncio.CancelledError, KeyboardInterrupt)
+            ):
+                raise
             logger.warning(
                 "Worker %d: Error checking author content for %s: %s",
                 self.worker_id,
                 getattr(entity, "username", "unknown"),
                 e,
             )
-
             return False
 
     async def _save_channel_to_db(
@@ -374,8 +253,10 @@ class Worker:
                 return False
 
         # Get full channel info for subscriber count
-        subscribers_count, description = await self._get_full_channel_info(
-            rec_channel
+        subscribers_count, description = await get_full_channel_info(
+            self.client,  # type: ignore[arg-type]
+            rec_channel,
+            safe_api_call=self.safe_api_call,
         )
 
         if subscribers_count is None:
@@ -417,7 +298,7 @@ class Worker:
         return True
 
     async def _get_recommendations(
-        self, entity: Channel | InputChannel, channel_id: int | None = None
+        self, entity: Channel | InputChannel, channel_id: int | None = None, operation_name: str = "get_recommendations"
     ) -> list[Channel]:
         """Fetch channel recommendations for a given channel."""
         if not self.client:
@@ -441,10 +322,11 @@ class Worker:
 
             # Wrap the API call specifically for Telethon errors
             try:
-                result = await self._call_api(
+                result = await self.safe_api_call(
+                    operation_name,
                     lambda: client(
                         GetChannelRecommendationsRequest(channel=input_channel)
-                    )
+                    ),
                 )
             except ChannelInvalidError:
                 logger.warning(
@@ -460,7 +342,9 @@ class Worker:
                         self.worker_id,
                         channel_id,
                     )
-                    raise ChannelTaskRejected(f"Channel {channel_id} is invalid")
+                    raise ChannelTaskRejected(
+                        f"Channel {channel_id} is invalid"
+                    )
                 # Re-raise other RPC errors
                 raise
 
@@ -490,12 +374,9 @@ class Worker:
             error_text = str(e)
             if "method that is not available for frozen accounts" in error_text:
                 logger.critical(
-                    f"Worker {self.worker_id}: ACCOUNT FROZEN by Telegram. Disconnecting."
+                    f"Worker {self.worker_id}: ACCOUNT FROZEN by Telegram. Raising SessionExpiredError."
                 )
-                self.is_frozen = True
-                if self.client and self.client.is_connected():
-                    await self.client.disconnect()  # type: ignore
-                return []
+                raise SessionExpiredError("Account frozen by Telegram")
             logger.error(
                 "Worker %d: Failed to get recommendations for %s: %s",
                 self.worker_id,
@@ -622,10 +503,20 @@ class Worker:
             logger.info("Worker %d: Starting processing loop", self.worker_id)
 
             while True:
+                if not self.is_alive:
+                    logger.info(
+                        "Worker %d: is_alive=False, terminating worker loop",
+                        self.worker_id,
+                    )
+                    return
                 if getattr(self, "is_frozen", False):
                     return
                 if self.processed_count >= self.DAILY_LIMIT:
-                    logger.info("Worker %d reached daily limit of %d channels. Stopping worker to protect session.", self.worker_id, self.DAILY_LIMIT)
+                    logger.info(
+                        "Worker %d reached daily limit of %d channels. Stopping worker to protect session.",
+                        self.worker_id,
+                        self.DAILY_LIMIT,
+                    )
                     return
                 channel = None
 
@@ -651,72 +542,68 @@ class Worker:
                             await asyncio.sleep(30)
                         continue
 
-                    # Try to resolve entity and get recommendations with fallback
+                    # Resolve entity with access_hash-first priority (more reliable)
                     entity = None
-                    recommendations = []
-                    used_optimistic = False
+                    resolved_entity_type = None  # 'hash' or 'username'
 
+                    # Step 1: Try to resolve by access_hash first (faster, no rate limits)
                     if channel.access_hash is not None:
-                        from telethon.tl.types import InputChannel
-                        entity = InputChannel(channel.id, channel.access_hash)
-                        used_optimistic = True
-                    else:
-                        identifier = channel.username if channel.username else channel.id
-                        entity = await self._get_channel_entity_safe(identifier)
+                        try:
+                            input_channel = InputChannel(channel.id, channel.access_hash)
+                            # Test the access_hash by calling _get_recommendations directly
+                            recommendations = await self._get_recommendations(
+                                input_channel, channel.id, operation_name="resolve_by_hash"
+                            )
+                            # Success - use the InputChannel as entity
+                            entity = input_channel
+                            resolved_entity_type = 'hash'
+                        except (RPCError, ValueError, ChannelTaskRejected) as e:
+                            # The stored access_hash is invalid/stale or other RPC error
+                            logger.warning(
+                                "Worker %d: Access hash failed for channel %s, switching to PLAN B (resolve by username)",
+                                self.worker_id,
+                                channel.username or channel.id,
+                            )
+                            entity = None
 
-                    if entity == "SHADOWBANNED":
-                        await self.db.mark_channel_pending(channel.id)
-                        self.consecutive_shadowbans += 1
-                        if not self.safe_mode:
-                            self.safe_mode = True
-                            logger.warning("Worker %d switched to SAFE MODE.", self.worker_id)
-                        if self.consecutive_shadowbans >= 3:
-                            logger.error("Worker %d is SHADOWBANNED. Suspending for 3 hours.", self.worker_id)
-                            await asyncio.sleep(10800)
-                            self.consecutive_shadowbans = 0
-                        else:
-                            await asyncio.sleep(60)
-                        continue
-
-                    self.consecutive_shadowbans = 0
-
-                    if self.safe_mode and channel.access_hash is None:
-                        await self.db.mark_channel_pending(channel.id)
-                        continue
-
-                    if entity is None:
-                        await self._mark_processed(channel.id)
-                        continue
-
-                    try:
-                        recommendations = await self._get_recommendations(entity, channel.id)
-                    except ChannelTaskRejected:
-                        if used_optimistic and channel.username:
-                            logger.info("Worker %d: access_hash rejected for %s, falling back to resolve by username", self.worker_id, channel.username)
-                            entity = await self._get_channel_entity_safe(channel.username)
-                            
-                            if entity == "SHADOWBANNED":
-                                await self.db.mark_channel_pending(channel.id)
-                                self.consecutive_shadowbans += 1
-                                await asyncio.sleep(60)
-                                continue
-                                
-                            self.consecutive_shadowbans = 0
-                            
-                            if entity:
-                                try:
-                                    recommendations = await self._get_recommendations(entity, channel.id)
-                                except ChannelTaskRejected:
-                                    logger.warning("Worker %d: Fallback failed for %s, moving to ready_for_parsing", self.worker_id, channel.username)
-                                    await self._mark_processed(channel.id)
-                                    continue
+                    # Step 2: Fallback to username resolution if hash failed or not available
+                    if entity is None and channel.username:
+                        try:
+                            # Resolve by username using safe_api_call directly
+                            entity = await self.safe_api_call(
+                                "resolve_by_username",
+                                lambda: self.client.get_entity(channel.username)  # type: ignore[arg-type]
+                            )
+                            # Check if entity is a broadcast channel
+                            if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
+                                resolved_entity_type = 'username'
+                                # Fetch recommendations separately after successful username resolution
+                                recommendations = await self._get_recommendations(
+                                    entity, channel.id, operation_name="get_recommendations"
+                                )
                             else:
+                                # Not a broadcast channel or invalid
+                                logger.error(
+                                    "Worker %d: PLAN B failed. Channel %s is unreachable.",
+                                    self.worker_id,
+                                    channel.username or channel.id,
+                                )
                                 await self._mark_processed(channel.id)
                                 continue
-                        else:
-                            logger.info("Worker %d: Task rejected for id=%s, moving to ready_for_parsing", self.worker_id, channel.id)
+                        except (RPCError, ValueError, ChannelTaskRejected) as e:
+                            # Username resolution also failed
+                            logger.error(
+                                "Worker %d: PLAN B failed. Channel %s is unreachable.",
+                                self.worker_id,
+                                channel.username or channel.id,
+                            )
                             await self._mark_processed(channel.id)
                             continue
+
+                    if entity is None:
+                        # Could not resolve channel by any method (no access_hash and no username)
+                        await self._mark_processed(channel.id)
+                        continue
 
                     # Process each recommendation
                     saved_count = 0
@@ -747,6 +634,28 @@ class Worker:
                     await self._mark_processed(channel.id)
                     self.processed_count += 1
 
+                    # IMPORTANT: Update the channel's access_hash in the database
+                    # with the session-local correct hash from the resolved entity.
+                    # This ensures future workers use the correct hash for this session.
+                    if hasattr(entity, 'access_hash') and entity.access_hash is not None:
+                        try:
+                            await self.db.update_channel_access_hash(
+                                channel.id,
+                                entity.access_hash
+                            )
+                            logger.debug(
+                                "Worker %d: Updated access_hash for channel %s in DB",
+                                self.worker_id,
+                                channel.id,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Worker %d: Failed to update access_hash for %s: %s",
+                                self.worker_id,
+                                channel.id,
+                                e,
+                            )
+
                 except FloodWaitError as e:
                     if channel:
                         await self.db.mark_channel_pending(channel.id)
@@ -774,6 +683,7 @@ class Worker:
             logger.critical(
                 f"Worker {self.worker_id}: SESSION DEAD. Error: {type(e).__name__}. File: {self.session_path}"
             )
+            self.is_alive = False
             return
 
         except KeyboardInterrupt:
@@ -788,169 +698,26 @@ class Worker:
 
 async def main() -> None:
     """Entry point: discover sessions, read individual configs, spawn worker tasks."""
-
-    global settings
     settings = load_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
     logger = logging.getLogger(__name__)
 
-    logger.info(
-        "Starting distributed crawler (delay=%d-%ds, min_subscribers=%d)",
-        settings.crawler_delay_min,
-        settings.crawler_delay_max,
-        3000,
-    )
+    logger.info("Starting distributed crawler via core runner...")
 
-    # Initialize database
     db = Database(settings.db_url)
     await db.init_db()
     await db.reset_orphaned_processing_channels()
 
-    # Scan sessions directory
-    sessions_dir = settings.session_dir
-    if not sessions_dir.exists():
-        logger.error("Sessions directory %s does not exist", sessions_dir)
-        return
-
-    session_files = sorted(sessions_dir.glob("*.session"))
-    if not session_files:
-        logger.error("No .session files found in %s", sessions_dir)
-        return
-
-    logger.info(
-        "Found %d session files: %s",
-        len(session_files),
-        [f.name for f in session_files],
-    )
-
-    # Create and spawn workers
-    workers: list[Worker] = []
-
-    for i, session_path in enumerate(session_files):
-        # Look for accompanying .json config file
-        json_path = session_path.with_suffix(".json")
-
-        api_id = settings.api_id
-        api_hash = settings.api_hash
-        proxy_url = settings.proxy_url
-        device_model = "PC 64bit"
-        system_version = "Windows 10"
-        app_version = "4.16.8"
-        lang_code = "en"
-        system_lang_code = "en-US"
-
-        if json_path.exists():
-            try:
-                import json
-
-                with json_path.open(encoding="utf-8") as f:
-                    config = json.load(f)
-
-                api_id = (
-                    config.get("api_id")
-                    or config.get("app_id")
-                    or settings.api_id
-                )
-                api_hash = (
-                    config.get("api_hash")
-                    or config.get("app_hash")
-                    or settings.api_hash
-                )
-                proxy_url = (
-                    config.get("proxy_url")
-                    if "proxy_url" in config
-                    else settings.proxy_url
-                )
-                device_model = (
-                    config.get("device_model")
-                    or config.get("device")
-                    or device_model
-                )
-                system_version = (
-                    config.get("system_version")
-                    or config.get("sdk")
-                    or system_version
-                )
-                app_version = config.get("app_version", app_version)
-                lang_code = config.get("lang_code", lang_code)
-                system_lang_code = config.get(
-                    "system_lang_code", system_lang_code
-                )
-
-                try:
-                    api_id = int(api_id)
-                except (ValueError, TypeError):
-                    api_id = settings.api_id
-                if not isinstance(api_hash, str):
-                    api_hash = settings.api_hash
-
-                logger.info(
-                    "Loaded config for %s from %s (api_id=%s, proxy=%s, device=%s)",
-                    session_path.name,
-                    json_path.name,
-                    api_id if api_id else "default",
-                    "yes" if proxy_url else "no",
-                    device_model,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to read %s: %s, using global settings",
-                    json_path.name,
-                    e,
-                )
-        else:
-            logger.debug(
-                "No config file for %s, using global settings",
-                session_path.name,
-            )
-
-        worker = Worker(
-            worker_id=i,
-            session_path=session_path,
-            db=db,
-            settings=settings,
-            min_subscribers=3000,
-            delay_min=settings.crawler_delay_min,
-            delay_max=settings.crawler_delay_max,
-            api_id=api_id,
-            api_hash=api_hash,
-            proxy_url=proxy_url,
-            device_model=device_model,
-            system_version=system_version,
-            app_version=app_version,
-            lang_code=lang_code,
-            system_lang_code=system_lang_code,
-        )
-        workers.append(worker)
-
-    logger.info("Spawning %d workers", len(workers))
-
-    # Run all workers concurrently
-    tasks = [asyncio.create_task(worker.run()) for worker in workers]
-
-    if not tasks:
-        logger.error("No workers to run. Check your session directory.")
-        await db.close()
-        logger.info("Database connections closed")
-        return
+    worker_args = {
+        "min_subscribers": 3000,
+        "delay_min": settings.crawler_delay_min,
+        "delay_max": settings.crawler_delay_max,
+    }
 
     try:
-        await asyncio.gather(*tasks)
-    except KeyboardInterrupt:
-        logger.info("Received interrupt signal, stopping workers...")
-
-        for task in tasks:
-            task.cancel()
-
-        await asyncio.gather(*tasks, return_exceptions=True)
-    except Exception as e:
-        logger.error("Global error in gather: %s", e, exc_info=True)
+        await start_workers(Worker, settings, db, worker_args=worker_args)
     finally:
         await db.close()
-        logger.info("Database connections closed")
+        logger.info("Database connections closed.")
 
 
 if __name__ == "__main__":

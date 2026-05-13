@@ -419,6 +419,32 @@ class Database:
                         "Returned channel id=%s to pending state", channel_id
                     )
 
+    async def update_channel_access_hash(self, channel_id: int, access_hash: int) -> None:
+        """Update the access_hash for a channel.
+
+        This is used to store the session-local correct access_hash after
+        successful resolution by username.
+
+        Args:
+            channel_id: Telegram channel ID.
+            access_hash: The resolved access_hash for this session.
+        """
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    select(Channel)
+                    .where(Channel.id == channel_id)
+                    .with_for_update()
+                )
+                result = await session.execute(stmt)
+                channel = result.scalar_one_or_none()
+
+                if channel is not None:
+                    channel.access_hash = access_hash
+                    logger.debug(
+                        "Updated access_hash for channel id=%s", channel_id
+                    )
+
     async def execute_cypher(self, query: str) -> Any:
         """
         Execute a raw Cypher query against the Apache AGE graph.
