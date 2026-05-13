@@ -1,26 +1,193 @@
 """Knowledge graph extractor for OpenSPG-based extraction pipeline."""
 
+import json
 import logging
+from typing import Any
 
+import aiohttp
+from pydantic import ValidationError
+
+from src.config.config import Settings
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
-from src.graph.schema import ExtractionResult, SPGEdge, SPGNode
+from src.graph.schema import (
+    ExtractionResult,
+    LLMEdge,
+    LLMExtractionResult,
+    LLMNode,
+    SPGEdge,
+    SPGNode,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class KnowledgeExtractor:
-    """Extracts knowledge triples (nodes and edges) from text content."""
+    """Extracts knowledge triples (nodes and edges) from text content using LLM."""
+
+    def __init__(self, settings: Settings) -> None:
+        """Initialize the extractor with configuration settings.
+
+        Args:
+            settings: Application settings containing LLM configuration.
+        """
+        self.settings = settings
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _call_llm(self, text: str, author_id: int) -> ExtractionResult:
+        """Call the LLM API to extract knowledge triples from text.
+
+        Args:
+            text: Input text to analyze.
+            author_id: Telegram user ID of the post author (used for author node).
+
+        Returns:
+            ExtractionResult containing extracted nodes and edges.
+            Returns empty result on any error (timeout, validation, etc.).
+        """
+        if not self.settings.llm_api_key:
+            logger.warning("LLM API key not configured, skipping extraction")
+            return ExtractionResult(nodes=[], edges=[])
+
+        # Lazy initialization of HTTP session
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+
+        # Construct the prompt for OpenSPG-style extraction
+        prompt = f"""Extract entities and relationships from the following text in OpenSPG format.
+
+Text: {text}
+
+Instructions:
+1. Identify all entities (people, organizations, locations, etc.) and assign them a unique ID.
+2. For each entity, provide: id (unique string), label (type), name (display name), description.
+3. Identify relationships between entities. For each relationship, provide: source_id (ID of source entity), relation_type (relationship type), target_id (ID of target entity).
+4. If the text mentions the author (Telegram user ID: {author_id}), create a Person node for them with id "person_{author_id}" and name "Author {author_id}".
+5. Return strictly a JSON object with two arrays: "nodes" and "edges".
+6. Do not include any text outside the JSON response.
+
+Example format:
+{{
+  "nodes": [
+    {{"id": "person_123", "label": "Person", "name": "John Doe", "description": "Example person"}},
+    {{"id": "org_456", "label": "Organization", "name": "Acme Corp", "description": "Example company"}}
+  ],
+  "edges": [
+    {{"source_id": "person_123", "relation_type": "WORKS_AT", "target_id": "org_456", "properties": {{}}}}
+  ]
+}}"""
+
+        try:
+            async with self._session.post(
+                f"{self.settings.llm_base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.settings.llm_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.settings.llm_model_name,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a knowledge graph extraction assistant. Always respond with valid JSON matching the requested schema.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 2000,
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status != 200:
+                    logger.error(
+                        "LLM API request failed: status=%d, response=%s",
+                        response.status,
+                        await response.text(),
+                    )
+                    return ExtractionResult(nodes=[], edges=[])
+
+                data = await response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                
+                if not content:
+                    logger.warning("LLM returned empty content")
+                    return ExtractionResult(nodes=[], edges=[])
+
+                # Parse the JSON response
+                try:
+                    llm_result = LLMExtractionResult.model_validate_json(content)
+                except ValidationError as e:
+                    logger.error(
+                        "Failed to parse LLM response as LLMExtractionResult: %s\nResponse: %s",
+                        e,
+                        content[:500],
+                    )
+                    return ExtractionResult(nodes=[], edges=[])
+
+                # Convert LLM models to SPG models
+                nodes: list[SPGNode] = []
+                for llm_node in llm_result.nodes:
+                    spg_node = SPGNode(
+                        label=llm_node.label,
+                        properties={
+                            "id": llm_node.id,
+                            "name": llm_node.name,
+                            "description": llm_node.description,
+                        },
+                    )
+                    nodes.append(spg_node)
+
+                edges: list[SPGEdge] = []
+                for llm_edge in llm_result.edges:
+                    spg_edge = SPGEdge(
+                        start_node_id=llm_edge.source_id,
+                        edge_label=llm_edge.relation_type,
+                        end_node_id=llm_edge.target_id,
+                        properties=llm_edge.properties or {},
+                    )
+                    edges.append(spg_edge)
+
+                logger.info(
+                    "LLM extraction successful: %d nodes, %d edges",
+                    len(nodes),
+                    len(edges),
+                )
+                return ExtractionResult(nodes=nodes, edges=edges)
+
+        except aiohttp.ClientError as e:
+            logger.error(
+                "LLM API request failed with network error: %s",
+                e,
+                exc_info=True,
+            )
+            return ExtractionResult(nodes=[], edges=[])
+        except TimeoutError as e:
+            logger.error(
+                "LLM API request timed out: %s",
+                e,
+                exc_info=True,
+            )
+            return ExtractionResult(nodes=[], edges=[])
+        except json.JSONDecodeError as e:
+            logger.error(
+                "Failed to decode LLM API response: %s",
+                e,
+                exc_info=True,
+            )
+            return ExtractionResult(nodes=[], edges=[])
+        except Exception as e:
+            logger.error(
+                "Unexpected error during LLM extraction: %s",
+                e,
+                exc_info=True,
+            )
+            return ExtractionResult(nodes=[], edges=[])
 
     async def extract_triplets(
         self, text: str, author_id: int
     ) -> ExtractionResult:
         """
-        Extract knowledge triples from the given text.
-
-        This is a mock implementation that looks for family-related keywords
-        and generates Person nodes and HAS_CHILD relationships using the
-        author_id to create a unique author node.
+        Extract knowledge triples from the given text using LLM.
 
         Args:
             text: Input text to analyze.
@@ -29,55 +196,15 @@ class KnowledgeExtractor:
         Returns:
             ExtractionResult containing extracted nodes and edges.
         """
-
         logger.debug("Extracting triples from text: %s", text[:100])
+        return await self._call_llm(text, author_id)
 
-        # Mock extraction logic: look for family-related keywords
-        keywords = ["child", "son", "daughter", "born"]
-        text_lower = text.lower()
-
-        if any(keyword in text_lower for keyword in keywords):
-            # Create a mock child node with unique ID based on author
-            child_node = SPGNode(
-                label="Person",
-                properties={
-                    "id": f"person_child_{author_id}",
-                    "name": "Child",
-                    "description": "Extracted from text mentioning family",
-                },
-            )
-
-            # Create an author node using the actual author_id
-            author_node = SPGNode(
-                label="Person",
-                properties={
-                    "id": f"person_{author_id}",
-                    "name": f"Author {author_id}",
-                    "description": f"Post author with Telegram ID {author_id}",
-                },
-            )
-
-            # Create HAS_CHILD edge
-            edge = SPGEdge(
-                start_node_id=f"person_{author_id}",
-                edge_label="HAS_CHILD",
-                end_node_id=f"person_child_{author_id}",
-                properties={},
-            )
-
-            logger.info(
-                "Mock extraction found family relationship: %s -> HAS_CHILD -> %s",
-                author_node.properties.get("name"),
-                child_node.properties.get("name"),
-            )
-
-            return ExtractionResult(
-                nodes=[author_node, child_node], edges=[edge]
-            )
-
-        # No extraction found
-        logger.debug("No relevant keywords found, returning empty result")
-        return ExtractionResult(nodes=[], edges=[])
+    async def close(self) -> None:
+        """Close the aiohttp session and clean up resources."""
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+            logger.debug("KnowledgeExtractor: aiohttp session closed")
 
     async def process_post(
         self,

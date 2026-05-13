@@ -45,3 +45,54 @@ class ExtractionResult(BaseModel):
     """List of extracted edges."""
 
     model_config = ConfigDict(extra="allow")
+
+
+# ----- LLM extraction models (for structured LLM output) -----
+
+
+class LLMNode(BaseModel):
+    """Schema for nodes as returned by the LLM extraction."""
+
+    id: str
+    """Unique identifier for the node (used for merging)."""
+
+    label: str
+    """Node type/label (e.g., 'Person', 'Organization')."""
+
+    name: str
+    """Display name for the entity."""
+
+    description: str
+    """Description of the entity."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class LLMEdge(BaseModel):
+    """Schema for edges as returned by the LLM extraction."""
+
+    source_id: str
+    """ID of the source node."""
+
+    relation_type: str
+    """Type of relationship (e.g., 'HAS_CHILD', 'WORKS_AT')."""
+
+    target_id: str
+    """ID of the target node."""
+
+    properties: dict[str, Any] = {}
+    """Optional dictionary of edge properties."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class LLMExtractionResult(BaseModel):
+    """Schema for the complete LLM extraction result."""
+
+    nodes: list[LLMNode]
+    """List of extracted nodes."""
+
+    edges: list[LLMEdge]
+    """List of extracted edges."""
+
+    model_config = ConfigDict(extra="allow")

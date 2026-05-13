@@ -41,9 +41,6 @@ from src.parser.core.utils import (
 
 logger = logging.getLogger(__name__)
 
-# Global knowledge extractor instance for processing post content
-knowledge_extractor = KnowledgeExtractor()
-
 
 async def _extract_channel_metadata(
     client: TelegramClient,
@@ -242,6 +239,7 @@ class ParserWorker(BaseTelegramWorker):
             system_lang_code=system_lang_code,
         )
         self.qdrant: QdrantService | None = None
+        self.knowledge_extractor = KnowledgeExtractor(settings)
 
     async def run(self) -> None:
         """Main worker loop: continuously fetch and parse channels from DB queue."""
@@ -258,50 +256,55 @@ class ParserWorker(BaseTelegramWorker):
             logger.error("Worker %d: Failed to initialize Qdrant: %s", self.worker_id, e)
             self.qdrant = None
 
-        while True:
-            if not self.is_alive:
-                logger.info(
-                    "Worker %d: is_alive=False, terminating worker loop",
-                    self.worker_id,
-                )
-                return
-            try:
-                channel = await self.db.get_channel_for_parsing()
-
-                if channel is None:
-                    logger.debug(
-                        "Worker %d: No channels ready for parsing, sleeping 30s",
+        try:
+            while True:
+                if not self.is_alive:
+                    logger.info(
+                        "Worker %d: is_alive=False, terminating worker loop",
                         self.worker_id,
                     )
+                    return
+                try:
+                    channel = await self.db.get_channel_for_parsing()
+
+                    if channel is None:
+                        logger.debug(
+                            "Worker %d: No channels ready for parsing, sleeping 30s",
+                            self.worker_id,
+                        )
+                        await asyncio.sleep(30)
+                        continue
+
+                    logger.info(
+                        "Worker %d: Processing channel id=%s username=%s",
+                        self.worker_id,
+                        channel.id,
+                        channel.username,
+                    )
+
+                    await self._parse_single_channel(channel)
+
+                except FloodWaitError as e:
+                    delay = int(getattr(e, "seconds", 0)) or 1
+                    total_delay = delay + 10
+                    logger.warning(
+                        "Worker %d: FloodWaitError, sleeping %ds (+10s safety)",
+                        self.worker_id,
+                        total_delay,
+                    )
+                    await asyncio.sleep(total_delay)
+                except Exception as e:
+                    logger.error(
+                        "Worker %d: Unexpected error in loop: %s",
+                        self.worker_id,
+                        e,
+                        exc_info=True,
+                    )
                     await asyncio.sleep(30)
-                    continue
-
-                logger.info(
-                    "Worker %d: Processing channel id=%s username=%s",
-                    self.worker_id,
-                    channel.id,
-                    channel.username,
-                )
-
-                await self._parse_single_channel(channel)
-
-            except FloodWaitError as e:
-                delay = int(getattr(e, "seconds", 0)) or 1
-                total_delay = delay + 10
-                logger.warning(
-                    "Worker %d: FloodWaitError, sleeping %ds (+10s safety)",
-                    self.worker_id,
-                    total_delay,
-                )
-                await asyncio.sleep(total_delay)
-            except Exception as e:
-                logger.error(
-                    "Worker %d: Unexpected error in loop: %s",
-                    self.worker_id,
-                    e,
-                    exc_info=True,
-                )
-                await asyncio.sleep(30)
+        finally:
+            # Cleanup: close knowledge extractor session
+            await self.knowledge_extractor.close()
+            logger.info("Worker %d: Cleanup complete", self.worker_id)
 
     async def _parse_single_channel(self, channel: Channel) -> None:
         """Fetch, normalize, and persist one channel with its recent posts.
@@ -389,7 +392,7 @@ class ParserWorker(BaseTelegramWorker):
                 # Knowledge graph extraction (secondary process)
                 try:
                     if msg.message:
-                        await knowledge_extractor.process_post(
+                        await self.knowledge_extractor.process_post(
                             post_id=post_id,
                             text=msg.message,
                             author_id=channel_id,

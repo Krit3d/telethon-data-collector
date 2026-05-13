@@ -77,6 +77,20 @@ class Settings(BaseSettings):
         description="Number of retries for failed Qdrant operations",
     )
 
+    # ---- LLM settings ----
+    llm_api_key: str | None = Field(
+        default=None,
+        description="API key for OpenAI-compatible LLM service",
+    )
+    llm_base_url: str = Field(
+        default="https://api.openai.com/v1",
+        description="Base URL for OpenAI-compatible API endpoint",
+    )
+    llm_model_name: str = Field(
+        default="gpt-4o-mini",
+        description="Model name to use for LLM extraction",
+    )
+
     # Crawler settings
     crawler_delay_min: int = Field(
         default=45,
