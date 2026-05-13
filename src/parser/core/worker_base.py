@@ -9,6 +9,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+import aiohttp
+
 from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyError,
@@ -91,6 +99,11 @@ class BaseTelegramWorker:
         self.system_lang_code = system_lang_code
         self.delay_min = delay_min
         self.delay_max = delay_max
+        
+        # Organic session heatup tracking
+        self._start_time = time.time()
+        self._heatup_duration_s = settings.organic_heatup_minutes * 60
+        self._is_heatup_complete = False
 
         # State tracking for graceful degradation
         self.client: TelegramClient | None = None
@@ -106,6 +119,118 @@ class BaseTelegramWorker:
             logging.getLogger(self.__class__.__name__),
             {"worker_id": self.worker_id}
         )
+        # Track last proxy rotation time to avoid excessive rotations
+        self._last_rotation_time = 0
+        self._rotation_cooldown_s = 300  # 5 minutes between rotations minimum
+    
+    def _calculate_heatup_factor(self) -> float:
+        """Calculate the current heatup factor for organic session warmup.
+        
+        During the first `organic_heatup_minutes` of operation, the worker
+        gradually increases its activity. Factor starts at 0.1 (10% speed)
+        and asymptotically approaches 1.0 over the heatup period.
+        
+        Returns:
+            Float between 0.1 and 1.0 representing current activity multiplier.
+        """
+
+        elapsed = time.time() - self._start_time
+        if elapsed >= self._heatup_duration_s:
+            self._is_heatup_complete = True
+            return 1.0
+        
+        # Smooth exponential growth: factor = 0.1 + 0.9 * (elapsed / duration)^2
+        # This gives a gentle start that accelerates over time
+        ratio = elapsed / self._heatup_duration_s
+        factor = 0.1 + 0.9 * (ratio ** 2)
+        return max(0.1, min(1.0, factor))
+    
+    def natural_delay(self, base_delay: float | None = None) -> float:
+        """Generate a human-like delay using Pareto/Gamma distribution.
+        
+        Instead of uniform random delays, this mimics natural human reading
+        patterns with occasional longer pauses (Pareto distribution heavy tail).
+        
+        Args:
+            base_delay: Base delay in seconds to scale. If None, uses settings
+                or heatup-adjusted value.
+        
+        Returns:
+            Delay in seconds (always >= 1.0 for safety).
+        """
+        
+        # Apply heatup factor to base delay
+        heatup_factor = self._calculate_heatup_factor()
+        
+        if base_delay is None:
+            # Use settings but scale by heatup factor (slower during heatup)
+            base_min = self.settings.crawler_delay_min
+            base_max = self.settings.crawler_delay_max
+            base_delay = random.uniform(base_min, base_max)
+        
+        # Scale by heatup factor (longer delays during warmup)
+        scaled_delay = base_delay / heatup_factor if heatup_factor < 1.0 else base_delay
+        
+        # Apply Pareto distribution for heavy-tail effect (human-like pauses)
+        # Pareto shape parameter alpha=3 gives ~80% short, ~20% long delays
+        pareto_factor = np.random.pareto(3) + 1  # +1 to make mean ~1.5
+        
+        # Combine: base scaled delay * Pareto factor
+        natural_delay = scaled_delay * pareto_factor
+        
+        # Clamp to reasonable bounds (1-300 seconds)
+        return max(1.0, min(300.0, natural_delay))
+
+    async def _rotate_mobile_proxy(self) -> bool:
+        """Rotate mobile proxy IP by calling the rotation URL.
+        
+        Uses the mobile_proxy_rotation_url from settings to request a new
+        IP address from the proxy provider. Respects a cooldown period to
+        avoid excessive rotations.
+        
+        Returns:
+            True if rotation was successful, False otherwise.
+        """
+        
+        rotation_url = self.settings.mobile_proxy_rotation_url
+        if not rotation_url:
+            return False
+        
+        current_time = time.time()
+        if current_time - self._last_rotation_time < self._rotation_cooldown_s:
+            self.logger.warning(
+                "Proxy rotation skipped: cooldown period not elapsed (%.0fs remaining)",
+                self._rotation_cooldown_s - (current_time - self._last_rotation_time),
+            )
+            return False
+        
+        try:
+            from aiohttp import ClientSession, ClientTimeout
+            timeout = ClientTimeout(total=10)
+            async with ClientSession() as session:
+                async with session.get(rotation_url, timeout=timeout) as response:
+                    if response.status == 200:
+                        self._last_rotation_time = current_time
+                        self.logger.info(
+                            "Worker %d: Mobile proxy rotated successfully via %s",
+                            self.worker_id,
+                            rotation_url,
+                        )
+                        return True
+                    else:
+                        self.logger.error(
+                            "Worker %d: Proxy rotation failed with status %d",
+                            self.worker_id,
+                            response.status,
+                        )
+                        return False
+        except Exception as e:
+            self.logger.error(
+                "Worker %d: Proxy rotation request failed: %s",
+                self.worker_id,
+                e,
+            )
+            return False
 
     def _build_proxy_config(self) -> dict[str, Any] | None:
         """Build Telethon proxy configuration from proxy_url.
@@ -322,12 +447,20 @@ class BaseTelegramWorker:
                     await asyncio.sleep(min(remaining, 60))  # Wake up every 60s to recheck
                     continue  # Retry after cooldown expires
 
-                # Apply random delay before API call to avoid rate limiting
-                delay = random.uniform(self.delay_min, self.delay_max)
-                self.logger.info(
-                    "Sleeping for %.1f seconds before API call",
-                    delay,
-                )
+                # Apply natural or uniform delay before API call to avoid rate limiting
+                if self.settings.use_natural_delays:
+                    delay = self.natural_delay()
+                    self.logger.info(
+                        "Natural delay: sleeping for %.1f seconds (heatup_factor=%.2f)",
+                        delay,
+                        self._calculate_heatup_factor(),
+                    )
+                else:
+                    delay = random.uniform(self.delay_min, self.delay_max)
+                    self.logger.info(
+                        "Sleeping for %.1f seconds before API call",
+                        delay,
+                    )
                 await asyncio.sleep(delay)
 
                 result = operation()
@@ -347,6 +480,24 @@ class BaseTelegramWorker:
                     delay,
                     flood_wait_total,
                 )
+
+                # Trigger mobile proxy rotation if configured (on any FloodWait)
+                if self.settings.mobile_proxy_rotation_url:
+                    self.logger.info(
+                        "%s: FloodWait detected - triggering mobile proxy rotation",
+                        operation_name,
+                    )
+                    rotation_success = await self._rotate_mobile_proxy()
+                    if rotation_success:
+                        self.logger.info(
+                            "%s: Mobile proxy rotated successfully",
+                            operation_name,
+                        )
+                    else:
+                        self.logger.warning(
+                            "%s: Mobile proxy rotation failed or skipped",
+                            operation_name,
+                        )
 
                 # SEVERE FLOODWAIT COOLDOWN: if delay > 3600 seconds, disconnect and wait 12h
                 if delay > 3600:

@@ -342,6 +342,38 @@ class ParserWorker(BaseTelegramWorker):
                 channel_data["title"],
             )
 
+            # NATIVE-LIKE EXPLORATION: Occasionally simulate "opening" the channel view
+            # by fetching a single message first, mimicking human browsing behavior
+            if random.random() < 0.3:  # 30% chance to do an exploration fetch
+                try:
+                    logger.debug(
+                        "Worker %d: Native exploration - fetching latest message from channel %s",
+                        self.worker_id,
+                        channel_id,
+                    )
+                    exploration_msg = await self.client.get_messages(  # type: ignore[attr-defined]
+                        entity, limit=1
+                    )
+                    # Small delay to simulate reading
+                    await asyncio.sleep(random.uniform(1, 3))
+                    # Count messages (handle both single Message and list responses)
+                    msg_count = 1 if exploration_msg else 0
+                    if isinstance(exploration_msg, list):
+                        msg_count = len(exploration_msg)
+                    self.logger.debug(
+                        "Worker %d: Exploration complete - found %d messages",
+                        self.worker_id,
+                        msg_count,
+                    )
+                except Exception as e:
+                    # Non-critical - log but continue with main parsing
+                    self.logger.warning(
+                        "Worker %d: Native exploration failed for channel %s: %s",
+                        self.worker_id,
+                        channel_id,
+                        e,
+                    )
+
             posts_saved = 0
 
             async for msg in self.client.iter_messages(  # type: ignore[attr-defined]

@@ -116,6 +116,20 @@ class Settings(BaseSettings):
         default=None,
         description="Optional proxy URL for Telegram connections",
     )
+    
+    # ---- Natparsing stealth settings ----
+    use_natural_delays: bool = Field(
+        default=False,
+        description="Enable natural human-like delay distribution (Pareto/Gamma) instead of uniform random",
+    )
+    mobile_proxy_rotation_url: str | None = Field(
+        default=None,
+        description="URL to call for mobile proxy IP rotation (e.g., http://proxy-api:8080/rotate)",
+    )
+    organic_heatup_minutes: int = Field(
+        default=30,
+        description="Duration of organic session heatup in minutes (slow start period)",
+    )
     log_level: str = Field(
         default="INFO",
         description="Logging level",
