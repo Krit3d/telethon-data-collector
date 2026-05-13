@@ -47,6 +47,36 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+  extractor:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    container_name: tg_parser_extractor
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - fastembed_cache:/app/model_cache
+    environment:
+      DB_URL: ${DB_URL}
+      QDRANT_URL: ${QDRANT_URL}
+      QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME}
+      QDRANT_BATCH_SIZE: ${QDRANT_BATCH_SIZE}
+      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT}
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      FASTEMBED_CACHE_PATH: /app/model_cache
+    depends_on:
+      - qdrant
+    networks:
+      - api_network
+    command: python -m src.api.extractor_worker
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 networks:
   api_network:

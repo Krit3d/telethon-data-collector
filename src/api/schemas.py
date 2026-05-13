@@ -1,6 +1,5 @@
 from datetime import datetime
 from pydantic import BaseModel, Field
-from typing import Optional
 
 
 class SearchRequest(BaseModel):
@@ -20,16 +19,18 @@ class SearchResultItem(BaseModel):
     url: str | None = None
 
 
+class GraphEdge(BaseModel):
+    """Represents a graph relationship (edge) between two entities."""
+
+    source_id: str
+    source_label: str
+    source_name: str | None = None
+    relation_type: str
+    target_id: str
+    target_label: str
+    target_name: str | None = None
+
+
 class SearchResponse(BaseModel):
     results: list[SearchResultItem]
-
-
-class IndexRequest(BaseModel):
-    limit: int = Field(
-        default=100, description="How many recent posts to index"
-    )
-
-
-class IndexResponse(BaseModel):
-    indexed_count: int
-    message: str
+    graph_context: list[GraphEdge] = Field(default_factory=list)

@@ -444,6 +444,72 @@ class QdrantService:
                 f"Failed to upsert embedding for post {post_id}: {e}"
             ) from e
 
+    async def search_entities(
+        self, query: str, limit: int = 5, score_threshold: float = 0.35
+    ) -> list[str]:
+        """Search for semantic entities in the telegram_entities collection.
+
+        Args:
+            query: Search query text.
+            limit: Maximum number of results to return.
+            score_threshold: Minimum similarity score threshold (0-1).
+
+        Returns:
+            List of original_id values from matched entity payloads.
+
+        Raises:
+            RuntimeError: If service is not initialized or search fails.
+        """
+
+        if not self._initialized:
+            await self.initialize()
+
+        collection_name = ENTITIES_COLLECTION
+
+        if not query or not query.strip():
+            logger.warning("Empty query provided for entity search")
+            return []
+
+        try:
+            # Generate embedding for the query
+            embedding_array = await self._generate_embeddings_batch([query])
+            query_embedding = embedding_array[0]
+
+            # Query the entities collection
+            response = await self.client.query_points(
+                collection_name=collection_name,
+                query=query_embedding.tolist(),
+                limit=limit,
+                score_threshold=score_threshold,
+                with_payload=True,
+            )
+
+            # Extract original_id from payloads
+            entity_ids = []
+            for hit in response.points:
+                if hit.payload and "original_id" in hit.payload:
+                    entity_ids.append(str(hit.payload["original_id"]))
+
+            logger.debug(
+                "Entity search successful",
+                extra={
+                    "query": query,
+                    "entities_found": len(entity_ids),
+                    "limit": limit,
+                    "score_threshold": score_threshold,
+                },
+            )
+
+            return entity_ids
+
+        except Exception as e:
+            logger.error(
+                "Error during entity search in Qdrant",
+                exc_info=e,
+                extra={"query": query, "limit": limit},
+            )
+            raise RuntimeError(f"Entity search failed: {e}") from e
+
     async def search_posts(
         self, query: str, limit: int = 10, score_threshold: float = 0.35
     ) -> list[dict]:

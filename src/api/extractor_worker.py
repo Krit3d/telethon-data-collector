@@ -9,7 +9,7 @@ import asyncio
 import logging
 import signal
 
-from src.config.config import Settings, load_settings
+from src.config.config import load_settings
 from src.db.database import Database
 from src.db.models import Post
 from src.embeddings.qdrant_service import QdrantService

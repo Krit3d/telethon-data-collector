@@ -299,14 +299,10 @@ class Database:
         Args:
             post_id: The database ID of the post to mark as extracted.
         """
-        
+
         async with self.async_session() as session:
             async with session.begin():
-                stmt = (
-                    select(Post)
-                    .where(Post.id == post_id)
-                    .with_for_update()
-                )
+                stmt = select(Post).where(Post.id == post_id).with_for_update()
                 result = await session.execute(stmt)
                 post = result.scalar_one_or_none()
 
@@ -460,7 +456,9 @@ class Database:
                         "Returned channel id=%s to pending state", channel_id
                     )
 
-    async def update_channel_access_hash(self, channel_id: int, access_hash: int) -> None:
+    async def update_channel_access_hash(
+        self, channel_id: int, access_hash: int
+    ) -> None:
         """Update the access_hash for a channel.
 
         This is used to store the session-local correct access_hash after
@@ -485,6 +483,117 @@ class Database:
                     logger.debug(
                         "Updated access_hash for channel id=%s", channel_id
                     )
+
+    async def get_subgraph_for_entities(
+        self, entity_ids: list[str]
+    ) -> list[dict]:
+        """
+        Fetch the subgraph (direct neighbors) for a list of entity IDs from Apache AGE.
+
+        Args:
+            entity_ids: List of entity original_id values to query graph relationships for.
+
+        Returns:
+            List of dictionaries representing graph edges with keys:
+            - source_id: ID of the source node
+            - source_label: Label of the source node
+            - source_name: Name property of the source node
+            - relation_type: Type of the relationship
+            - target_id: ID of the target node
+            - target_label: Label of the target node
+            - target_name: Name property of the target node
+
+        Raises:
+            ValueError: If entity_ids is empty.
+            RuntimeError: If query execution fails.
+        """
+
+        if not entity_ids:
+            return []
+
+        try:
+            # Build parameterized query using UNWIND for safe list handling
+            # Using $ids parameter with json.dumps ensures proper escaping
+            params_json = json.dumps({"ids": entity_ids})
+
+            query = f"""
+                SELECT * FROM cypher(
+                    'telegram_graph',
+                    $$
+                        UNWIND $ids AS id
+                        MATCH (a)-[r]-(b)
+                        WHERE a.id = id
+                        RETURN a.id as a_id, a.label as a_label, a.name as a_name,
+                               type(r) as rel_type,
+                               b.id as b_id, b.label as b_label, b.name as b_name
+                    $$,
+                    :params
+                ) AS (
+                    a_id agtype,
+                    a_label agtype,
+                    a_name agtype,
+                    rel_type agtype,
+                    b_id agtype,
+                    b_label agtype,
+                    b_name agtype
+                );
+            """
+
+            async with self.async_session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        text(query).bindparams(params=params_json)
+                    )
+                    rows = result.scalars().all()
+
+            # Parse agtype results into dictionaries
+            edges = []
+            for row in rows:
+                # Each field is returned as agtype (text representation)
+                # agtype format is similar to JSON but with some differences
+                # We'll parse each field as JSON after stripping quotes if needed
+                def parse_agtype(value):
+                    if value is None:
+                        return None
+                    # agtype values are typically returned as strings that represent JSON
+                    # e.g., '"some_string"' or '{"key": "value"}'
+                    text = str(value)
+                    # Remove surrounding quotes if present
+                    if text.startswith('"') and text.endswith('"'):
+                        text = text[1:-1]
+                    # Try to parse as JSON, otherwise return as-is
+                    try:
+                        return json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        return text
+
+                edge = {
+                    "source_id": parse_agtype(row[0]),
+                    "source_label": parse_agtype(row[1]),
+                    "source_name": parse_agtype(row[2]),
+                    "relation_type": parse_agtype(row[3]),
+                    "target_id": parse_agtype(row[4]),
+                    "target_label": parse_agtype(row[5]),
+                    "target_name": parse_agtype(row[6]),
+                }
+                edges.append(edge)
+
+            logger.debug(
+                "Fetched subgraph for entities",
+                extra={
+                    "entity_count": len(entity_ids),
+                    "edges_found": len(edges),
+                },
+            )
+            return edges
+
+        except Exception as e:
+            logger.error(
+                "Failed to fetch subgraph for entities",
+                exc_info=e,
+                extra={"entity_ids": entity_ids},
+            )
+            raise RuntimeError(f"Subgraph query failed: {e}") from e
 
     async def execute_cypher(self, query: str) -> Any:
         """
