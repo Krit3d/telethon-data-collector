@@ -13,7 +13,7 @@ from telethon.tl.types import InputChannel, InputPeerChannel, Message
 
 logger = logging.getLogger(__name__)
 
-# Local in-memory cache for entity resolution within a single worker run
+# Global in-memory cache for entity resolution (legacy, kept for backward compatibility)
 # Key: (channel_id, access_hash) tuple, Value: resolved TlChannel entity
 # Limited to 10000 entries to prevent unbounded memory growth; oldest entries are evicted
 _entity_cache: dict[tuple[int, int | None], TlChannel] = {}
@@ -126,6 +126,7 @@ async def get_channel_entity_safe(
     *,
     safe_api_call: Callable[..., Any] | None = None,
     access_hash: int | None = None,
+    entity_cache: dict[tuple[int, int | None], Any] | None = None,
 ) -> ChannelResolutionResult:
     """Safely get channel entity by ID or username with caching and cheap resolution.
 
@@ -134,7 +135,7 @@ async def get_channel_entity_safe(
     uses the client's get_entity directly.
 
     Optimizations:
-    - Checks local cache first to avoid repeated API calls
+    - Checks worker's entity cache first (if provided), then global cache
     - If access_hash is provided, constructs InputPeerChannel directly (cheap, no FloodWait)
     - Falls back to username-based resolution only when necessary
 
@@ -144,19 +145,30 @@ async def get_channel_entity_safe(
         safe_api_call: Optional async function that wraps API calls with
             retry logic and error handling. Format: safe_api_call(name, callable).
         access_hash: Optional access_hash for cheap resolution via InputPeerChannel.
+        entity_cache: Optional per-worker entity cache dict to check before global cache.
 
     Returns:
         ChannelResolutionResult containing the entity or error status.
     """
 
-    # Only cache numeric IDs
+    # Check worker's entity cache first if provided (per-worker cache)
+    if entity_cache is not None and isinstance(channel_id, int):
+        cache_key = (channel_id, access_hash)
+        if cache_key in entity_cache:
+            cached_entity = entity_cache[cache_key]
+            logger.info(
+                "Cache HIT for channel id=%s (Cheap - from worker cache)",
+                channel_id,
+            )
+            return ChannelResolutionResult(entity=cached_entity)
+
+    # Check global cache next (shared across workers)
     if isinstance(channel_id, int):
         cache_key = (channel_id, access_hash)
-        # Check cache first
         if cache_key in _entity_cache:
             cached_entity = _entity_cache[cache_key]
             logger.info(
-                "Cache HIT for channel id=%s (Cheap - from local cache)",
+                "Cache HIT for channel id=%s (Cheap - from global cache)",
                 channel_id,
             )
             return ChannelResolutionResult(entity=cached_entity)
@@ -182,10 +194,12 @@ async def get_channel_entity_safe(
                     "Resolved entity by ID+HASH (Cheap): id=%s",
                     channel_id,
                 )
-                # Cache with the access_hash we used
-                if isinstance(channel_id, int):
+                # Cache with the access_hash we used in both global and worker cache
+                if isinstance(channel_id, int) and access_hash is not None:
                     cache_key_with_hash = (channel_id, access_hash)
                     _entity_cache[cache_key_with_hash] = entity
+                    if entity_cache is not None:
+                        entity_cache[cache_key_with_hash] = entity
                     # Simple eviction: if cache exceeds max size, clear it (oldest entries dropped)
                     if len(_entity_cache) > _MAX_CACHE_SIZE:
                         _entity_cache.clear()
@@ -231,6 +245,8 @@ async def get_channel_entity_safe(
             if isinstance(channel_id, int) and getattr(entity, "access_hash", None):
                 cache_key_with_hash = (channel_id, entity.access_hash)
                 _entity_cache[cache_key_with_hash] = entity
+                if entity_cache is not None:
+                    entity_cache[cache_key_with_hash] = entity
                 # Simple eviction: if cache exceeds max size, clear it
                 if len(_entity_cache) > _MAX_CACHE_SIZE:
                     _entity_cache.clear()

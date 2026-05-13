@@ -97,7 +97,9 @@ class BaseTelegramWorker:
         self.consecutive_shadowbans = 0
         self.safe_mode = False
         self.is_alive = True  # Flag to indicate if worker should continue running
-        self._flood_wait_cooldown_until = 0  # Timestamp for FloodWait cooldown
+        self._flood_wait_cooldown_until = 0  # Timestamp for standard FloodWait cooldown
+        self._severe_flood_wait_until = 0  # Timestamp for severe FloodWait (>3600s) 12h cooldown
+        self._entity_cache: dict[tuple[int, int | None], Any] = {}  # In-memory entity cache: (channel_id, access_hash) -> entity
         
         # Logger with worker_id context for structured logging
         self.logger = logging.LoggerAdapter(
@@ -284,8 +286,29 @@ class BaseTelegramWorker:
 
         while True:
             try:
-                # Check if we're in a FloodWait cooldown period
+                # Check if we're in a SEVERE FloodWait cooldown period (>3600s, 12h)
                 current_time = time.time()
+                if current_time < self._severe_flood_wait_until:
+                    remaining = self._severe_flood_wait_until - current_time
+                    self.logger.critical(
+                        "%s: In SEVERE FloodWait cooldown (12h). %.0fs remaining. Worker is terminated for this session.",
+                        operation_name,
+                        remaining,
+                    )
+                    # Ensure client is disconnected during cooldown
+                    if self.client and self.client.is_connected():
+                        await self.disconnect()
+                    # Mark worker as dead and exit immediately
+                    self.is_alive = False
+                    self.logger.critical(
+                        "%s: Worker %d is DEAD due to severe FloodWait. Session protected. Cooldown expires in %.0f seconds.",
+                        operation_name,
+                        self.worker_id,
+                        remaining,
+                    )
+                    return  # Exit the operation and worker loop
+                
+                # Check if we're in a standard FloodWait cooldown period
                 if current_time < self._flood_wait_cooldown_until:
                     remaining = self._flood_wait_cooldown_until - current_time
                     self.logger.warning(
@@ -325,28 +348,26 @@ class BaseTelegramWorker:
                     flood_wait_total,
                 )
 
-                # SEVERE FLOODWAIT COOLDOWN: if delay > 1000 seconds, disconnect and wait
-                if delay > 1000:
+                # SEVERE FLOODWAIT COOLDOWN: if delay > 3600 seconds, disconnect and wait 12h
+                if delay > 3600:
                     self.logger.critical(
-                        "%s: FloodWait > 1000s (%ds). Entering cooldown: disconnect and wait without retrying.",
+                        "%s: FloodWait > 3600s (%ds). CRITICAL: Entering 12h cooldown. Worker will be terminated to save session.",
                         operation_name,
                         delay,
                     )
-                    # Set cooldown timestamp (current time + delay + 10s safety)
-                    self._flood_wait_cooldown_until = time.time() + delay + 10
+                    # Set severe cooldown timestamp (current time + 12 hours = 43200 seconds)
+                    self._severe_flood_wait_until = time.time() + 43200
                     # Disconnect immediately to free proxy and avoid holding TCP
                     await self.disconnect()
-                    # Wait for cooldown to expire
-                    await asyncio.sleep(delay + 10)
-                    # After cooldown, reconnect and retry
-                    await self.connect()
-                    self.logger.info(
-                        "%s: Cooldown expired, reconnected and resuming operations",
+                    # Mark worker as dead for this session - it will not restart after cooldown
+                    self.is_alive = False
+                    self.logger.critical(
+                        "%s: Worker %d is now DEAD. Session saved from permanent ban. Cooldown: 12h (%ds).",
                         operation_name,
+                        self.worker_id,
+                        43200,
                     )
-                    # Reset flood_wait_total to allow fresh attempts after cooldown
-                    flood_wait_total = 0
-                    continue
+                    return  # Exit the operation and worker loop
 
                 if flood_wait_total >= max_flood_wait_s:
                     self.logger.error(

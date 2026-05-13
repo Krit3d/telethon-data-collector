@@ -52,12 +52,15 @@ async def _extract_channel_metadata(
     avatars_dir: Path,
     *,
     safe_api_call: Callable[..., Any],
+    entity_cache: dict[tuple[int, int | None], Any] | None = None,
 ) -> tuple[dict[str, Any], TlChannel] | None:
     """Extract channel metadata with comprehensive error handling.
 
     This function resolves the channel entity, fetches full channel info,
-    and downloads the avatar. It handles both username-based and hash-based
-    resolution with proper fallbacks.
+    and downloads the avatar. Implements Zero-Username policy: if access_hash
+    is available, use cheap InputPeerChannel resolution. Only use username
+    resolution when access_hash is missing (first encounter), then immediately
+    save the hash to the DB.
 
     Args:
         client: Telethon client instance.
@@ -66,42 +69,78 @@ async def _extract_channel_metadata(
         avatars_dir: Directory where avatar files are stored.
         safe_api_call: Async function that wraps API calls with retry logic
             and error handling. Format: safe_api_call(name, callable).
+        entity_cache: Optional per-worker entity cache for cheap lookups.
     """
     channel_id = channel.id
 
-    # Resolve entity: prioritize username resolution for correct session-local access_hash
+    # ZERO-USERNAME POLICY: Prioritize cheap ID+hash resolution to avoid FloodWait
     entity = None
-    if channel.username:
-        # Try username first - Telethon caches the correct access_hash in session
-        result = await get_channel_entity_safe(
-            client, channel.username, safe_api_call=safe_api_call
-        )
-        if result.is_success() and result.entity is not None:
-            entity = result.entity
-        else:
-            # Username resolution failed, will fall back to access_hash below
-            entity = None
-
-    if entity is None:
-        # Fallback: try with channel ID + access_hash from DB (cheap, no FloodWait)
-        # This uses InputPeerChannel directly if access_hash is available
+    
+    # First, try cheap resolution with access_hash if available (NO USERNAME)
+    if channel.access_hash is not None:
         result = await get_channel_entity_safe(
             client,
             channel_id,
             safe_api_call=safe_api_call,
             access_hash=channel.access_hash,
+            entity_cache=entity_cache,
         )
-        if not result.is_success() or result.entity is None:
+        if result.is_success() and result.entity is not None:
+            entity = result.entity
+            logger.info(
+                "Channel id=%s resolved via access_hash (cheap, no FloodWait)",
+                channel_id,
+            )
+        else:
+            # Cheap resolution failed - could be invalid hash or account restrictions
+            logger.warning(
+                "Cheap resolution failed for channel id=%s with access_hash. Error: %s",
+                channel_id,
+                result.reason or "unknown",
+            )
+            entity = None
+
+    # Fallback: Only if access_hash is missing OR cheap resolution failed, try username
+    # WARNING: This is EXPENSIVE and can trigger FloodWait!
+    if entity is None and channel.username:
+        logger.info(
+            "Channel id=%s: access_hash missing or invalid, falling back to username resolution (EXPENSIVE)",
+            channel_id,
+        )
+        result = await get_channel_entity_safe(
+            client,
+            channel.username,
+            safe_api_call=safe_api_call,
+            entity_cache=entity_cache,
+        )
+        if result.is_success() and result.entity is not None:
+            entity = result.entity
+            # IMMEDIATELY save the access_hash to DB for future cheap resolution
+            try:
+                resolved_hash = getattr(entity, "access_hash", None)
+                if resolved_hash is not None:
+                    await db.update_channel_access_hash(channel_id, resolved_hash)
+                    logger.info(
+                        "Updated access_hash for channel id=%s from username resolution",
+                        channel_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to update access_hash for channel id=%s: %s",
+                    channel_id,
+                    e,
+                )
+        else:
+            # Username resolution failed
             if result.shadowbanned:
                 await db.mark_channel_pending(channel_id)
             else:
                 await db.mark_channel_rejected(channel_id)
                 await asyncio.sleep(random.uniform(10, 20))
             return None
-        entity = result.entity
 
     if entity is None:
-        # Both methods failed
+        # Both cheap (hash) and expensive (username) resolution failed
         await db.mark_channel_rejected(channel_id)
         await asyncio.sleep(random.uniform(10, 20))
         return None
@@ -286,6 +325,7 @@ class ParserWorker(BaseTelegramWorker):
                 self.db,
                 self.settings.avatars_dir,
                 safe_api_call=self.safe_api_call,
+                entity_cache=self._entity_cache,  # Pass per-worker entity cache
             )
             if result is None:
                 await self.db.mark_channel_rejected(channel_id)
