@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,8 +55,8 @@ class BaseTelegramWorker:
         app_version: str = "4.16.8",
         lang_code: str = "en",
         system_lang_code: str = "en-US",
-        delay_min: float = 0.5,
-        delay_max: float = 2.0,
+        delay_min: float = 5.0,
+        delay_max: float = 15.0,
     ):
         """Initialize the base worker.
 
@@ -72,8 +73,8 @@ class BaseTelegramWorker:
             app_version: App version string.
             lang_code: Language code (e.g., 'en').
             system_lang_code: System language code (e.g., 'en-US').
-            delay_min: Minimum random delay in seconds before API calls.
-            delay_max: Maximum random delay in seconds before API calls.
+            delay_min: Minimum random delay in seconds before API calls (default: 5.0).
+            delay_max: Maximum random delay in seconds before API calls (default: 15.0).
         """
 
         self.worker_id = worker_id
@@ -96,6 +97,7 @@ class BaseTelegramWorker:
         self.consecutive_shadowbans = 0
         self.safe_mode = False
         self.is_alive = True  # Flag to indicate if worker should continue running
+        self._flood_wait_cooldown_until = 0  # Timestamp for FloodWait cooldown
         
         # Logger with worker_id context for structured logging
         self.logger = logging.LoggerAdapter(
@@ -244,6 +246,7 @@ class BaseTelegramWorker:
         - Shadowban detection and mitigation with connection lifecycle management
         - Safe mode activation after repeated shadowban indicators
         - Graceful degradation for non-fatal errors
+        - Cool-down period for severe FloodWait (>1000s): disconnect and wait without retrying
 
         Args:
             operation_name: Human-readable identifier for the operation (used in logging).
@@ -281,6 +284,21 @@ class BaseTelegramWorker:
 
         while True:
             try:
+                # Check if we're in a FloodWait cooldown period
+                current_time = time.time()
+                if current_time < self._flood_wait_cooldown_until:
+                    remaining = self._flood_wait_cooldown_until - current_time
+                    self.logger.warning(
+                        "%s: In FloodWait cooldown. %.0fs remaining. Disconnected during cooldown.",
+                        operation_name,
+                        remaining,
+                    )
+                    # Ensure client is disconnected during cooldown to avoid holding TCP
+                    if self.client and self.client.is_connected():
+                        await self.disconnect()
+                    await asyncio.sleep(min(remaining, 60))  # Wake up every 60s to recheck
+                    continue  # Retry after cooldown expires
+
                 # Apply random delay before API call to avoid rate limiting
                 delay = random.uniform(self.delay_min, self.delay_max)
                 self.logger.info(
@@ -306,6 +324,29 @@ class BaseTelegramWorker:
                     delay,
                     flood_wait_total,
                 )
+
+                # SEVERE FLOODWAIT COOLDOWN: if delay > 1000 seconds, disconnect and wait
+                if delay > 1000:
+                    self.logger.critical(
+                        "%s: FloodWait > 1000s (%ds). Entering cooldown: disconnect and wait without retrying.",
+                        operation_name,
+                        delay,
+                    )
+                    # Set cooldown timestamp (current time + delay + 10s safety)
+                    self._flood_wait_cooldown_until = time.time() + delay + 10
+                    # Disconnect immediately to free proxy and avoid holding TCP
+                    await self.disconnect()
+                    # Wait for cooldown to expire
+                    await asyncio.sleep(delay + 10)
+                    # After cooldown, reconnect and retry
+                    await self.connect()
+                    self.logger.info(
+                        "%s: Cooldown expired, reconnected and resuming operations",
+                        operation_name,
+                    )
+                    # Reset flood_wait_total to allow fresh attempts after cooldown
+                    flood_wait_total = 0
+                    continue
 
                 if flood_wait_total >= max_flood_wait_s:
                     self.logger.error(

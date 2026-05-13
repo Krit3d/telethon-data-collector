@@ -83,9 +83,13 @@ async def _extract_channel_metadata(
             entity = None
 
     if entity is None:
-        # Fallback: try with channel ID (may use cached access_hash from session if available)
+        # Fallback: try with channel ID + access_hash from DB (cheap, no FloodWait)
+        # This uses InputPeerChannel directly if access_hash is available
         result = await get_channel_entity_safe(
-            client, channel_id, safe_api_call=safe_api_call
+            client,
+            channel_id,
+            safe_api_call=safe_api_call,
+            access_hash=channel.access_hash,
         )
         if not result.is_success() or result.entity is None:
             if result.shadowbanned:
