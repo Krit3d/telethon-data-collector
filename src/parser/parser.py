@@ -26,8 +26,6 @@ from telethon.tl.types import Message
 from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.models import Channel
-from src.embeddings.qdrant_service import QdrantService
-from src.graph.extractor import KnowledgeExtractor
 from src.parser.core.runner import start_workers
 from src.parser.core.worker_base import BaseTelegramWorker
 from src.parser.core.utils import (
@@ -238,23 +236,12 @@ class ParserWorker(BaseTelegramWorker):
             lang_code=lang_code,
             system_lang_code=system_lang_code,
         )
-        self.qdrant: QdrantService | None = None
-        self.knowledge_extractor = KnowledgeExtractor(settings)
 
     async def run(self) -> None:
         """Main worker loop: continuously fetch and parse channels from DB queue."""
         await self.connect()
 
         logger.info("Worker %d: Starting parser loop", self.worker_id)
-
-        # Initialize Qdrant service
-        try:
-            self.qdrant = QdrantService(self.settings)
-            await self.qdrant.initialize()
-            logger.info("Worker %d: Qdrant service initialized", self.worker_id)
-        except Exception as e:
-            logger.error("Worker %d: Failed to initialize Qdrant: %s", self.worker_id, e)
-            self.qdrant = None
 
         try:
             while True:
@@ -302,8 +289,6 @@ class ParserWorker(BaseTelegramWorker):
                     )
                     await asyncio.sleep(30)
         finally:
-            # Cleanup: close knowledge extractor session
-            await self.knowledge_extractor.close()
             logger.info("Worker %d: Cleanup complete", self.worker_id)
 
     async def _parse_single_channel(self, channel: Channel) -> None:
@@ -388,24 +373,6 @@ class ParserWorker(BaseTelegramWorker):
                 post_id = await _process_message(msg, entity, self.db)
                 if post_id is None:
                     continue
-
-                # Knowledge graph extraction (secondary process)
-                try:
-                    if msg.message:
-                        await self.knowledge_extractor.process_post(
-                            post_id=post_id,
-                            text=msg.message,
-                            author_id=channel_id,
-                            db=self.db,
-                            qdrant=self.qdrant,
-                        )
-                except Exception as e:
-                    logger.error(
-                        "Failed to extract knowledge graph for post id=%s: %s",
-                        post_id,
-                        e,
-                        exc_info=True,
-                    )
 
                 posts_saved += 1
 

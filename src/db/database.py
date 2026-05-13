@@ -273,6 +273,47 @@ class Database:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def get_unextracted_posts(self, limit: int = 50) -> list[Post]:
+        """Fetch posts that have not yet been extracted to knowledge graph.
+
+        Args:
+            limit: Maximum number of posts to return.
+
+        Returns:
+            List of Post objects where is_extracted is False.
+        """
+
+        async with self.async_session() as session:
+            stmt = (
+                select(Post)
+                .where(Post.is_extracted == False)  # noqa: E712
+                .order_by(Post.id.asc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def mark_post_extracted(self, post_id: int) -> None:
+        """Mark a post as extracted (is_extracted = True).
+
+        Args:
+            post_id: The database ID of the post to mark as extracted.
+        """
+        
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    select(Post)
+                    .where(Post.id == post_id)
+                    .with_for_update()
+                )
+                result = await session.execute(stmt)
+                post = result.scalar_one_or_none()
+
+                if post is not None:
+                    post.is_extracted = True
+                    logger.debug("Marked post id=%s as extracted", post_id)
+
     async def get_random_pending_channel(
         self, require_hash: bool = False
     ) -> Channel | None:

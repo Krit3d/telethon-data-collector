@@ -105,6 +105,13 @@ class Post(Base):
         autoincrement=True,
         comment="Surrogate primary key",
     )
+    is_extracted: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        index=True,
+        comment="True if knowledge graph and embeddings are extracted",
+    )
     channel_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("channels.id", ondelete="CASCADE"),

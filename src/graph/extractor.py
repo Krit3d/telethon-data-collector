@@ -234,6 +234,13 @@ Example format:
             logger.debug("Post id=%s: no knowledge triples extracted", post_id)
             return
 
+        # Build node ID -> label mapping for edge upserts
+        node_id_to_label: dict[str, str] = {}
+        for node in result.nodes:
+            node_id = node.properties.get("id")
+            if node_id:
+                node_id_to_label[str(node_id)] = node.label
+
         # Upsert nodes to AGE graph
         for node in result.nodes:
             try:
@@ -258,21 +265,25 @@ Example format:
 
         # Upsert edges to AGE graph
         for edge in result.edges:
+            start_label = node_id_to_label.get(edge.start_node_id, "Entity")
+            end_label = node_id_to_label.get(edge.end_node_id, "Entity")
             try:
                 await db.upsert_graph_edge(
-                    start_label="Person",
+                    start_label=start_label,
                     start_merge_key="id",
                     start_merge_val=edge.start_node_id,
                     edge_label=edge.edge_label,
-                    end_label="Person",
+                    end_label=end_label,
                     end_merge_key="id",
                     end_merge_val=edge.end_node_id,
                     edge_properties=edge.properties,
                 )
                 logger.debug(
-                    "Upserted edge: %s-%s->%s",
+                    "Upserted edge: %s(%s)-%s->%s(%s)",
+                    start_label,
                     edge.start_node_id,
                     edge.edge_label,
+                    end_label,
                     edge.end_node_id,
                 )
             except Exception as e:
