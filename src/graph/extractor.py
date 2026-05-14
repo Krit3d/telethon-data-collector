@@ -14,6 +14,7 @@ from src.graph.schema import (
     ExtractionResult,
     OpenSPGExtractionResult,
     Property,
+    PropertyType,
     SPGEdge,
     SPGNode,
     get_open_spg_llm_prompt,
@@ -30,19 +31,19 @@ def _convert_properties_dict_to_list(properties_dict: dict[str, Any]) -> list[Pr
         properties_dict: Dictionary mapping property keys to values.
 
     Returns:
-        List of Property objects with inferred types.
+        List of Property objects with inferred types matching PropertyType enum.
     """
     properties = []
     for key, value in properties_dict.items():
-        # Infer property type based on value type
+        # Infer property type based on value type to match PropertyType enum
         if isinstance(value, str):
-            prop_type = "string"
+            prop_type = PropertyType.TEXT
         elif isinstance(value, (int, float)):
-            prop_type = "number"
+            prop_type = PropertyType.NUMERIC
         elif isinstance(value, list) and len(value) == 2 and all(isinstance(x, (int, float)) for x in value):
-            prop_type = "geo"
+            prop_type = PropertyType.GEO
         else:
-            prop_type = "string"  # fallback
+            prop_type = PropertyType.TEXT  # fallback to text for any string-like value
         properties.append(Property(key=key, value=value, type=prop_type))
     return properties
 

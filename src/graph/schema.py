@@ -4,43 +4,134 @@ OpenSPG supports dynamic knowledge extraction with typed property accumulation
 for flexible entity and relationship attributes.
 """
 
+from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class PropertyType(str, Enum):
+    """Enumeration of supported property types in OpenSPG.
+
+    All properties in the system must conform to one of these strict types
+    to ensure type safety and universal domain support (IT, politics, etc.).
+    """
+
+    TEXT = "text"
+    NUMERIC = "numeric"
+    GEO = "geo"
+    LANGUAGE = "language"
+    LOCATION = "location"
 
 
 class Property(BaseModel):
-    """Represents a dynamic property with type information.
+    """Represents a typed dynamic property with strict validation.
 
-    OpenSPG allows accumulating various types of properties on entities and relations:
-    - string: Textual data
-    - number: Numeric data (int, float)
-    - geo: Geospatial coordinates
-    - language: Language codes
-    - etc.
+    Properties are used to store attributes on entities and relations.
+    Each property has a key, a value, and a type from the PropertyType enum.
+    The value is validated against the type to ensure data integrity.
     """
 
     key: str = Field(..., description="Property name/key")
-    value: Any = Field(..., description="Property value (any JSON-serializable type)")
-    type: str = Field(
-        ..., description="Property type category: 'string', 'number', 'geo', 'language', etc."
+    value: Any = Field(..., description="Property value (validated based on type)")
+    type: PropertyType = Field(
+        ..., description="Property type category from PropertyType enum"
     )
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_type_string(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """Convert string type to PropertyType enum for backward compatibility.
+
+        This validator allows passing type as a string (e.g., "text") which
+        is automatically converted to the corresponding PropertyType enum value.
+
+        Args:
+            data: Raw input data before model validation.
+
+        Returns:
+            Modified data with type converted to PropertyType enum if it was a string.
+        """
+        if isinstance(data, dict) and "type" in data:
+            type_value = data["type"]
+            if isinstance(type_value, str):
+                try:
+                    data["type"] = PropertyType(type_value)
+                except ValueError:
+                    pass  # Let Pydantic raise the appropriate error for invalid types
+        return data
+
+    @model_validator(mode="after")
+    def validate_value_against_type(self) -> "Property":
+        """Validate that the property value matches the expected type.
+
+        Enforces strict type constraints:
+        - NUMERIC: value must be int or float
+        - GEO: value must be a list of exactly two floats
+        - LANGUAGE: value must be a 2-letter string
+        - TEXT: any string value accepted
+        - LOCATION: any string value accepted (human-readable location)
+
+        Returns:
+            The validated Property instance.
+
+        Raises:
+            ValueError: If the value does not match the type constraints.
+        """
+        prop_type = self.type
+        value = self.value
+
+        if prop_type == PropertyType.NUMERIC:
+            if not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"Property '{self.key}' with type NUMERIC must have an int or float value, got {type(value).__name__}"
+                )
+
+        elif prop_type == PropertyType.GEO:
+            if not (
+                isinstance(value, list)
+                and len(value) == 2
+                and all(isinstance(coord, (int, float)) for coord in value)
+            ):
+                raise ValueError(
+                    f"Property '{self.key}' with type GEO must be a list of two floats, got {value!r}"
+                )
+
+        elif prop_type == PropertyType.LANGUAGE:
+            if not (isinstance(value, str) and len(value) == 2 and value.isalpha()):
+                raise ValueError(
+                    f"Property '{self.key}' with type LANGUAGE must be a 2-letter alphabetic string, got {value!r}"
+                )
+
+        elif prop_type == PropertyType.TEXT:
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"Property '{self.key}' with type TEXT must be a string, got {type(value).__name__}"
+                )
+
+        elif prop_type == PropertyType.LOCATION:
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"Property '{self.key}' with type LOCATION must be a string, got {type(value).__name__}"
+                )
+
+        return self
 
 
 class ExtractedEntity(BaseModel):
     """Represents an extracted entity node in OpenSPG format.
 
     Entities are the nodes in the knowledge graph. They have a unique standardized
-    ID, a type label, a display name, and a list of dynamic properties.
+    ID, a type label, a display name, and a list of typed properties.
     """
 
     id: str = Field(..., description="Unique standardized identifier (e.g., 'person_pavel_durov')")
     label: str = Field(..., description="Entity type (e.g., 'Person', 'Organization', 'Location')")
     name: str = Field(..., description="Display name for the entity")
     properties: list[Property] = Field(
-        default_factory=list, description="List of dynamic properties (age, coordinates, language, etc.)"
+        default_factory=list, description="List of typed properties (age, coordinates, language, etc.)"
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -53,21 +144,24 @@ class ExtractedEntity(BaseModel):
         """
         return {prop.key: prop.value for prop in self.properties}
 
-    def add_property(self, key: str, value: Any, type: str) -> None:
-        """Add a property to the entity.
+    def add_property(self, key: str, value: Any, type: str | PropertyType) -> None:
+        """Add a typed property to the entity.
 
         Args:
             key: Property name.
-            value: Property value.
-            type: Property type category.
+            value: Property value (will be validated against type).
+            type: Property type - either a PropertyType enum member or its string value.
         """
+        # Convert string to PropertyType enum for backward compatibility
+        if isinstance(type, str):
+            type = PropertyType(type)
         self.properties.append(Property(key=key, value=value, type=type))
 
 
 class ExtractedRelation(BaseModel):
     """Represents an extracted relationship/edge in OpenSPG format.
 
-    Relations connect entities and can have their own dynamic properties
+    Relations connect entities and can have their own typed properties
     to provide context (e.g., 'since_year', 'confidence', 'role').
     """
 
@@ -77,7 +171,7 @@ class ExtractedRelation(BaseModel):
     )
     target_id: str = Field(..., description="ID of the target entity")
     properties: list[Property] = Field(
-        default_factory=list, description="Optional list of relation properties"
+        default_factory=list, description="Optional list of typed relation properties"
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -90,14 +184,17 @@ class ExtractedRelation(BaseModel):
         """
         return {prop.key: prop.value for prop in self.properties}
 
-    def add_property(self, key: str, value: Any, type: str) -> None:
-        """Add a property to the relation.
+    def add_property(self, key: str, value: Any, type: str | PropertyType) -> None:
+        """Add a typed property to the relation.
 
         Args:
             key: Property name.
-            value: Property value.
-            type: Property type category.
+            value: Property value (will be validated against type).
+            type: Property type - either a PropertyType enum member or its string value.
         """
+        # Convert string to PropertyType enum for backward compatibility
+        if isinstance(type, str):
+            type = PropertyType(type)
         self.properties.append(Property(key=key, value=value, type=type))
 
 
@@ -315,15 +412,15 @@ Extraction Instructions:
    IMPORTANT: The "properties" field is a FLAT DICTIONARY (key-value pairs), NOT a list of objects. The system will automatically infer property types from the values.
    
    REQUIRED PROPERTIES: For each entity, you MUST extract at least one relevant property beyond name. Examples:
-   - Person: telegram_id (numeric), nationality (string), birth_year (numeric)
-   - Location: coordinates (array [lat, lon]), country (string)
-   - Organization: founded (numeric), industry (string), website (string)
-   - Event: timestamp (numeric), location (string), participants (string)
-   - IT_Concept: category (string), version (string), language (string)
+   - Person: telegram_id (numeric), nationality (text), birth_year (numeric)
+   - Location: coordinates (array [lat, lon]), country (text)
+   - Organization: founded (numeric), industry (text), website (text)
+   - Event: timestamp (numeric), location (text), participants (text)
+   - IT_Concept: category (text), version (text), language (text)
 
 3. PROPERTY VALUE TYPES (infer from value):
-   - String values: "text", automatically typed as string
-   - Numeric values (int/float): 123, automatically typed as number
+   - String values: "text", automatically typed as text
+   - Numeric values (int/float): 123, automatically typed as numeric
    - Geographic coordinates: [lat, lon] array, automatically typed as geo
    - Language codes: "en", "ru", etc., automatically typed as language
 
