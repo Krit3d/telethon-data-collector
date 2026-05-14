@@ -520,7 +520,7 @@ class Database:
                                type(r) as rel_type,
                                b.id as b_id, b.label as b_label, b.name as b_name
                     $$,
-                    :params::agtype
+                    CAST(:params AS agtype)
                 ) AS (
                     a_id agtype,
                     a_label agtype,
@@ -622,13 +622,13 @@ class Database:
             merge_key: Property name to use for MERGE matching (default: 'id').
         """
 
-        params_json = json.dumps(properties)
+        params_json = json.dumps({"props": properties})
         query = f"""
             SELECT * FROM cypher('telegram_graph', $$
                 MERGE (n:{label} {{{merge_key}: $props.{merge_key}}})
                 SET n += $props
                 RETURN n
-            $$, :params::agtype) AS (v agtype);
+            $$, CAST(:params AS agtype)) AS (v agtype);
         """
         stmt = text(query).bindparams(params=params_json)
         async with self.async_session() as session:
@@ -675,7 +675,7 @@ class Database:
                 MERGE (a)-[r:{edge_label}]->(b)
                 SET r += $props
                 RETURN r
-            $$, :params::agtype) AS (v agtype);
+            $$, CAST(:params AS agtype)) AS (v agtype);
         """
         stmt = text(query).bindparams(params=json.dumps(params_dict))
         async with self.async_session() as session:
