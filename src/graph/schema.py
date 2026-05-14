@@ -379,57 +379,81 @@ def get_open_spg_llm_prompt(text: str, author_id: int | None = None) -> str:
     """
     author_instruction = ""
     if author_id is not None:
-        author_instruction = f"""5. If the text mentions or references the author (Telegram user ID: {author_id}), create a Person node with id "person_{author_id}" and name "Author {author_id}". Include a 'telegram_id' property with numeric value {author_id}. This author node serves as the root for the knowledge subgraph.
+        author_instruction = f"""5. If the text mentions or references the author (Telegram user ID: {author_id}), create an Actor node with id "actor_{author_id}" and name "Author {author_id}". Include a property {{'key': 'telegram_id', 'value': {author_id}, 'type': 'numeric'}}. This author node serves as the root for the knowledge subgraph.
 6. """
 
-    prompt = f"""You are an OpenSPG (Semantic Parsing Graph) engine. Your task is to perform dynamic incremental subgraph extraction from the provided text. Follow these OpenSPG paradigms strictly:
+    prompt = f"""You are an OpenSPG (Semantic Parsing Graph) incremental knowledge accumulation engine. Your task is to extract or update knowledge entities and relationships from the provided text, treating the graph as a persistent state that grows incrementally across any domain (IT, politics, lifestyle, science, etc.).
+
+CRITICAL OpenSPG DOCTRINE:
+- You are building a KNOWLEDGE GRAPH that accumulates facts over time.
+- If a post mentions that a blogger has a second child, you must extract a property {{'key': 'children_count', 'value': 2, 'type': 'numeric'}} for that Actor node, so the graph updates its state incrementally.
+- Every entity may have multiple properties added across different texts. Do not replace existing properties; only add new ones or update numeric/text values when new information is provided.
+- Use ONLY the four core universal labels: Actor (persons, organizations, any named individual/group), Entity (abstract concepts, products, technologies, objects), Event (occurrences, meetings, incidents), Place (geographic locations, cities, coordinates).
 
 OpenSPG Principles:
 - Build a connected subgraph of entities and relationships.
-- Separate data types: classify all non-entity attributes as typed properties (text, numeric, geo, language).
-- Use canonical IDs and uppercase relation types.
+- All non-entity attributes MUST be expressed as TYPED PROPERTIES with explicit type classification.
+- Use canonical IDs (lowercase with underscores) and UPPER_SNAKE_CASE relation types.
+- Properties are the mechanism for incremental state updates.
 
 Text to analyze:
 {text}
 
 Extraction Instructions:
 
-1. ENTITY TYPES (Primary OpenSPG Categories):
-   - Person: Individuals (including the author if mentioned)
-   - Location: Geographic places, cities, countries, coordinates
-   - Organization: Companies, institutions, agencies
-   - Event: Occurrences, meetings, incidents
-   - IT_Concept: Technologies, software, programming concepts, digital products
+1. UNIVERSAL ENTITY TYPES (use EXACTLY these four labels):
+   - Actor: People, organizations, groups, or any named entity that can act or be referenced (e.g., "Pavel Durov", "Telegram", "UN Security Council")
+   - Entity: Concepts, objects, products, technologies, ideas, or any non-place, non-event thing (e.g., "Python programming language", "Quantum Computing", "iPhone 15")
+   - Event: Occurrences, meetings, incidents, or time-bound activities (e.g., "WWDC 2024", "Russian invasion of Ukraine", "product launch")
+   - Place: Geographic locations, cities, countries, coordinates, or physical places (e.g., "Moscow", "Silicon Valley", "[55.7558, 37.6173]")
 
-2. FORMAT FOR EACH ENTITY:
+2. ENTITY FORMAT (strict JSON structure):
    {{
-     "id": "canonical_string_id" (e.g., "person_john_doe", "loc_paris", "org_telegram"),
-     "label": "EntityType" (exact: Person, Location, Organization, Event, IT_Concept),
+     "id": "canonical_string_id" (e.g., "actor_pavel_durov", "entity_python", "event_wwdc_2024", "place_moscow"),
+     "label": "Actor" | "Entity" | "Event" | "Place" (exactly one of these four),
      "name": "Human-readable display name",
-     "properties": {{"property_name": <value>, "property_name2": <value>}}
+     "properties": [
+       {{"key": "property_name", "value": <any>, "type": "text" | "numeric" | "geo" | "language" | "location"}}
+     ]
    }}
    
-   IMPORTANT: The "properties" field is a FLAT DICTIONARY (key-value pairs), NOT a list of objects. The system will automatically infer property types from the values.
+   CRITICAL: "properties" is a LIST OF OBJECTS, each with 'key', 'value', and 'type' fields. NOT a dictionary.
    
-   REQUIRED PROPERTIES: For each entity, you MUST extract at least one relevant property beyond name. Examples:
-   - Person: telegram_id (numeric), nationality (text), birth_year (numeric)
-   - Location: coordinates (array [lat, lon]), country (text)
-   - Organization: founded (numeric), industry (text), website (text)
-   - Event: timestamp (numeric), location (text), participants (text)
-   - IT_Concept: category (text), version (text), language (text)
+   PROPERTY TYPE RULES (strict enforcement):
+   - "text": string values (names, descriptions, languages, etc.)
+   - "numeric": int or float values (counts, years, quantities, IDs, timestamps)
+   - "geo": array of exactly two floats [latitude, longitude] (e.g., [55.7558, 37.6173])
+   - "language": 2-letter language code string (e.g., "en", "ru", "zh")
+   - "location": human-readable location string (e.g., "Moscow, Russia", "Cupertino, CA")
+   
+   EXAMPLES OF PROPERTIES:
+   - Actor: [{{'key': 'telegram_id', 'value': 123456, 'type': 'numeric'}}, {{'key': 'nationality', 'value': 'Russian', 'type': 'text'}}]
+   - Entity: [{{'key': 'category', 'value': 'programming_language', 'type': 'text'}}, {{'key': 'release_year', 'value': 1991, 'type': 'numeric'}}]
+   - Event: [{{'key': 'timestamp', 'value': 1712345678, 'type': 'numeric'}}, {{'key': 'location', 'value': 'San Francisco', 'type': 'location'}}]
+   - Place: [{{'key': 'coordinates', 'value': [55.7558, 37.6173], 'type': 'geo'}}, {{'key': 'country', 'value': 'Russia', 'type': 'text'}}]
 
-3. PROPERTY VALUE TYPES (infer from value):
-   - String values: "text", automatically typed as text
-   - Numeric values (int/float): 123, automatically typed as numeric
-   - Geographic coordinates: [lat, lon] array, automatically typed as geo
-   - Language codes: "en", "ru", etc., automatically typed as language
-
-4. RELATIONSHIPS:
-   - relation_type: MUST be UPPER_SNAKE_CASE (e.g., LOCATED_IN, WORKS_AT, DISCUSSES, MENTIONS, CREATED, PART_OF)
+3. RELATIONSHIPS:
+   - relation_type: MUST be UPPER_SNAKE_CASE (e.g., LOCATED_IN, WORKS_AT, DISCUSSES, MENTIONS, CREATED, PART_OF, ATTENDED, INFLUENCED_BY)
    - Connect entities via source_id and target_id
-   - "properties" is also a flat dictionary (can include optional metadata like confidence, time_period)
+   - "properties": list of typed property objects (can include metadata like confidence, time_period, role)
+   
+   RELATIONSHIP FORMAT:
+   {{
+     "source_id": "entity_id",
+     "relation_type": "UPPER_SNAKE_CASE",
+     "target_id": "entity_id",
+     "properties": [{{"key": "...", "value": <any>, "type": "text" | "numeric" | "geo" | "language" | "location"}}]
+   }}
 
-{author_instruction}5. OUTPUT FORMAT:
+{author_instruction}4. INCREMENTAL AGGREGATION STRATEGY:
+   - Extract ALL entities and relationships mentioned in the text, even if they seem obvious.
+   - For each entity, include at least 1-2 relevant properties beyond the name.
+   - If an entity already exists in the graph with properties, you are ADDING to its knowledge. Do not worry about deduplication; the system handles merging by canonical ID.
+   - Numeric properties can be updated (e.g., if children_count increases, extract the new value).
+   - Text properties can be extended (e.g., add new 'alternate_name' or 'description').
+   - Always prefer extracting concrete, factual properties over vague ones.
+
+5. OUTPUT FORMAT:
 Return ONLY a valid JSON object with exactly this structure:
 {{
   "entities": [ ... ],
@@ -438,39 +462,64 @@ Return ONLY a valid JSON object with exactly this structure:
 
 Do not include any explanatory text, markdown formatting, or code block delimiters. The response must be pure JSON.
 
-Example:
+Example for a tech blog post:
 {{
   "entities": [
     {{
-      "id": "person_elon_musk",
-      "label": "Person",
-      "name": "Elon Musk",
-      "properties": {{"nationality": "South African/American", "birth_year": 1971}}
+      "id": "actor_john_doe",
+      "label": "Actor",
+      "name": "John Doe",
+      "properties": [
+        {{"key": "telegram_id", "value": 987654321, "type": "numeric"}},
+        {{"key": "role", "value": "software_engineer", "type": "text"}}
+      ]
     }},
     {{
-      "id": "org_tesla",
-      "label": "Organization",
-      "name": "Tesla Inc.",
-      "properties": {{"industry": "Electric Vehicles", "founded": 2003}}
+      "id": "entity_python",
+      "label": "Entity",
+      "name": "Python",
+      "properties": [
+        {{"key": "category", "value": "programming_language", "type": "text"}},
+        {{"key": "release_year", "value": 1991, "type": "numeric"}}
+      ]
     }},
     {{
-      "id": "loc_palo_alto",
-      "label": "Location",
-      "name": "Palo Alto",
-      "properties": {{"coordinates": [37.4419, -122.1430]}}
+      "id": "event_pycon_2024",
+      "label": "Event",
+      "name": "PyCon 2024",
+      "properties": [
+        {{"key": "timestamp", "value": 1712345678, "type": "numeric"}},
+        {{"key": "location", "value": "Pittsburgh, PA", "type": "location"}}
+      ]
+    }},
+    {{
+      "id": "place_pittsburgh",
+      "label": "Place",
+      "name": "Pittsburgh",
+      "properties": [
+        {{"key": "coordinates", "value": [40.4406, -79.9959], "type": "geo"}},
+        {{"key": "country", "value": "USA", "type": "text"}}
+      ]
     }}
   ],
   "relations": [
     {{
-      "source_id": "person_elon_musk",
-      "relation_type": "WORKS_AT",
-      "target_id": "org_tesla",
-      "properties": {{"role": "CEO"}}
+      "source_id": "actor_john_doe",
+      "relation_type": "ATTENDED",
+      "target_id": "event_pycon_2024",
+      "properties": [
+        {{"key": "role", "value": "speaker", "type": "text"}}
+      ]
     }},
     {{
-      "source_id": "org_tesla",
+      "source_id": "event_pycon_2024",
       "relation_type": "LOCATED_IN",
-      "target_id": "loc_palo_alto"
+      "target_id": "place_pittsburgh"
+    }},
+    {{
+      "source_id": "actor_john_doe",
+      "relation_type": "USES",
+      "target_id": "entity_python"
     }}
   ]
 }}"""

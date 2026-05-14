@@ -24,27 +24,56 @@ from src.graph.schema import (
 logger = logging.getLogger(__name__)
 
 
-def _convert_properties_dict_to_list(properties_dict: dict[str, Any]) -> list[Property]:
-    """Convert a flat properties dictionary to a list of Property objects.
+def _convert_properties_dict_to_list(properties_list: list[dict[str, Any]]) -> list[Property]:
+    """Convert a list of property objects to a list of Property objects.
+
+    The LLM now returns properties as a list of objects with explicit type:
+    [{"key": "prop_name", "value": <any>, "type": "text" | "numeric" | "geo" | "language" | "location"}]
 
     Args:
-        properties_dict: Dictionary mapping property keys to values.
+        properties_list: List of dictionaries, each containing 'key', 'value', and 'type' fields.
 
     Returns:
-        List of Property objects with inferred types matching PropertyType enum.
+        List of validated Property objects with types mapped to PropertyType enum.
     """
     properties = []
-    for key, value in properties_dict.items():
-        # Infer property type based on value type to match PropertyType enum
-        if isinstance(value, str):
-            prop_type = PropertyType.TEXT
-        elif isinstance(value, (int, float)):
-            prop_type = PropertyType.NUMERIC
-        elif isinstance(value, list) and len(value) == 2 and all(isinstance(x, (int, float)) for x in value):
-            prop_type = PropertyType.GEO
-        else:
-            prop_type = PropertyType.TEXT  # fallback to text for any string-like value
-        properties.append(Property(key=key, value=value, type=prop_type))
+    for prop_data in properties_list:
+        try:
+            # Extract fields from the property object
+            key = prop_data.get("key")
+            value = prop_data.get("value")
+            type_str = prop_data.get("type")
+
+            if key is None or value is None or type_str is None:
+                logger.warning(
+                    "Skipping invalid property: missing required fields (key, value, type): %s",
+                    prop_data,
+                )
+                continue
+
+            # Convert type string to PropertyType enum (handles both string and enum)
+            try:
+                prop_type = PropertyType(type_str)
+            except ValueError:
+                logger.warning(
+                    "Invalid property type '%s' for key '%s', defaulting to TEXT",
+                    type_str,
+                    key,
+                )
+                prop_type = PropertyType.TEXT
+
+            # Create Property object - validation happens in the model
+            property_obj = Property(key=key, value=value, type=prop_type)
+            properties.append(property_obj)
+
+        except Exception as e:
+            logger.warning(
+                "Failed to parse property %s: %s. Skipping.",
+                prop_data,
+                e,
+            )
+            continue
+
     return properties
 
 
@@ -139,11 +168,11 @@ class KnowledgeExtractor:
                 entities_data = parsed_json.get("entities", [])
                 relations_data = parsed_json.get("relations", [])
 
-                # Transform entities: convert properties dict to list of Property objects
+                # Transform entities: convert properties list to list of Property objects
                 transformed_entities = []
                 for entity_data in entities_data:
-                    props_dict = entity_data.get("properties", {})
-                    properties_list = _convert_properties_dict_to_list(props_dict)
+                    props_list = entity_data.get("properties", [])
+                    properties_list = _convert_properties_dict_to_list(props_list)
 
                     transformed_entity = {
                         "id": entity_data["id"],
@@ -153,11 +182,11 @@ class KnowledgeExtractor:
                     }
                     transformed_entities.append(transformed_entity)
 
-                # Transform relations: convert properties dict to list of Property objects
+                # Transform relations: convert properties list to list of Property objects
                 transformed_relations = []
                 for relation_data in relations_data:
-                    props_dict = relation_data.get("properties", {})
-                    properties_list = _convert_properties_dict_to_list(props_dict)
+                    props_list = relation_data.get("properties", [])
+                    properties_list = _convert_properties_dict_to_list(props_list)
 
                     transformed_relation = {
                         "source_id": relation_data["source_id"],
