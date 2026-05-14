@@ -503,18 +503,19 @@ class Database:
             return []
 
         try:
-            # Convert list to JSON and ensure it does not break the $age$ delimiter
-            ids_json = json.dumps(entity_ids).replace("$age$", "")
-            
-            query = f"""
-                SELECT * FROM cypher('telegram_graph', $age$
-                    UNWIND {ids_json} AS id
-                    MATCH (a)-[r]-(b)
-                    WHERE a.id = id
-                    RETURN a.id as a_id, a.label as a_label, a.name as a_name,
-                           type(r) as rel_type,
-                           b.id as b_id, b.label as b_label, b.name as b_name
-                $age$) AS (
+            # Build the SQL query with literal Cypher string and bind parameter for entity IDs
+            # The Cypher query is embedded directly using $$ delimiters (not a bind parameter)
+            # The :params bind parameter contains the entity IDs as a JSON array and is cast to agtype
+            query = text("""
+                SELECT * FROM cypher('telegram_graph',
+                    $$ UNWIND $ids AS id
+                       MATCH (a)-[r]-(b)
+                       WHERE a.id = id
+                       RETURN a.id as a_id, a.label as a_label, a.name as a_name,
+                              type(r) as rel_type,
+                              b.id as b_id, b.label as b_label, b.name as b_name $$,
+                    CAST(:params AS agtype)
+                ) AS (
                     a_id agtype,
                     a_label agtype,
                     a_name agtype,
@@ -522,30 +523,26 @@ class Database:
                     b_id agtype,
                     b_label agtype,
                     b_name agtype
-                );
-            """
-            # Execute query without bindparams
+                )
+            """)
+
+            # Package entity IDs as JSON array
+            params = json.dumps({"ids": entity_ids})
+
             async with self.async_session() as session:
                 async with session.begin():
-                    result = await session.execute(text(query))
+                    result = await session.execute(query, {"params": params})
                     rows = result.all()
-            # Keep the existing parsing logic intact...
+
             # Parse agtype results into dictionaries
             edges = []
             for row in rows:
-                # Each field is returned as agtype (text representation)
-                # agtype format is similar to JSON but with some differences
-                # We'll parse each field as JSON after stripping quotes if needed
                 def parse_agtype(value):
                     if value is None:
                         return None
-                    # agtype values are typically returned as strings that represent JSON
-                    # e.g., '"some_string"' or '{"key": "value"}'
                     text = str(value)
-                    # Remove surrounding quotes if present
                     if text.startswith('"') and text.endswith('"'):
                         text = text[1:-1]
-                    # Try to parse as JSON, otherwise return as-is
                     try:
                         return json.loads(text)
                     except (json.JSONDecodeError, TypeError):
@@ -609,7 +606,9 @@ class Database:
 
         IMPORTANT: Labels cannot be parameterized in Cypher, so we validate that
         the label is alphanumeric (with underscores) to prevent injection attacks.
-        Properties are passed as SQLAlchemy bind parameters and cast to agtype.
+        All property keys are validated using regex to prevent Cypher injection.
+        Properties are passed as individual JSON parameters to avoid the
+        `SET clause expects a map` bug in Apache AGE when using += with asyncpg.
 
         Args:
             label: Graph node label (e.g., 'Channel', 'Post'). Must be alphanumeric.
@@ -617,7 +616,7 @@ class Database:
             merge_key: Property name to use for MERGE matching (default: 'id').
 
         Raises:
-            ValueError: If label contains non-alphanumeric characters (except underscore).
+            ValueError: If label, merge_key, or any property key contains non-alphanumeric characters.
         """
         # Validate label to prevent Cypher injection (labels cannot be parameterized)
         if not re.match(r'^[A-Za-z0-9_]+$', label):
@@ -627,23 +626,34 @@ class Database:
         if not re.match(r'^[A-Za-z0-9_]+$', merge_key):
             raise ValueError(f"Invalid merge_key '{merge_key}': must be alphanumeric with underscores")
 
-        # Build the Cypher query string with validated label and merge_key
-        # The $props reference will be bound as a parameter
-        cypher_query = f"""
-            MERGE (n:{label} {{{merge_key}: $props.id}})
-            SET n += $props
-            RETURN n
-        """
+        # Validate all property keys to prevent Cypher injection
+        for key in properties.keys():
+            if not re.match(r'^[A-Za-z0-9_]+$', key):
+                raise ValueError(f"Invalid property key '{key}': must be alphanumeric with underscores")
 
-        # Build the full SQL query with a bind parameter for properties
-        # The :props parameter will be automatically cast to agtype by AGE
-        query = text(
-            "SELECT * FROM cypher('telegram_graph', $q$, :props) AS (v agtype);"
-        ).bindparams(q=cypher_query, props=properties)
+        # Build dynamic SET clause with individual property assignments
+        set_clauses = ", ".join([f"n.{k} = $prop_{k}" for k in properties.keys()])
+        set_query = f"SET {set_clauses}" if set_clauses else ""
+
+        # Build the SQL query with literal Cypher string and bind parameters for each property
+        # The Cypher query is embedded directly using $$ delimiters (not a bind parameter)
+        # The :params bind parameter contains all Cypher parameters as JSON and is cast to agtype
+        query = text(f"""
+            SELECT * FROM cypher('telegram_graph',
+                $$ MERGE (n:{label} {{{merge_key}: $merge_val}}) {set_query} RETURN n $$,
+                CAST(:params AS agtype)
+            ) AS (v agtype)
+        """)
+
+        # Package Cypher parameters as a single JSON object
+        params_dict = {"merge_val": properties.get(merge_key)}
+        for k, v in properties.items():
+            params_dict[f"prop_{k}"] = v
+        params = json.dumps(params_dict)
 
         async with self.async_session() as session:
             async with session.begin():
-                await session.execute(query)
+                await session.execute(query, {"params": params})
 
     async def upsert_graph_edge(
         self,
@@ -660,24 +670,25 @@ class Database:
         Upsert an edge in the Apache AGE graph.
 
         Matches start and end nodes by label and merge keys, then MERGEs the edge.
-        Edge properties are set using the += operator for incremental updates.
+        Edge properties are set using individual assignments to avoid the
+        `SET clause expects a map` bug in Apache AGE when using += with asyncpg.
 
         IMPORTANT: Labels and relationship types cannot be parameterized in Cypher,
-        so we validate them to prevent injection attacks. Properties are passed
-        as SQLAlchemy bind parameters and cast to agtype.
+        so we validate them to prevent injection attacks. All property keys are
+        validated using regex. Properties are passed as individual JSON parameters.
 
         Args:
             start_label: Label of the start node. Must be alphanumeric.
             start_merge_key: Property name to match start node.
-            start_merge_val: Value for start node matching (passed as parameter).
+            start_merge_val: Value for start node matching.
             edge_label: Relationship type label. Must be alphanumeric.
             end_label: Label of the end node. Must be alphanumeric.
             end_merge_key: Property name to match end node.
-            end_merge_val: Value for end node matching (passed as parameter).
+            end_merge_val: Value for end node matching.
             edge_properties: Optional dictionary of edge properties.
 
         Raises:
-            ValueError: If any label or edge_label contains non-alphanumeric characters.
+            ValueError: If any label, edge_label, merge key, or property key contains non-alphanumeric characters.
         """
         # Validate all alphanumeric identifiers to prevent Cypher injection
         for identifier_name, identifier_value in [
@@ -696,28 +707,35 @@ class Database:
         if not re.match(r'^[A-Za-z0-9_]+$', end_merge_key):
             raise ValueError(f"Invalid end_merge_key '{end_merge_key}': must be alphanumeric with underscores")
 
-        # Build the Cypher query string with validated labels and keys
-        # The $start_id, $end_id, and $edge_props references will be bound as parameters
-        cypher_query = f"""
-            MATCH (a:{start_label} {{{start_merge_key}: $start_id}})
-            MATCH (b:{end_label} {{{end_merge_key}: $end_id}})
-            MERGE (a)-[r:{edge_label}]->(b)
-            SET r += $edge_props
-            RETURN r
-        """
+        # Validate all edge property keys to prevent Cypher injection
+        edge_properties = edge_properties or {}
+        for key in edge_properties.keys():
+            if not re.match(r'^[A-Za-z0-9_]+$', key):
+                raise ValueError(f"Invalid edge property key '{key}': must be alphanumeric with underscores")
 
-        # Build parameters dict
+        # Build dynamic SET clause with individual property assignments
+        set_clauses = ", ".join([f"r.{k} = $prop_{k}" for k in edge_properties.keys()])
+        set_query = f"SET {set_clauses}" if set_clauses else ""
+
+        # Build the SQL query with literal Cypher string and bind parameters for each property
+        # The Cypher query is embedded directly using $$ delimiters (not a bind parameter)
+        # The :params bind parameter contains all Cypher parameters as JSON and is cast to agtype
+        query = text(f"""
+            SELECT * FROM cypher('telegram_graph',
+                $$ MATCH (a:{start_label} {{{start_merge_key}: $sid}}) MATCH (b:{end_label} {{{end_merge_key}: $eid}}) MERGE (a)-[r:{edge_label}]->(b) {set_query} RETURN r $$,
+                CAST(:params AS agtype)
+            ) AS (v agtype)
+        """)
+
+        # Package all parameters as a single JSON object
         params_dict = {
-            'start_id': start_merge_val,
-            'end_id': end_merge_val,
-            'edge_props': edge_properties or {}
+            "sid": start_merge_val,
+            "eid": end_merge_val,
         }
-
-        # Build the full SQL query with bind parameters
-        query = text(
-            "SELECT * FROM cypher('telegram_graph', $q$, :params) AS (v agtype);"
-        ).bindparams(q=cypher_query, params=params_dict)
+        for k, v in edge_properties.items():
+            params_dict[f"prop_{k}"] = v
+        params = json.dumps(params_dict)
 
         async with self.async_session() as session:
             async with session.begin():
-                await session.execute(query)
+                await session.execute(query, {"params": params})

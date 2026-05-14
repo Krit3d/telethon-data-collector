@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from typing import Any
 
 import aiohttp
@@ -22,6 +23,81 @@ from src.graph.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _repair_json(content: str) -> str:
+    """Attempt to repair malformed or truncated JSON.
+    
+    Uses simple heuristics to fix common issues:
+    - Unclosed braces/brackets
+    - Trailing incomplete tokens
+    - Truncated strings
+    
+    Args:
+        content: The potentially malformed JSON string.
+        
+    Returns:
+        Repaired JSON string if successful, otherwise original content.
+    """
+    original = content
+    
+    # Strip whitespace from ends
+    content = content.strip()
+    
+    # Try to find the last complete JSON object by counting braces
+    brace_count = 0
+    bracket_count = 0
+    in_string = False
+    escape_next = False
+    last_valid_pos = -1
+    
+    for i, char in enumerate(content):
+        if escape_next:
+            escape_next = False
+            continue
+            
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+            
+        if char == '"':
+            in_string = not in_string
+            continue
+            
+        if in_string:
+            continue
+            
+        if char == '{':
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0 and bracket_count == 0:
+                last_valid_pos = i
+        elif char == '[':
+            bracket_count += 1
+        elif char == ']':
+            bracket_count -= 1
+            if brace_count == 0 and bracket_count == 0:
+                last_valid_pos = i
+    
+    # If we have unclosed braces, try to close them
+    if brace_count > 0 or bracket_count > 0:
+        # Find position where we had a complete object
+        if last_valid_pos > 0:
+            content = content[:last_valid_pos + 1]
+            # Add missing closing braces/brackets
+            content += ']' * bracket_count
+            content += '}' * brace_count
+        else:
+            # Could not find a complete object, return original
+            return original
+    
+    # Validate that the repaired JSON is parseable
+    try:
+        json.loads(content)
+        return content
+    except json.JSONDecodeError:
+        return original
 
 
 def _convert_properties_dict_to_list(properties_list: list[dict[str, Any]]) -> list[Property]:
@@ -89,12 +165,13 @@ class KnowledgeExtractor:
         self.settings = settings
         self._session: aiohttp.ClientSession | None = None
 
-    async def _call_llm(self, text: str, author_id: int) -> ExtractionResult:
-        """Call the LLM API to extract knowledge triples from text.
+    async def _call_llm(self, text: str, author_id: int, post_id: int) -> ExtractionResult:
+        """Call the LLM API to extract knowledge triples from text with retry logic.
 
         Args:
             text: Input text to analyze.
             author_id: Telegram user ID of the post author (used for author node).
+            post_id: Database ID of the post (used for logging and context).
 
         Returns:
             ExtractionResult containing extracted nodes and edges.
@@ -111,145 +188,209 @@ class KnowledgeExtractor:
         # Construct the OpenSPG prompt
         prompt = get_open_spg_llm_prompt(text, author_id)
 
-        try:
-            async with self._session.post(
-                f"{self.settings.llm_base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.settings.llm_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.settings.llm_model_name,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a highly meticulous OpenSPG knowledge extraction engine. Even for short texts, identify at least the author and any mentioned concepts, locations, or dates. Never skip entities if they are present.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 4000,
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as response:
-                if response.status != 200:
-                    logger.error(
-                        "LLM API request failed: status=%d, response=%s",
-                        response.status,
-                        await response.text(),
-                    )
-                    return ExtractionResult(nodes=[], edges=[])
+        max_retries = 2
+        last_error = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                async with self._session.post(
+                    f"{self.settings.llm_base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.settings.llm_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.settings.llm_model_name,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a highly meticulous OpenSPG knowledge extraction engine. Even for short texts, identify at least the author and any mentioned concepts, locations, or dates. Never skip entities if they are present.",
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.3,
+                        "max_tokens": 4000,
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as response:
+                    if response.status != 200:
+                        logger.error(
+                            "LLM API request failed: status=%d, response=%s",
+                            response.status,
+                            await response.text(),
+                        )
+                        if attempt < max_retries:
+                            continue
+                        return ExtractionResult(nodes=[], edges=[])
 
-                data = await response.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    data = await response.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-                if not content:
-                    logger.warning("LLM returned empty content")
-                    return ExtractionResult(nodes=[], edges=[])
+                    if not content:
+                        logger.warning("LLM returned empty content")
+                        if attempt < max_retries:
+                            continue
+                        return ExtractionResult(nodes=[], edges=[])
 
-                # Parse the JSON response
-                try:
-                    parsed_json = json.loads(content)
-                except json.JSONDecodeError as e:
-                    logger.error(
-                        "Failed to decode LLM response as JSON: %s\n"
-                        "First 500 chars: %s\n"
-                        "Last 500 chars: %s",
-                        e,
-                        content[:500],
-                        content[-500:] if len(content) > 500 else content,
-                    )
-                    return ExtractionResult(nodes=[], edges=[])
+                    # Try to repair JSON if malformed
+                    repaired_content = _repair_json(content)
+                    if repaired_content != content:
+                        logger.info("Applied JSON repair for post_id=%s", post_id)
+                        content = repaired_content
 
-                # Convert flat properties dict to OpenSPG format
-                # LLM now returns: {"entities": [{...}], "relations": [{...}]}
-                # where each entity has "properties" as a simple dict
-                entities_data = parsed_json.get("entities", [])
-                relations_data = parsed_json.get("relations", [])
+                    # Parse the JSON response
+                    try:
+                        parsed_json = json.loads(content)
+                    except json.JSONDecodeError as e:
+                        if attempt < max_retries:
+                            logger.warning(
+                                "Failed to decode LLM response as JSON (attempt %d/%d) for post_id=%s: %s\n"
+                                "First 500 chars: %s\n"
+                                "Last 500 chars: %s",
+                                attempt + 1,
+                                max_retries,
+                                post_id,
+                                e,
+                                content[:500],
+                                content[-500:] if len(content) > 500 else content,
+                            )
+                            # Modify prompt for retry
+                            prompt = get_open_spg_llm_prompt(text, author_id) + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
+                            continue
+                        else:
+                            logger.error(
+                                "Failed to decode LLM response as JSON after %d retries for post_id=%s: %s\n"
+                                "First 500 chars: %s\n"
+                                "Last 500 chars: %s",
+                                max_retries,
+                                post_id,
+                                e,
+                                content[:500],
+                                content[-500:] if len(content) > 500 else content,
+                            )
+                            return ExtractionResult(nodes=[], edges=[])
 
-                # Transform entities: convert properties list to list of Property objects
-                transformed_entities = []
-                for entity_data in entities_data:
-                    props_list = entity_data.get("properties", [])
-                    properties_list = _convert_properties_dict_to_list(props_list)
+                    # Convert flat properties dict to OpenSPG format
+                    # LLM now returns: {"entities": [{...}], "relations": [{...}]}
+                    # where each entity has "properties" as a simple dict
+                    entities_data = parsed_json.get("entities", [])
+                    relations_data = parsed_json.get("relations", [])
 
-                    transformed_entity = {
-                        "id": entity_data["id"],
-                        "label": entity_data["label"],
-                        "name": entity_data["name"],
-                        "properties": properties_list,
+                    # Transform entities: convert properties list to list of Property objects
+                    transformed_entities = []
+                    for entity_data in entities_data:
+                        props_list = entity_data.get("properties", [])
+                        properties_list = _convert_properties_dict_to_list(props_list)
+
+                        transformed_entity = {
+                            "id": entity_data["id"],
+                            "label": entity_data["label"],
+                            "name": entity_data["name"],
+                            "properties": properties_list,
+                        }
+                        transformed_entities.append(transformed_entity)
+
+                    # Transform relations: convert properties list to list of Property objects
+                    transformed_relations = []
+                    for relation_data in relations_data:
+                        props_list = relation_data.get("properties", [])
+                        properties_list = _convert_properties_dict_to_list(props_list)
+
+                        transformed_relation = {
+                            "source_id": relation_data["source_id"],
+                            "relation_type": relation_data["relation_type"],
+                            "target_id": relation_data["target_id"],
+                            "properties": properties_list,
+                        }
+                        transformed_relations.append(transformed_relation)
+
+                    # Build the OpenSPG result JSON with transformed data
+                    open_spg_json = {
+                        "entities": transformed_entities,
+                        "relations": transformed_relations,
                     }
-                    transformed_entities.append(transformed_entity)
 
-                # Transform relations: convert properties list to list of Property objects
-                transformed_relations = []
-                for relation_data in relations_data:
-                    props_list = relation_data.get("properties", [])
-                    properties_list = _convert_properties_dict_to_list(props_list)
+                    # Validate the transformed result against the OpenSPG schema
+                    try:
+                        open_spg_result = OpenSPGExtractionResult.model_validate(open_spg_json)
+                    except ValidationError as e:
+                        if attempt < max_retries:
+                            logger.warning(
+                                "Failed to validate transformed OpenSPG result (attempt %d/%d) for post_id=%s: %s\n"
+                                "First 500 chars of transformed JSON: %s",
+                                attempt + 1,
+                                max_retries,
+                                post_id,
+                                e,
+                                json.dumps(open_spg_json)[:500],
+                            )
+                            # Modify prompt for retry
+                            prompt = get_open_spg_llm_prompt(text, author_id) + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
+                            continue
+                        else:
+                            logger.error(
+                                "Failed to validate transformed OpenSPG result after %d retries for post_id=%s: %s\n"
+                                "First 500 chars of transformed JSON: %s",
+                                max_retries,
+                                post_id,
+                                e,
+                                json.dumps(open_spg_json)[:500],
+                            )
+                            return ExtractionResult(nodes=[], edges=[])
 
-                    transformed_relation = {
-                        "source_id": relation_data["source_id"],
-                        "relation_type": relation_data["relation_type"],
-                        "target_id": relation_data["target_id"],
-                        "properties": properties_list,
-                    }
-                    transformed_relations.append(transformed_relation)
+                    # Convert OpenSPG result to legacy ExtractionResult for backward compatibility
+                    extraction_result = open_spg_result_to_extraction_result(open_spg_result)
+                    nodes = extraction_result.nodes
+                    edges = extraction_result.edges
 
-                # Build the OpenSPG result JSON with transformed data
-                open_spg_json = {
-                    "entities": transformed_entities,
-                    "relations": transformed_relations,
-                }
-
-                # Validate the transformed result against the OpenSPG schema
-                try:
-                    open_spg_result = OpenSPGExtractionResult.model_validate(open_spg_json)
-                except ValidationError as e:
-                    logger.error(
-                        "Failed to validate transformed OpenSPG result: %s\n"
-                        "First 500 chars of transformed JSON: %s",
-                        e,
-                        json.dumps(open_spg_json)[:500],
+                    logger.info(
+                        "LLM extraction successful: %d nodes, %d edges",
+                        len(nodes),
+                        len(edges),
                     )
-                    return ExtractionResult(nodes=[], edges=[])
+                    return ExtractionResult(nodes=nodes, edges=edges)
 
-                # Convert OpenSPG result to legacy ExtractionResult for backward compatibility
-                extraction_result = open_spg_result_to_extraction_result(open_spg_result)
-                nodes = extraction_result.nodes
-                edges = extraction_result.edges
-
-                logger.info(
-                    "LLM extraction successful: %d nodes, %d edges",
-                    len(nodes),
-                    len(edges),
+            except aiohttp.ClientError as e:
+                last_error = e
+                logger.error(
+                    "LLM API request failed with network error (attempt %d/%d) for post_id=%s: %s",
+                    attempt + 1,
+                    max_retries + 1,
+                    post_id,
+                    e,
                 )
-                return ExtractionResult(nodes=nodes, edges=edges)
-
-        except aiohttp.ClientError as e:
-            logger.error(
-                "LLM API request failed with network error: %s",
-                e,
-                exc_info=True,
-            )
-            return ExtractionResult(nodes=[], edges=[])
-        except TimeoutError as e:
-            logger.error(
-                "LLM API request timed out: %s",
-                e,
-                exc_info=True,
-            )
-            return ExtractionResult(nodes=[], edges=[])
-        except Exception as e:
-            logger.error(
-                "Unexpected error during LLM extraction: %s",
-                e,
-                exc_info=True,
-            )
-            return ExtractionResult(nodes=[], edges=[])
+                if attempt < max_retries:
+                    continue
+            except TimeoutError as e:
+                last_error = e
+                logger.error(
+                    "LLM API request timed out (attempt %d/%d) for post_id=%s: %s",
+                    attempt + 1,
+                    max_retries + 1,
+                    post_id,
+                    e,
+                )
+                if attempt < max_retries:
+                    continue
+            except Exception as e:
+                last_error = e
+                logger.error(
+                    "Unexpected error during LLM extraction (attempt %d/%d) for post_id=%s: %s",
+                    attempt + 1,
+                    max_retries + 1,
+                    post_id,
+                    e,
+                    exc_info=True,
+                )
+                if attempt < max_retries:
+                    continue
+        
+        # If we exhausted all retries, return empty result
+        return ExtractionResult(nodes=[], edges=[])
 
     async def extract_triplets(
-        self, text: str, author_id: int
+        self, text: str, author_id: int, post_id: int
     ) -> ExtractionResult:
         """
         Extract knowledge triples from the given text using LLM.
@@ -257,12 +398,13 @@ class KnowledgeExtractor:
         Args:
             text: Input text to analyze.
             author_id: Telegram user ID of the post author.
+            post_id: Database ID of the post (for logging).
 
         Returns:
             ExtractionResult containing extracted nodes and edges.
         """
         logger.debug("Extracting triples from text: %s", text[:100])
-        return await self._call_llm(text, author_id)
+        return await self._call_llm(text, author_id, post_id)
 
     async def close(self) -> None:
         """Close the aiohttp session and clean up resources."""
@@ -293,7 +435,7 @@ class KnowledgeExtractor:
         logger.info("Processing post id=%s for knowledge extraction", post_id)
 
         # Extract triples from text
-        result = await self.extract_triplets(text, author_id)
+        result = await self.extract_triplets(text, author_id, post_id)
 
         if not result.nodes and not result.edges:
             logger.warning(

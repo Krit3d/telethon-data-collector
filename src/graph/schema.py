@@ -5,9 +5,10 @@ for flexible entity and relationship attributes.
 """
 
 from enum import Enum
+import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class PropertyType(str, Enum):
@@ -62,6 +63,23 @@ class Property(BaseModel):
                 except ValueError:
                     pass  # Let Pydantic raise the appropriate error for invalid types
         return data
+
+    @field_validator("key", mode="before")
+    @classmethod
+    def sanitize_key(cls, v: Any) -> str:
+        """Sanitize property keys to ensure they are Cypher-safe snake_case.
+
+        Converts hyphens and spaces to underscores, and strips special characters.
+        """
+        if not isinstance(v, str):
+            v = str(v)
+        # Convert hyphens and spaces to underscores
+        v = v.replace("-", "_").replace(" ", "_")
+        # Remove non-alphanumeric and non-underscore characters
+        v = re.sub(r'[^A-Za-z0-9_]', '', v)
+        # Convert to lowercase
+        v = v.lower()
+        return v if v else "unknown_property"
 
     @model_validator(mode="after")
     def validate_value_against_type(self) -> "Property":
@@ -425,6 +443,8 @@ Extraction Instructions:
    - "geo": array of exactly two floats [latitude, longitude] (e.g., [55.7558, 37.6173])
    - "language": 2-letter language code string (e.g., "en", "ru", "zh")
    - "location": human-readable location string (e.g., "Moscow, Russia", "Cupertino, CA")
+
+   CRITICAL: Property keys MUST be in strict snake_case (e.g., 'birth_date', 'co_founder' -> 'co_founder'). No hyphens or spaces allowed in keys.
    
    EXAMPLES OF PROPERTIES:
    - Actor: [{{'key': 'telegram_id', 'value': 123456, 'type': 'numeric'}}, {{'key': 'nationality', 'value': 'Russian', 'type': 'text'}}]
