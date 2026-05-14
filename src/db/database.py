@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy import event
 
 from src.db.models import Base, Channel, Post
 
@@ -37,11 +36,9 @@ class Database:
             echo=echo,
             pool_size=10,
             max_overflow=20,
-            connect_args={
-                "server_settings": {
-                    "search_path": "ag_catalog, \"$user\", public"
-                }
-            }
+            pool_pre_ping=True,
+            pool_recycle=3600,
+            connect_args={"command_timeout": 120, "timeout": 60},
         )
 
         self.async_session = async_sessionmaker(
@@ -477,6 +474,29 @@ class Database:
                         "Updated access_hash for channel id=%s", channel_id
                     )
 
+    def _to_cypher_map(self, props: dict) -> str:
+        """
+        Convert a dictionary to a Cypher map literal with unquoted keys.
+
+        Keys are not quoted (Cypher syntax), and values are JSON-encoded
+        to ensure proper escaping of strings, numbers, booleans, and nulls.
+
+        Args:
+            props: Dictionary of properties to convert.
+
+        Returns:
+            A string representing a Cypher map literal, e.g., '{name: "John", age: 30}'.
+        """
+        if not props:
+            return "{}"
+
+        parts = []
+        for key, value in props.items():
+            # Use json.dumps for proper escaping of strings, numbers, booleans, null
+            json_value = json.dumps(value, ensure_ascii=False)
+            parts.append(f"{key}: {json_value}")
+        return "{" + ", ".join(parts) + "}"
+
     async def get_subgraph_for_entities(
         self, entity_ids: list[str]
     ) -> list[dict]:
@@ -505,23 +525,18 @@ class Database:
             return []
 
         try:
-            # Build parameterized query using UNWIND for safe list handling
-            # Using $ids parameter with json.dumps ensures proper escaping
-            params_json = json.dumps({"ids": entity_ids})
-
+            # Convert list to JSON and ensure it does not break the $age$ delimiter
+            ids_json = json.dumps(entity_ids).replace("$age$", "")
+            
             query = f"""
-                SELECT * FROM cypher(
-                    'telegram_graph',
-                    $$
-                        UNWIND $ids AS id
-                        MATCH (a)-[r]-(b)
-                        WHERE a.id = id
-                        RETURN a.id as a_id, a.label as a_label, a.name as a_name,
-                               type(r) as rel_type,
-                               b.id as b_id, b.label as b_label, b.name as b_name
-                    $$,
-                    CAST(:params AS agtype)
-                ) AS (
+                SELECT * FROM cypher('telegram_graph', $age$
+                    UNWIND {ids_json} AS id
+                    MATCH (a)-[r]-(b)
+                    WHERE a.id = id
+                    RETURN a.id as a_id, a.label as a_label, a.name as a_name,
+                           type(r) as rel_type,
+                           b.id as b_id, b.label as b_label, b.name as b_name
+                $age$) AS (
                     a_id agtype,
                     a_label agtype,
                     a_name agtype,
@@ -531,14 +546,12 @@ class Database:
                     b_name agtype
                 );
             """
-
+            # Execute query without bindparams
             async with self.async_session() as session:
                 async with session.begin():
-                    result = await session.execute(
-                        text(query).bindparams(params=params_json)
-                    )
+                    result = await session.execute(text(query))
                     rows = result.all()
-
+            # Keep the existing parsing logic intact...
             # Parse agtype results into dictionaries
             edges = []
             for row in rows:
@@ -622,18 +635,19 @@ class Database:
             merge_key: Property name to use for MERGE matching (default: 'id').
         """
 
-        params_json = json.dumps({"props": properties})
+        merge_val_json = json.dumps(properties.get(merge_key))
+        map_literal = self._to_cypher_map(properties)
+        
         query = f"""
             SELECT * FROM cypher('telegram_graph', $$
-                MERGE (n:{label} {{{merge_key}: $props.{merge_key}}})
-                SET n += $props
+                MERGE (n:{label} {{{merge_key}: {merge_val_json}}})
+                SET n += {map_literal}
                 RETURN n
-            $$, CAST(:params AS agtype)) AS (v agtype);
+            $$) AS (v agtype);
         """
-        stmt = text(query).bindparams(params=params_json)
         async with self.async_session() as session:
             async with session.begin():
-                await session.execute(stmt)
+                await session.execute(text(query))
 
     async def upsert_graph_edge(
         self,
@@ -650,7 +664,7 @@ class Database:
         Upsert an edge in the Apache AGE graph.
 
         Matches start and end nodes by label and merge keys, then MERGEs the edge.
-        Edge properties are set using the += operator (overwrites if edge exists).
+        Edge properties are set using the = operator (overwrites if edge exists).
 
         Args:
             start_label: Label of the start node.
@@ -663,21 +677,19 @@ class Database:
             edge_properties: Optional dictionary of edge properties.
         """
 
-        params_dict = {
-            "start_val": start_merge_val,
-            "end_val": end_merge_val,
-            "props": edge_properties or {},
-        }
+        start_val_json = json.dumps(start_merge_val)
+        end_val_json = json.dumps(end_merge_val)
+        edge_map_literal = self._to_cypher_map(edge_properties or {})
+        
         query = f"""
             SELECT * FROM cypher('telegram_graph', $$
-                MATCH (a:{start_label} {{{start_merge_key}: $start_val}})
-                MATCH (b:{end_label} {{{end_merge_key}: $end_val}})
+                MATCH (a:{start_label} {{{start_merge_key}: {start_val_json}}})
+                MATCH (b:{end_label} {{{end_merge_key}: {end_val_json}}})
                 MERGE (a)-[r:{edge_label}]->(b)
-                SET r += $props
+                SET r += {edge_map_literal}
                 RETURN r
-            $$, CAST(:params AS agtype)) AS (v agtype);
+            $$) AS (v agtype);
         """
-        stmt = text(query).bindparams(params=json.dumps(params_dict))
         async with self.async_session() as session:
             async with session.begin():
-                await session.execute(stmt)
+                await session.execute(text(query))

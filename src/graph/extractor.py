@@ -13,6 +13,7 @@ from src.embeddings.qdrant_service import QdrantService
 from src.graph.schema import (
     ExtractionResult,
     OpenSPGExtractionResult,
+    Property,
     SPGEdge,
     SPGNode,
     get_open_spg_llm_prompt,
@@ -20,6 +21,30 @@ from src.graph.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _convert_properties_dict_to_list(properties_dict: dict[str, Any]) -> list[Property]:
+    """Convert a flat properties dictionary to a list of Property objects.
+
+    Args:
+        properties_dict: Dictionary mapping property keys to values.
+
+    Returns:
+        List of Property objects with inferred types.
+    """
+    properties = []
+    for key, value in properties_dict.items():
+        # Infer property type based on value type
+        if isinstance(value, str):
+            prop_type = "string"
+        elif isinstance(value, (int, float)):
+            prop_type = "number"
+        elif isinstance(value, list) and len(value) == 2 and all(isinstance(x, (int, float)) for x in value):
+            prop_type = "geo"
+        else:
+            prop_type = "string"  # fallback
+        properties.append(Property(key=key, value=value, type=prop_type))
+    return properties
 
 
 class KnowledgeExtractor:
@@ -68,14 +93,15 @@ class KnowledgeExtractor:
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are a knowledge graph extraction assistant. Always respond with valid JSON matching the requested schema.",
+                            "content": "You are a highly meticulous OpenSPG knowledge extraction engine. Even for short texts, identify at least the author and any mentioned concepts, locations, or dates. Never skip entities if they are present.",
                         },
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.3,
-                    "max_tokens": 2000,
+                    "max_tokens": 4000,
+                    "response_format": {"type": "json_object"},
                 },
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=120),
             ) as response:
                 if response.status != 200:
                     logger.error(
@@ -92,14 +118,69 @@ class KnowledgeExtractor:
                     logger.warning("LLM returned empty content")
                     return ExtractionResult(nodes=[], edges=[])
 
-                # Parse the JSON response as OpenSPG format
+                # Parse the JSON response
                 try:
-                    open_spg_result = OpenSPGExtractionResult.model_validate_json(content)
-                except ValidationError as e:
+                    parsed_json = json.loads(content)
+                except json.JSONDecodeError as e:
                     logger.error(
-                        "Failed to parse LLM response as OpenSPGExtractionResult: %s\nResponse: %s",
+                        "Failed to decode LLM response as JSON: %s\n"
+                        "First 500 chars: %s\n"
+                        "Last 500 chars: %s",
                         e,
                         content[:500],
+                        content[-500:] if len(content) > 500 else content,
+                    )
+                    return ExtractionResult(nodes=[], edges=[])
+
+                # Convert flat properties dict to OpenSPG format
+                # LLM now returns: {"entities": [{...}], "relations": [{...}]}
+                # where each entity has "properties" as a simple dict
+                entities_data = parsed_json.get("entities", [])
+                relations_data = parsed_json.get("relations", [])
+
+                # Transform entities: convert properties dict to list of Property objects
+                transformed_entities = []
+                for entity_data in entities_data:
+                    props_dict = entity_data.get("properties", {})
+                    properties_list = _convert_properties_dict_to_list(props_dict)
+
+                    transformed_entity = {
+                        "id": entity_data["id"],
+                        "label": entity_data["label"],
+                        "name": entity_data["name"],
+                        "properties": properties_list,
+                    }
+                    transformed_entities.append(transformed_entity)
+
+                # Transform relations: convert properties dict to list of Property objects
+                transformed_relations = []
+                for relation_data in relations_data:
+                    props_dict = relation_data.get("properties", {})
+                    properties_list = _convert_properties_dict_to_list(props_dict)
+
+                    transformed_relation = {
+                        "source_id": relation_data["source_id"],
+                        "relation_type": relation_data["relation_type"],
+                        "target_id": relation_data["target_id"],
+                        "properties": properties_list,
+                    }
+                    transformed_relations.append(transformed_relation)
+
+                # Build the OpenSPG result JSON with transformed data
+                open_spg_json = {
+                    "entities": transformed_entities,
+                    "relations": transformed_relations,
+                }
+
+                # Validate the transformed result against the OpenSPG schema
+                try:
+                    open_spg_result = OpenSPGExtractionResult.model_validate(open_spg_json)
+                except ValidationError as e:
+                    logger.error(
+                        "Failed to validate transformed OpenSPG result: %s\n"
+                        "First 500 chars of transformed JSON: %s",
+                        e,
+                        json.dumps(open_spg_json)[:500],
                     )
                     return ExtractionResult(nodes=[], edges=[])
 
@@ -125,13 +206,6 @@ class KnowledgeExtractor:
         except TimeoutError as e:
             logger.error(
                 "LLM API request timed out: %s",
-                e,
-                exc_info=True,
-            )
-            return ExtractionResult(nodes=[], edges=[])
-        except json.JSONDecodeError as e:
-            logger.error(
-                "Failed to decode LLM API response: %s",
                 e,
                 exc_info=True,
             )
@@ -192,7 +266,11 @@ class KnowledgeExtractor:
         result = await self.extract_triplets(text, author_id)
 
         if not result.nodes and not result.edges:
-            logger.debug("Post id=%s: no knowledge triples extracted", post_id)
+            logger.warning(
+                "Empty extraction for post id=%s. Text snippet: %s",
+                post_id,
+                text[:100],
+            )
             return
 
         # Build node ID -> label mapping for edge upserts

@@ -282,7 +282,7 @@ def get_open_spg_llm_prompt(text: str, author_id: int | None = None) -> str:
     """
     author_instruction = ""
     if author_id is not None:
-        author_instruction = f"""5. If the text mentions or references the author (Telegram user ID: {author_id}), create a Person node with id "person_{author_id}" and name "Author {author_id}". Include a 'telegram_id' property with type 'number' and value {author_id}. This author node serves as the root for the knowledge subgraph.
+        author_instruction = f"""5. If the text mentions or references the author (Telegram user ID: {author_id}), create a Person node with id "person_{author_id}" and name "Author {author_id}". Include a 'telegram_id' property with numeric value {author_id}. This author node serves as the root for the knowledge subgraph.
 6. """
 
     prompt = f"""You are an OpenSPG (Semantic Parsing Graph) engine. Your task is to perform dynamic incremental subgraph extraction from the provided text. Follow these OpenSPG paradigms strictly:
@@ -309,21 +309,28 @@ Extraction Instructions:
      "id": "canonical_string_id" (e.g., "person_john_doe", "loc_paris", "org_telegram"),
      "label": "EntityType" (exact: Person, Location, Organization, Event, IT_Concept),
      "name": "Human-readable display name",
-     "properties": [
-       {{"key": "property_name", "value": <any JSON-serializable value>, "type": "string|number|geo|language"}}
-     ]
+     "properties": {{"property_name": <value>, "property_name2": <value>}}
    }}
+   
+   IMPORTANT: The "properties" field is a FLAT DICTIONARY (key-value pairs), NOT a list of objects. The system will automatically infer property types from the values.
+   
+   REQUIRED PROPERTIES: For each entity, you MUST extract at least one relevant property beyond name. Examples:
+   - Person: telegram_id (numeric), nationality (string), birth_year (numeric)
+   - Location: coordinates (array [lat, lon]), country (string)
+   - Organization: founded (numeric), industry (string), website (string)
+   - Event: timestamp (numeric), location (string), participants (string)
+   - IT_Concept: category (string), version (string), language (string)
 
-3. PROPERTY TYPE CLASSIFICATION:
-   - "string": General text, descriptions, names, titles
-   - "number": Numeric data (integers, floats), counts, years, ages, IDs
-   - "geo": Geographic coordinates (lat/lon), addresses, places (use for Location entities' coordinates)
-   - "language": Language codes (e.g., "en", "ru", "fr")
+3. PROPERTY VALUE TYPES (infer from value):
+   - String values: "text", automatically typed as string
+   - Numeric values (int/float): 123, automatically typed as number
+   - Geographic coordinates: [lat, lon] array, automatically typed as geo
+   - Language codes: "en", "ru", etc., automatically typed as language
 
 4. RELATIONSHIPS:
    - relation_type: MUST be UPPER_SNAKE_CASE (e.g., LOCATED_IN, WORKS_AT, DISCUSSES, MENTIONS, CREATED, PART_OF)
    - Connect entities via source_id and target_id
-   - Optional properties array for relationship metadata (e.g., confidence, time_period)
+   - "properties" is also a flat dictionary (can include optional metadata like confidence, time_period)
 
 {author_instruction}5. OUTPUT FORMAT:
 Return ONLY a valid JSON object with exactly this structure:
@@ -341,27 +348,19 @@ Example:
       "id": "person_elon_musk",
       "label": "Person",
       "name": "Elon Musk",
-      "properties": [
-        {{"key": "nationality", "value": "South African/American", "type": "string"}},
-        {{"key": "birth_year", "value": 1971, "type": "number"}}
-      ]
+      "properties": {{"nationality": "South African/American", "birth_year": 1971}}
     }},
     {{
       "id": "org_tesla",
       "label": "Organization",
       "name": "Tesla Inc.",
-      "properties": [
-        {{"key": "industry", "value": "Electric Vehicles", "type": "string"}},
-        {{"key": "founded", "value": 2003, "type": "number"}}
-      ]
+      "properties": {{"industry": "Electric Vehicles", "founded": 2003}}
     }},
     {{
       "id": "loc_palo_alto",
       "label": "Location",
       "name": "Palo Alto",
-      "properties": [
-        {{"key": "coordinates", "value": [37.4419, -122.1430], "type": "geo"}}
-      ]
+      "properties": {{"coordinates": [37.4419, -122.1430]}}
     }}
   ],
   "relations": [
@@ -369,9 +368,7 @@ Example:
       "source_id": "person_elon_musk",
       "relation_type": "WORKS_AT",
       "target_id": "org_tesla",
-      "properties": [
-        {{"key": "role", "value": "CEO", "type": "string"}}
-      ]
+      "properties": {{"role": "CEO"}}
     }},
     {{
       "source_id": "org_tesla",
