@@ -2,13 +2,15 @@
 Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
 """
 
+import asyncio
 import json
 import logging
+import random
 import re
 from typing import Any, Sequence
 
 from sqlalchemy import bindparam, case, func, select, update, text
-from sqlalchemy.dialects.postgresql import insert, JSON
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -39,40 +41,87 @@ class Database:
             max_overflow=20,
             pool_pre_ping=True,
             pool_recycle=3600,
-            connect_args={"command_timeout": 120, "timeout": 60},
+            connect_args={
+                "command_timeout": 120,
+                "timeout": 60,
+                "server_settings": {
+                    "tcp_keepalives_idle": "60",
+                    "tcp_keepalives_interval": "10",
+                    "tcp_keepalives_count": "5",
+                },
+            },
         )
 
         self.async_session = async_sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
         )
 
-    async def init_db(self) -> None:
-        """Create all tables defined in the models (if they don't exist)."""
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+    async def init_db(self, max_retries: int = 5, base_delay: float = 1.0) -> None:
+        """
+        Create all tables defined in the models (if they don't exist).
 
-            # Initialize Apache AGE extension and graph
+        Implements retry with exponential backoff and jitter for resilience
+        against temporary network or database unavailability during startup.
+
+        Args:
+            max_retries: Maximum number of retry attempts (default: 5).
+            base_delay: Base delay in seconds for exponential backoff (default: 1.0).
+        """
+        
+        last_exception: Exception | None = None
+
+        for attempt in range(1, max_retries + 1):
             try:
-                # Create extension if not exists
-                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
-                # Load AGE library
-                await conn.execute(text("LOAD 'age';"))
-                # Set search path for AGE
-                await conn.execute(
-                    text('SET search_path = ag_catalog, "$user", public;')
-                )
-                # Create the base graph (ignore if already exists)
-                await conn.execute(
-                    text(
-                        "SELECT create_graph('telegram_graph') WHERE NOT EXISTS (SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');"
-                    )
-                )
-                logger.info("Apache AGE extension and graph initialized")
-            except Exception as e:
-                logger.error("Failed to initialize Apache AGE: %s", e)
-                raise
+                async with self.engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
 
-        logger.info("Database tables created (if not exist)")
+                    # Initialize Apache AGE extension and graph
+                    try:
+                        # Create extension if not exists
+                        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
+                        # Load AGE library
+                        await conn.execute(text("LOAD 'age';"))
+                        # Set search path for AGE
+                        await conn.execute(
+                            text('SET search_path = ag_catalog, "$user", public;')
+                        )
+                        # Create the base graph (ignore if already exists)
+                        await conn.execute(
+                            text(
+                                "SELECT create_graph('telegram_graph') WHERE NOT EXISTS (SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');"
+                            )
+                        )
+                        logger.info("Apache AGE extension and graph initialized")
+                    except Exception as e:
+                        logger.error("Failed to initialize Apache AGE: %s", e)
+                        raise
+
+                logger.info("Database tables created (if not exist)")
+                return  # Success, exit the retry loop
+
+            except Exception as e:
+                last_exception = e
+                if attempt == max_retries:
+                    logger.error(
+                        "Database initialization failed after %d attempts: %s",
+                        max_retries,
+                        e,
+                    )
+                    raise
+
+                # Exponential backoff with jitter to avoid thundering herd
+                delay = min(base_delay * (2 ** (attempt - 1)), 60)  # Cap at 60 seconds
+                jitter = random.uniform(0, delay * 0.1)  # 10% jitter
+                total_delay = delay + jitter
+
+                logger.warning(
+                    "Database initialization attempt %d/%d failed: %s. Retrying in %.2f seconds...",
+                    attempt,
+                    max_retries,
+                    e,
+                    total_delay,
+                )
+                await asyncio.sleep(total_delay)
 
     async def reset_orphaned_processing_channels(self) -> None:
         """Reset all channels with status='processing' back to 'pending'.
@@ -489,7 +538,6 @@ class Database:
             - source_id: ID of the source node
             - source_label: Label of the source node
             - source_name: Name property of the source node
-            - relation_type: Type of the relationship
             - target_id: ID of the target node
             - target_label: Label of the target node
             - target_name: Name property of the target node
@@ -575,6 +623,99 @@ class Database:
                 extra={"entity_ids": entity_ids},
             )
             raise RuntimeError(f"Subgraph query failed: {e}") from e
+
+    async def get_nodes_by_ids(self, node_ids: list[str], label: str | None = None) -> list[dict]:
+        """
+        Fetch full node details from Apache AGE graph by node IDs.
+
+        Args:
+            node_ids: List of node IDs to fetch.
+            label: Optional node label filter to restrict search to a specific label.
+
+        Returns:
+            List of dictionaries with node details: id, label, name, properties (as dict).
+
+        Raises:
+            RuntimeError: If query execution fails.
+        """
+
+        if not node_ids:
+            return []
+
+        try:
+            # Build Cypher query to fetch nodes with all properties
+            # Using UNWIND to pass the list of IDs
+            query = text("""
+                SELECT * FROM cypher('telegram_graph',
+                    $$ UNWIND $ids AS id
+                       MATCH (n)
+                       WHERE n.id = id
+                       RETURN n.id as n_id, n.label as n_label, n.name as n_name, n $$,
+                    CAST(:params AS agtype)
+                ) AS (
+                    n_id agtype,
+                    n_label agtype,
+                    n_name agtype,
+                    n agtype
+                )
+            """)
+
+            params = json.dumps({"ids": node_ids})
+
+            async with self.async_session() as session:
+                async with session.begin():
+                    result = await session.execute(query, {"params": params})
+                    rows = result.all()
+
+            nodes = []
+            for row in rows:
+                def parse_agtype(value):
+                    if value is None:
+                        return None
+                    text = str(value)
+                    if text.startswith('"') and text.endswith('"'):
+                        text = text[1:-1]
+                    try:
+                        return json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        return text
+
+                node_id = parse_agtype(row[0])
+                node_label = parse_agtype(row[1])
+                node_name = parse_agtype(row[2])
+                node_data = parse_agtype(row[3])
+
+                # Extract properties from node data
+                properties = {}
+                if isinstance(node_data, dict):
+                    # Copy all keys except id, label, name (these are already extracted)
+                    for key, value in node_data.items():
+                        if key not in ('id', 'label', 'name'):
+                            properties[key] = value
+
+                nodes.append({
+                    "id": node_id,
+                    "label": node_label,
+                    "name": node_name,
+                    "properties": properties
+                })
+
+            logger.debug(
+                "Fetched nodes from graph",
+                extra={
+                    "node_count": len(nodes),
+                    "requested_ids": len(node_ids),
+                },
+            )
+            return nodes
+
+        except Exception as e:
+            logger.error(
+                "Failed to fetch nodes from graph",
+                exc_info=e,
+                extra={"node_ids": node_ids},
+            )
+            raise RuntimeError(f"Node fetch failed: {e}") from e
 
     async def execute_cypher(self, query: str) -> Any:
         """

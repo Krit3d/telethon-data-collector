@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 from pydantic import BaseModel, Field
 
 
@@ -7,6 +8,9 @@ class SearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50, description="Number of results")
     score_threshold: float = Field(
         default=0.35, description="Minimum match threshold"
+    )
+    include_author_info: bool = Field(
+        default=False, description="Include author (Actor) node details for found posts"
     )
 
 
@@ -17,6 +21,9 @@ class SearchResultItem(BaseModel):
     score: float
     created_at: datetime
     url: str | None = None
+    # Optional author info when include_author_info=True
+    author_id: int | None = None
+    author_name: str | None = None
 
 
 class GraphEdge(BaseModel):
@@ -31,9 +38,20 @@ class GraphEdge(BaseModel):
     target_name: str | None = None
 
 
+class GraphEntity(BaseModel):
+    """Groups graph relationships by entity for easier frontend rendering."""
+    
+    entity_id: str
+    entity_label: str
+    entity_name: str | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+    relationships: list[GraphEdge] = Field(default_factory=list)
+
+
 class SearchResponse(BaseModel):
     results: list[SearchResultItem]
     graph_context: list[GraphEdge] = Field(default_factory=list)
+    graph_entities: list[GraphEntity] = Field(default_factory=list)
 
 
 class IndexRequest(BaseModel):

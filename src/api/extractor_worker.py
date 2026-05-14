@@ -9,6 +9,15 @@ import asyncio
 import logging
 import signal
 
+from sqlalchemy.exc import OperationalError
+
+try:
+    import asyncpg.exceptions
+    PostgresError = asyncpg.exceptions.PostgresError
+except ImportError:
+    # asyncpg may not be installed in all environments
+    PostgresError = Exception  # Fallback to base Exception
+
 from src.config.config import load_settings
 from src.db.database import Database
 from src.db.models import Post
@@ -61,7 +70,26 @@ class ExtractionWorker:
         while not self._shutdown_event.is_set():
             try:
                 # Fetch batch of unextracted posts
-                posts = await self.db.get_unextracted_posts(limit=self.batch_size)
+                try:
+                    posts = await self.db.get_unextracted_posts(limit=self.batch_size)
+                except (OperationalError, PostgresError) as e:
+                    # Database connection error - log warning, back off, and retry
+                    logger.warning(
+                        "Database connection error while fetching posts: %s. "
+                        "Retrying after backoff (%.1fs)...",
+                        e,
+                        self.poll_interval * 2,
+                    )
+                    # Use wait_for to allow shutdown during sleep
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown_event.wait(),
+                            timeout=self.poll_interval * 2,
+                        )
+                    except asyncio.TimeoutError:
+                        # Timeout is expected - continue to retry
+                        pass
+                    continue
 
                 if not posts:
                     logger.debug("No unextracted posts found, sleeping %ds", self.poll_interval)

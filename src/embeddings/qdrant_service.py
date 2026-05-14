@@ -446,7 +446,7 @@ class QdrantService:
 
     async def search_entities(
         self, query: str, limit: int = 5, score_threshold: float = 0.35
-    ) -> list[str]:
+    ) -> list[dict]:
         """Search for semantic entities in the telegram_entities collection.
 
         Args:
@@ -455,7 +455,8 @@ class QdrantService:
             score_threshold: Minimum similarity score threshold (0-1).
 
         Returns:
-            List of original_id values from matched entity payloads.
+            List of dictionaries containing entity_id, score, and payload data.
+            Each dict has keys: 'entity_id' (original_id), 'score', 'payload' (dict).
 
         Raises:
             RuntimeError: If service is not initialized or search fails.
@@ -484,23 +485,27 @@ class QdrantService:
                 with_payload=True,
             )
 
-            # Extract original_id from payloads
-            entity_ids = []
+            # Extract entity data with scores and full payload
+            entities = []
             for hit in response.points:
                 if hit.payload and "original_id" in hit.payload:
-                    entity_ids.append(str(hit.payload["original_id"]))
+                    entities.append({
+                        "entity_id": str(hit.payload["original_id"]),
+                        "score": hit.score,
+                        "payload": hit.payload
+                    })
 
             logger.debug(
                 "Entity search successful",
                 extra={
                     "query": query,
-                    "entities_found": len(entity_ids),
+                    "entities_found": len(entities),
                     "limit": limit,
                     "score_threshold": score_threshold,
                 },
             )
 
-            return entity_ids
+            return entities
 
         except Exception as e:
             logger.error(
