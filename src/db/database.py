@@ -4,10 +4,11 @@ Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
 
 import json
 import logging
+import re
 from typing import Any, Sequence
 
-from sqlalchemy import case, func, select, update, text
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import bindparam, case, func, select, update, text
+from sqlalchemy.dialects.postgresql import insert, JSON
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -474,29 +475,6 @@ class Database:
                         "Updated access_hash for channel id=%s", channel_id
                     )
 
-    def _to_cypher_map(self, props: dict) -> str:
-        """
-        Convert a dictionary to a Cypher map literal with unquoted keys.
-
-        Keys are not quoted (Cypher syntax), and values are JSON-encoded
-        to ensure proper escaping of strings, numbers, booleans, and nulls.
-
-        Args:
-            props: Dictionary of properties to convert.
-
-        Returns:
-            A string representing a Cypher map literal, e.g., '{name: "John", age: 30}'.
-        """
-        if not props:
-            return "{}"
-
-        parts = []
-        for key, value in props.items():
-            # Use json.dumps for proper escaping of strings, numbers, booleans, null
-            json_value = json.dumps(value, ensure_ascii=False)
-            parts.append(f"{key}: {json_value}")
-        return "{" + ", ".join(parts) + "}"
-
     async def get_subgraph_for_entities(
         self, entity_ids: list[str]
     ) -> list[dict]:
@@ -629,25 +607,43 @@ class Database:
         Uses MERGE to create or update a node with the given label and properties.
         The node is matched on the merge_key (default: 'id').
 
+        IMPORTANT: Labels cannot be parameterized in Cypher, so we validate that
+        the label is alphanumeric (with underscores) to prevent injection attacks.
+        Properties are passed as SQLAlchemy bind parameters and cast to agtype.
+
         Args:
-            label: Graph node label (e.g., 'Channel', 'Post').
+            label: Graph node label (e.g., 'Channel', 'Post'). Must be alphanumeric.
             properties: Dictionary of node properties.
             merge_key: Property name to use for MERGE matching (default: 'id').
+
+        Raises:
+            ValueError: If label contains non-alphanumeric characters (except underscore).
+        """
+        # Validate label to prevent Cypher injection (labels cannot be parameterized)
+        if not re.match(r'^[A-Za-z0-9_]+$', label):
+            raise ValueError(f"Invalid label '{label}': must be alphanumeric with underscores")
+
+        # Validate merge_key as a simple identifier
+        if not re.match(r'^[A-Za-z0-9_]+$', merge_key):
+            raise ValueError(f"Invalid merge_key '{merge_key}': must be alphanumeric with underscores")
+
+        # Build the Cypher query string with validated label and merge_key
+        # The $props reference will be bound as a parameter
+        cypher_query = f"""
+            MERGE (n:{label} {{{merge_key}: $props.id}})
+            SET n += $props
+            RETURN n
         """
 
-        merge_val_json = json.dumps(properties.get(merge_key))
-        map_literal = self._to_cypher_map(properties)
-        
-        query = f"""
-            SELECT * FROM cypher('telegram_graph', $$
-                MERGE (n:{label} {{{merge_key}: {merge_val_json}}})
-                SET n += {map_literal}
-                RETURN n
-            $$) AS (v agtype);
-        """
+        # Build the full SQL query with a bind parameter for properties
+        # The :props parameter will be automatically cast to agtype by AGE
+        query = text(
+            "SELECT * FROM cypher('telegram_graph', $q$, :props) AS (v agtype);"
+        ).bindparams(q=cypher_query, props=properties)
+
         async with self.async_session() as session:
             async with session.begin():
-                await session.execute(text(query))
+                await session.execute(query)
 
     async def upsert_graph_edge(
         self,
@@ -664,32 +660,64 @@ class Database:
         Upsert an edge in the Apache AGE graph.
 
         Matches start and end nodes by label and merge keys, then MERGEs the edge.
-        Edge properties are set using the = operator (overwrites if edge exists).
+        Edge properties are set using the += operator for incremental updates.
+
+        IMPORTANT: Labels and relationship types cannot be parameterized in Cypher,
+        so we validate them to prevent injection attacks. Properties are passed
+        as SQLAlchemy bind parameters and cast to agtype.
 
         Args:
-            start_label: Label of the start node.
+            start_label: Label of the start node. Must be alphanumeric.
             start_merge_key: Property name to match start node.
-            start_merge_val: Value for start node matching.
-            edge_label: Relationship type label.
-            end_label: Label of the end node.
+            start_merge_val: Value for start node matching (passed as parameter).
+            edge_label: Relationship type label. Must be alphanumeric.
+            end_label: Label of the end node. Must be alphanumeric.
             end_merge_key: Property name to match end node.
-            end_merge_val: Value for end node matching.
+            end_merge_val: Value for end node matching (passed as parameter).
             edge_properties: Optional dictionary of edge properties.
+
+        Raises:
+            ValueError: If any label or edge_label contains non-alphanumeric characters.
+        """
+        # Validate all alphanumeric identifiers to prevent Cypher injection
+        for identifier_name, identifier_value in [
+            ("start_label", start_label),
+            ("edge_label", edge_label),
+            ("end_label", end_label),
+        ]:
+            if not re.match(r'^[A-Za-z0-9_]+$', identifier_value):
+                raise ValueError(
+                    f"Invalid {identifier_name} '{identifier_value}': must be alphanumeric with underscores"
+                )
+
+        # Merge keys are also identifiers in the Cypher query, validate them
+        if not re.match(r'^[A-Za-z0-9_]+$', start_merge_key):
+            raise ValueError(f"Invalid start_merge_key '{start_merge_key}': must be alphanumeric with underscores")
+        if not re.match(r'^[A-Za-z0-9_]+$', end_merge_key):
+            raise ValueError(f"Invalid end_merge_key '{end_merge_key}': must be alphanumeric with underscores")
+
+        # Build the Cypher query string with validated labels and keys
+        # The $start_id, $end_id, and $edge_props references will be bound as parameters
+        cypher_query = f"""
+            MATCH (a:{start_label} {{{start_merge_key}: $start_id}})
+            MATCH (b:{end_label} {{{end_merge_key}: $end_id}})
+            MERGE (a)-[r:{edge_label}]->(b)
+            SET r += $edge_props
+            RETURN r
         """
 
-        start_val_json = json.dumps(start_merge_val)
-        end_val_json = json.dumps(end_merge_val)
-        edge_map_literal = self._to_cypher_map(edge_properties or {})
-        
-        query = f"""
-            SELECT * FROM cypher('telegram_graph', $$
-                MATCH (a:{start_label} {{{start_merge_key}: {start_val_json}}})
-                MATCH (b:{end_label} {{{end_merge_key}: {end_val_json}}})
-                MERGE (a)-[r:{edge_label}]->(b)
-                SET r += {edge_map_literal}
-                RETURN r
-            $$) AS (v agtype);
-        """
+        # Build parameters dict
+        params_dict = {
+            'start_id': start_merge_val,
+            'end_id': end_merge_val,
+            'edge_props': edge_properties or {}
+        }
+
+        # Build the full SQL query with bind parameters
+        query = text(
+            "SELECT * FROM cypher('telegram_graph', $q$, :params) AS (v agtype);"
+        ).bindparams(q=cypher_query, params=params_dict)
+
         async with self.async_session() as session:
             async with session.begin():
-                await session.execute(text(query))
+                await session.execute(query)
