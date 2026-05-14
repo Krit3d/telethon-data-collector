@@ -2,7 +2,7 @@
 
 import json
 import logging
-import re
+import time
 from typing import Any
 
 import aiohttp
@@ -27,71 +27,71 @@ logger = logging.getLogger(__name__)
 
 def _repair_json(content: str) -> str:
     """Attempt to repair malformed or truncated JSON.
-    
+
     Uses simple heuristics to fix common issues:
     - Unclosed braces/brackets
     - Trailing incomplete tokens
     - Truncated strings
-    
+
     Args:
         content: The potentially malformed JSON string.
-        
+
     Returns:
         Repaired JSON string if successful, otherwise original content.
     """
     original = content
-    
+
     # Strip whitespace from ends
     content = content.strip()
-    
+
     # Try to find the last complete JSON object by counting braces
     brace_count = 0
     bracket_count = 0
     in_string = False
     escape_next = False
     last_valid_pos = -1
-    
+
     for i, char in enumerate(content):
         if escape_next:
             escape_next = False
             continue
-            
-        if char == '\\' and in_string:
+
+        if char == "\\" and in_string:
             escape_next = True
             continue
-            
+
         if char == '"':
             in_string = not in_string
             continue
-            
+
         if in_string:
             continue
-            
-        if char == '{':
+
+        if char == "{":
             brace_count += 1
-        elif char == '}':
+        elif char == "}":
             brace_count -= 1
             if brace_count == 0 and bracket_count == 0:
                 last_valid_pos = i
-        elif char == '[':
+        elif char == "[":
             bracket_count += 1
-        elif char == ']':
+        elif char == "]":
             bracket_count -= 1
             if brace_count == 0 and bracket_count == 0:
                 last_valid_pos = i
-    
+
     # If we have unclosed braces, try to close them
     if brace_count > 0 or bracket_count > 0:
         # Find position where we had a complete object
         if last_valid_pos > 0:
-            content = content[:last_valid_pos + 1]
+            content = content[: last_valid_pos + 1]
             # Add missing closing braces/brackets
-            content += ']' * bracket_count
-            content += '}' * brace_count
+            content += "]" * bracket_count
+            content += "}" * brace_count
         else:
             # Could not find a complete object, return original
             return original
-    
+
     # Validate that the repaired JSON is parseable
     try:
         json.loads(content)
@@ -100,7 +100,9 @@ def _repair_json(content: str) -> str:
         return original
 
 
-def _convert_properties_dict_to_list(properties_list: list[dict[str, Any]]) -> list[Property]:
+def _convert_properties_dict_to_list(
+    properties_list: list[dict[str, Any]],
+) -> list[Property]:
     """Convert a list of property objects to a list of Property objects.
 
     The LLM now returns properties as a list of objects with explicit type:
@@ -165,7 +167,9 @@ class KnowledgeExtractor:
         self.settings = settings
         self._session: aiohttp.ClientSession | None = None
 
-    async def _call_llm(self, text: str, author_id: int, post_id: int) -> ExtractionResult:
+    async def _call_llm(
+        self, text: str, author_id: int, post_id: int
+    ) -> ExtractionResult:
         """Call the LLM API to extract knowledge triples from text with retry logic.
 
         Args:
@@ -190,7 +194,7 @@ class KnowledgeExtractor:
 
         max_retries = 2
         last_error = None
-        
+
         for attempt in range(max_retries + 1):
             try:
                 async with self._session.post(
@@ -225,7 +229,11 @@ class KnowledgeExtractor:
                         return ExtractionResult(nodes=[], edges=[])
 
                     data = await response.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    content = (
+                        data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
 
                     if not content:
                         logger.warning("LLM returned empty content")
@@ -236,7 +244,9 @@ class KnowledgeExtractor:
                     # Try to repair JSON if malformed
                     repaired_content = _repair_json(content)
                     if repaired_content != content:
-                        logger.info("Applied JSON repair for post_id=%s", post_id)
+                        logger.info(
+                            "Applied JSON repair for post_id=%s", post_id
+                        )
                         content = repaired_content
 
                     # Parse the JSON response
@@ -253,10 +263,17 @@ class KnowledgeExtractor:
                                 post_id,
                                 e,
                                 content[:500],
-                                content[-500:] if len(content) > 500 else content,
+                                (
+                                    content[-500:]
+                                    if len(content) > 500
+                                    else content
+                                ),
                             )
                             # Modify prompt for retry
-                            prompt = get_open_spg_llm_prompt(text, author_id) + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
+                            prompt = (
+                                get_open_spg_llm_prompt(text, author_id)
+                                + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
+                            )
                             continue
                         else:
                             logger.error(
@@ -267,7 +284,11 @@ class KnowledgeExtractor:
                                 post_id,
                                 e,
                                 content[:500],
-                                content[-500:] if len(content) > 500 else content,
+                                (
+                                    content[-500:]
+                                    if len(content) > 500
+                                    else content
+                                ),
                             )
                             return ExtractionResult(nodes=[], edges=[])
 
@@ -281,7 +302,9 @@ class KnowledgeExtractor:
                     transformed_entities = []
                     for entity_data in entities_data:
                         props_list = entity_data.get("properties", [])
-                        properties_list = _convert_properties_dict_to_list(props_list)
+                        properties_list = _convert_properties_dict_to_list(
+                            props_list
+                        )
 
                         transformed_entity = {
                             "id": entity_data["id"],
@@ -295,7 +318,9 @@ class KnowledgeExtractor:
                     transformed_relations = []
                     for relation_data in relations_data:
                         props_list = relation_data.get("properties", [])
-                        properties_list = _convert_properties_dict_to_list(props_list)
+                        properties_list = _convert_properties_dict_to_list(
+                            props_list
+                        )
 
                         transformed_relation = {
                             "source_id": relation_data["source_id"],
@@ -313,7 +338,11 @@ class KnowledgeExtractor:
 
                     # Validate the transformed result against the OpenSPG schema
                     try:
-                        open_spg_result = OpenSPGExtractionResult.model_validate(open_spg_json)
+                        open_spg_result = (
+                            OpenSPGExtractionResult.model_validate(
+                                open_spg_json
+                            )
+                        )
                     except ValidationError as e:
                         if attempt < max_retries:
                             logger.warning(
@@ -326,7 +355,10 @@ class KnowledgeExtractor:
                                 json.dumps(open_spg_json)[:500],
                             )
                             # Modify prompt for retry
-                            prompt = get_open_spg_llm_prompt(text, author_id) + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
+                            prompt = (
+                                get_open_spg_llm_prompt(text, author_id)
+                                + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
+                            )
                             continue
                         else:
                             logger.error(
@@ -340,7 +372,9 @@ class KnowledgeExtractor:
                             return ExtractionResult(nodes=[], edges=[])
 
                     # Convert OpenSPG result to legacy ExtractionResult for backward compatibility
-                    extraction_result = open_spg_result_to_extraction_result(open_spg_result)
+                    extraction_result = open_spg_result_to_extraction_result(
+                        open_spg_result
+                    )
                     nodes = extraction_result.nodes
                     edges = extraction_result.edges
 
@@ -385,7 +419,7 @@ class KnowledgeExtractor:
                 )
                 if attempt < max_retries:
                     continue
-        
+
         # If we exhausted all retries, return empty result
         return ExtractionResult(nodes=[], edges=[])
 
@@ -444,6 +478,11 @@ class KnowledgeExtractor:
                 text[:100],
             )
             return
+
+        # Add last_modified_at timestamp to all nodes (for incremental updates tracking)
+        current_timestamp = int(time.time())
+        for node in result.nodes:
+            node.properties["last_modified_at"] = current_timestamp
 
         # Build node ID -> label mapping for edge upserts
         node_id_to_label: dict[str, str] = {}

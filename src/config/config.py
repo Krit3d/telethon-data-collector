@@ -131,6 +131,28 @@ class Settings(BaseSettings):
         description="Optional proxy URL for Telegram connections",
     )
 
+    # ---- S3 storage settings ----
+    s3_endpoint: str | None = Field(
+        default=None,
+        description="S3 endpoint URL (e.g., https://s3.amazonaws.com or custom for MinIO/Cloudflare)",
+    )
+    s3_access_key: str | None = Field(
+        default=None,
+        description="S3 access key ID",
+    )
+    s3_secret_key: str | None = Field(
+        default=None,
+        description="S3 secret access key",
+    )
+    s3_bucket_name: str | None = Field(
+        default=None,
+        description="S3 bucket name for storing media files",
+    )
+    s3_region: str | None = Field(
+        default=None,
+        description="S3 region (e.g., us-east-1, eu-west-1)",
+    )
+
     # ---- Natparsing stealth settings ----
     use_natural_delays: bool = Field(
         default=False,

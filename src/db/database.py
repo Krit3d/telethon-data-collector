@@ -56,19 +56,25 @@ class Database:
             self.engine, class_=AsyncSession, expire_on_commit=False
         )
 
-    async def init_db(self, max_retries: int = 5, base_delay: float = 1.0) -> None:
+    async def init_db(self, max_retries: int = 5, base_delay: float = 1.0, timeout: float = 120.0) -> None:
         """
         Create all tables defined in the models (if they don't exist).
 
         Implements retry with exponential backoff and jitter for resilience
         against temporary network or database unavailability during startup.
+        Also enforces an overall timeout to prevent indefinite blocking.
 
         Args:
             max_retries: Maximum number of retry attempts (default: 5).
             base_delay: Base delay in seconds for exponential backoff (default: 1.0).
+            timeout: Overall timeout in seconds for the entire initialization process (default: 120.0).
+
+        Raises:
+            RuntimeError: If initialization fails after all retries or times out.
         """
         
         last_exception: Exception | None = None
+        start_time = asyncio.get_event_loop().time()
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -96,7 +102,7 @@ class Database:
                         logger.error("Failed to initialize Apache AGE: %s", e)
                         raise
 
-                logger.info("Database tables created (if not exist)")
+                logger.info("Database initialization successful")
                 return  # Success, exit the retry loop
 
             except Exception as e:
@@ -107,7 +113,21 @@ class Database:
                         max_retries,
                         e,
                     )
-                    raise
+                    raise RuntimeError(
+                        f"Database initialization failed after {max_retries} attempts"
+                    ) from e
+
+                # Check if we've exceeded the overall timeout
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= timeout:
+                    logger.error(
+                        "Database initialization exceeded timeout of %.1f seconds after %d attempts",
+                        timeout,
+                        attempt,
+                    )
+                    raise RuntimeError(
+                        f"Database initialization timed out after {elapsed:.1f} seconds"
+                    ) from last_exception
 
                 # Exponential backoff with jitter to avoid thundering herd
                 delay = min(base_delay * (2 ** (attempt - 1)), 60)  # Cap at 60 seconds
@@ -736,6 +756,45 @@ class Database:
                 result = await session.execute(text(query))
                 return result.scalars().all()
 
+    def _sanitize_properties(self, properties: dict) -> dict:
+        """
+        Sanitize property keys to ensure they are strictly alphanumeric snake_case.
+
+        This utility method prevents hidden characters or invalid syntax from
+        breaking the Cypher query parser. Keys are stripped, converted to
+        snake_case, and validated against a strict pattern.
+
+        Args:
+            properties: Raw properties dictionary.
+
+        Returns:
+            Dictionary with sanitized keys (original values preserved).
+
+        Raises:
+            ValueError: If any key cannot be sanitized to a valid identifier.
+        """
+        sanitized = {}
+        for key, value in properties.items():
+            # Strip whitespace and convert to snake_case
+            clean_key = key.strip().lower()
+            # Replace any non-alphanumeric (except underscore) with underscore
+            clean_key = re.sub(r'[^a-z0-9_]', '_', clean_key)
+            # Collapse multiple underscores
+            clean_key = re.sub(r'_+', '_', clean_key)
+            # Trim leading/trailing underscores
+            clean_key = clean_key.strip('_')
+
+            # Validate final key
+            if not re.match(r'^[a-z0-9_]+$', clean_key):
+                raise ValueError(
+                    f"Property key '{key}' could not be sanitized to a valid identifier "
+                    f"(got '{clean_key}'). Only alphanumeric characters and underscores are allowed."
+                )
+
+            sanitized[clean_key] = value
+
+        return sanitized
+
     async def upsert_graph_node(
         self, label: str, properties: dict, merge_key: str = "id"
     ) -> None:
@@ -745,11 +804,10 @@ class Database:
         Uses MERGE to create or update a node with the given label and properties.
         The node is matched on the merge_key (default: 'id').
 
-        IMPORTANT: Labels cannot be parameterized in Cypher, so we validate that
-        the label is alphanumeric (with underscores) to prevent injection attacks.
-        All property keys are validated using regex to prevent Cypher injection.
-        Properties are passed as individual JSON parameters to avoid the
-        `SET clause expects a map` bug in Apache AGE when using += with asyncpg.
+        IMPORTANT: Labels and property keys cannot be parameterized in Cypher,
+        so we validate them to prevent injection attacks. Properties are set
+        using an explicit SET clause with individual bind parameters to avoid
+        the "SET clause expects a map" error in Apache AGE.
 
         Args:
             label: Graph node label (e.g., 'Channel', 'Post'). Must be alphanumeric.
@@ -767,29 +825,43 @@ class Database:
         if not re.match(r'^[A-Za-z0-9_]+$', merge_key):
             raise ValueError(f"Invalid merge_key '{merge_key}': must be alphanumeric with underscores")
 
-        # Validate all property keys to prevent Cypher injection
-        for key in properties.keys():
-            if not re.match(r'^[A-Za-z0-9_]+$', key):
-                raise ValueError(f"Invalid property key '{key}': must be alphanumeric with underscores")
+        # Sanitize all property keys to prevent Cypher injection
+        props = self._sanitize_properties(properties)
 
-        # Build dynamic SET clause with individual property assignments
-        set_clauses = ", ".join([f"n.{k} = $prop_{k}" for k in properties.keys()])
-        set_query = f"SET {set_clauses}" if set_clauses else ""
+        # Ensure merge_key is present in properties
+        if merge_key not in props:
+            props[merge_key] = properties.get(merge_key)
 
-        # Build the SQL query with literal Cypher string and bind parameters for each property
-        # The Cypher query is embedded directly using $$ delimiters (not a bind parameter)
-        # The :params bind parameter contains all Cypher parameters as JSON and is cast to agtype
+        # Build dynamic SET clause by iterating over properties
+        # Exclude merge_key from SET to avoid conflicts (it's already used in MERGE)
+        set_clauses = []
+        set_params = {}
+        for key, value in props.items():
+            if key == merge_key:
+                continue  # Skip merge_key to prevent conflicts
+            # Use backticks for property names to avoid reserved keyword conflicts
+            # Prefix parameter names with 'prop_' to avoid parameter name conflicts
+            set_clauses.append(f"n.`{key}` = $prop_{key}")
+            set_params[f"prop_{key}"] = value
+
+        # Join SET clauses with comma, ensuring no trailing comma
+        set_clause_str = ", ".join(set_clauses) if set_clauses else ""
+
+        # Build the SQL query with explicit SET assignments
+        # All parameters are passed as a single agtype map via :params
+        # Inside Cypher, individual values are accessed as $key from the agtype map
         query = text(f"""
             SELECT * FROM cypher('telegram_graph',
-                $$ MERGE (n:{label} {{{merge_key}: $merge_val}}) {set_query} RETURN n $$,
+                $$ MERGE (n:{label} {{{merge_key}: $merge_val}})
+                   {f"SET {set_clause_str}" if set_clause_str else ""}
+                   RETURN n $$,
                 CAST(:params AS agtype)
             ) AS (v agtype)
         """)
 
-        # Package Cypher parameters as a single JSON object
-        params_dict = {"merge_val": properties.get(merge_key)}
-        for k, v in properties.items():
-            params_dict[f"prop_{k}"] = v
+        # Package all parameters as a single JSON object
+        # The agtype map contains all values referenced in the Cypher query
+        params_dict = {"merge_val": props.get(merge_key), **set_params}
         params = json.dumps(params_dict)
 
         async with self.async_session() as session:
@@ -811,12 +883,12 @@ class Database:
         Upsert an edge in the Apache AGE graph.
 
         Matches start and end nodes by label and merge keys, then MERGEs the edge.
-        Edge properties are set using individual assignments to avoid the
-        `SET clause expects a map` bug in Apache AGE when using += with asyncpg.
+        Edge properties are set using an explicit SET clause with individual bind
+        parameters to avoid the "SET clause expects a map" error in Apache AGE.
 
         IMPORTANT: Labels and relationship types cannot be parameterized in Cypher,
         so we validate them to prevent injection attacks. All property keys are
-        validated using regex. Properties are passed as individual JSON parameters.
+        sanitized to valid identifiers. Properties are assigned individually.
 
         Args:
             start_label: Label of the start node. Must be alphanumeric.
@@ -848,33 +920,39 @@ class Database:
         if not re.match(r'^[A-Za-z0-9_]+$', end_merge_key):
             raise ValueError(f"Invalid end_merge_key '{end_merge_key}': must be alphanumeric with underscores")
 
-        # Validate all edge property keys to prevent Cypher injection
+        # Sanitize all edge property keys to prevent Cypher injection
         edge_properties = edge_properties or {}
-        for key in edge_properties.keys():
-            if not re.match(r'^[A-Za-z0-9_]+$', key):
-                raise ValueError(f"Invalid edge property key '{key}': must be alphanumeric with underscores")
+        props = self._sanitize_properties(edge_properties)
 
-        # Build dynamic SET clause with individual property assignments
-        set_clauses = ", ".join([f"r.{k} = $prop_{k}" for k in edge_properties.keys()])
-        set_query = f"SET {set_clauses}" if set_clauses else ""
+        # Build dynamic SET clause by iterating over edge properties
+        set_clauses = []
+        set_params = {}
+        for key, value in props.items():
+            # Use backticks for property names to avoid reserved keyword conflicts
+            # Prefix parameter names with 'prop_' to avoid parameter name conflicts
+            set_clauses.append(f"r.`{key}` = $prop_{key}")
+            set_params[f"prop_{key}"] = value
 
-        # Build the SQL query with literal Cypher string and bind parameters for each property
-        # The Cypher query is embedded directly using $$ delimiters (not a bind parameter)
-        # The :params bind parameter contains all Cypher parameters as JSON and is cast to agtype
+        # Join SET clauses with comma, ensuring no trailing comma
+        set_clause_str = ", ".join(set_clauses) if set_clauses else ""
+
+        # Build the SQL query with explicit SET assignments
+        # All parameters are passed as a single agtype map via :params
+        # Inside Cypher, individual values are accessed as $key from the agtype map
         query = text(f"""
             SELECT * FROM cypher('telegram_graph',
-                $$ MATCH (a:{start_label} {{{start_merge_key}: $sid}}) MATCH (b:{end_label} {{{end_merge_key}: $eid}}) MERGE (a)-[r:{edge_label}]->(b) {set_query} RETURN r $$,
+                $$ MATCH (a:{start_label} {{{start_merge_key}: $sid}})
+                   MATCH (b:{end_label} {{{end_merge_key}: $eid}})
+                   MERGE (a)-[r:{edge_label}]->(b)
+                   {f"SET {set_clause_str}" if set_clause_str else ""}
+                   RETURN r $$,
                 CAST(:params AS agtype)
             ) AS (v agtype)
         """)
 
         # Package all parameters as a single JSON object
-        params_dict = {
-            "sid": start_merge_val,
-            "eid": end_merge_val,
-        }
-        for k, v in edge_properties.items():
-            params_dict[f"prop_{k}"] = v
+        # The agtype map contains all values referenced in the Cypher query
+        params_dict = {"sid": start_merge_val, "eid": end_merge_val, **set_params}
         params = json.dumps(params_dict)
 
         async with self.async_session() as session:

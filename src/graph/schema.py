@@ -469,6 +469,7 @@ Extraction Instructions:
    - Extract ALL entities and relationships mentioned in the text, even if they seem obvious.
    - For each entity, include at least 1-2 relevant properties beyond the name.
    - If an entity already exists in the graph with properties, you are ADDING to its knowledge. Do not worry about deduplication; the system handles merging by canonical ID.
+   - CRITICAL UPDATE RULE: If you detect that a property (like a counter, status, location, or any other attribute) has CHANGED from a previous state, you MUST return the NEW value for that property with the SAME property key. The system will merge by replacing the old value with the new one. For example, if "John now has 2 children" and previously he had 1, extract {{'key': 'children_count', 'value': 2, 'type': 'numeric'}}.
    - Numeric properties can be updated (e.g., if children_count increases, extract the new value).
    - Text properties can be extended (e.g., add new 'alternate_name' or 'description').
    - Always prefer extracting concrete, factual properties over vague ones.

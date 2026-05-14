@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import TypedDict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.dependencies import get_db, get_qdrant
@@ -86,15 +86,14 @@ async def check_apache_age(db: Database) -> ServiceStatus:
     try:
         async with db.async_session() as session:
             async with session.begin():
-                # Check if the telegram_graph exists in ag_graph
+                # Check if the telegram_graph exists in ag_catalog.ag_graph
                 result = await session.execute(
-                    text(
-                        "SELECT 1 FROM ag_graph WHERE name = 'telegram_graph' AND kind = 'normal'"
-                    )
+                    text("SELECT count(*) FROM ag_catalog.ag_graph WHERE name = :graph_name"),
+                    {"graph_name": "telegram_graph"}
                 )
-                exists = result.scalar_one_or_none()
+                count = result.scalar_one()
 
-                if not exists:
+                if count == 0:
                     return {
                         "status": "unhealthy",
                         "timestamp": datetime.now(timezone.utc).isoformat(),

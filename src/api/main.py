@@ -20,12 +20,21 @@ async def lifespan(app: FastAPI):
 
     db = Database(settings.db_url)
     qdrant = QdrantService(settings)
+    
+    # Initialize database with retry logic and timeout
+    try:
+        await db.init_db(max_retries=5, timeout=120.0)
+    except Exception as e:
+        logger.error("Failed to initialize database during startup: %s", e)
+        # Re-raise to prevent application from starting in a broken state
+        raise
+
     await qdrant.initialize()
 
     app.state.db = db
     app.state.qdrant = qdrant
 
-    logger.info("FastAPI application started.")
+    logger.info("FastAPI application started successfully.")
     yield
 
     await db.close()
