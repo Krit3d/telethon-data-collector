@@ -522,6 +522,13 @@ Extraction Instructions:
    - Numeric properties can be updated (e.g., if children_count increases, extract the new value).
    - Text properties can be extended (e.g., add new 'alternate_name' or 'description').
    - Always prefer extracting concrete, factual properties over vague ones.
+   - MANDATORY PROPERTY EXTRACTION: ALWAYS extract the following property types if present in the text:
+     * Language: 2-letter language code (e.g., "en", "ru", "zh") with type "language"
+     * Location: human-readable location string (e.g., "Moscow, Russia") with type "location"
+     * Geo: coordinates as [latitude, longitude] array with type "geo"
+     * Text: any textual data (names, descriptions, etc.) with type "text"
+     * Numeric: counts, ages, years, quantities with type "numeric"
+     These properties are essential for maintaining a rich, queryable knowledge graph state.
 
 5. LENGTH CONSTRAINT:
    - To avoid JSON truncation, be extremely concise. Extract a maximum of 5-7 most important entities per post.
