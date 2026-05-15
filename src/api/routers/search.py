@@ -114,6 +114,22 @@ async def search_posts(
 
         entity_ids: list[str] = [e["entity_id"] for e in entity_results]
 
+        # Log detailed entity matching information for debugging
+        if entity_ids:
+            scores = list(entity_id_to_score.values())
+            max_score = max(scores) if scores else 0.0
+            min_score = min(scores) if scores else 0.0
+            logger.info(
+                "Found %d entities in Qdrant for query. Score range: min=%.4f, max=%.4f",
+                len(entity_ids),
+                min_score,
+                max_score,
+            )
+        else:
+            logger.warning(
+                "No entities found in Qdrant for query. Graph context will be empty."
+            )
+
         # Fetch full post records from PostgreSQL (with channels eagerly loaded)
         post_ids: list[int] = [item["post_id"] for item in posts_data]
         posts_dict: dict[int, Any] = await db.get_posts_by_ids(post_ids) if post_ids else {}
@@ -156,6 +172,26 @@ async def search_posts(
         if entity_ids:
             try:
                 edges_data: list[dict[str, Any]] = await db.get_subgraph_for_entities(entity_ids)
+                
+                # Strip extra quotes from source_id and target_id if they are string-represented agtypes
+                for edge in edges_data:
+                    source_id = edge["source_id"]
+                    target_id = edge["target_id"]
+                    
+                    # Clean source_id: strip surrounding quotes if present (e.g., '"entity_123"' -> 'entity_123')
+                    if isinstance(source_id, str) and source_id.startswith('"') and source_id.endswith('"'):
+                        edge["source_id"] = source_id[1:-1]
+                    
+                    # Clean target_id: strip surrounding quotes if present
+                    if isinstance(target_id, str) and target_id.startswith('"') and target_id.endswith('"'):
+                        edge["target_id"] = target_id[1:-1]
+                
+                # Log first 3 edges for debugging graph structure
+                logger.info(
+                    "First 3 edges from graph subgraph: %s",
+                    edges_data[:3] if edges_data else "No edges found"
+                )
+                
                 for edge in edges_data:
                     source_id: Any = edge["source_id"]
                     target_id: Any = edge["target_id"]
@@ -165,7 +201,8 @@ async def search_posts(
                     # Identify Post nodes (label should be 'Post')
                     # The graph connects entities to posts via relationships
                     # Clean post IDs by stripping "post_" prefix and converting to int
-                    if source_label == "Post" and target_id in entity_ids:
+                    # Use case-insensitive comparison to handle variations like "POST", "post", etc.
+                    if source_label.lower() == "post" and target_id in entity_ids:
                         cleaned_source_id = _clean_post_id(source_id)
                         if cleaned_source_id is not None:
                             connected_post_ids.add(cleaned_source_id)
@@ -173,7 +210,7 @@ async def search_posts(
                                 entity_to_connected_posts[target_id] = []
                             entity_to_connected_posts[target_id].append(cleaned_source_id)
 
-                    if target_label == "Post" and source_id in entity_ids:
+                    if target_label.lower() == "post" and source_id in entity_ids:
                         cleaned_target_id = _clean_post_id(target_id)
                         if cleaned_target_id is not None:
                             connected_post_ids.add(cleaned_target_id)

@@ -591,9 +591,9 @@ class Database:
             # The :params bind parameter contains the entity IDs as a JSON array and is cast to agtype
             query = text("""
                 SELECT * FROM cypher('telegram_graph',
-                    $$ UNWIND $ids AS id
+                    $$ UNWIND $ids AS target_id
                        MATCH (a)-[r]-(b)
-                       WHERE a.id = id
+                       WHERE a.id = target_id
                        RETURN a.id as a_id, label(a) as a_label, a.name as a_name,
                               type(r) as rel_type,
                               b.id as b_id, label(b) as b_label, b.name as b_name $$,
@@ -682,9 +682,9 @@ class Database:
             # Using UNWIND to pass the list of IDs
             query = text("""
                 SELECT * FROM cypher('telegram_graph',
-                    $$ UNWIND $ids AS id
+                    $$ UNWIND $ids AS target_id
                        MATCH (n)
-                       WHERE n.id = id
+                       WHERE n.id = target_id
                        RETURN n.id as n_id, label(n) as n_label, n.name as n_name, n $$,
                     CAST(:params AS agtype)
                 ) AS (
