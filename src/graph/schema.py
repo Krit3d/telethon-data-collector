@@ -64,6 +64,53 @@ class Property(BaseModel):
                     pass  # Let Pydantic raise the appropriate error for invalid types
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_value_types(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """Coerce value types to match PropertyType expectations for resilience.
+
+        This validator automatically converts common type mismatches caused by LLM output:
+        - TEXT: converts non-string values (bool, int, float) to strings
+        - NUMERIC: converts numeric strings to int or float
+
+        This ensures the extractor does not crash on minor type mistakes while
+        maintaining strict validation for GEO and LANGUAGE types.
+
+        Args:
+            data: Raw input data before model validation.
+
+        Returns:
+            Modified data with coerced values where appropriate.
+        """
+
+        if isinstance(data, dict):
+            prop_type = data.get("type")
+            value = data.get("value")
+
+            if prop_type is None or value is None:
+                return data
+
+            # Handle TEXT type: convert any non-string to string
+            if prop_type == PropertyType.TEXT and not isinstance(value, str):
+                data["value"] = str(value)
+                return data
+
+            # Handle NUMERIC type: convert string numbers to numeric
+            if prop_type == PropertyType.NUMERIC and isinstance(value, str):
+                stripped = value.strip()
+                try:
+                    # Try to convert to int first for whole numbers (including negative)
+                    if stripped.isdigit() or (stripped.startswith('-') and stripped[1:].isdigit()):
+                        data["value"] = int(stripped)
+                    else:
+                        # Try float for decimal numbers or scientific notation
+                        data["value"] = float(stripped)
+                except (ValueError, TypeError):
+                    # If conversion fails, keep original and let validation handle error
+                    pass
+
+        return data
+
     @field_validator("key", mode="before")
     @classmethod
     def sanitize_key(cls, v: Any) -> str:
@@ -71,6 +118,7 @@ class Property(BaseModel):
 
         Converts hyphens and spaces to underscores, and strips special characters.
         """
+
         if not isinstance(v, str):
             v = str(v)
         # Convert hyphens and spaces to underscores
@@ -98,6 +146,7 @@ class Property(BaseModel):
         Raises:
             ValueError: If the value does not match the type constraints.
         """
+        
         prop_type = self.type
         value = self.value
 
@@ -397,7 +446,7 @@ def get_open_spg_llm_prompt(text: str, author_id: int | None = None) -> str:
     """
     author_instruction = ""
     if author_id is not None:
-        author_instruction = f"""5. If the text mentions or references the author (Telegram user ID: {author_id}), create an Actor node with id "actor_{author_id}" and name "Author {author_id}". Include a property {{'key': 'telegram_id', 'value': {author_id}, 'type': 'numeric'}}. This author node serves as the root for the knowledge subgraph.
+        author_instruction = f"""5. If the text EXPLICITLY mentions or references the author by name (Telegram user ID: {author_id}), OR if the author performs specific actions described in the text, create an Actor node with id "actor_{author_id}" and name based on the author's displayed name (if available) or "Author {author_id}". Include a property {{'key': 'telegram_id', 'value': {author_id}, 'type': 'numeric'}}. If the author is only implied or not directly mentioned, DO NOT create an author node.
 6. """
 
     prompt = f"""You are an OpenSPG (Semantic Parsing Graph) incremental knowledge accumulation engine. Your task is to extract or update knowledge entities and relationships from the provided text, treating the graph as a persistent state that grows incrementally across any domain (IT, politics, lifestyle, science, etc.).
@@ -474,7 +523,12 @@ Extraction Instructions:
    - Text properties can be extended (e.g., add new 'alternate_name' or 'description').
    - Always prefer extracting concrete, factual properties over vague ones.
 
-5. OUTPUT FORMAT:
+5. LENGTH CONSTRAINT:
+   - To avoid JSON truncation, be extremely concise. Extract a maximum of 5-7 most important entities per post.
+   - Only include entities and relations that are directly and explicitly mentioned in the text.
+   - Omit less important or peripheral entities to stay within the limit.
+
+6. OUTPUT FORMAT:
 Return ONLY a valid JSON object with exactly this structure:
 {{
   "entities": [ ... ],

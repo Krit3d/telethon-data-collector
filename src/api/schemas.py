@@ -10,7 +10,8 @@ class SearchRequest(BaseModel):
         default=0.35, description="Minimum match threshold"
     )
     include_author_info: bool = Field(
-        default=False, description="Include author (Actor) node details for found posts"
+        default=False,
+        description="Include author (Actor) node details for found posts",
     )
 
 
@@ -21,6 +22,7 @@ class SearchResultItem(BaseModel):
     score: float
     created_at: datetime
     url: str | None = None
+    media_url: str | None = None
     # Optional author info when include_author_info=True
     author_id: int | None = None
     author_name: str | None = None
@@ -40,7 +42,7 @@ class GraphEdge(BaseModel):
 
 class GraphEntity(BaseModel):
     """Groups graph relationships by entity for easier frontend rendering."""
-    
+
     entity_id: str
     entity_label: str
     entity_name: str | None = None
@@ -55,7 +57,12 @@ class SearchResponse(BaseModel):
 
 
 class IndexRequest(BaseModel):
-    limit: int = Field(default=100, ge=1, le=1000, description="Maximum number of posts to index")
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Maximum number of posts to index",
+    )
 
 
 class IndexResponse(BaseModel):

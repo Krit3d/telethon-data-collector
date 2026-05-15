@@ -2,9 +2,10 @@
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 import aioboto3
+import aiofiles
+from botocore.exceptions import ClientError
 from pydantic import BaseModel
 
 from src.config.config import Settings
@@ -15,11 +16,11 @@ logger = logging.getLogger(__name__)
 class S3Config(BaseModel):
     """Configuration for S3 service extracted from Settings."""
 
-    endpoint: Optional[str] = None
-    access_key: Optional[str] = None
-    secret_key: Optional[str] = None
-    bucket_name: Optional[str] = None
-    region: Optional[str] = None
+    endpoint: str | None = None
+    access_key: str | None = None
+    secret_key: str | None = None
+    bucket_name: str | None = None
+    region: str | None = None
 
     @property
     def is_configured(self) -> bool:
@@ -48,7 +49,6 @@ class S3Service:
         Args:
             settings: Application settings containing S3 configuration.
         """
-
         self.config = S3Config(
             endpoint=settings.s3_endpoint,
             access_key=settings.s3_access_key,
@@ -56,7 +56,7 @@ class S3Service:
             bucket_name=settings.s3_bucket_name,
             region=settings.s3_region,
         )
-        self._session: Optional[aioboto3.Session] = None
+        self._session: aioboto3.Session | None = None
 
     async def __aenter__(self) -> "S3Service":
         """Async context manager entry."""
@@ -68,7 +68,7 @@ class S3Service:
         await self.close()
 
     async def connect(self) -> None:
-        """Initialize aioboto3 session and S3 client."""
+        """Initialize aioboto3 session."""
         if not self.config.is_configured:
             logger.warning(
                 "S3 service is not fully configured. Some operations may fail."
@@ -96,7 +96,7 @@ class S3Service:
             logger.info("S3 service closed")
 
     async def upload_file(self, local_path: Path | str, object_key: str) -> str:
-        """Upload a file to S3 bucket.
+        """Upload a file to S3 bucket using async file operations.
 
         Args:
             local_path: Local file path to upload.
@@ -107,9 +107,8 @@ class S3Service:
 
         Raises:
             ValueError: If S3 service is not configured or file not found.
-            Exception: If upload fails.
+            ClientError: If S3 upload fails.
         """
-
         if not self.config.is_configured:
             raise ValueError(
                 "S3 service is not configured. Set S3_* environment variables."
@@ -129,14 +128,22 @@ class S3Service:
         )
 
         try:
-            async with self._session.client(
-                "s3", endpoint_url=self.config.endpoint
-            ) as s3_client:
-                with open(local_path, "rb") as file_obj:
-                    await s3_client.upload_fileobj(
-                        file_obj,
-                        self.config.bucket_name,
-                        object_key,
+            # Create session - aioboto3.Session().client() returns an async context manager
+            session = aioboto3.Session(
+                aws_access_key_id=self.config.access_key,
+                aws_secret_access_key=self.config.secret_key,
+                region_name=self.config.region,
+            )
+            # type: ignore[# type: ignore] - aioboto3 client is an async context manager but Pylance cannot infer it
+            async with session.client("s3", endpoint_url=self.config.endpoint) as s3:  # type: ignore[attr-defined]
+                # Read file asynchronously using aiofiles
+                async with aiofiles.open(local_path, "rb") as file_obj:
+                    file_data = await file_obj.read()
+                    # Upload raw bytes using put_object
+                    await s3.put_object(
+                        Bucket=self.config.bucket_name,
+                        Key=object_key,
+                        Body=file_data,
                     )
 
             # Generate permanent public URL
@@ -147,11 +154,96 @@ class S3Service:
             )
             return url
 
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            error_message = e.response.get("Error", {}).get("Message", str(e))
+            logger.error(
+                "S3 upload failed",
+                extra={
+                    "local_path": str(local_path),
+                    "object_key": object_key,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                },
+            )
+            raise
         except Exception as e:
             logger.error(
                 "Failed to upload file to S3",
                 extra={
                     "local_path": str(local_path),
+                    "object_key": object_key,
+                    "error": str(e),
+                },
+            )
+            raise
+
+    async def upload_bytes(self, data: bytes, object_key: str) -> str:
+        """Upload raw bytes to S3 bucket without disk I/O.
+
+        Useful for small files like Telegram photos that are already in memory.
+
+        Args:
+            data: Raw bytes to upload.
+            object_key: S3 object key (path within bucket).
+
+        Returns:
+            Public URL of the uploaded file.
+
+        Raises:
+            ValueError: If S3 service is not configured.
+            ClientError: If S3 upload fails.
+        """
+        if not self.config.is_configured:
+            raise ValueError(
+                "S3 service is not configured. Set S3_* environment variables."
+            )
+
+        logger.info(
+            "Uploading bytes to S3",
+            extra={
+                "object_key": object_key,
+                "bucket": self.config.bucket_name,
+                "size": len(data),
+            },
+        )
+
+        try:
+            session = aioboto3.Session(
+                aws_access_key_id=self.config.access_key,
+                aws_secret_access_key=self.config.secret_key,
+                region_name=self.config.region,
+            )
+            async with session.client("s3", endpoint_url=self.config.endpoint) as s3:  # type: ignore[attr-defined]
+                await s3.put_object(
+                    Bucket=self.config.bucket_name,
+                    Key=object_key,
+                    Body=data,
+                )
+
+            url = self.get_file_url(object_key)
+            logger.info(
+                "Bytes uploaded successfully",
+                extra={"object_key": object_key, "url": url},
+            )
+            return url
+
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            error_message = e.response.get("Error", {}).get("Message", str(e))
+            logger.error(
+                "S3 upload_bytes failed",
+                extra={
+                    "object_key": object_key,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                },
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                "Failed to upload bytes to S3",
+                extra={
                     "object_key": object_key,
                     "error": str(e),
                 },
@@ -169,7 +261,6 @@ class S3Service:
         Returns:
             Permanent public URL to the S3 object.
         """
-        
         if not self.config.endpoint or not self.config.bucket_name:
             raise ValueError(
                 "S3 endpoint and bucket name must be configured to generate URL."
@@ -178,16 +269,12 @@ class S3Service:
         # Remove trailing slash from endpoint
         endpoint = self.config.endpoint.rstrip("/")
 
-        # Construct URL: {endpoint}/{bucket_name}/{object_key}
-        # For AWS S3, the standard format is:
-        # https://{bucket_name}.s3.{region}.amazonaws.com/{object_key}
-        # For custom S3-compatible storage (MinIO, Cloudflare R2, etc.):
-        # {endpoint}/{bucket_name}/{object_key}
+        # Construct URL based on endpoint type
         if "amazonaws.com" in endpoint:
             # AWS S3 standard URL format
             url = f"https://{self.config.bucket_name}.s3.{self.config.region}.amazonaws.com/{object_key}"
         else:
-            # Custom S3-compatible endpoint
+            # Custom S3-compatible endpoint (MinIO, Cloudflare R2, etc.)
             url = f"{endpoint}/{self.config.bucket_name}/{object_key}"
 
         return url

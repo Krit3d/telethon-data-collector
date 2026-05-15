@@ -26,6 +26,9 @@ from src.graph.extractor import KnowledgeExtractor
 
 logger = logging.getLogger(__name__)
 
+# Rate limit cooldown duration (seconds)
+RATE_LIMIT_COOLDOWN = 60
+
 
 class ExtractionWorker:
     """Background worker that processes unextracted posts."""
@@ -35,8 +38,8 @@ class ExtractionWorker:
         db: Database,
         qdrant: QdrantService,
         extractor: KnowledgeExtractor,
-        batch_size: int = 10,
-        poll_interval: int = 10,
+        batch_size: int = 20,
+        poll_interval: int = 5,
     ) -> None:
         """Initialize the extraction worker.
 
@@ -52,6 +55,7 @@ class ExtractionWorker:
         self.extractor = extractor
         self.batch_size = batch_size
         self.poll_interval = poll_interval
+        self.priority_mode: bool = False
         self._shutdown_event = asyncio.Event()
 
     def handle_shutdown(self, *args: object) -> None:
@@ -62,16 +66,20 @@ class ExtractionWorker:
     async def run(self) -> None:
         """Main worker loop: continuously poll and process unextracted posts."""
         logger.info(
-            "Extraction worker started (batch_size=%d, poll_interval=%ds)",
+            "Extraction worker started (batch_size=%d, poll_interval=%ds, priority_mode=%s)",
             self.batch_size,
             self.poll_interval,
+            self.priority_mode,
         )
 
         while not self._shutdown_event.is_set():
             try:
                 # Fetch batch of unextracted posts
                 try:
-                    posts = await self.db.get_unextracted_posts(limit=self.batch_size)
+                    posts = await self.db.get_unextracted_posts(
+                        limit=self.batch_size,
+                        priority_mode=self.priority_mode
+                    )
                 except (OperationalError, PostgresError) as e:
                     # Database connection error - log warning, back off, and retry
                     logger.warning(
@@ -193,14 +201,16 @@ async def run_extractor() -> None:
     # Initialize knowledge extractor
     extractor = KnowledgeExtractor(settings)
 
-    # Create and run worker
+    # Create and run worker with optimized settings
     worker = ExtractionWorker(
         db=db,
         qdrant=qdrant,
         extractor=extractor,
-        batch_size=10,
-        poll_interval=10,
+        batch_size=20,
+        poll_interval=5,
     )
+    # Set priority mode from configuration (default: True for recent posts first)
+    worker.priority_mode = settings.extraction_priority_mode
 
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, worker.handle_shutdown)

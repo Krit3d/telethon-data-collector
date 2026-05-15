@@ -171,6 +171,12 @@ class Settings(BaseSettings):
         description="Logging level",
     )
 
+    # ---- Extraction worker settings ----
+    extraction_priority_mode: bool = Field(
+        default=True,
+        description="If True, process most recent posts first (ordered by published_at DESC). If False, process oldest posts first (ordered by id ASC).",
+    )
+
     # ---- API server settings ----
     api_host: str = Field(
         default="0.0.0.0",

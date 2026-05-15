@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import joinedload
 
 from src.db.models import Base, Channel, Post
 
@@ -247,6 +248,7 @@ class Database:
             "comments_count": stmt.excluded.comments_count,
             "shares_count": stmt.excluded.shares_count,
             "reactions_count": stmt.excluded.reactions_count,
+            "media_url": stmt.excluded.media_url,
             "updated_at": stmt.excluded.updated_at,
         }
 
@@ -309,19 +311,19 @@ class Database:
 
     async def get_posts_by_ids(self, post_ids: list[int]) -> dict[int, Post]:
         """
-        Fetch posts by a list of post IDs.
+        Fetch posts by a list of post IDs with their associated channels eagerly loaded.
 
         Args:
             post_ids: List of PostgreSQL post IDs (primary keys).
 
         Returns:
-            Dictionary mapping post_id to Post object for efficient lookup.
+            Dictionary mapping post_id to Post object (with .channel populated) for efficient lookup.
         """
         if not post_ids:
             return {}
 
         async with self.async_session() as session:
-            stmt = select(Post).where(Post.id.in_(post_ids))
+            stmt = select(Post).options(joinedload(Post.channel)).where(Post.id.in_(post_ids))
             result = await session.execute(stmt)
             posts = result.scalars().all()
             return {post.id: post for post in posts}
@@ -333,28 +335,37 @@ class Database:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    async def get_unextracted_posts(self, limit: int = 50) -> list[Post]:
+    async def get_unextracted_posts(self, limit: int = 50, priority_mode: bool = False) -> list[Post]:
         """Fetch posts that have not yet been extracted to knowledge graph.
 
         Args:
             limit: Maximum number of posts to return.
+            priority_mode: If True, order by published_at DESC (most recent first).
+                          If False, order by id ASC (oldest first).
 
         Returns:
             List of Post objects where is_extracted is False.
         """
 
         async with self.async_session() as session:
-            stmt = (
-                select(Post)
-                .where(Post.is_extracted == False)  # noqa: E712
-                .order_by(Post.id.asc())
-                .limit(limit)
-            )
+            stmt = select(Post).where(Post.is_extracted == False)  # noqa: E712
+            
+            if priority_mode:
+                # Priority mode: process most recent posts first (for search relevance)
+                stmt = stmt.order_by(Post.published_at.desc())
+            else:
+                # Default: process oldest posts first (FIFO)
+                stmt = stmt.order_by(Post.id.asc())
+            
+            stmt = stmt.limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
     async def mark_post_extracted(self, post_id: int) -> None:
         """Mark a post as extracted (is_extracted = True).
+
+        Uses a direct atomic UPDATE statement to avoid FOR UPDATE issues
+        with outer joins caused by lazy="joined" relationships.
 
         Args:
             post_id: The database ID of the post to mark as extracted.
@@ -362,13 +373,17 @@ class Database:
 
         async with self.async_session() as session:
             async with session.begin():
-                stmt = select(Post).where(Post.id == post_id).with_for_update()
+                stmt = (
+                    update(Post)
+                    .where(Post.id == post_id)
+                    .values(is_extracted=True)
+                )
                 result = await session.execute(stmt)
-                post = result.scalar_one_or_none()
 
-                if post is not None:
-                    post.is_extracted = True
+                if result.rowcount > 0:  # type: ignore[attr-defined]
                     logger.debug("Marked post id=%s as extracted", post_id)
+                else:
+                    logger.warning("Post id=%s not found when marking as extracted", post_id)
 
     async def get_random_pending_channel(
         self, require_hash: bool = False
@@ -579,9 +594,9 @@ class Database:
                     $$ UNWIND $ids AS id
                        MATCH (a)-[r]-(b)
                        WHERE a.id = id
-                       RETURN a.id as a_id, a.label as a_label, a.name as a_name,
+                       RETURN a.id as a_id, label(a) as a_label, a.name as a_name,
                               type(r) as rel_type,
-                              b.id as b_id, b.label as b_label, b.name as b_name $$,
+                              b.id as b_id, label(b) as b_label, b.name as b_name $$,
                     CAST(:params AS agtype)
                 ) AS (
                     a_id agtype,
@@ -670,7 +685,7 @@ class Database:
                     $$ UNWIND $ids AS id
                        MATCH (n)
                        WHERE n.id = id
-                       RETURN n.id as n_id, n.label as n_label, n.name as n_name, n $$,
+                       RETURN n.id as n_id, label(n) as n_label, n.name as n_name, n $$,
                     CAST(:params AS agtype)
                 ) AS (
                     n_id agtype,
@@ -817,6 +832,7 @@ class Database:
         Raises:
             ValueError: If label, merge_key, or any property key contains non-alphanumeric characters.
         """
+
         # Validate label to prevent Cypher injection (labels cannot be parameterized)
         if not re.match(r'^[A-Za-z0-9_]+$', label):
             raise ValueError(f"Invalid label '{label}': must be alphanumeric with underscores")
@@ -903,6 +919,7 @@ class Database:
         Raises:
             ValueError: If any label, edge_label, merge key, or property key contains non-alphanumeric characters.
         """
+        
         # Validate all alphanumeric identifiers to prevent Cypher injection
         for identifier_name, identifier_value in [
             ("start_label", start_label),

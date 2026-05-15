@@ -14,7 +14,7 @@ from sqlalchemy import (
     DateTime,
     UniqueConstraint,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -85,6 +85,11 @@ class Channel(Base):
         comment="Timestamp of the last record update",
     )
 
+    # Relationship back to posts
+    posts: Mapped[list["Post"]] = relationship(
+        back_populates="channel", cascade="all, delete-orphan"
+    )
+
     def __repr__(self) -> str:
         return f"<Channel(id={self.id}, username={self.username})>"
 
@@ -118,6 +123,11 @@ class Post(Base):
         nullable=False,
         comment="Foreign key referencing the channel",
     )
+    # Relationship to Channel for eager loading and access to channel data
+    channel: Mapped["Channel"] = relationship(
+        back_populates="posts",
+        lazy="joined",  # Eager load by default when querying posts
+    )
     message_id: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
@@ -145,6 +155,10 @@ class Post(Base):
     )
     reactions_count: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="Number of reactions (likes)"
+    )
+
+    media_url: Mapped[str | None] = mapped_column(
+        String(512), nullable=True, comment="URL to the media attached to the post"
     )
 
     created_at: Mapped[datetime] = mapped_column(

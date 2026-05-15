@@ -17,7 +17,7 @@ from qdrant_client.http.models import (
 )
 
 from src.config.config import Settings
-from src.graph.schema import SPGNode
+from src.graph.schema import ExtractedEntity, PropertyType
 
 logger = logging.getLogger(__name__)
 
@@ -282,11 +282,11 @@ class QdrantService:
             )
             raise
 
-    async def upsert_entities(self, nodes: list[SPGNode]) -> None:
+    async def upsert_entities(self, nodes: list[ExtractedEntity]) -> None:
         """Upsert graph entity nodes into the telegram_entities collection.
 
         Args:
-            nodes: List of SPGNode objects to upsert.
+            nodes: List of ExtractedEntity objects to upsert.
 
         Raises:
             RuntimeError: If service is not initialized or upsert fails.
@@ -308,27 +308,29 @@ class QdrantService:
             original_ids = []
 
             for node in nodes:
-                node_id = node.properties.get("id")
+                # node.id is directly available
+                node_id = node.id
                 if not node_id:
                     logger.warning(
-                        "Skipping node with missing 'id' property",
+                        "Skipping entity with missing 'id'",
                         extra={"label": node.label},
                     )
                     continue
 
-                # Build text representation: "Label: name. description"
-                name = node.properties.get("name", "")
-                description = node.properties.get("description", "")
-                text_parts = [node.label]
-                if name:
-                    text_parts.append(f": {name}")
-                if description:
-                    text_parts.append(f". {description}")
+                # Build text representation: "Label: name"
+                # Optionally append properties of type TEXT or LOCATION
+                text_parts = [f"{node.label}: {node.name}"]
+                
+                # Append relevant properties
+                for prop in node.properties:
+                    if prop.type in (PropertyType.TEXT, PropertyType.LOCATION):
+                        text_parts.append(f", {prop.key}: {prop.value}")
+                
                 text = "".join(text_parts)
 
                 if not text.strip():
                     logger.warning(
-                        "Skipping node with empty text representation",
+                        "Skipping entity with empty text representation",
                         extra={"id": node_id, "label": node.label},
                     )
                     continue
@@ -360,7 +362,8 @@ class QdrantService:
                         payload={
                             "original_id": orig_id,
                             "label": label,
-                            "properties": node.properties,
+                            "name": node.name,
+                            "properties": node.get_property_dict(),
                         },
                     )
                 )

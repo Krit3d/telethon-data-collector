@@ -1,9 +1,10 @@
 """Knowledge graph extractor for OpenSPG-based extraction pipeline."""
 
+import asyncio
 import json
 import logging
+import re
 import time
-from typing import Any
 
 import aiohttp
 from pydantic import ValidationError
@@ -12,14 +13,10 @@ from src.config.config import Settings
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.schema import (
-    ExtractionResult,
+    ExtractedEntity,
+    ExtractedRelation,
     OpenSPGExtractionResult,
-    Property,
-    PropertyType,
-    SPGEdge,
-    SPGNode,
     get_open_spg_llm_prompt,
-    open_spg_result_to_extraction_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,10 +25,12 @@ logger = logging.getLogger(__name__)
 def _repair_json(content: str) -> str:
     """Attempt to repair malformed or truncated JSON.
 
-    Uses simple heuristics to fix common issues:
-    - Unclosed braces/brackets
+    Uses multiple strategies to fix common issues:
+    - Strip markdown code blocks (```json ... ```)
+    - Unclosed braces/brackets at root level
+    - Truncated objects inside entities/relations lists (discards partial objects)
     - Trailing incomplete tokens
-    - Truncated strings
+    - Fallback: find last complete closing brace/bracket and close root
 
     Args:
         content: The potentially malformed JSON string.
@@ -41,10 +40,47 @@ def _repair_json(content: str) -> str:
     """
     original = content
 
-    # Strip whitespace from ends
     content = content.strip()
+    if content.startswith("```json") and content.endswith("```"):
+        content = content[7:-3].strip()
+    elif content.startswith("```") and content.endswith("```"):
+        content = content[3:-3].strip()
 
-    # Try to find the last complete JSON object by counting braces
+    if not content:
+        return original
+
+    # First, try simple parsing to see if it is already valid
+    try:
+        json.loads(content)
+        return content
+    except json.JSONDecodeError:
+        pass  # Proceed with repair strategies
+
+    # Pre-check: Detect if the last character is inside an unclosed string
+    # (common truncation pattern: "... "key": "value" <-- missing closing quote)
+    in_string = False
+    escape_next = False
+    for i, char in enumerate(content):
+        if escape_next:
+            escape_next = False
+            continue
+        if char == "\\" and in_string:
+            escape_next = True
+            continue
+        if char == '"':
+            in_string = not in_string
+    
+    # If we end inside a string, add a closing quote before further repairs
+    if in_string:
+        content = content + '"'
+        logger.debug("Added closing quote for unclosed string in JSON")
+        try:
+            json.loads(content)
+            return content
+        except json.JSONDecodeError:
+            pass  # Continue with other strategies
+
+    # Strategy 1: Simple brace/bracket matching for root-level truncation
     brace_count = 0
     bracket_count = 0
     in_string = False
@@ -55,18 +91,14 @@ def _repair_json(content: str) -> str:
         if escape_next:
             escape_next = False
             continue
-
         if char == "\\" and in_string:
             escape_next = True
             continue
-
         if char == '"':
             in_string = not in_string
             continue
-
         if in_string:
             continue
-
         if char == "{":
             brace_count += 1
         elif char == "}":
@@ -80,79 +112,136 @@ def _repair_json(content: str) -> str:
             if brace_count == 0 and bracket_count == 0:
                 last_valid_pos = i
 
-    # If we have unclosed braces, try to close them
     if brace_count > 0 or bracket_count > 0:
-        # Find position where we had a complete object
         if last_valid_pos > 0:
-            content = content[: last_valid_pos + 1]
-            # Add missing closing braces/brackets
-            content += "]" * bracket_count
-            content += "}" * brace_count
-        else:
-            # Could not find a complete object, return original
-            return original
-
-    # Validate that the repaired JSON is parseable
-    try:
-        json.loads(content)
-        return content
-    except json.JSONDecodeError:
-        return original
-
-
-def _convert_properties_dict_to_list(
-    properties_list: list[dict[str, Any]],
-) -> list[Property]:
-    """Convert a list of property objects to a list of Property objects.
-
-    The LLM now returns properties as a list of objects with explicit type:
-    [{"key": "prop_name", "value": <any>, "type": "text" | "numeric" | "geo" | "language" | "location"}]
-
-    Args:
-        properties_list: List of dictionaries, each containing 'key', 'value', and 'type' fields.
-
-    Returns:
-        List of validated Property objects with types mapped to PropertyType enum.
-    """
-    properties = []
-    for prop_data in properties_list:
-        try:
-            # Extract fields from the property object
-            key = prop_data.get("key")
-            value = prop_data.get("value")
-            type_str = prop_data.get("type")
-
-            if key is None or value is None or type_str is None:
-                logger.warning(
-                    "Skipping invalid property: missing required fields (key, value, type): %s",
-                    prop_data,
-                )
-                continue
-
-            # Convert type string to PropertyType enum (handles both string and enum)
+            truncated = content[: last_valid_pos + 1]
+            truncated += "]" * bracket_count
+            truncated += "}" * brace_count
             try:
-                prop_type = PropertyType(type_str)
-            except ValueError:
-                logger.warning(
-                    "Invalid property type '%s' for key '%s', defaulting to TEXT",
-                    type_str,
-                    key,
-                )
-                prop_type = PropertyType.TEXT
+                json.loads(truncated)
+                logger.debug("JSON repaired using root-level brace closure")
+                return truncated
+            except json.JSONDecodeError:
+                pass  # Fall through to array-level repair
 
-            # Create Property object - validation happens in the model
-            property_obj = Property(key=key, value=value, type=prop_type)
-            properties.append(property_obj)
+    # Strategy 2: Handle truncation inside entities/relations arrays
+    # Find the start positions of entities and relations arrays
+    entities_key_match = re.search(r'"entities"\s*:\s*\[', content)
+    relations_key_match = re.search(r'"relations"\s*:\s*\[', content)
 
-        except Exception as e:
-            logger.warning(
-                "Failed to parse property %s: %s. Skipping.",
-                prop_data,
-                e,
-            )
-            continue
+    if entities_key_match or relations_key_match:
+        truncate_point = last_valid_pos if last_valid_pos > 0 else len(content)
 
-    return properties
+        # Find the last complete entity
+        last_complete_entity_end = -1
+        if entities_key_match:
+            entities_array_start = entities_key_match.end()
+            search_limit = min(truncate_point, len(content))
+            pos = entities_array_start
+            while pos < search_limit:
+                brace_pos = content.find("}", pos, search_limit)
+                if brace_pos == -1:
+                    break
+                depth = 0
+                i = entities_array_start
+                while i <= brace_pos:
+                    c = content[i]
+                    if c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            after = brace_pos + 1
+                            while after < search_limit and content[after] in " \t\n\r":
+                                after += 1
+                            if after >= search_limit:
+                                last_complete_entity_end = brace_pos
+                                break
+                            if content[after] in (",", "]"):
+                                last_complete_entity_end = brace_pos
+                                pos = brace_pos + 1
+                                if content[after] == "]":
+                                    break
+                                continue
+                    i += 1
+                break
+
+        # Find the last complete relation
+        last_complete_relation_end = -1
+        if relations_key_match:
+            relations_array_start = relations_key_match.end()
+            search_limit = min(truncate_point, len(content))
+            pos = relations_array_start
+            while pos < search_limit:
+                brace_pos = content.find("}", pos, search_limit)
+                if brace_pos == -1:
+                    break
+                depth = 0
+                i = relations_array_start
+                while i <= brace_pos:
+                    c = content[i]
+                    if c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            after = brace_pos + 1
+                            while after < search_limit and content[after] in " \t\n\r":
+                                after += 1
+                            if after >= search_limit:
+                                last_complete_relation_end = brace_pos
+                                break
+                            if content[after] in (",", "]"):
+                                last_complete_relation_end = brace_pos
+                                pos = brace_pos + 1
+                                if content[after] == "]":
+                                    break
+                                continue
+                    i += 1
+                break
+
+        if last_complete_entity_end > 0 or last_complete_relation_end > 0:
+            repaired = "{"
+            if entities_key_match:
+                repaired += content[entities_key_match.start():entities_array_start]
+                if last_complete_entity_end > 0:
+                    repaired += content[entities_array_start:last_complete_entity_end + 1]
+                repaired += "]"
+            if relations_key_match:
+                if entities_key_match:
+                    repaired += ","
+                repaired += content[relations_key_match.start():relations_array_start]
+                if last_complete_relation_end > 0:
+                    repaired += content[relations_array_start:last_complete_relation_end + 1]
+                repaired += "]"
+            repaired += "}"
+
+            try:
+                parsed = json.loads(repaired)
+                if isinstance(parsed.get("entities"), list) and isinstance(parsed.get("relations"), list):
+                    logger.debug("JSON repaired using array truncation strategy")
+                    return repaired
+            except json.JSONDecodeError:
+                pass
+
+    # Strategy 3 (Fallback): Find the last complete closing brace or bracket
+    # that closes the root object/array and truncate there
+    if last_valid_pos > 0:
+        # Try to close the root object with just a single }
+        fallback = content[:last_valid_pos + 1]
+        # Count if we need to add closing brackets/braces
+        if brace_count > 0:
+            fallback += "}" * brace_count
+        if bracket_count > 0:
+            fallback += "]" * bracket_count
+        try:
+            parsed = json.loads(fallback)
+            logger.debug("JSON repaired using fallback brace closure at last_valid_pos")
+            return fallback
+        except json.JSONDecodeError:
+            pass
+
+    return original
 
 
 class KnowledgeExtractor:
@@ -169,7 +258,7 @@ class KnowledgeExtractor:
 
     async def _call_llm(
         self, text: str, author_id: int, post_id: int
-    ) -> ExtractionResult:
+    ) -> OpenSPGExtractionResult | None:
         """Call the LLM API to extract knowledge triples from text with retry logic.
 
         Args:
@@ -178,12 +267,12 @@ class KnowledgeExtractor:
             post_id: Database ID of the post (used for logging and context).
 
         Returns:
-            ExtractionResult containing extracted nodes and edges.
-            Returns empty result on any error (timeout, validation, etc.).
+            OpenSPGExtractionResult containing extracted entities and relations.
+            Returns None on complete failure (all retries exhausted).
         """
         if not self.settings.llm_api_key:
             logger.warning("LLM API key not configured, skipping extraction")
-            return ExtractionResult(nodes=[], edges=[])
+            return None
 
         # Lazy initialization of HTTP session
         if self._session is None:
@@ -213,20 +302,40 @@ class KnowledgeExtractor:
                             {"role": "user", "content": prompt},
                         ],
                         "temperature": 0.3,
-                        "max_tokens": 4000,
+                        "max_tokens": 4096,
                         "response_format": {"type": "json_object"},
                     },
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as response:
                     if response.status != 200:
+                        error_text = await response.text()
                         logger.error(
                             "LLM API request failed: status=%d, response=%s",
                             response.status,
-                            await response.text(),
+                            error_text,
                         )
+                        # Specific handling for rate limit (429) errors
+                        if response.status == 429:
+                            if attempt < max_retries:
+                                cooldown = 60  # 60-second cooldown for rate limits
+                                logger.warning(
+                                    "Rate limit hit (429). Cooling down for %d seconds before retry %d/%d...",
+                                    cooldown,
+                                    attempt + 1,
+                                    max_retries,
+                                )
+                                await asyncio.sleep(cooldown)
+                                continue
+                            else:
+                                logger.error(
+                                    "Rate limit error persisted after %d retries for post_id=%s",
+                                    max_retries,
+                                    post_id,
+                                )
+                                return None
                         if attempt < max_retries:
                             continue
-                        return ExtractionResult(nodes=[], edges=[])
+                        return None
 
                     data = await response.json()
                     content = (
@@ -235,11 +344,18 @@ class KnowledgeExtractor:
                         .get("content", "")
                     )
 
+                    # Log raw content length for debugging truncation issues
+                    logger.debug(
+                        "LLM response received for post_id=%s: content_length=%d chars",
+                        post_id,
+                        len(content),
+                    )
+
                     if not content:
                         logger.warning("LLM returned empty content")
                         if attempt < max_retries:
                             continue
-                        return ExtractionResult(nodes=[], edges=[])
+                        return None
 
                     # Try to repair JSON if malformed
                     repaired_content = _repair_json(content)
@@ -290,100 +406,66 @@ class KnowledgeExtractor:
                                     else content
                                 ),
                             )
-                            return ExtractionResult(nodes=[], edges=[])
+                            # Raise exception to skip post and retry later
+                            raise Exception(
+                                f"Failed to decode LLM response as JSON after {max_retries} retries for post_id={post_id}"
+                            ) from e
 
-                    # Convert flat properties dict to OpenSPG format
-                    # LLM now returns: {"entities": [{...}], "relations": [{...}]}
-                    # where each entity has "properties" as a simple dict
-                    entities_data = parsed_json.get("entities", [])
-                    relations_data = parsed_json.get("relations", [])
-
-                    # Transform entities: convert properties list to list of Property objects
-                    transformed_entities = []
-                    for entity_data in entities_data:
-                        props_list = entity_data.get("properties", [])
-                        properties_list = _convert_properties_dict_to_list(
-                            props_list
-                        )
-
-                        transformed_entity = {
-                            "id": entity_data["id"],
-                            "label": entity_data["label"],
-                            "name": entity_data["name"],
-                            "properties": properties_list,
-                        }
-                        transformed_entities.append(transformed_entity)
-
-                    # Transform relations: convert properties list to list of Property objects
-                    transformed_relations = []
-                    for relation_data in relations_data:
-                        props_list = relation_data.get("properties", [])
-                        properties_list = _convert_properties_dict_to_list(
-                            props_list
-                        )
-
-                        transformed_relation = {
-                            "source_id": relation_data["source_id"],
-                            "relation_type": relation_data["relation_type"],
-                            "target_id": relation_data["target_id"],
-                            "properties": properties_list,
-                        }
-                        transformed_relations.append(transformed_relation)
-
-                    # Build the OpenSPG result JSON with transformed data
-                    open_spg_json = {
-                        "entities": transformed_entities,
-                        "relations": transformed_relations,
-                    }
-
-                    # Validate the transformed result against the OpenSPG schema
+                    # Parse and validate the JSON response directly
                     try:
-                        open_spg_result = (
-                            OpenSPGExtractionResult.model_validate(
-                                open_spg_json
-                            )
+                        parsed_json = json.loads(content)
+                        open_spg_result = OpenSPGExtractionResult.model_validate(
+                            parsed_json
                         )
-                    except ValidationError as e:
+                    except (json.JSONDecodeError, ValidationError) as e:
                         if attempt < max_retries:
                             logger.warning(
-                                "Failed to validate transformed OpenSPG result (attempt %d/%d) for post_id=%s: %s\n"
-                                "First 500 chars of transformed JSON: %s",
+                                "Failed to parse/validate LLM response (attempt %d/%d) for post_id=%s: %s\n"
+                                "First 500 chars: %s\n"
+                                "Last 500 chars: %s",
                                 attempt + 1,
                                 max_retries,
                                 post_id,
                                 e,
-                                json.dumps(open_spg_json)[:500],
+                                content[:500],
+                                (
+                                    content[-500:]
+                                    if len(content) > 500
+                                    else content
+                                ),
                             )
                             # Modify prompt for retry
                             prompt = (
                                 get_open_spg_llm_prompt(text, author_id)
-                                + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
+                                + "\n\nIMPORTANT: Your previous response was truncated or invalid. Ensure you return ONLY valid JSON with the exact structure specified in the prompt. Limit to 5-7 most important entities."
                             )
                             continue
                         else:
                             logger.error(
-                                "Failed to validate transformed OpenSPG result after %d retries for post_id=%s: %s\n"
-                                "First 500 chars of transformed JSON: %s",
+                                "Failed to parse/validate LLM response after %d retries for post_id=%s: %s\n"
+                                "First 500 chars: %s\n"
+                                "Last 500 chars: %s",
                                 max_retries,
                                 post_id,
                                 e,
-                                json.dumps(open_spg_json)[:500],
+                                content[:500],
+                                (
+                                    content[-500:]
+                                    if len(content) > 500
+                                    else content
+                                ),
                             )
-                            return ExtractionResult(nodes=[], edges=[])
-
-                    # Convert OpenSPG result to legacy ExtractionResult for backward compatibility
-                    extraction_result = open_spg_result_to_extraction_result(
-                        open_spg_result
-                    )
-                    nodes = extraction_result.nodes
-                    edges = extraction_result.edges
+                            # Raise exception to skip post and retry later
+                            raise Exception(
+                                f"Failed to parse/validate LLM response after {max_retries} retries for post_id={post_id}"
+                            ) from e
 
                     logger.info(
-                        "LLM extraction successful: %d nodes, %d edges",
-                        len(nodes),
-                        len(edges),
+                        "LLM extraction successful: %d entities, %d relations",
+                        len(open_spg_result.entities),
+                        len(open_spg_result.relations),
                     )
-                    return ExtractionResult(nodes=nodes, edges=edges)
+                    return open_spg_result
 
             except aiohttp.ClientError as e:
                 last_error = e
@@ -420,12 +502,12 @@ class KnowledgeExtractor:
                 if attempt < max_retries:
                     continue
 
-        # If we exhausted all retries, return empty result
-        return ExtractionResult(nodes=[], edges=[])
+        # If we exhausted all retries, return None
+        return None
 
     async def extract_triplets(
         self, text: str, author_id: int, post_id: int
-    ) -> ExtractionResult:
+    ) -> OpenSPGExtractionResult | None:
         """
         Extract knowledge triples from the given text using LLM.
 
@@ -435,7 +517,8 @@ class KnowledgeExtractor:
             post_id: Database ID of the post (for logging).
 
         Returns:
-            ExtractionResult containing extracted nodes and edges.
+            OpenSPGExtractionResult containing extracted entities and relations.
+            Returns None if extraction failed completely.
         """
         logger.debug("Extracting triples from text: %s", text[:100])
         return await self._call_llm(text, author_id, post_id)
@@ -468,10 +551,32 @@ class KnowledgeExtractor:
 
         logger.info("Processing post id=%s for knowledge extraction", post_id)
 
+        # Upsert Post node with standardized ID format first
+        post_node_id = f"post_{post_id}"
+        try:
+            await db.upsert_graph_node(
+                label="Post",
+                properties={
+                    "id": post_node_id,
+                    "post_id": post_id,  # Keep original DB ID for reference
+                    "author_id": author_id,
+                },
+                merge_key="id",
+            )
+            logger.debug("Upserted Post node: id=%s", post_node_id)
+        except Exception as e:
+            logger.error(
+                "Failed to upsert Post node (post_id=%s): %s",
+                post_id,
+                e,
+                exc_info=True,
+            )
+            raise
+
         # Extract triples from text
         result = await self.extract_triplets(text, author_id, post_id)
 
-        if not result.nodes and not result.edges:
+        if result is None or (not result.entities and not result.relations):
             logger.warning(
                 "Empty extraction for post id=%s. Text snippet: %s",
                 post_id,
@@ -479,68 +584,160 @@ class KnowledgeExtractor:
             )
             return
 
-        # Add last_modified_at timestamp to all nodes (for incremental updates tracking)
-        current_timestamp = int(time.time())
-        for node in result.nodes:
-            node.properties["last_modified_at"] = current_timestamp
+        # Detailed logging after extraction (before upserting)
+        logger.info(
+            "Extracted %d entities and %d relations from post %d",
+            len(result.entities),
+            len(result.relations),
+            post_id,
+        )
 
-        # Build node ID -> label mapping for edge upserts
-        node_id_to_label: dict[str, str] = {}
-        for node in result.nodes:
-            node_id = node.properties.get("id")
-            if node_id:
-                node_id_to_label[str(node_id)] = node.label
-
-        # Upsert nodes to AGE graph
-        for node in result.nodes:
+        # Index post embedding in Qdrant (non-critical, does not block extraction)
+        if qdrant is not None:
             try:
-                await db.upsert_graph_node(
-                    label=node.label,
-                    properties=node.properties,
-                    merge_key="id",
+                await qdrant.upsert_post_embedding(
+                    post_id=post_id,
+                    text=text,
+                    channel_id=author_id
                 )
                 logger.debug(
-                    "Upserted node: label=%s, id=%s",
-                    node.label,
-                    node.properties.get("id"),
+                    "Indexed post embedding in Qdrant for post_id=%s",
+                    post_id,
                 )
             except Exception as e:
                 logger.error(
-                    "Failed to upsert node (post_id=%s, label=%s): %s",
+                    "Failed to index post embedding in Qdrant (post_id=%s): %s",
                     post_id,
-                    node.label,
+                    e,
+                    exc_info=True,
+                )
+                # Do not raise - Qdrant failure should not stop the pipeline
+
+        # Add last_modified_at timestamp to all entities (for incremental updates tracking)
+        current_timestamp = int(time.time())
+        for entity in result.entities:
+            entity.add_property("last_modified_at", current_timestamp, "numeric")
+
+        # Add default confidence property to relations if not present
+        for relation in result.relations:
+            props_dict = relation.get_property_dict()
+            if "confidence" not in props_dict:
+                relation.add_property("confidence", 0.5, "numeric")
+
+        # Build entity ID -> label mapping for relation upserts
+        entity_id_to_label: dict[str, str] = {}
+        for entity in result.entities:
+            entity_id_to_label[entity.id] = entity.label
+
+        # Upsert entities to AGE graph
+        for entity in result.entities:
+            try:
+                props = {"id": entity.id, "name": entity.name, **entity.get_property_dict()}
+                await db.upsert_graph_node(
+                    label=entity.label,
+                    properties=props,
+                    merge_key="id",
+                )
+                logger.debug(
+                    "Upserted entity: label=%s, id=%s",
+                    entity.label,
+                    entity.id,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to upsert entity (post_id=%s, label=%s): %s",
+                    post_id,
+                    entity.label,
                     e,
                 )
                 raise
 
-        # Upsert edges to AGE graph
-        for edge in result.edges:
-            start_label = node_id_to_label.get(edge.start_node_id, "Entity")
-            end_label = node_id_to_label.get(edge.end_node_id, "Entity")
+        # Create MENTIONS relationship: (Post)-[:MENTIONS]->(Entity) for each extracted entity
+        for entity in result.entities:
             try:
                 await db.upsert_graph_edge(
-                    start_label=start_label,
+                    start_label="Post",
                     start_merge_key="id",
-                    start_merge_val=edge.start_node_id,
-                    edge_label=edge.edge_label,
-                    end_label=end_label,
+                    start_merge_val=post_node_id,  # Use standardized Post node ID
+                    edge_label="MENTIONS",
+                    end_label=entity.label,
                     end_merge_key="id",
-                    end_merge_val=edge.end_node_id,
-                    edge_properties=edge.properties,
+                    end_merge_val=entity.id,
+                    edge_properties={},
                 )
                 logger.debug(
-                    "Upserted edge: %s(%s)-%s->%s(%s)",
-                    start_label,
-                    edge.start_node_id,
-                    edge.edge_label,
-                    end_label,
-                    edge.end_node_id,
+                    "Created MENTIONS relationship: Post(%s)-[:MENTIONS]->%s(%s)",
+                    post_node_id,
+                    entity.label,
+                    entity.id,
                 )
             except Exception as e:
                 logger.error(
-                    "Failed to upsert edge (post_id=%s, edge=%s): %s",
+                    "Failed to create MENTIONS relationship (post_id=%s, entity_id=%s): %s",
                     post_id,
-                    edge.edge_label,
+                    entity.id,
+                    e,
+                )
+                # Do not raise - continue with other operations
+
+        # Create POSTED relationship: (Actor {id: author_id})-[:POSTED]->(Post) if author entity exists
+        author_entity_id = f"actor_{author_id}"
+        if author_entity_id in entity_id_to_label:
+            # The author entity was extracted from this post
+            try:
+                await db.upsert_graph_edge(
+                    start_label="Actor",
+                    start_merge_key="id",
+                    start_merge_val=author_entity_id,
+                    edge_label="POSTED",
+                    end_label="Post",
+                    end_merge_key="id",
+                    end_merge_val=post_node_id,  # Use standardized Post node ID
+                    edge_properties={},
+                )
+                logger.debug(
+                    "Created POSTED relationship: Actor(%s)-[:POSTED]->Post(%s)",
+                    author_entity_id,
+                    post_node_id,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to create POSTED relationship (author_id=%s, post_id=%s): %s",
+                    author_id,
+                    post_id,
+                    e,
+                )
+                # Do not raise - continue with other operations
+
+        # Upsert relations to AGE graph
+        for relation in result.relations:
+            start_label = entity_id_to_label.get(relation.source_id, "Entity")
+            end_label = entity_id_to_label.get(relation.target_id, "Entity")
+            try:
+                edge_props = relation.get_property_dict()
+                await db.upsert_graph_edge(
+                    start_label=start_label,
+                    start_merge_key="id",
+                    start_merge_val=relation.source_id,
+                    edge_label=relation.relation_type,
+                    end_label=end_label,
+                    end_merge_key="id",
+                    end_merge_val=relation.target_id,
+                    edge_properties=edge_props,
+                )
+                logger.debug(
+                    "Upserted relation: %s(%s)-%s->%s(%s)",
+                    start_label,
+                    relation.source_id,
+                    relation.relation_type,
+                    end_label,
+                    relation.target_id,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to upsert relation (post_id=%s, relation=%s): %s",
+                    post_id,
+                    relation.relation_type,
                     e,
                 )
                 raise
@@ -548,7 +745,7 @@ class KnowledgeExtractor:
         # Sync entities to Qdrant (if service is available)
         if qdrant is not None:
             try:
-                await qdrant.upsert_entities(result.nodes)
+                await qdrant.upsert_entities(result.entities)
             except Exception as e:
                 logger.error(
                     "Failed to sync entities to Qdrant (post_id=%s): %s",
@@ -559,8 +756,8 @@ class KnowledgeExtractor:
                 # Do not raise - Qdrant failure should not crash the pipeline
 
         logger.info(
-            "Completed processing post id=%s: %d nodes, %d edges",
+            "Completed processing post id=%s: %d entities, %d relations",
             post_id,
-            len(result.nodes),
-            len(result.edges),
+            len(result.entities),
+            len(result.relations),
         )
