@@ -10,11 +10,9 @@ import aiohttp
 from pydantic import ValidationError
 
 from src.config.config import Settings
-from src.db.database import Database
+from src.db.graph_repo import GraphRepository
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.schema import (
-    ExtractedEntity,
-    ExtractedRelation,
     OpenSPGExtractionResult,
     get_open_spg_llm_prompt,
 )
@@ -69,7 +67,7 @@ def _repair_json(content: str) -> str:
             continue
         if char == '"':
             in_string = not in_string
-    
+
     # If we end inside a string, add a closing quote before further repairs
     if in_string:
         content = content + '"'
@@ -152,7 +150,10 @@ def _repair_json(content: str) -> str:
                         depth -= 1
                         if depth == 0:
                             after = brace_pos + 1
-                            while after < search_limit and content[after] in " \t\n\r":
+                            while (
+                                after < search_limit
+                                and content[after] in " \t\n\r"
+                            ):
                                 after += 1
                             if after >= search_limit:
                                 last_complete_entity_end = brace_pos
@@ -186,7 +187,10 @@ def _repair_json(content: str) -> str:
                         depth -= 1
                         if depth == 0:
                             after = brace_pos + 1
-                            while after < search_limit and content[after] in " \t\n\r":
+                            while (
+                                after < search_limit
+                                and content[after] in " \t\n\r"
+                            ):
                                 after += 1
                             if after >= search_limit:
                                 last_complete_relation_end = brace_pos
@@ -203,23 +207,35 @@ def _repair_json(content: str) -> str:
         if last_complete_entity_end > 0 or last_complete_relation_end > 0:
             repaired = "{"
             if entities_key_match:
-                repaired += content[entities_key_match.start():entities_array_start]
+                repaired += content[
+                    entities_key_match.start() : entities_array_start
+                ]
                 if last_complete_entity_end > 0:
-                    repaired += content[entities_array_start:last_complete_entity_end + 1]
+                    repaired += content[
+                        entities_array_start : last_complete_entity_end + 1
+                    ]
                 repaired += "]"
             if relations_key_match:
                 if entities_key_match:
                     repaired += ","
-                repaired += content[relations_key_match.start():relations_array_start]
+                repaired += content[
+                    relations_key_match.start() : relations_array_start
+                ]
                 if last_complete_relation_end > 0:
-                    repaired += content[relations_array_start:last_complete_relation_end + 1]
+                    repaired += content[
+                        relations_array_start : last_complete_relation_end + 1
+                    ]
                 repaired += "]"
             repaired += "}"
 
             try:
                 parsed = json.loads(repaired)
-                if isinstance(parsed.get("entities"), list) and isinstance(parsed.get("relations"), list):
-                    logger.debug("JSON repaired using array truncation strategy")
+                if isinstance(parsed.get("entities"), list) and isinstance(
+                    parsed.get("relations"), list
+                ):
+                    logger.debug(
+                        "JSON repaired using array truncation strategy"
+                    )
                     return repaired
             except json.JSONDecodeError:
                 pass
@@ -228,7 +244,7 @@ def _repair_json(content: str) -> str:
     # that closes the root object/array and truncate there
     if last_valid_pos > 0:
         # Try to close the root object with just a single }
-        fallback = content[:last_valid_pos + 1]
+        fallback = content[: last_valid_pos + 1]
         # Count if we need to add closing brackets/braces
         if brace_count > 0:
             fallback += "}" * brace_count
@@ -236,7 +252,9 @@ def _repair_json(content: str) -> str:
             fallback += "]" * bracket_count
         try:
             parsed = json.loads(fallback)
-            logger.debug("JSON repaired using fallback brace closure at last_valid_pos")
+            logger.debug(
+                "JSON repaired using fallback brace closure at last_valid_pos"
+            )
             return fallback
         except json.JSONDecodeError:
             pass
@@ -317,7 +335,9 @@ class KnowledgeExtractor:
                         # Specific handling for rate limit (429) errors
                         if response.status == 429:
                             if attempt < max_retries:
-                                cooldown = 60  # 60-second cooldown for rate limits
+                                cooldown = (
+                                    60  # 60-second cooldown for rate limits
+                                )
                                 logger.warning(
                                     "Rate limit hit (429). Cooling down for %d seconds before retry %d/%d...",
                                     cooldown,
@@ -414,8 +434,8 @@ class KnowledgeExtractor:
                     # Parse and validate the JSON response directly
                     try:
                         parsed_json = json.loads(content)
-                        open_spg_result = OpenSPGExtractionResult.model_validate(
-                            parsed_json
+                        open_spg_result = (
+                            OpenSPGExtractionResult.model_validate(parsed_json)
                         )
                     except (json.JSONDecodeError, ValidationError) as e:
                         if attempt < max_retries:
@@ -535,7 +555,7 @@ class KnowledgeExtractor:
         post_id: int,
         text: str,
         author_id: int,
-        db: Database,
+        graph_repo: GraphRepository,
         qdrant: QdrantService | None = None,
     ) -> None:
         """
@@ -545,7 +565,7 @@ class KnowledgeExtractor:
             post_id: Database ID of the post.
             text: Text content of the post.
             author_id: Telegram user ID of the post author.
-            db: Database instance for persistence operations.
+            graph_repo: GraphRepository instance for AGE graph persistence operations.
             qdrant: Optional QdrantService for syncing entities to vector store.
         """
 
@@ -554,7 +574,7 @@ class KnowledgeExtractor:
         # Upsert Post node with standardized ID format first
         post_node_id = f"post_{post_id}"
         try:
-            await db.upsert_graph_node(
+            await graph_repo.upsert_graph_node(
                 label="Post",
                 properties={
                     "id": post_node_id,
@@ -596,9 +616,7 @@ class KnowledgeExtractor:
         if qdrant is not None:
             try:
                 await qdrant.upsert_post_embedding(
-                    post_id=post_id,
-                    text=text,
-                    channel_id=author_id
+                    post_id=post_id, text=text, channel_id=author_id
                 )
                 logger.debug(
                     "Indexed post embedding in Qdrant for post_id=%s",
@@ -616,7 +634,9 @@ class KnowledgeExtractor:
         # Add last_modified_at timestamp to all entities (for incremental updates tracking)
         current_timestamp = int(time.time())
         for entity in result.entities:
-            entity.add_property("last_modified_at", current_timestamp, "numeric")
+            entity.add_property(
+                "last_modified_at", current_timestamp, "numeric"
+            )
 
         # Add default confidence property to relations if not present
         for relation in result.relations:
@@ -632,8 +652,12 @@ class KnowledgeExtractor:
         # Upsert entities to AGE graph
         for entity in result.entities:
             try:
-                props = {"id": entity.id, "name": entity.name, **entity.get_property_dict()}
-                await db.upsert_graph_node(
+                props = {
+                    "id": entity.id,
+                    "name": entity.name,
+                    **entity.get_property_dict(),
+                }
+                await graph_repo.upsert_graph_node(
                     label=entity.label,
                     properties=props,
                     merge_key="id",
@@ -655,7 +679,7 @@ class KnowledgeExtractor:
         # Create MENTIONS relationship: (Post)-[:MENTIONS]->(Entity) for each extracted entity
         for entity in result.entities:
             try:
-                await db.upsert_graph_edge(
+                await graph_repo.upsert_graph_edge(
                     start_label="Post",
                     start_merge_key="id",
                     start_merge_val=post_node_id,  # Use standardized Post node ID
@@ -685,7 +709,7 @@ class KnowledgeExtractor:
         if author_entity_id in entity_id_to_label:
             # The author entity was extracted from this post
             try:
-                await db.upsert_graph_edge(
+                await graph_repo.upsert_graph_edge(
                     start_label="Actor",
                     start_merge_key="id",
                     start_merge_val=author_entity_id,
@@ -715,7 +739,7 @@ class KnowledgeExtractor:
             end_label = entity_id_to_label.get(relation.target_id, "Entity")
             try:
                 edge_props = relation.get_property_dict()
-                await db.upsert_graph_edge(
+                await graph_repo.upsert_graph_edge(
                     start_label=start_label,
                     start_merge_key="id",
                     start_merge_val=relation.source_id,

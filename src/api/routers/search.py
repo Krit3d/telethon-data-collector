@@ -13,8 +13,9 @@ from src.api.schemas import (
     GraphEntity,
 )
 from src.embeddings.qdrant_service import QdrantService
-from src.api.dependencies import get_qdrant, get_db
+from src.api.dependencies import get_qdrant, get_db, get_graph_repo
 from src.db.database import Database
+from src.db.graph_repo import GraphRepository
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/search", tags=["Search"])
@@ -66,6 +67,7 @@ async def search_posts(
     payload: SearchRequest,
     qdrant: QdrantService = Depends(get_qdrant),
     db: Database = Depends(get_db),
+    graph_repo: GraphRepository = Depends(get_graph_repo),
 ) -> SearchResponse:
     """Hybrid search for posts with graph context and intelligent ranking.
 
@@ -78,7 +80,8 @@ async def search_posts(
     Args:
         payload: Search request with query, limit, score_threshold, and include_author_info.
         qdrant: Qdrant service instance (injected).
-        db: Database instance (injected).
+        db: Database instance (injected) for ORM operations.
+        graph_repo: GraphRepository instance (injected) for Apache AGE queries.
 
     Returns:
         SearchResponse with intelligently ranked posts, grouped graph entities, and optional author info.
@@ -132,7 +135,9 @@ async def search_posts(
 
         # Fetch full post records from PostgreSQL (with channels eagerly loaded)
         post_ids: list[int] = [item["post_id"] for item in posts_data]
-        posts_dict: dict[int, Any] = await db.get_posts_by_ids(post_ids) if post_ids else {}
+        posts_dict: dict[int, Any] = (
+            await db.get_posts_by_ids(post_ids) if post_ids else {}
+        )
 
         # Build initial results with Qdrant scores
         merged_results: list[dict[str, Any]] = []
@@ -146,7 +151,11 @@ async def search_posts(
                 continue
 
             # Build URL: use channel username if available, otherwise fall back to channel_id
-            channel_username = getattr(post.channel, 'username', None) if post.channel else None
+            channel_username = (
+                getattr(post.channel, "username", None)
+                if post.channel
+                else None
+            )
             if channel_username:
                 url = f"https://t.me/{channel_username}/{post.message_id}"
             else:
@@ -167,31 +176,54 @@ async def search_posts(
 
         # Fetch graph relationships to identify posts connected to matched entities
         connected_post_ids: set[int] = set()
-        entity_to_connected_posts: dict[str, list[int]] = {}  # entity_id -> list of cleaned post IDs
+        entity_to_connected_posts: dict[str, list[int]] = (
+            {}
+        )  # entity_id -> list of cleaned post IDs
 
+        edges_data: list[dict[str, Any]] = []
         if entity_ids:
             try:
-                edges_data: list[dict[str, Any]] = await db.get_subgraph_for_entities(entity_ids)
-                
-                # Strip extra quotes from source_id and target_id if they are string-represented agtypes
-                for edge in edges_data:
-                    source_id = edge["source_id"]
-                    target_id = edge["target_id"]
-                    
-                    # Clean source_id: strip surrounding quotes if present (e.g., '"entity_123"' -> 'entity_123')
-                    if isinstance(source_id, str) and source_id.startswith('"') and source_id.endswith('"'):
-                        edge["source_id"] = source_id[1:-1]
-                    
-                    # Clean target_id: strip surrounding quotes if present
-                    if isinstance(target_id, str) and target_id.startswith('"') and target_id.endswith('"'):
-                        edge["target_id"] = target_id[1:-1]
-                
-                # Log first 3 edges for debugging graph structure
-                logger.info(
-                    "First 3 edges from graph subgraph: %s",
-                    edges_data[:3] if edges_data else "No edges found"
+                edges_data = await graph_repo.get_subgraph_for_entities(
+                    entity_ids
                 )
-                
+
+                if edges_data:
+                    # Strip extra quotes from source_id and target_id if they are string-represented agtypes
+                    for edge in edges_data:
+                        source_id = edge["source_id"]
+                        target_id = edge["target_id"]
+
+                        # Clean source_id: strip surrounding quotes if present (e.g., '"entity_123"' -> 'entity_123')
+                        if (
+                            isinstance(source_id, str)
+                            and source_id.startswith('"')
+                            and source_id.endswith('"')
+                        ):
+                            edge["source_id"] = source_id[1:-1]
+
+                        # Clean target_id: strip surrounding quotes if present
+                        if (
+                            isinstance(target_id, str)
+                            and target_id.startswith('"')
+                            and target_id.endswith('"')
+                        ):
+                            edge["target_id"] = target_id[1:-1]
+
+                    # Log first 3 edges for debugging graph structure
+                    logger.info(
+                        "First 3 edges from graph subgraph: %s",
+                        edges_data[:3],
+                    )
+                else:
+                    logger.warning(
+                        "Graph subgraph returned 0 edges for %d entity IDs. "
+                        "This may indicate: (a) graph has no edges yet, "
+                        "(b) entity IDs do not match any nodes in the graph, "
+                        "or (c) the graph query timed out over the VPN link. "
+                        "graph_context and graph_entities will be empty.",
+                        len(entity_ids),
+                    )
+
                 for edge in edges_data:
                     source_id: Any = edge["source_id"]
                     target_id: Any = edge["target_id"]
@@ -202,21 +234,31 @@ async def search_posts(
                     # The graph connects entities to posts via relationships
                     # Clean post IDs by stripping "post_" prefix and converting to int
                     # Use case-insensitive comparison to handle variations like "POST", "post", etc.
-                    if source_label.lower() == "post" and target_id in entity_ids:
+                    if (
+                        source_label.lower() == "post"
+                        and target_id in entity_ids
+                    ):
                         cleaned_source_id = _clean_post_id(source_id)
                         if cleaned_source_id is not None:
                             connected_post_ids.add(cleaned_source_id)
                             if target_id not in entity_to_connected_posts:
                                 entity_to_connected_posts[target_id] = []
-                            entity_to_connected_posts[target_id].append(cleaned_source_id)
+                            entity_to_connected_posts[target_id].append(
+                                cleaned_source_id
+                            )
 
-                    if target_label.lower() == "post" and source_id in entity_ids:
+                    if (
+                        target_label.lower() == "post"
+                        and source_id in entity_ids
+                    ):
                         cleaned_target_id = _clean_post_id(target_id)
                         if cleaned_target_id is not None:
                             connected_post_ids.add(cleaned_target_id)
                             if source_id not in entity_to_connected_posts:
                                 entity_to_connected_posts[source_id] = []
-                            entity_to_connected_posts[source_id].append(cleaned_target_id)
+                            entity_to_connected_posts[source_id].append(
+                                cleaned_target_id
+                            )
             except Exception as e:
                 logger.warning(
                     "Failed to fetch graph for post-entity connection: %s",
@@ -226,7 +268,9 @@ async def search_posts(
 
         # Apply score boost for posts connected to high-scoring entities
         for result in merged_results:
-            post_id_int: int = result["post_id"]  # Already an integer from PostgreSQL
+            post_id_int: int = result[
+                "post_id"
+            ]  # Already an integer from PostgreSQL
             base_score: float = result["score"]
             boost: float = 0.0
 
@@ -238,7 +282,9 @@ async def search_posts(
                     connected_posts,
                 ) in entity_to_connected_posts.items():
                     if post_id_int in connected_posts:
-                        entity_score: float = entity_id_to_score.get(entity_id, 0.0)
+                        entity_score: float = entity_id_to_score.get(
+                            entity_id, 0.0
+                        )
                         connected_entity_scores.append(entity_score)
 
                 if connected_entity_scores:
@@ -294,9 +340,8 @@ async def search_posts(
         graph_entities: list[GraphEntity] = []
         graph_context: list[GraphEdge] = []  # Keep for backward compatibility
 
-        if entity_ids:
+        if entity_ids and edges_data:
             try:
-                edges_data: list[dict[str, Any]] = await db.get_subgraph_for_entities(entity_ids)
                 graph_context = [
                     GraphEdge(
                         source_id=edge["source_id"],
@@ -319,7 +364,9 @@ async def search_posts(
 
                 # Fetch full node details for all nodes in the subgraph
                 if node_ids:
-                    nodes_data: list[dict[str, Any]] = await db.get_nodes_by_ids(list(node_ids))
+                    nodes_data: list[dict[str, Any]] = (
+                        await graph_repo.get_nodes_by_ids(list(node_ids))
+                    )
 
                     # Build node lookup: node_id -> node data
                     node_lookup: dict[Any, dict[str, Any]] = {}
@@ -342,7 +389,9 @@ async def search_posts(
                                 # This is a matched entity
                                 if node_id not in entity_lookup:
                                     # Get node details
-                                    node_data: dict[str, Any] = node_lookup.get(node_id, {})
+                                    node_data: dict[str, Any] = node_lookup.get(
+                                        node_id, {}
+                                    )
                                     entity_lookup[node_id] = GraphEntity(
                                         entity_id=node_id,
                                         entity_label=node_data.get("label", ""),

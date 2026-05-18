@@ -3,13 +3,11 @@ Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
 """
 
 import asyncio
-import json
 import logging
 import random
-import re
 from typing import Any, Sequence
 
-from sqlalchemy import bindparam, case, func, select, update, text
+from sqlalchemy import case, func, select, update, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -17,6 +15,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import joinedload
+
 
 from src.db.models import Base, Channel, Post
 
@@ -35,21 +34,19 @@ class Database:
             echo: Enable SQL query logging (for debugging).
         """
 
+        # command_timeout is set to 120s to accommodate graph queries over
+        # high-latency VPN tunnels (Tailscale, 300ms+).  Individual graph
+        # operations are additionally guarded by Python-level asyncio.wait_for
+        # timeouts in GraphRepository (default 15s per label query).
         self.engine = create_async_engine(
             db_url,
             echo=echo,
-            pool_size=10,
-            max_overflow=20,
+            pool_size=20,
+            max_overflow=10,
             pool_pre_ping=True,
             pool_recycle=3600,
             connect_args={
                 "command_timeout": 120,
-                "timeout": 60,
-                "server_settings": {
-                    "tcp_keepalives_idle": "60",
-                    "tcp_keepalives_interval": "10",
-                    "tcp_keepalives_count": "5",
-                },
             },
         )
 
@@ -57,7 +54,12 @@ class Database:
             self.engine, class_=AsyncSession, expire_on_commit=False
         )
 
-    async def init_db(self, max_retries: int = 5, base_delay: float = 1.0, timeout: float = 120.0) -> None:
+    async def init_db(
+        self,
+        max_retries: int = 5,
+        base_delay: float = 1.0,
+        timeout: float = 120.0,
+    ) -> None:
         """
         Create all tables defined in the models (if they don't exist).
 
@@ -73,24 +75,33 @@ class Database:
         Raises:
             RuntimeError: If initialization fails after all retries or times out.
         """
-        
+
         last_exception: Exception | None = None
         start_time = asyncio.get_event_loop().time()
 
         for attempt in range(1, max_retries + 1):
             try:
+                # ===================================================================
+                # STAGE 1: Core Setup (Transactional)
+                # ===================================================================
+                # Use engine.begin() for automatic transaction management
                 async with self.engine.begin() as conn:
+                    # Create SQLAlchemy-managed tables
                     await conn.run_sync(Base.metadata.create_all)
 
                     # Initialize Apache AGE extension and graph
                     try:
                         # Create extension if not exists
-                        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
+                        await conn.execute(
+                            text("CREATE EXTENSION IF NOT EXISTS age;")
+                        )
                         # Load AGE library
                         await conn.execute(text("LOAD 'age';"))
                         # Set search path for AGE
                         await conn.execute(
-                            text('SET search_path = ag_catalog, "$user", public;')
+                            text(
+                                'SET search_path = ag_catalog, "$user", public;'
+                            )
                         )
                         # Create the base graph (ignore if already exists)
                         await conn.execute(
@@ -98,10 +109,62 @@ class Database:
                                 "SELECT create_graph('telegram_graph') WHERE NOT EXISTS (SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');"
                             )
                         )
-                        logger.info("Apache AGE extension and graph initialized")
+
+                        logger.info(
+                            "Apache AGE extension and graph initialized"
+                        )
                     except Exception as e:
                         logger.error("Failed to initialize Apache AGE: %s", e)
                         raise
+                # Transaction is automatically committed when the context exits
+
+                # ===================================================================
+                # STAGE 2: Graph Indexes (Non-transactional)
+                # ===================================================================
+                # Use connect() without begin() for manual transaction control
+                async with self.engine.connect() as conn:
+                    labels = [
+                        "Actor",
+                        "Entity",
+                        "Event",
+                        "Place",
+                        "Channel",
+                        "Post",
+                    ]
+                    for label in labels:
+                        try:
+                            # B-Tree index using agtype_access_operator for @> operator (optimal for id lookups)
+                            await conn.execute(text(f"""
+                                CREATE INDEX IF NOT EXISTS idx_{label.lower()}_id
+                                ON telegram_graph."{label}"
+                                USING btree (agtype_access_operator(properties, '"id"'));
+                            """))
+                        except Exception as e:
+                            logger.debug(
+                                "Skipped index creation for %s: %s", label, e
+                            )
+
+                    # Explicitly commit the index creations (connection is not in autocommit mode)
+                    await conn.commit()
+
+                # ===================================================================
+                # STAGE 3: Maintenance (Autocommit)
+                # ===================================================================
+                # Create a separate connection with AUTOCOMMIT isolation level
+                # VACUUM cannot run inside a transaction block
+                async with self.engine.connect() as conn:
+                    # Set autocommit BEFORE executing any statements
+                    conn = await conn.execution_options(
+                        isolation_level="AUTOCOMMIT"
+                    )
+                    try:
+                        await conn.execute(text("VACUUM ANALYZE;"))
+                        logger.info("VACUUM ANALYZE completed successfully")
+                    except Exception as e:
+                        # VACUUM failure should not crash the entire startup
+                        logger.warning(
+                            "VACUUM ANALYZE failed (non-critical): %s", e
+                        )
 
                 logger.info("Database initialization successful")
                 return  # Success, exit the retry loop
@@ -131,7 +194,9 @@ class Database:
                     ) from last_exception
 
                 # Exponential backoff with jitter to avoid thundering herd
-                delay = min(base_delay * (2 ** (attempt - 1)), 60)  # Cap at 60 seconds
+                delay = min(
+                    base_delay * (2 ** (attempt - 1)), 60
+                )  # Cap at 60 seconds
                 jitter = random.uniform(0, delay * 0.1)  # 10% jitter
                 total_delay = delay + jitter
 
@@ -323,7 +388,11 @@ class Database:
             return {}
 
         async with self.async_session() as session:
-            stmt = select(Post).options(joinedload(Post.channel)).where(Post.id.in_(post_ids))
+            stmt = (
+                select(Post)
+                .options(joinedload(Post.channel))
+                .where(Post.id.in_(post_ids))
+            )
             result = await session.execute(stmt)
             posts = result.scalars().all()
             return {post.id: post for post in posts}
@@ -335,8 +404,11 @@ class Database:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    async def get_unextracted_posts(self, limit: int = 50, priority_mode: bool = False) -> list[Post]:
-        """Fetch posts that have not yet been extracted to knowledge graph.
+    async def get_unextracted_posts(
+        self, limit: int = 50, priority_mode: bool = False
+    ) -> list[Post]:
+        """
+        Fetch posts that have not yet been extracted to knowledge graph.
 
         Args:
             limit: Maximum number of posts to return.
@@ -349,14 +421,14 @@ class Database:
 
         async with self.async_session() as session:
             stmt = select(Post).where(Post.is_extracted == False)  # noqa: E712
-            
+
             if priority_mode:
                 # Priority mode: process most recent posts first (for search relevance)
                 stmt = stmt.order_by(Post.published_at.desc())
             else:
                 # Default: process oldest posts first (FIFO)
                 stmt = stmt.order_by(Post.id.asc())
-            
+
             stmt = stmt.limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
@@ -383,7 +455,10 @@ class Database:
                 if result.rowcount > 0:  # type: ignore[attr-defined]
                     logger.debug("Marked post id=%s as extracted", post_id)
                 else:
-                    logger.warning("Post id=%s not found when marking as extracted", post_id)
+                    logger.warning(
+                        "Post id=%s not found when marking as extracted",
+                        post_id,
+                    )
 
     async def get_random_pending_channel(
         self, require_hash: bool = False
@@ -476,7 +551,7 @@ class Database:
                 stmt = (
                     select(Channel)
                     .where(Channel.status == "ready_for_parsing")
-                    .where(Channel.is_author_blog == True)
+                    .where(Channel.is_author_blog == True)  # noqa: E712
                     .where(Channel.access_hash.is_not(None))
                     .order_by(func.random())
                     .limit(1)
@@ -558,420 +633,3 @@ class Database:
                     logger.debug(
                         "Updated access_hash for channel id=%s", channel_id
                     )
-
-    async def get_subgraph_for_entities(
-        self, entity_ids: list[str]
-    ) -> list[dict]:
-        """
-        Fetch the subgraph (direct neighbors) for a list of entity IDs from Apache AGE.
-
-        Args:
-            entity_ids: List of entity original_id values to query graph relationships for.
-
-        Returns:
-            List of dictionaries representing graph edges with keys:
-            - source_id: ID of the source node
-            - source_label: Label of the source node
-            - source_name: Name property of the source node
-            - target_id: ID of the target node
-            - target_label: Label of the target node
-            - target_name: Name property of the target node
-
-        Raises:
-            ValueError: If entity_ids is empty.
-            RuntimeError: If query execution fails.
-        """
-
-        if not entity_ids:
-            return []
-
-        try:
-            # Build the SQL query with literal Cypher string and bind parameter for entity IDs
-            # The Cypher query is embedded directly using $$ delimiters (not a bind parameter)
-            # The :params bind parameter contains the entity IDs as a JSON array and is cast to agtype
-            query = text("""
-                SELECT * FROM cypher('telegram_graph',
-                    $$ UNWIND $ids AS target_id
-                       MATCH (a)-[r]-(b)
-                       WHERE a.id = target_id
-                       RETURN a.id as a_id, label(a) as a_label, a.name as a_name,
-                              type(r) as rel_type,
-                              b.id as b_id, label(b) as b_label, b.name as b_name $$,
-                    CAST(:params AS agtype)
-                ) AS (
-                    a_id agtype,
-                    a_label agtype,
-                    a_name agtype,
-                    rel_type agtype,
-                    b_id agtype,
-                    b_label agtype,
-                    b_name agtype
-                )
-            """)
-
-            # Package entity IDs as JSON array
-            params = json.dumps({"ids": entity_ids})
-
-            async with self.async_session() as session:
-                async with session.begin():
-                    result = await session.execute(query, {"params": params})
-                    rows = result.all()
-
-            # Parse agtype results into dictionaries
-            edges = []
-            for row in rows:
-                def parse_agtype(value):
-                    if value is None:
-                        return None
-                    text = str(value)
-                    if text.startswith('"') and text.endswith('"'):
-                        text = text[1:-1]
-                    try:
-                        return json.loads(text)
-                    except (json.JSONDecodeError, TypeError):
-                        return text
-
-                edge = {
-                    "source_id": parse_agtype(row[0]),
-                    "source_label": parse_agtype(row[1]),
-                    "source_name": parse_agtype(row[2]),
-                    "relation_type": parse_agtype(row[3]),
-                    "target_id": parse_agtype(row[4]),
-                    "target_label": parse_agtype(row[5]),
-                    "target_name": parse_agtype(row[6]),
-                }
-                edges.append(edge)
-
-            logger.debug(
-                "Fetched subgraph for entities",
-                extra={
-                    "entity_count": len(entity_ids),
-                    "edges_found": len(edges),
-                },
-            )
-            return edges
-
-        except Exception as e:
-            logger.error(
-                "Failed to fetch subgraph for entities",
-                exc_info=e,
-                extra={"entity_ids": entity_ids},
-            )
-            raise RuntimeError(f"Subgraph query failed: {e}") from e
-
-    async def get_nodes_by_ids(self, node_ids: list[str], label: str | None = None) -> list[dict]:
-        """
-        Fetch full node details from Apache AGE graph by node IDs.
-
-        Args:
-            node_ids: List of node IDs to fetch.
-            label: Optional node label filter to restrict search to a specific label.
-
-        Returns:
-            List of dictionaries with node details: id, label, name, properties (as dict).
-
-        Raises:
-            RuntimeError: If query execution fails.
-        """
-
-        if not node_ids:
-            return []
-
-        try:
-            # Build Cypher query to fetch nodes with all properties
-            # Using UNWIND to pass the list of IDs
-            query = text("""
-                SELECT * FROM cypher('telegram_graph',
-                    $$ UNWIND $ids AS target_id
-                       MATCH (n)
-                       WHERE n.id = target_id
-                       RETURN n.id as n_id, label(n) as n_label, n.name as n_name, n $$,
-                    CAST(:params AS agtype)
-                ) AS (
-                    n_id agtype,
-                    n_label agtype,
-                    n_name agtype,
-                    n agtype
-                )
-            """)
-
-            params = json.dumps({"ids": node_ids})
-
-            async with self.async_session() as session:
-                async with session.begin():
-                    result = await session.execute(query, {"params": params})
-                    rows = result.all()
-
-            nodes = []
-            for row in rows:
-                def parse_agtype(value):
-                    if value is None:
-                        return None
-                    text = str(value)
-                    if text.startswith('"') and text.endswith('"'):
-                        text = text[1:-1]
-                    try:
-                        return json.loads(text)
-                    except (json.JSONDecodeError, TypeError):
-                        return text
-
-                node_id = parse_agtype(row[0])
-                node_label = parse_agtype(row[1])
-                node_name = parse_agtype(row[2])
-                node_data = parse_agtype(row[3])
-
-                # Extract properties from node data
-                properties = {}
-                if isinstance(node_data, dict):
-                    # Copy all keys except id, label, name (these are already extracted)
-                    for key, value in node_data.items():
-                        if key not in ('id', 'label', 'name'):
-                            properties[key] = value
-
-                nodes.append({
-                    "id": node_id,
-                    "label": node_label,
-                    "name": node_name,
-                    "properties": properties
-                })
-
-            logger.debug(
-                "Fetched nodes from graph",
-                extra={
-                    "node_count": len(nodes),
-                    "requested_ids": len(node_ids),
-                },
-            )
-            return nodes
-
-        except Exception as e:
-            logger.error(
-                "Failed to fetch nodes from graph",
-                exc_info=e,
-                extra={"node_ids": node_ids},
-            )
-            raise RuntimeError(f"Node fetch failed: {e}") from e
-
-    async def execute_cypher(self, query: str) -> Any:
-        """
-        Execute a raw Cypher query against the Apache AGE graph.
-
-        This is a placeholder method for future graph operations.
-        The query will be executed in the context of the telegram_graph.
-
-        Args:
-            query: Cypher query string (e.g., "SELECT * FROM cypher('telegram_graph', $$ MATCH (n) RETURN n $$) AS (n agtype);")
-
-        Returns:
-            Raw query result (will be refined when graph queries are implemented).
-        """
-
-        async with self.async_session() as session:
-            async with session.begin():
-                result = await session.execute(text(query))
-                return result.scalars().all()
-
-    def _sanitize_properties(self, properties: dict) -> dict:
-        """
-        Sanitize property keys to ensure they are strictly alphanumeric snake_case.
-
-        This utility method prevents hidden characters or invalid syntax from
-        breaking the Cypher query parser. Keys are stripped, converted to
-        snake_case, and validated against a strict pattern.
-
-        Args:
-            properties: Raw properties dictionary.
-
-        Returns:
-            Dictionary with sanitized keys (original values preserved).
-
-        Raises:
-            ValueError: If any key cannot be sanitized to a valid identifier.
-        """
-        sanitized = {}
-        for key, value in properties.items():
-            # Strip whitespace and convert to snake_case
-            clean_key = key.strip().lower()
-            # Replace any non-alphanumeric (except underscore) with underscore
-            clean_key = re.sub(r'[^a-z0-9_]', '_', clean_key)
-            # Collapse multiple underscores
-            clean_key = re.sub(r'_+', '_', clean_key)
-            # Trim leading/trailing underscores
-            clean_key = clean_key.strip('_')
-
-            # Validate final key
-            if not re.match(r'^[a-z0-9_]+$', clean_key):
-                raise ValueError(
-                    f"Property key '{key}' could not be sanitized to a valid identifier "
-                    f"(got '{clean_key}'). Only alphanumeric characters and underscores are allowed."
-                )
-
-            sanitized[clean_key] = value
-
-        return sanitized
-
-    async def upsert_graph_node(
-        self, label: str, properties: dict, merge_key: str = "id"
-    ) -> None:
-        """
-        Upsert a node in the Apache AGE graph.
-
-        Uses MERGE to create or update a node with the given label and properties.
-        The node is matched on the merge_key (default: 'id').
-
-        IMPORTANT: Labels and property keys cannot be parameterized in Cypher,
-        so we validate them to prevent injection attacks. Properties are set
-        using an explicit SET clause with individual bind parameters to avoid
-        the "SET clause expects a map" error in Apache AGE.
-
-        Args:
-            label: Graph node label (e.g., 'Channel', 'Post'). Must be alphanumeric.
-            properties: Dictionary of node properties.
-            merge_key: Property name to use for MERGE matching (default: 'id').
-
-        Raises:
-            ValueError: If label, merge_key, or any property key contains non-alphanumeric characters.
-        """
-
-        # Validate label to prevent Cypher injection (labels cannot be parameterized)
-        if not re.match(r'^[A-Za-z0-9_]+$', label):
-            raise ValueError(f"Invalid label '{label}': must be alphanumeric with underscores")
-
-        # Validate merge_key as a simple identifier
-        if not re.match(r'^[A-Za-z0-9_]+$', merge_key):
-            raise ValueError(f"Invalid merge_key '{merge_key}': must be alphanumeric with underscores")
-
-        # Sanitize all property keys to prevent Cypher injection
-        props = self._sanitize_properties(properties)
-
-        # Ensure merge_key is present in properties
-        if merge_key not in props:
-            props[merge_key] = properties.get(merge_key)
-
-        # Build dynamic SET clause by iterating over properties
-        # Exclude merge_key from SET to avoid conflicts (it's already used in MERGE)
-        set_clauses = []
-        set_params = {}
-        for key, value in props.items():
-            if key == merge_key:
-                continue  # Skip merge_key to prevent conflicts
-            # Use backticks for property names to avoid reserved keyword conflicts
-            # Prefix parameter names with 'prop_' to avoid parameter name conflicts
-            set_clauses.append(f"n.`{key}` = $prop_{key}")
-            set_params[f"prop_{key}"] = value
-
-        # Join SET clauses with comma, ensuring no trailing comma
-        set_clause_str = ", ".join(set_clauses) if set_clauses else ""
-
-        # Build the SQL query with explicit SET assignments
-        # All parameters are passed as a single agtype map via :params
-        # Inside Cypher, individual values are accessed as $key from the agtype map
-        query = text(f"""
-            SELECT * FROM cypher('telegram_graph',
-                $$ MERGE (n:{label} {{{merge_key}: $merge_val}})
-                   {f"SET {set_clause_str}" if set_clause_str else ""}
-                   RETURN n $$,
-                CAST(:params AS agtype)
-            ) AS (v agtype)
-        """)
-
-        # Package all parameters as a single JSON object
-        # The agtype map contains all values referenced in the Cypher query
-        params_dict = {"merge_val": props.get(merge_key), **set_params}
-        params = json.dumps(params_dict)
-
-        async with self.async_session() as session:
-            async with session.begin():
-                await session.execute(query, {"params": params})
-
-    async def upsert_graph_edge(
-        self,
-        start_label: str,
-        start_merge_key: str,
-        start_merge_val: Any,
-        edge_label: str,
-        end_label: str,
-        end_merge_key: str,
-        end_merge_val: Any,
-        edge_properties: dict | None = None,
-    ) -> None:
-        """
-        Upsert an edge in the Apache AGE graph.
-
-        Matches start and end nodes by label and merge keys, then MERGEs the edge.
-        Edge properties are set using an explicit SET clause with individual bind
-        parameters to avoid the "SET clause expects a map" error in Apache AGE.
-
-        IMPORTANT: Labels and relationship types cannot be parameterized in Cypher,
-        so we validate them to prevent injection attacks. All property keys are
-        sanitized to valid identifiers. Properties are assigned individually.
-
-        Args:
-            start_label: Label of the start node. Must be alphanumeric.
-            start_merge_key: Property name to match start node.
-            start_merge_val: Value for start node matching.
-            edge_label: Relationship type label. Must be alphanumeric.
-            end_label: Label of the end node. Must be alphanumeric.
-            end_merge_key: Property name to match end node.
-            end_merge_val: Value for end node matching.
-            edge_properties: Optional dictionary of edge properties.
-
-        Raises:
-            ValueError: If any label, edge_label, merge key, or property key contains non-alphanumeric characters.
-        """
-        
-        # Validate all alphanumeric identifiers to prevent Cypher injection
-        for identifier_name, identifier_value in [
-            ("start_label", start_label),
-            ("edge_label", edge_label),
-            ("end_label", end_label),
-        ]:
-            if not re.match(r'^[A-Za-z0-9_]+$', identifier_value):
-                raise ValueError(
-                    f"Invalid {identifier_name} '{identifier_value}': must be alphanumeric with underscores"
-                )
-
-        # Merge keys are also identifiers in the Cypher query, validate them
-        if not re.match(r'^[A-Za-z0-9_]+$', start_merge_key):
-            raise ValueError(f"Invalid start_merge_key '{start_merge_key}': must be alphanumeric with underscores")
-        if not re.match(r'^[A-Za-z0-9_]+$', end_merge_key):
-            raise ValueError(f"Invalid end_merge_key '{end_merge_key}': must be alphanumeric with underscores")
-
-        # Sanitize all edge property keys to prevent Cypher injection
-        edge_properties = edge_properties or {}
-        props = self._sanitize_properties(edge_properties)
-
-        # Build dynamic SET clause by iterating over edge properties
-        set_clauses = []
-        set_params = {}
-        for key, value in props.items():
-            # Use backticks for property names to avoid reserved keyword conflicts
-            # Prefix parameter names with 'prop_' to avoid parameter name conflicts
-            set_clauses.append(f"r.`{key}` = $prop_{key}")
-            set_params[f"prop_{key}"] = value
-
-        # Join SET clauses with comma, ensuring no trailing comma
-        set_clause_str = ", ".join(set_clauses) if set_clauses else ""
-
-        # Build the SQL query with explicit SET assignments
-        # All parameters are passed as a single agtype map via :params
-        # Inside Cypher, individual values are accessed as $key from the agtype map
-        query = text(f"""
-            SELECT * FROM cypher('telegram_graph',
-                $$ MATCH (a:{start_label} {{{start_merge_key}: $sid}})
-                   MATCH (b:{end_label} {{{end_merge_key}: $eid}})
-                   MERGE (a)-[r:{edge_label}]->(b)
-                   {f"SET {set_clause_str}" if set_clause_str else ""}
-                   RETURN r $$,
-                CAST(:params AS agtype)
-            ) AS (v agtype)
-        """)
-
-        # Package all parameters as a single JSON object
-        # The agtype map contains all values referenced in the Cypher query
-        params_dict = {"sid": start_merge_val, "eid": end_merge_val, **set_params}
-        params = json.dumps(params_dict)
-
-        async with self.async_session() as session:
-            async with session.begin():
-                await session.execute(query, {"params": params})

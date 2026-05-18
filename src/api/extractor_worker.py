@@ -13,6 +13,7 @@ from sqlalchemy.exc import OperationalError
 
 try:
     import asyncpg.exceptions
+
     PostgresError = asyncpg.exceptions.PostgresError
 except ImportError:
     # asyncpg may not be installed in all environments
@@ -20,6 +21,7 @@ except ImportError:
 
 from src.config.config import load_settings
 from src.db.database import Database
+from src.db.graph_repo import GraphRepository
 from src.db.models import Post
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.extractor import KnowledgeExtractor
@@ -36,6 +38,7 @@ class ExtractionWorker:
     def __init__(
         self,
         db: Database,
+        graph_repo: GraphRepository,
         qdrant: QdrantService,
         extractor: KnowledgeExtractor,
         batch_size: int = 20,
@@ -45,12 +48,14 @@ class ExtractionWorker:
 
         Args:
             db: Database instance for data access.
+            graph_repo: GraphRepository for Apache AGE graph operations.
             qdrant: QdrantService for entity embedding sync.
             extractor: KnowledgeExtractor for LLM-based extraction.
             batch_size: Number of posts to fetch per poll.
             poll_interval: Sleep interval in seconds when no posts are found.
         """
         self.db = db
+        self.graph_repo = graph_repo
         self.qdrant = qdrant
         self.extractor = extractor
         self.batch_size = batch_size
@@ -77,8 +82,7 @@ class ExtractionWorker:
                 # Fetch batch of unextracted posts
                 try:
                     posts = await self.db.get_unextracted_posts(
-                        limit=self.batch_size,
-                        priority_mode=self.priority_mode
+                        limit=self.batch_size, priority_mode=self.priority_mode
                     )
                 except (OperationalError, PostgresError) as e:
                     # Database connection error - log warning, back off, and retry
@@ -100,11 +104,16 @@ class ExtractionWorker:
                     continue
 
                 if not posts:
-                    logger.debug("No unextracted posts found, sleeping %ds", self.poll_interval)
+                    logger.debug(
+                        "No unextracted posts found, sleeping %ds",
+                        self.poll_interval,
+                    )
                     await asyncio.sleep(self.poll_interval)
                     continue
 
-                logger.info("Processing batch of %d unextracted posts", len(posts))
+                logger.info(
+                    "Processing batch of %d unextracted posts", len(posts)
+                )
 
                 # Process each post sequentially (could be parallelized with semaphore)
                 for post in posts:
@@ -126,7 +135,9 @@ class ExtractionWorker:
                 logger.info("Worker task cancelled")
                 break
             except Exception as e:
-                logger.error("Unexpected error in worker loop: %s", e, exc_info=True)
+                logger.error(
+                    "Unexpected error in worker loop: %s", e, exc_info=True
+                )
                 await asyncio.sleep(5)  # Back off on unexpected errors
 
         logger.info("Extraction worker stopped")
@@ -138,7 +149,9 @@ class ExtractionWorker:
             post: Post object from database.
         """
         if not post.content or not post.content.strip():
-            logger.debug("Post id=%s has no content, skipping extraction", post.id)
+            logger.debug(
+                "Post id=%s has no content, skipping extraction", post.id
+            )
             await self.db.mark_post_extracted(post.id)
             return
 
@@ -149,7 +162,7 @@ class ExtractionWorker:
                 post_id=post.id,
                 text=post.content,
                 author_id=post.channel_id,
-                db=self.db,
+                graph_repo=self.graph_repo,
                 qdrant=self.qdrant,
             )
         except Exception as e:
@@ -195,15 +208,21 @@ async def run_extractor() -> None:
         logger.info("Qdrant service initialized")
     except Exception as e:
         logger.error("Failed to initialize Qdrant: %s", e)
-        logger.warning("Continuing without Qdrant - entity embeddings will be disabled")
+        logger.warning(
+            "Continuing without Qdrant - entity embeddings will be disabled"
+        )
         # Qdrant is optional for extraction; we can still extract to AGE graph
 
     # Initialize knowledge extractor
     extractor = KnowledgeExtractor(settings)
 
+    # Create GraphRepository sharing the same async sessionmaker as Database
+    graph_repo = GraphRepository(db.async_session)
+
     # Create and run worker with optimized settings
     worker = ExtractionWorker(
         db=db,
+        graph_repo=graph_repo,
         qdrant=qdrant,
         extractor=extractor,
         batch_size=20,
