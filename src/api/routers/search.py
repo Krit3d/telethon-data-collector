@@ -267,6 +267,23 @@ async def search_posts(
                 )
 
         # Apply score boost for posts connected to high-scoring entities
+        # Debug logs for ID comparison
+        logger.info(
+            "Vector search post IDs: %s",
+            post_ids
+        )
+        logger.info(
+            "Graph connected post IDs: %s",
+            connected_post_ids
+        )
+        intersection = set(post_ids).intersection(connected_post_ids)
+        logger.info(
+            "Intersection of vector and graph post IDs: %s",
+            intersection
+        )
+        # Precompute string versions of connected post IDs for safe comparison
+        connected_post_ids_str = {str(id) for id in connected_post_ids}
+        
         for result in merged_results:
             post_id_int: int = result[
                 "post_id"
@@ -274,13 +291,15 @@ async def search_posts(
             base_score: float = result["score"]
             boost: float = 0.0
 
-            if post_id_int in connected_post_ids:
+            # Compare as strings to handle potential type mismatches from graph data
+            if str(post_id_int) in connected_post_ids_str:
                 # Find which entities this post is connected to
                 connected_entity_scores: list[float] = []
                 for (
                     entity_id,
                     connected_posts,
                 ) in entity_to_connected_posts.items():
+                    # connected_posts contains integers; compare directly
                     if post_id_int in connected_posts:
                         entity_score: float = entity_id_to_score.get(
                             entity_id, 0.0
@@ -296,6 +315,10 @@ async def search_posts(
                     boost = max_entity_score * WEIGHT_FACTOR
                     # Asymptotically approach 1.0 without exceeding it
                     result["score"] = base_score + (1.0 - base_score) * boost
+                    logger.info(
+                        "Boosting post %d: base score %.4f, boosted score %.4f, boost amount %.4f",
+                        post_id_int, base_score, result["score"], boost
+                    )
                     result["boosted"] = True
                 else:
                     result["boosted"] = False
