@@ -133,46 +133,10 @@ async def search_posts(
                 "No entities found in Qdrant for query. Graph context will be empty."
             )
 
-        # Fetch full post records from PostgreSQL (with channels eagerly loaded)
-        post_ids: list[int] = [item["post_id"] for item in posts_data]
-        posts_dict: dict[int, Any] = (
-            await db.get_posts_by_ids(post_ids) if post_ids else {}
-        )
-
-        # Build initial results with Qdrant scores
-        merged_results: list[dict[str, Any]] = []
-        for item in posts_data:
-            post = posts_dict.get(item["post_id"])
-            if post is None:
-                logger.warning(
-                    "Post ID %d from Qdrant results not found in PostgreSQL",
-                    item["post_id"],
-                )
-                continue
-
-            # Build URL: use channel username if available, otherwise fall back to channel_id
-            channel_username = (
-                getattr(post.channel, "username", None)
-                if post.channel
-                else None
-            )
-            if channel_username:
-                url = f"https://t.me/{channel_username}/{post.message_id}"
-            else:
-                url = f"https://t.me/c/{post.channel_id}/{post.message_id}"
-
-            merged_results.append(
-                {
-                    "post_obj": post,
-                    "score": item["score"],
-                    "url": url,
-                    "channel_id": post.channel_id,
-                    "text": post.content or "",
-                    "created_at": post.created_at,
-                    "post_id": post.id,
-                    "channel": post.channel,  # Include channel for author info
-                }
-            )
+        # Extract vector post IDs to scores mapping
+        vector_scores: dict[int, float] = {
+            item["post_id"]: item["score"] for item in posts_data
+        }
 
         # Fetch graph relationships to identify posts connected to matched entities
         connected_post_ids: set[int] = set()
@@ -266,64 +230,86 @@ async def search_posts(
                     exc_info=e,
                 )
 
-        # Apply score boost for posts connected to high-scoring entities
-        # Debug logs for ID comparison
-        logger.info(
-            "Vector search post IDs: %s",
-            post_ids
-        )
-        logger.info(
-            "Graph connected post IDs: %s",
-            connected_post_ids
-        )
-        intersection = set(post_ids).intersection(connected_post_ids)
-        logger.info(
-            "Intersection of vector and graph post IDs: %s",
-            intersection
-        )
-        # Precompute string versions of connected post IDs for safe comparison
-        connected_post_ids_str = {str(id) for id in connected_post_ids}
-        
-        for result in merged_results:
-            post_id_int: int = result[
-                "post_id"
-            ]  # Already an integer from PostgreSQL
-            base_score: float = result["score"]
-            boost: float = 0.0
+        # Combine vector post IDs and graph-connected post IDs
+        all_post_ids: set[int] = set(vector_scores.keys()) | connected_post_ids
 
-            # Compare as strings to handle potential type mismatches from graph data
-            if str(post_id_int) in connected_post_ids_str:
-                # Find which entities this post is connected to
+        # Log ID sets for debugging
+        logger.info("Vector search post IDs: %s", list(vector_scores.keys()))
+        logger.info("Graph connected post IDs: %s", connected_post_ids)
+        logger.info("Union of all post IDs: %s", all_post_ids)
+
+        # Fetch ALL these posts from the database
+        posts_dict: dict[int, Any] = (
+            await db.get_posts_by_ids(list(all_post_ids)) if all_post_ids else {}
+        )
+
+        # Build merged results from all_post_ids
+        merged_results: list[dict[str, Any]] = []
+        for post_id in all_post_ids:
+            post = posts_dict.get(post_id)
+            if post is None:
+                logger.warning(
+                    "Post ID %d from combined results not found in PostgreSQL",
+                    post_id,
+                )
+                continue
+
+            # Get base score from vector search (0.0 if not in vector results)
+            base_score: float = vector_scores.get(post_id, 0.0)
+
+            # Calculate boost if post is connected to high-scoring entities
+            boost: float = 0.0
+            if post_id in connected_post_ids:
                 connected_entity_scores: list[float] = []
                 for (
                     entity_id,
                     connected_posts,
                 ) in entity_to_connected_posts.items():
-                    # connected_posts contains integers; compare directly
-                    if post_id_int in connected_posts:
+                    if post_id in connected_posts:
                         entity_score: float = entity_id_to_score.get(
                             entity_id, 0.0
                         )
                         connected_entity_scores.append(entity_score)
 
                 if connected_entity_scores:
-                    # Boost by the maximum entity score (could also use average)
+                    # Boost by the maximum entity score
                     max_entity_score = max(connected_entity_scores)
-                    WEIGHT_FACTOR = (
-                        0.5  # Adjust how much entity presence matters
-                    )
+                    WEIGHT_FACTOR = 0.5  # Adjust how much entity presence matters
                     boost = max_entity_score * WEIGHT_FACTOR
-                    # Asymptotically approach 1.0 without exceeding it
-                    result["score"] = base_score + (1.0 - base_score) * boost
-                    logger.info(
-                        "Boosting post %d: base score %.4f, boosted score %.4f, boost amount %.4f",
-                        post_id_int, base_score, result["score"], boost
-                    )
-                    result["boosted"] = True
-                else:
-                    result["boosted"] = False
+
+            # Apply RRF/Boost formula: asymptotically approach 1.0 without exceeding it
+            final_score: float = base_score + (1.0 - base_score) * boost
+
+            # Build URL: use channel username if available, otherwise fall back to channel_id
+            channel_username = (
+                getattr(post.channel, "username", None)
+                if post.channel
+                else None
+            )
+            if channel_username:
+                url = f"https://t.me/{channel_username}/{post.message_id}"
             else:
-                result["boosted"] = False
+                url = f"https://t.me/c/{post.channel_id}/{post.message_id}"
+
+            merged_results.append(
+                {
+                    "post_obj": post,
+                    "score": final_score,
+                    "url": url,
+                    "channel_id": post.channel_id,
+                    "text": post.content or "",
+                    "created_at": post.created_at,
+                    "post_id": post.id,
+                    "channel": post.channel,  # Include channel for author info
+                    "boosted": boost > 0,
+                }
+            )
+
+            if boost > 0:
+                logger.info(
+                    "Post %d: base score %.4f, final score %.4f, boost amount %.4f",
+                    post_id, base_score, final_score, boost
+                )
 
         # Re-sort by final score
         merged_results.sort(key=lambda x: x["score"], reverse=True)
