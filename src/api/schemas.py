@@ -26,6 +26,8 @@ class SearchResultItem(BaseModel):
     # Optional author info when include_author_info=True
     author_id: int | None = None
     author_name: str | None = None
+    # Indicates if the result was prioritized by the Graph (OpenSPG) logic
+    boosted: bool = False
 
 
 class GraphEdge(BaseModel):
@@ -52,7 +54,6 @@ class GraphEntity(BaseModel):
 
 class SearchResponse(BaseModel):
     results: list[SearchResultItem]
-    graph_context: list[GraphEdge] = Field(default_factory=list)
     graph_entities: list[GraphEntity] = Field(default_factory=list)
 
 

@@ -69,12 +69,12 @@ async def search_posts(
     db: Database = Depends(get_db),
     graph_repo: GraphRepository = Depends(get_graph_repo),
 ) -> SearchResponse:
-    """Hybrid search for posts with graph context and intelligent ranking.
+    """Hybrid search for posts with graph entities and intelligent ranking.
 
     Performs concurrent semantic search for posts and entities, then:
     - Applies Reciprocal Rank Fusion to combine post and entity relevance scores
     - Boosts posts that have associated highly relevant entities
-    - Fetches graph context and groups relationships by entity
+    - Fetches graph relationships and groups them by entity
     - Optionally includes author (Actor) node details for found posts
 
     Args:
@@ -220,7 +220,7 @@ async def search_posts(
                         "This may indicate: (a) graph has no edges yet, "
                         "(b) entity IDs do not match any nodes in the graph, "
                         "or (c) the graph query timed out over the VPN link. "
-                        "graph_context and graph_entities will be empty.",
+                        "graph_entities will be empty.",
                         len(entity_ids),
                     )
 
@@ -336,6 +336,7 @@ async def search_posts(
                 media_url=post.media_url,
                 author_id=author_id,
                 author_name=author_name,
+                boosted=result.get("boosted", False),
             )
             final_results.append(item)
 
