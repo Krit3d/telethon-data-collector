@@ -290,9 +290,12 @@ async def search_posts(
                 if connected_entity_scores:
                     # Boost by the maximum entity score (could also use average)
                     max_entity_score = max(connected_entity_scores)
-                    # Weighted combination: 70% post score, 30% best entity score
-                    boost = max_entity_score * 0.3
-                    result["score"] = base_score + boost
+                    WEIGHT_FACTOR = (
+                        0.5  # Adjust how much entity presence matters
+                    )
+                    boost = max_entity_score * WEIGHT_FACTOR
+                    # Asymptotically approach 1.0 without exceeding it
+                    result["score"] = base_score + (1.0 - base_score) * boost
                     result["boosted"] = True
                 else:
                     result["boosted"] = False
@@ -336,25 +339,11 @@ async def search_posts(
             )
             final_results.append(item)
 
-        # Fetch graph context and group by entity
+        # Fetch graph entities and group by entity
         graph_entities: list[GraphEntity] = []
-        graph_context: list[GraphEdge] = []  # Keep for backward compatibility
 
         if entity_ids and edges_data:
             try:
-                graph_context = [
-                    GraphEdge(
-                        source_id=edge["source_id"],
-                        source_label=edge["source_label"],
-                        source_name=edge["source_name"],
-                        relation_type=edge["relation_type"],
-                        target_id=edge["target_id"],
-                        target_label=edge["target_label"],
-                        target_name=edge["target_name"],
-                    )
-                    for edge in edges_data
-                ]
-
                 # Group edges by entity to create GraphEntity objects
                 # Collect all unique node IDs from edges
                 node_ids: set[Any] = set()
@@ -435,7 +424,6 @@ async def search_posts(
 
         return SearchResponse(
             results=final_results,
-            graph_context=graph_context,
             graph_entities=graph_entities,
         )
 

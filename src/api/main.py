@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config.config import load_settings
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
-from src.api.routers import search, index, health
+from src.api.routers import search, health
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,6 @@ app.add_middleware(
 
 # API v1 routing
 app.include_router(search.router, prefix="/api/v1")
-app.include_router(index.router, prefix="/api/v1")
 app.include_router(health.router, prefix="/api/v1")
 
 
