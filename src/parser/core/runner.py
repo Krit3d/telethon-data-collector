@@ -421,6 +421,7 @@ async def start_workers(
     db: Any,
     *,
     worker_args: dict[str, Any] | None = None,
+    ignore_concurrency_limit: bool = False,
 ) -> None:
     """Start worker tasks with session pool management.
     
@@ -436,6 +437,7 @@ async def start_workers(
         settings: Global settings configuration.
         db: Database instance to pass to each worker.
         worker_args: Additional arguments to pass to worker constructor.
+        ignore_concurrency_limit: If True, use all available sessions ignoring settings.concurrency.
     """
     
     if worker_args is None:
@@ -456,7 +458,7 @@ async def start_workers(
         return
     
     # Determine actual concurrency (can't have more runners than sessions)
-    actual_concurrency = min(settings.concurrency, session_pool.size())
+    actual_concurrency = session_pool.size() if ignore_concurrency_limit else min(settings.concurrency, session_pool.size())
     logger.info(
         "Spawning %d worker runners (pool size: %d, loaded: %d, banned: %d)",
         actual_concurrency,
