@@ -22,7 +22,6 @@ class SearchResultItem(BaseModel):
     score: float
     created_at: datetime
     url: str | None = None
-    media_url: str | None = None
     # Optional author info when include_author_info=True
     author_id: int | None = None
     author_name: str | None = None

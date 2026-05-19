@@ -48,9 +48,6 @@ class Channel(Base):
     subscribers_count: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="Number of subscribers (may be hidden)"
     )
-    avatar_url: Mapped[str | None] = mapped_column(
-        String(512), nullable=True, comment="URL to channel avatar"
-    )
     access_hash: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
@@ -155,10 +152,6 @@ class Post(Base):
     )
     reactions_count: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="Number of reactions (likes)"
-    )
-
-    media_url: Mapped[str | None] = mapped_column(
-        String(512), nullable=True, comment="URL to the media attached to the post"
     )
 
     created_at: Mapped[datetime] = mapped_column(

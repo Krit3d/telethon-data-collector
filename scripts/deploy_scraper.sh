@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Check arguments
+# Check if required arguments are provided
 if [ $# -ne 2 ]; then
     echo "Usage: $0 SSH_USER SSH_HOST"
     exit 1
@@ -12,9 +12,8 @@ SSH_HOST="$2"
 
 echo "Deploying SCRAPER to $SSH_USER@$SSH_HOST..."
 
-# Step 1: Remote environment check and setup
+# Step 1: Remote environment check and setup (idempotent)
 echo "Checking and configuring remote environment..."
-
 ssh "$SSH_USER@$SSH_HOST" bash <<'EOF'
 # Ensure ~/.bashrc exists
 if [ ! -f ~/.bashrc ]; then
@@ -45,93 +44,126 @@ if [ "$CURRENT_SHELL" != "/bin/bash" ]; then
 fi
 EOF
 
-# Step 2: Sync files
+# Step 2: Sync source files to remote server
 echo "Syncing source files..."
 rsync -avz --delete \
     --exclude='.git/' --exclude='__pycache__/' --exclude='.venv/' \
-    --exclude='*.pyc' --exclude='avatars/' --exclude='sessions/' \
-    --exclude='.env' \
+    --exclude='*.pyc' --exclude='sessions/' --exclude='.env' \
     ./ "$SSH_USER@$SSH_HOST:/opt/telethon-scraper"
 
+# Brief delay to ensure file sync completion
 sleep 2
 
-# Step 3: Prune unused Docker resources to prevent disk space issues
+# Step 3: Execute deployment steps on remote server
+echo "Starting remote deployment steps..."
+ssh "$SSH_USER@$SSH_HOST" bash <<'EOF'
+set -e  # Exit remote script on error
+
+cd /opt/telethon-scraper
+COMPOSE_FILE="docker-compose.scraper.yml"
+
+# Prune unused Docker resources to prevent disk space issues
 echo "Pruning unused Docker resources..."
-ssh "$SSH_USER@$SSH_HOST" "docker image prune -f" || echo "Warning: Docker prune failed, continuing with deployment..."
+docker image prune -f || echo "Warning: Docker prune failed, continuing..."
 
-# Step 4: Build and start infrastructure containers only (db, llm_proxy)
-# Note: parser and crawler workers are NOT started automatically for safe deployment
-echo "Building and starting SCRAPER infrastructure (db, llm_proxy)..."
-ssh "$SSH_USER@$SSH_HOST" "cd /opt/telethon-scraper && docker compose -f docker-compose.scraper.yml up -d --build db llm_proxy"
+# Step 3a: Build all images explicitly before starting any containers
+echo "Building all Docker images..."
+docker compose -f $COMPOSE_FILE build
 
-# Note: The following block for waiting on parser health check has been commented out
-# because parser is no longer auto-started. Use the manual commands below to start workers.
-# ssh "$SSH_USER@$SSH_HOST" bash <<'EOF'
-# cd /opt/telethon-scraper
-#
-# COMPOSE_FILE="docker-compose.scraper.yml"
-# SERVICE_NAME="parser"
-#
-# # Wait for container to be running and healthy
-# MAX_WAIT=60
-# ELAPSED=0
-# while [ $ELAPSED -lt $MAX_WAIT ]; do
-#     CONTAINER_ID=$(docker compose -f $COMPOSE_FILE ps -q $SERVICE_NAME 2>/dev/null)
-#
-#     if [ -z "$CONTAINER_ID" ]; then
-#         echo "Container for $SERVICE_NAME not found, waiting..."
-#         sleep 5
-#         ELAPSED=$((ELAPSED + 5))
-#         continue
-#     fi
-#
-#     # Check container running status
-#     STATUS=$(docker inspect --format='{{.State.Status}}' $CONTAINER_ID 2>/dev/null)
-#     if [ "$STATUS" != "running" ]; then
-#         echo "Container is $STATUS, waiting..."
-#         sleep 5
-#         ELAPSED=$((ELAPSED + 5))
-#         continue
-#     fi
-#
-#     # Check health status if health check is configured
-#     HEALTH=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' $CONTAINER_ID 2>/dev/null)
-#
-#     if [ "$HEALTH" = "healthy" ] || [ "$HEALTH" = "no-healthcheck" ]; then
-#         echo "$SERVICE_NAME is ready!"
-#         break
-#     fi
-#
-#     echo "Waiting for $SERVICE_NAME to become healthy... ($ELAPSED/$MAX_WAIT seconds)"
-#     sleep 5
-#     ELAPSED=$((ELAPSED + 5))
-# done
-#
-# if [ $ELAPSED -ge $MAX_WAIT ]; then
-#     echo "Warning: Timeout waiting for $SERVICE_NAME to become ready."
-# fi
-#
-# # Display last 20 lines of logs
-# echo ""
-# echo "=== Last 20 lines of $SERVICE_NAME logs ==="
-# docker compose -f $COMPOSE_FILE logs --tail=20 $SERVICE_NAME
-# EOF
+# Step 3b: Start infrastructure containers (db, llm_proxy) without rebuilding
+echo "Starting infrastructure containers (db, llm_proxy)..."
+docker compose -f $COMPOSE_FILE up -d db llm_proxy
 
-# Safe Start helper message
+# Wait for db service to become healthy (max 60 seconds)
+echo "Waiting for db service to become healthy (max 60 seconds)..."
+SERVICE="db"
+MAX_WAIT=60
+INTERVAL=5
+ELAPSED=0
+
+while [ $ELAPSED -lt $MAX_WAIT ]; do
+    # Get container ID for the service
+    CONTAINER_ID=$(docker compose -f $COMPOSE_FILE ps -q $SERVICE 2>/dev/null)
+    
+    if [ -z "$CONTAINER_ID" ]; then
+        echo "db container not found, waiting..."
+        sleep $INTERVAL
+        ELAPSED=$((ELAPSED + INTERVAL))
+        continue
+    fi
+    
+    # Check if container is running
+    STATUS=$(docker inspect --format='{{.State.Status}}' $CONTAINER_ID 2>/dev/null)
+    if [ "$STATUS" != "running" ]; then
+        echo "db container is $STATUS, waiting..."
+        sleep $INTERVAL
+        ELAPSED=$((ELAPSED + INTERVAL))
+        continue
+    fi
+    
+    # Check health status using docker inspect
+    HEALTH=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' $CONTAINER_ID 2>/dev/null)
+    
+    if [ "$HEALTH" = "healthy" ]; then
+        echo "db service is healthy!"
+        break
+    fi
+    
+    echo "Waiting for db to become healthy... ($ELAPSED/$MAX_WAIT seconds)"
+    sleep $INTERVAL
+    ELAPSED=$((ELAPSED + INTERVAL))
+done
+
+# Check if timeout occurred
+if [ $ELAPSED -ge $MAX_WAIT ]; then
+    echo "Error: db service did not become healthy within $MAX_WAIT seconds."
+    exit 1
+fi
+
+# Step 3c: Run database migration in an ephemeral container
+echo "Running database migration..."
+docker compose -f $COMPOSE_FILE run --rm parser python -m src.db.migrate
+
+# Step 3d: Start crawler service with --no-deps to avoid triggering DB restarts
+echo "Starting crawler service..."
+docker compose -f $COMPOSE_FILE up -d --no-deps crawler
+
+# Cool-down delay for crawler initialization
+echo "Waiting 10 seconds for crawler to initialize..."
+sleep 10
+
+# Step 3e: Start parser service with --no-deps to avoid triggering DB restarts
+echo "Starting parser service..."
+docker compose -f $COMPOSE_FILE up -d --no-deps parser
+
+# Final check that all services are running
+echo "Performing final service status check..."
+SERVICES=("db" "crawler" "parser")
+for SERVICE in "${SERVICES[@]}"; do
+    CONTAINER_ID=$(docker compose -f $COMPOSE_FILE ps -q $SERVICE 2>/dev/null)
+    if [ -z "$CONTAINER_ID" ]; then
+        echo "Error: Service $SERVICE is not running (no container found)."
+        exit 1
+    fi
+    
+    STATUS=$(docker inspect --format='{{.State.Status}}' $CONTAINER_ID 2>/dev/null)
+    if [ "$STATUS" != "running" ]; then
+        echo "Error: Service $SERVICE is not running (status: $STATUS)."
+        exit 1
+    fi
+    echo "Service $SERVICE is running."
+done
+
+# Print clean summary table of service statuses
 echo ""
-echo "=========================================="
-echo "Infrastructure updated successfully!"
+echo "=== Service Status Summary ==="
+docker compose -f $COMPOSE_FILE ps
+
+# Print recent logs for debugging
 echo ""
-echo "To start workers manually, use the following commands:"
-echo ""
-echo "  Start parser worker:"
-echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-scraper && docker compose -f docker-compose.scraper.yml up -d parser && docker compose -f docker-compose.scraper.yml logs -f --tail=50 parser'"
-echo ""
-echo "  Start crawler worker:"
-echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-scraper && docker compose -f docker-compose.scraper.yml up -d crawler && docker compose -f docker-compose.scraper.yml logs -f --tail=50 crawler'"
-echo ""
-echo "  Start both workers:"
-echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-scraper && docker compose -f docker-compose.scraper.yml up -d parser crawler && docker compose -f docker-compose.scraper.yml logs -f --tail=50'"
-echo "=========================================="
+echo "=== Recent Logs (last 20 lines per service) ==="
+docker compose -f $COMPOSE_FILE logs --tail=20 db crawler parser
+
+EOF
 
 echo "SCRAPER deployment completed successfully!"

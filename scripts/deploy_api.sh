@@ -49,8 +49,7 @@ EOF
 echo "Syncing source files..."
 rsync -avz --delete \
     --exclude='.git/' --exclude='__pycache__/' --exclude='.venv/' \
-    --exclude='*.pyc' --exclude='avatars/' --exclude='sessions/' \
-    --exclude='.env' \
+    --exclude='*.pyc' --exclude='sessions/' --exclude='.env' \
     ./ "$SSH_USER@$SSH_HOST:/opt/telethon-api"
 
 sleep 2

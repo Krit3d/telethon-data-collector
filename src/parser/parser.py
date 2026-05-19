@@ -19,7 +19,6 @@ from telethon.errors import (
     SessionRevokedError,
     UserDeactivatedError,
 )
-from telethon.errors.rpcerrorlist import FloodWaitError
 from telethon.tl.types import Channel as TlChannel
 from telethon.tl.types import Message
 
@@ -31,7 +30,6 @@ from src.parser.core.worker_base import BaseTelegramWorker
 from src.parser.core.utils import (
     count_message_comments,
     count_message_reactions,
-    fetch_avatar_path,
     get_channel_entity_safe,
     get_full_channel_info,
     normalize_username,
@@ -44,24 +42,22 @@ async def _extract_channel_metadata(
     client: TelegramClient,
     channel: Channel,
     db: Database,
-    avatars_dir: Path,
     *,
     safe_api_call: Callable[..., Any],
     entity_cache: dict[tuple[int, int | None], Any] | None = None,
 ) -> tuple[dict[str, Any], TlChannel] | None:
     """Extract channel metadata with comprehensive error handling.
 
-    This function resolves the channel entity, fetches full channel info,
-    and downloads the avatar. Implements Zero-Username policy: if access_hash
-    is available, use cheap InputPeerChannel resolution. Only use username
-    resolution when access_hash is missing (first encounter), then immediately
-    save the hash to the DB.
+    This function resolves the channel entity and fetches full channel info.
+    Implements Zero-Username policy:
+    if access_hash is available, use cheap InputPeerChannel resolution.
+    Only use username resolution when access_hash is missing (first encounter),
+    then immediately save the hash to the DB.
 
     Args:
         client: Telethon client instance.
         channel: Channel object from database with id and username.
         db: Database service for marking channel status.
-        avatars_dir: Directory where avatar files are stored.
         safe_api_call: Async function that wraps API calls with retry logic
             and error handling. Format: safe_api_call(name, callable).
         entity_cache: Optional per-worker entity cache for cheap lookups.
@@ -70,7 +66,7 @@ async def _extract_channel_metadata(
 
     # ZERO-USERNAME POLICY: Prioritize cheap ID+hash resolution to avoid FloodWait
     entity = None
-    
+
     # First, try cheap resolution with access_hash if available (NO USERNAME)
     if channel.access_hash is not None:
         result = await get_channel_entity_safe(
@@ -114,7 +110,9 @@ async def _extract_channel_metadata(
             try:
                 resolved_hash = getattr(entity, "access_hash", None)
                 if resolved_hash is not None:
-                    await db.update_channel_access_hash(channel_id, resolved_hash)
+                    await db.update_channel_access_hash(
+                        channel_id, resolved_hash
+                    )
                     logger.info(
                         "Updated access_hash for channel id=%s from username resolution",
                         channel_id,
@@ -145,18 +143,12 @@ async def _extract_channel_metadata(
         client, entity, safe_api_call=safe_api_call
     )
 
-    # Fetch avatar
-    avatar_path = await fetch_avatar_path(
-        client, entity, avatars_dir, safe_api_call=safe_api_call
-    )
-
     channel_data: dict[str, Any] = {
         "id": int(entity.id),
         "username": normalize_username(getattr(entity, "username", None)),
         "title": getattr(entity, "title", "") or "",
         "description": description,
         "subscribers_count": subscribers_count,
-        "avatar_url": avatar_path,
         "access_hash": getattr(entity, "access_hash", None),
     }
 
@@ -167,13 +159,20 @@ async def _process_message(
     msg: Message,
     entity: TlChannel,
     db: Database,
+    *,
+    safe_api_call: Callable[..., Any] | None = None,
 ) -> int | None:
     """Process a single message: save to PostgreSQL and return its ID.
+
+    Enriched metadata extraction for OpenSPG knowledge graph integration.
+    Extracts author, forward information, grouped_id, media flags, and geo data.
 
     Args:
         msg: Telethon message object.
         entity: Channel entity.
         db: Database service.
+        safe_api_call: Optional async function that wraps API calls with
+            retry logic and error handling.
 
     Returns:
         Post ID if successfully processed, None otherwise.
@@ -185,6 +184,20 @@ async def _process_message(
     if published_at.tzinfo is None:
         published_at = published_at.replace(tzinfo=timezone.utc)
 
+    # Extract forward information if available
+    fwd_from_channel_id: int | None = None
+    if msg.fwd_from and hasattr(msg.fwd_from, "channel_id"):
+        fwd_from_channel_id = getattr(msg.fwd_from, "channel_id", None)
+
+    # Extract geo data if available
+    geo_lat: float | None = None
+    geo_long: float | None = None
+    if msg.media and hasattr(msg.media, "geo"):
+        geo = getattr(msg.media, "geo", None)
+        if geo:
+            geo_lat = getattr(geo, "lat", None)
+            geo_long = getattr(geo, "long", None)
+
     post_data: dict[str, Any] = {
         "channel_id": int(entity.id),
         "message_id": int(msg.id),
@@ -194,6 +207,13 @@ async def _process_message(
         "comments_count": count_message_comments(msg),
         "shares_count": getattr(msg, "forwards", None),
         "reactions_count": count_message_reactions(msg),
+        # Enriched metadata for OpenSPG knowledge graph
+        "author": getattr(msg, "post_author", None),
+        "fwd_from_channel_id": fwd_from_channel_id,
+        "grouped_id": getattr(msg, "grouped_id", None),
+        "has_media": bool(msg.media),  # Boolean flag only, no downloads
+        "geo_lat": geo_lat,
+        "geo_long": geo_long,
     }
 
     post = await db.upsert_post(post_data)
@@ -271,15 +291,6 @@ class ParserWorker(BaseTelegramWorker):
 
                     await self._parse_single_channel(channel)
 
-                except FloodWaitError as e:
-                    delay = int(getattr(e, "seconds", 0)) or 1
-                    total_delay = delay + 10
-                    logger.warning(
-                        "Worker %d: FloodWaitError, sleeping %ds (+10s safety)",
-                        self.worker_id,
-                        total_delay,
-                    )
-                    await asyncio.sleep(total_delay)
                 except Exception as e:
                     logger.error(
                         "Worker %d: Unexpected error in loop: %s",
@@ -292,12 +303,15 @@ class ParserWorker(BaseTelegramWorker):
             logger.info("Worker %d: Cleanup complete", self.worker_id)
 
     async def _parse_single_channel(self, channel: Channel) -> None:
-        """Fetch, normalize, and persist one channel with its recent posts.
+        """Fetch, normalize, and persist one channel with its recent posts using safe pagination.
+
+        Implements controlled chunk-based fetching to avoid burst requests that trigger
+        FloodWait bans. Messages are fetched in small chunks with natural delays between
+        requests.
 
         Args:
             channel: Channel object from database with id and username.
         """
-        from datetime import timezone
 
         channel_id = channel.id
         logger.info(
@@ -311,7 +325,6 @@ class ParserWorker(BaseTelegramWorker):
                 self.client,  # type: ignore[attr-defined]
                 channel,
                 self.db,
-                self.settings.avatars_dir,
                 safe_api_call=self.safe_api_call,
                 entity_cache=self._entity_cache,  # Pass per-worker entity cache
             )
@@ -339,8 +352,12 @@ class ParserWorker(BaseTelegramWorker):
                         self.worker_id,
                         channel_id,
                     )
-                    exploration_msg = await self.client.get_messages(  # type: ignore[attr-defined]
-                        entity, limit=1
+                    # Wrap API call in safe_api_call to handle FloodWaitError properly
+                    exploration_msg = await self.safe_api_call(
+                        "exploration_fetch",
+                        lambda: self.client.get_messages(  # type: ignore[attr-defined]
+                            entity, limit=1
+                        ),
                     )
                     # Small delay to simulate reading
                     await asyncio.sleep(random.uniform(1, 3))
@@ -362,19 +379,111 @@ class ParserWorker(BaseTelegramWorker):
                         e,
                     )
 
+            # SAFE PAGINATION: Fetch messages in controlled chunks to avoid burst requests
             posts_saved = 0
+            chunk_size = 20  # Safe chunk size to avoid triggering FloodWait
+            last_msg_id: int = (
+                0  # Track last message ID for pagination (initialized to integer 0)
+            )
+            posts_limit = self.settings.posts_limit
 
-            async for msg in self.client.iter_messages(  # type: ignore[attr-defined]
-                entity, limit=self.settings.posts_limit
-            ):
-                if not isinstance(msg, Message):
-                    continue
+            # SMART SKIP: Fetch the latest known message ID from DB to avoid re-fetching
+            # This saves API limits by not requesting messages we already have
+            latest_known_id = await self.db.get_latest_message_id(channel_id) or 0
+            if latest_known_id > 0:
+                self.logger.info(
+                    "Channel %s: Latest known message ID is %d, will skip older messages",
+                    channel_id,
+                    latest_known_id,
+                )
 
-                post_id = await _process_message(msg, entity, self.db)
-                if post_id is None:
-                    continue
+            while posts_saved < posts_limit:
+                # Calculate how many messages to fetch in this chunk
+                remaining = posts_limit - posts_saved
+                current_chunk_size = min(chunk_size, remaining)
 
-                posts_saved += 1
+                # Fetch a chunk of messages with manual pagination
+                # Use offset_id to get messages older than the last fetched message
+                # Note: offset_id=None means "start from the most recent message"
+                # Use min_id to skip messages we already have (optimization)
+                messages = await self.safe_api_call(
+                    f"get_messages(channel_id={channel_id}, chunk_size={current_chunk_size})",
+                    operation=lambda oid=last_msg_id if last_msg_id else 0, lim=current_chunk_size, lkid=latest_known_id: self.client.get_messages(  # type: ignore[attr-defined]
+                        entity, limit=lim, offset_id=oid, min_id=lkid
+                    ),
+                )
+
+                # Handle API call failure
+                if messages is None:
+                    self.logger.warning(
+                        "Worker %d: Failed to fetch messages for channel %s",
+                        self.worker_id,
+                        channel_id,
+                    )
+                    break
+
+                # Normalize to list (get_messages may return a single Message or a list)
+                if not isinstance(messages, list):
+                    messages = [messages]
+
+                # If no messages returned, we've reached the end
+                if not messages:
+                    break
+
+                # Process messages in this chunk
+                for msg in messages:
+                    if not isinstance(msg, Message):
+                        continue
+
+                    # SMART SKIP: Early exit if we encounter messages we already have
+                    # This prevents wasting API limits on already-processed content
+                    if msg.id is not None and msg.id <= latest_known_id:
+                        self.logger.info(
+                            "Channel %s: Reached already known message ID %d (latest known: %d). Stopping pagination.",
+                            channel_id,
+                            msg.id,
+                            latest_known_id,
+                        )
+                        # Break out of the for loop
+                        posts_saved = posts_limit  # Set to limit to exit while loop
+                        break
+
+                    post_id = await _process_message(
+                        msg,
+                        entity,
+                        self.db,
+                        safe_api_call=self.safe_api_call,
+                    )
+                    if post_id is None:
+                        continue
+
+                    posts_saved += 1
+
+                    # Check if we've reached the limit
+                    if posts_saved >= posts_limit:
+                        break
+
+                # If we broke out due to smart skip, exit the while loop
+                if posts_saved >= posts_limit:
+                    break
+
+                # Update last_msg_id for pagination (get messages older than oldest in chunk)
+                if messages:
+                    oldest_msg = messages[
+                        -1
+                    ]  # Last message in list is the oldest
+                    if (
+                        isinstance(oldest_msg, Message)
+                        and oldest_msg.id is not None
+                    ):
+                        last_msg_id = oldest_msg.id
+
+                # If we got fewer messages than requested, we've reached the end
+                if len(messages) < current_chunk_size:
+                    break
+
+                # Apply natural delay between chunks to avoid rate limits
+                await asyncio.sleep(self.natural_delay(base_delay=3.0))
 
             await self.db.mark_channel_parsed(channel_id)
 
@@ -388,21 +497,15 @@ class ParserWorker(BaseTelegramWorker):
             # Random delay between channels to avoid rate limits
             await asyncio.sleep(random.uniform(5, 15))
 
-        except FloodWaitError as e:
-            delay = int(getattr(e, "seconds", 0)) or 1
-            total_delay = delay + 10  # Add 10 seconds safety margin
-
-            logger.warning(
-                "Channel %s: FloodWaitError, sleeping %ss (+10s safety)",
-                channel_id,
-                total_delay,
-            )
-
-            await self.db.mark_channel_pending(channel_id)
-            await asyncio.sleep(total_delay)
-
-        except (ChannelPrivateError, UserDeactivatedError, AuthKeyError, SessionRevokedError) as e:
-            if isinstance(e, (UserDeactivatedError, AuthKeyError, SessionRevokedError)):
+        except (
+            ChannelPrivateError,
+            UserDeactivatedError,
+            AuthKeyError,
+            SessionRevokedError,
+        ) as e:
+            if isinstance(
+                e, (UserDeactivatedError, AuthKeyError, SessionRevokedError)
+            ):
                 logger.critical(
                     "Worker %d: Account is DEAD/FROZEN (%s). Terminating worker to protect proxy.",
                     self.worker_id,
@@ -442,14 +545,24 @@ async def main() -> None:
     settings = load_settings()
     logger = logging.getLogger(__name__)
 
+    # Print summary of changes/features enabled
+    logger.info("=" * 60)
+    logger.info("PARSER INITIALIZATION SUMMARY")
+    logger.info("=" * 60)
+    logger.info("- Safe API calls: All API calls wrapped in safe_api_call (FloodWait handled by worker_base)")
+    logger.info("- Smart skip: Enabled (min_id=latest_known_id to avoid re-fetching)")
+    logger.info("- Metadata enrichment: Enabled (author, fwd_from, grouped_id, has_media, geo)")
+    logger.info("- Exception cleanup: Redundant FloodWaitError blocks removed")
+    logger.info("- Posts limit per channel: %d", settings.posts_limit)
+    logger.info("=" * 60)
+
     logger.info(
         "Starting parser (posts_limit=%d, concurrency from session count)",
         settings.posts_limit,
     )
 
-    # Initialize database
+    # Database is assumed to be initialized by the migration script
     db = Database(settings.db_url)
-    await db.init_db()
 
     # Use the shared runner to start workers
     await start_workers(

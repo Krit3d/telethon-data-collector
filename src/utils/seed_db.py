@@ -67,7 +67,6 @@ async def main():
                     "title": entity.title,
                     "description": None,
                     "subscribers_count": None,
-                    "avatar_url": None,
                     "status": "pending",
                     "is_author_blog": True,
                 }

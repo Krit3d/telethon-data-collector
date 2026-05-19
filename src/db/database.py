@@ -110,6 +110,38 @@ class Database:
                             )
                         )
 
+                        # Initialize vertex labels for the graph
+                        vertex_labels = [
+                            "Actor",
+                            "Entity",
+                            "Event",
+                            "Place",
+                            "Channel",
+                            "Post",
+                        ]
+                        for label in vertex_labels:
+                            try:
+                                await conn.execute(text(f"""
+                                    DO $$
+                                    BEGIN
+                                        IF NOT EXISTS (
+                                            SELECT 1 FROM information_schema.tables
+                                            WHERE table_schema = 'telegram_graph'
+                                            AND table_name = '{label}'
+                                        ) THEN
+                                            PERFORM create_vlabel('telegram_graph', '{label}');
+                                        END IF;
+                                    END
+                                    $$;
+                                """))
+                                logger.debug(
+                                    "Ensured vertex label exists: %s", label
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to create vertex label %s: %s", label, e
+                                )
+
                         logger.info(
                             "Apache AGE extension and graph initialized"
                         )
@@ -258,7 +290,6 @@ class Database:
             "title": stmt.excluded.title,
             "description": stmt.excluded.description,
             "subscribers_count": stmt.excluded.subscribers_count,
-            "avatar_url": stmt.excluded.avatar_url,
             "access_hash": stmt.excluded.access_hash,
             "is_author_blog": stmt.excluded.is_author_blog,
             "updated_at": stmt.excluded.updated_at,
@@ -313,7 +344,6 @@ class Database:
             "comments_count": stmt.excluded.comments_count,
             "shares_count": stmt.excluded.shares_count,
             "reactions_count": stmt.excluded.reactions_count,
-            "media_url": stmt.excluded.media_url,
             "updated_at": stmt.excluded.updated_at,
         }
 
@@ -633,3 +663,23 @@ class Database:
                     logger.debug(
                         "Updated access_hash for channel id=%s", channel_id
                     )
+
+    async def get_latest_message_id(self, channel_id: int) -> int | None:
+        """Fetch the latest (highest) message ID for a given channel.
+
+        This is used to implement smart skip logic in the parser,
+        allowing us to avoid re-fetching messages we already have.
+
+        Args:
+            channel_id: Telegram channel ID.
+
+        Returns:
+            The highest message_id for the channel, or None if no posts exist.
+        """
+        async with self.async_session() as session:
+            stmt = (
+                select(func.max(Post.message_id))
+                .where(Post.channel_id == channel_id)
+            )
+            result = await session.execute(stmt)
+            return result.scalar()  # Returns None if no rows exist

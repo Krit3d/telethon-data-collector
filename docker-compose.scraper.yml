@@ -84,6 +84,7 @@ services:
         condition: service_healthy
     command: python -m src.parser.parser
     volumes:
+      - .:/app
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
     networks:
@@ -98,12 +99,19 @@ services:
     image: nginx:alpine
     container_name: tg_parser_llm_proxy
     restart: always
-    volumes:
-      - ./docker/nginx-llm.conf:/etc/nginx/nginx.conf:ro
+    env_file:
+      - .env
     ports:
       - "${TS_IP_SCRAPER}:8080:8080"
+    volumes:
+      - ./docker/nginx-llm.conf:/etc/nginx/nginx.conf:ro
     networks:
       - scraper_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 networks:
   scraper_network:
@@ -111,4 +119,5 @@ networks:
 
 volumes:
   postgres_data:
+    external: true
     name: tg_parser_pg18_final

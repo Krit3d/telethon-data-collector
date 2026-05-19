@@ -15,8 +15,6 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
-import aiohttp
-
 from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyError,
@@ -173,7 +171,11 @@ class BaseTelegramWorker:
         
         # Apply Pareto distribution for heavy-tail effect (human-like pauses)
         # Pareto shape parameter alpha=3 gives ~80% short, ~20% long delays
-        pareto_factor = np.random.pareto(3) + 1  # +1 to make mean ~1.5
+        if HAS_NUMPY:
+            pareto_factor = np.random.pareto(3) + 1  # +1 to make mean ~1.5
+        else:
+            # random.paretovariate(alpha) returns Pareto type I (xm=1, alpha>=1), equivalent to np.random.pareto(alpha) + 1
+            pareto_factor = random.paretovariate(3)
         
         # Combine: base scaled delay * Pareto factor
         natural_delay = scaled_delay * pareto_factor

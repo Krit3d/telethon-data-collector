@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pydantic import (
     Field,
+    field_validator,
     ValidationError,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -106,10 +107,6 @@ class Settings(BaseSettings):
         default=Path("sessions"),
         description="Directory for storing sessions",
     )
-    avatars_dir: Path = Field(
-        default=Path("avatars"),
-        description="Directory for downloaded channel avatars",
-    )
     posts_limit: int = Field(
         default=10,
         description="Maximum number of posts to fetch per channel",
@@ -129,28 +126,6 @@ class Settings(BaseSettings):
     proxy_url: str | None = Field(
         default=None,
         description="Optional proxy URL for Telegram connections",
-    )
-
-    # ---- S3 storage settings ----
-    s3_endpoint: str | None = Field(
-        default=None,
-        description="S3 endpoint URL (e.g., https://s3.amazonaws.com or custom for MinIO/Cloudflare)",
-    )
-    s3_access_key: str | None = Field(
-        default=None,
-        description="S3 access key ID",
-    )
-    s3_secret_key: str | None = Field(
-        default=None,
-        description="S3 secret access key",
-    )
-    s3_bucket_name: str | None = Field(
-        default=None,
-        description="S3 bucket name for storing media files",
-    )
-    s3_region: str | None = Field(
-        default=None,
-        description="S3 region (e.g., us-east-1, eu-west-1)",
     )
 
     # ---- Natparsing stealth settings ----
@@ -216,7 +191,6 @@ class Settings(BaseSettings):
             c = c[: max(0, self.channels_limit)]
 
         return c
-
 
 class JsonFormatter(logging.Formatter):
     """Custom JSON formatter for structured logging."""

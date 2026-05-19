@@ -342,7 +342,6 @@ async def search_posts(
                 score=result["score"],
                 created_at=result["created_at"],
                 url=result["url"],
-                media_url=post.media_url,
                 author_id=author_id,
                 author_name=author_name,
                 boosted=result.get("boosted", False),

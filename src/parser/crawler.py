@@ -213,7 +213,6 @@ class Worker(BaseTelegramWorker):
             "title": title,
             "description": description,
             "subscribers_count": subscribers_count,
-            "avatar_url": None,  # Avatar fetching not needed for recommendations
             "status": "pending",
             "is_author_blog": is_author_blog,
             "access_hash": access_hash,
@@ -703,8 +702,8 @@ async def main() -> None:
 
     logger.info("Starting distributed crawler via core runner...")
 
+    # Database is assumed to be initialized by the migration script
     db = Database(settings.db_url)
-    await db.init_db()
     await db.reset_orphaned_processing_channels()
 
     worker_args = {

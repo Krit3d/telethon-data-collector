@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any, Callable
 
 from telethon import TelegramClient
@@ -70,54 +69,6 @@ def count_message_comments(message: Message) -> int | None:
     replies = getattr(message, "replies", None)
     count = getattr(replies, "replies", None) if replies else None
     return count if isinstance(count, int) else None
-
-
-async def fetch_avatar_path(
-    client: TelegramClient,
-    entity: TlChannel | InputPeerChannel,
-    avatars_dir: Path,
-    *,
-    safe_api_call: Callable[..., Any] | None = None,
-) -> str | None:
-    """Download and return a channel avatar path.
-
-    Args:
-        client: Initialized Telethon client instance.
-        entity: Telegram channel entity used as avatar source.
-        avatars_dir: Directory where avatar files are stored.
-        safe_api_call: Optional async function that wraps API calls with
-            retry logic and error handling. Format: safe_api_call(name, callable).
-
-    Returns:
-        Absolute or relative file path returned by Telethon if avatar download
-        succeeds, otherwise `None`.
-    """
-
-    entity_id = getattr(entity, "id", None) or getattr(
-        entity, "channel_id", "unknown"
-    )
-
-    if not getattr(entity, "photo", None):
-        logger.info("Channel %s has no profile photo, skipping", entity_id)
-        return None
-
-    avatars_dir.mkdir(parents=True, exist_ok=True)
-    target_file = avatars_dir / f"{entity_id}.jpg"
-
-    async def _download() -> str | None:
-        result = await client.download_profile_photo(
-            entity, file=str(target_file)
-        )
-        return str(result) if result else None
-
-    try:
-        if safe_api_call:
-            return await safe_api_call("download_avatar", _download)
-        else:
-            return await _download()
-    except Exception:
-        logger.exception("Failed to download avatar for channel %s", entity_id)
-        return None
 
 
 async def get_channel_entity_safe(
