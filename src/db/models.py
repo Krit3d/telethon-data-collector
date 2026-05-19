@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Float,
     ForeignKey,
     String,
     Text,
@@ -152,6 +153,29 @@ class Post(Base):
     )
     reactions_count: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="Number of reactions (likes)"
+    )
+
+    # OpenSPG Knowledge Graph metadata fields
+    author: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment="Author of the post"
+    )
+    fwd_from_channel_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="Forwarded from channel ID"
+    )
+    grouped_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="Grouped ID for grouped messages"
+    )
+    has_media: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", comment="Whether the post contains media"
+    )
+    geo_lat: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="Geolocation latitude"
+    )
+    geo_long: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="Geolocation longitude"
+    )
+    language: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, comment="Detected language code"
     )
 
     created_at: Mapped[datetime] = mapped_column(

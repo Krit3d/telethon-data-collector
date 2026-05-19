@@ -344,6 +344,11 @@ class Database:
             "comments_count": stmt.excluded.comments_count,
             "shares_count": stmt.excluded.shares_count,
             "reactions_count": stmt.excluded.reactions_count,
+            "author": stmt.excluded.author,
+            "has_media": stmt.excluded.has_media,
+            "geo_lat": stmt.excluded.geo_lat,
+            "geo_long": stmt.excluded.geo_long,
+            "language": stmt.excluded.language,
             "updated_at": stmt.excluded.updated_at,
         }
 
