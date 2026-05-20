@@ -484,16 +484,24 @@ async def start_workers(
     ]
     
     try:
-        await asyncio.gather(*runners)
+        results = await asyncio.gather(*runners, return_exceptions=True)
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, stopping workers...")
         # Cancel all runner tasks
         for task in runners:
             task.cancel()
         # Wait for all tasks to complete (with cancellation exceptions)
-        await asyncio.gather(*runners, return_exceptions=True)
-    except Exception as e:
-        logger.error("Global error in worker runners: %s", e, exc_info=True)
+        results = await asyncio.gather(*runners, return_exceptions=True)
+    else:
+        # Log any exceptions returned by worker tasks
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.critical(
+                    "Worker runner %d died with unhandled exception: %s",
+                    i,
+                    result,
+                    exc_info=True,
+                )
     finally:
         logger.info(
             "All worker runners have stopped (sessions loaded: %d, banned: %d)",

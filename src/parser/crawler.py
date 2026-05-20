@@ -699,6 +699,13 @@ async def main() -> None:
     """Entry point: discover sessions, read individual configs, spawn worker tasks."""
     settings = load_settings()
 
+    # Install global asyncio exception handler to prevent silent crashes
+    loop = asyncio.get_running_loop()
+    def global_exception_handler(loop, context):
+        msg = context.get("exception", context["message"])
+        logging.getLogger("asyncio_global").critical(f"Unhandled asyncio exception: {msg}")
+    loop.set_exception_handler(global_exception_handler)
+
     logger.info("Starting distributed crawler via core runner...")
 
     # Database is assumed to be initialized by the migration script
