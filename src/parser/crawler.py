@@ -22,12 +22,6 @@ from telethon.errors import (
     SessionRevokedError,
     UserDeactivatedError,
 )
-from telethon.network.connection.tcpintermediate import (
-    ConnectionTcpIntermediate,
-)
-from telethon.network.connection.tcpmtproxy import (
-    ConnectionTcpMTProxyRandomizedIntermediate,
-)
 from telethon.tl.functions.channels import (
     GetChannelRecommendationsRequest,
 )
@@ -47,7 +41,6 @@ from src.parser.core.utils import (
 )
 from src.parser.core.worker_base import BaseTelegramWorker
 from src.parser.core.runner import start_workers
-from src.utils.proxy import build_telethon_proxy
 from src.parser.core.exceptions import (
     ChannelTaskRejected,
     SessionExpiredError,
@@ -55,6 +48,14 @@ from src.parser.core.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Fatal session exceptions that should bubble up to the runner without being caught locally
+FATAL_SESSION_EXCEPTIONS = (
+    AuthKeyError,
+    UserDeactivatedError,
+    SessionRevokedError,
+    SessionExpiredError,
+)
 
 # Regex for first-person pronouns and characteristic words (Russian)
 FIRST_PERSON_REGEX = re.compile(
@@ -230,13 +231,23 @@ class Worker(BaseTelegramWorker):
             subscribers_count or "hidden",
         )
 
-    async def _process_recommendation(self, rec_channel: Channel) -> bool:
+    async def _process_recommendation(
+        self, rec_channel: Channel, client: TelegramClient | None = None
+    ) -> bool:
         """
         Process a recommended channel: check filters and save to DB.
+
+        Args:
+            rec_channel: The recommended channel to process.
+            client: Optional TelegramClient to use. If None, uses self.client.
 
         Returns True if channel was saved, False otherwise.
         """
         channel_name = rec_channel.username or str(rec_channel.id)
+        active_client = client or self.client
+
+        if not active_client:
+            raise RuntimeError("Telegram client is not initialized")
 
         # Check if channel already exists in DB
         async with self.db.async_session() as session:
@@ -255,7 +266,7 @@ class Worker(BaseTelegramWorker):
 
         # Get full channel info for subscriber count
         subscribers_count, description = await get_full_channel_info(
-            self.client,  # type: ignore[arg-type]
+            active_client,
             rec_channel,
             safe_api_call=self.safe_api_call,
         )
@@ -299,7 +310,10 @@ class Worker(BaseTelegramWorker):
         return True
 
     async def _get_recommendations(
-        self, entity: Channel | InputChannel, channel_id: int | None = None, operation_name: str = "get_recommendations"
+        self,
+        entity: Channel | InputChannel,
+        channel_id: int | None = None,
+        operation_name: str = "get_recommendations",
     ) -> list[Channel]:
         """Fetch channel recommendations for a given channel."""
         if not self.client:
@@ -424,84 +438,18 @@ class Worker(BaseTelegramWorker):
 
     async def run(self) -> None:
         """Main worker loop: claim channels, get recommendations, process them."""
-        # Build proxy configuration
-        proxy_config = None
+        # Connect using base class logic (handles proxy, client creation, auth check)
+        await self.connect()
 
-        if self.proxy_url:
-            try:
-                proxy_config = build_telethon_proxy(self.proxy_url)
-            except ValueError as e:
-                logger.error(
-                    "Worker %d: Invalid proxy URL %s: %s",
-                    self.worker_id,
-                    self.proxy_url,
-                    e,
-                )
-                return
+        # Ensure client is initialized after connect()
+        if self.client is None:
+            raise RuntimeError(
+                "Telegram client is not initialized after connect()"
+            )
 
-        # Create Telethon client with device parameters from session JSON
-        client_kwargs: dict[str, Any] = {
-            "device_model": self.device_model,
-            "system_version": self.system_version,
-            "app_version": self.app_version,
-            "lang_code": self.lang_code,
-            "system_lang_code": self.system_lang_code,
-            "use_ipv6": False,
-            "timeout": 60,
-            "connection": ConnectionTcpIntermediate,
-            "connection_retries": 10,
-            "retry_delay": 5,
-        }
-
-        if proxy_config:
-            if proxy_config.pop("is_mtproxy", False):
-                client_kwargs["connection"] = (
-                    ConnectionTcpMTProxyRandomizedIntermediate
-                )
-                client_kwargs["proxy"] = (
-                    proxy_config["addr"],
-                    proxy_config["port"],
-                    proxy_config["secret"],
-                )
-            else:
-                client_kwargs["proxy"] = proxy_config
-
-        # Log absolute session path for debugging
-        session_abs_path = self.session_path.with_suffix("").absolute()
-        logger.info(
-            "Worker %d: Attempting to load session from: %s",
-            self.worker_id,
-            session_abs_path,
-        )
-
-        self.client = TelegramClient(
-            str(session_abs_path),
-            self.api_id,
-            self.api_hash,
-            **client_kwargs,
-        )
+        client = self.client  # Local reference for type safety
 
         try:
-            # Log MTProxy connection if applicable
-            if proxy_config and proxy_config.get("is_mtproxy"):
-                logger.info(
-                    "Worker %d: Connecting to MTProxy %s:%d",
-                    self.worker_id,
-                    proxy_config["addr"],
-                    proxy_config["port"],
-                )
-
-            await self.client.connect()
-
-            if not await self.client.is_user_authorized():
-                logger.critical(
-                    "Worker %d: SESSION UNAUTHORIZED. Path: %s. "
-                    "Interactive login is impossible in Docker. Check your session files!",
-                    self.worker_id,
-                    self.session_path,
-                )
-                return
-
             logger.info("Worker %d: Starting processing loop", self.worker_id)
 
             while True:
@@ -511,8 +459,10 @@ class Worker(BaseTelegramWorker):
                         self.worker_id,
                     )
                     return
+
                 if getattr(self, "is_frozen", False):
                     return
+
                 if self.processed_count >= self.DAILY_LIMIT:
                     logger.info(
                         "Worker %d reached daily limit of %d channels. Stopping worker to protect session.",
@@ -520,6 +470,7 @@ class Worker(BaseTelegramWorker):
                         self.DAILY_LIMIT,
                     )
                     return
+
                 channel = None
 
                 try:
@@ -550,7 +501,7 @@ class Worker(BaseTelegramWorker):
 
                     # Step 1: Resolve entity using session-aware safe lookup
                     result = await get_channel_entity_safe(
-                        self.client,
+                        client,
                         channel.id,
                         safe_api_call=self.safe_api_call,
                         entity_cache=self._entity_cache,
@@ -559,7 +510,7 @@ class Worker(BaseTelegramWorker):
                     # Fallback to username only if ID resolution failed and username exists
                     if not result.is_success() and channel.username:
                         result = await get_channel_entity_safe(
-                            self.client,
+                            client,
                             channel.username,
                             safe_api_call=self.safe_api_call,
                             entity_cache=self._entity_cache,
@@ -570,7 +521,9 @@ class Worker(BaseTelegramWorker):
                     # If entity is resolved successfully, fetch the recommendations
                     if entity is not None:
                         recommendations = await self._get_recommendations(
-                            entity, channel.id, operation_name="get_recommendations"
+                            entity,
+                            channel.id,
+                            operation_name="get_recommendations",
                         )
                     else:
                         # Could not resolve channel by any method
@@ -588,7 +541,7 @@ class Worker(BaseTelegramWorker):
                     for rec_channel in recommendations:
                         try:
                             saved = await self._process_recommendation(
-                                rec_channel
+                                rec_channel, client=client
                             )
                             if saved:
                                 saved_count += 1
@@ -611,22 +564,24 @@ class Worker(BaseTelegramWorker):
                     await self._mark_processed(channel.id)
                     self.processed_count += 1
 
-                    # Database access_hash update removed to prevent cache thrashing.
-                    # Telethon's native session cache handles access_hash lookup internally.
-
                 except FloodWaitError as e:
+                    # Revert channel to pending and re-raise for session pool runner to handle
                     if channel:
                         await self.db.mark_channel_pending(channel.id)
 
-                    delay = int(getattr(e, "seconds", 0)) or 1
                     logger.warning(
-                        "Worker %d: FloodWaitError, sleeping %ds",
+                        "Worker %d: FloodWaitError, re-raising for pool runner",
                         self.worker_id,
-                        delay + 10,
                     )
-                    await asyncio.sleep(delay + 10)
+                    raise  # Re-raise to let session pool runner handle cooldown
+
+                except FATAL_SESSION_EXCEPTIONS:
+                    # Fatal session exceptions: do NOT catch - let them bubble up naturally
+                    # The runner will mark the session as permanently banned
+                    raise
 
                 except Exception as e:
+                    # Revert channel to pending for transient/non-fatal errors
                     if channel:
                         await self.db.mark_channel_pending(channel.id)
 
@@ -635,26 +590,11 @@ class Worker(BaseTelegramWorker):
                         self.worker_id,
                         type(e).__name__,
                     )
-                    await asyncio.sleep(15)
+                    raise  # Re-raise to let runner handle them
 
-        except (AuthKeyError, UserDeactivatedError, SessionRevokedError) as e:
-            logger.critical(
-                "Worker %d: SESSION DEAD. Error: %s. File: %s",
-                self.worker_id,
-                type(e).__name__,
-                self.session_path,
-            )
-            self.is_alive = False
-            return
-
-        except KeyboardInterrupt:
-            logger.info("Worker %d: Stopped by user", self.worker_id)
-        except Exception as e:
-            logger.exception("Worker %d: Fatal error: %s", self.worker_id, e)
         finally:
-            if self.client:
-                await self.client.disconnect()  # type: ignore
-                logger.info("Worker %d: Disconnected", self.worker_id)
+            # Guaranteed disconnect on exit
+            await self.disconnect()
 
 
 async def main() -> None:
@@ -663,9 +603,13 @@ async def main() -> None:
 
     # Install global asyncio exception handler to prevent silent crashes
     loop = asyncio.get_running_loop()
+
     def global_exception_handler(loop, context):
         msg = context.get("exception", context["message"])
-        logging.getLogger("asyncio_global").critical("Unhandled asyncio exception: %s", msg)
+        logging.getLogger("asyncio_global").critical(
+            "Unhandled asyncio exception: %s", msg
+        )
+
     loop.set_exception_handler(global_exception_handler)
 
     logger.info("Starting distributed crawler via core runner...")
@@ -681,7 +625,13 @@ async def main() -> None:
     }
 
     try:
-        await start_workers(Worker, settings, db, worker_args=worker_args, ignore_concurrency_limit=True)
+        await start_workers(
+            Worker,
+            settings,
+            db,
+            worker_args=worker_args,
+            ignore_concurrency_limit=True,
+        )
     finally:
         await db.close()
         logger.info("Database connections closed.")

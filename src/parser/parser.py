@@ -18,6 +18,7 @@ from telethon.errors import (
     ChannelPrivateError,
     FloodWaitError,
     RPCError,
+    SessionExpiredError,
     SessionRevokedError,
     UserDeactivatedError,
 )
@@ -232,16 +233,10 @@ async def _process_message(
     numeric_metrics["word_count"] = len(text_content.split())
     numeric_metrics["char_count"] = len(text_content)
 
-    # Build the metadata dictionary for JSONB column
+    # Build the metadata dictionary for JSONB column (only non-redundant fields for OpenSPG)
     metadata: dict[str, Any] = {
-        "language": language,
-        "geo": {
-            "lat": geo_lat,
-            "long": geo_long,
-        } if geo_lat is not None or geo_long is not None else None,
         "reply_to_msg_id": reply_to_msg_id,
         "numeric_metrics": numeric_metrics if numeric_metrics else None,
-        # Domain-specific flags can be added here based on content analysis
         "has_links": link_count > 0,
         "has_mentions": mention_count > 0,
         "has_hashtags": hashtag_count > 0,
@@ -346,6 +341,9 @@ class ParserWorker(BaseTelegramWorker):
 
                     await self._parse_single_channel(channel)
 
+                except (FloodWaitError, AuthKeyError, UserDeactivatedError, SessionExpiredError, SessionRevokedError) as e:
+                    # Propagate critical exceptions to _worker_runner for session cooldown/ban handling
+                    raise
                 except Exception as e:
                     logger.error(
                         "Worker %d: Unexpected error in loop: %s",
@@ -586,9 +584,10 @@ class ParserWorker(BaseTelegramWorker):
             UserDeactivatedError,
             AuthKeyError,
             SessionRevokedError,
+            SessionExpiredError,
         ) as e:
             if isinstance(
-                e, (UserDeactivatedError, AuthKeyError, SessionRevokedError)
+                e, (UserDeactivatedError, AuthKeyError, SessionRevokedError, SessionExpiredError)
             ):
                 logger.critical(
                     "Worker %d: Account is DEAD/FROZEN (%s). Terminating worker to protect proxy.",
@@ -597,7 +596,7 @@ class ParserWorker(BaseTelegramWorker):
                 )
                 self.is_alive = False
                 await self.db.mark_channel_rejected(channel_id)
-                return
+                raise  # Re-raise to propagate fatal session error
             logger.warning(
                 "Channel %s: access denied (%s), marking as rejected",
                 channel_id,

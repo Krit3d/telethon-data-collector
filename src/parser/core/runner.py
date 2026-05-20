@@ -323,16 +323,24 @@ async def _worker_runner(
         # Get a session from the pool
         entry = await session_pool.get_session()
         if entry is None:
-            # No sessions available (pool is empty or all in cooldown)
-            # Check if we should keep waiting or exit
-            if session_pool.size() == 0:
+            # No sessions available right now (all checked out or in cooldown)
+            # Check if all loaded sessions have been permanently banned
+            active_sessions = session_pool.loaded_count - session_pool.banned_count
+            if active_sessions <= 0:
                 logger.info(
-                    "Worker runner %d: session pool is empty, stopping", 
+                    "Worker runner %d: all sessions have been permanently banned, stopping",
                     runner_id,
                 )
                 break
-            # Pool has items but they might be in cooldown, wait a bit
-            await asyncio.sleep(1.0)
+            # There are still active sessions, but they are currently checked out or in cooldown
+            # Wait and try again
+            logger.debug(
+                "Worker runner %d: no sessions available right now, waiting (active: %d, banned: %d)",
+                runner_id,
+                active_sessions,
+                session_pool.banned_count,
+            )
+            await asyncio.sleep(2.0)
             continue
         
         # Check if session is in cooldown
@@ -472,11 +480,17 @@ async def start_workers(
     if worker_args is None:
         worker_args = {}
     
-    logger.info(
-        "Starting workers with class %s (concurrency=%d)",
-        worker_class.__name__,
-        settings.concurrency,
-    )
+    if ignore_concurrency_limit:
+        logger.info(
+            "Starting workers with class %s (ignoring concurrency limit, using all available sessions)",
+            worker_class.__name__,
+        )
+    else:
+        logger.info(
+            "Starting workers with class %s (concurrency=%d)",
+            worker_class.__name__,
+            settings.concurrency,
+        )
     
     # Create session pool and load sessions
     session_pool = SessionPool(cooldown_period=300.0)  # 5 minute cooldown for failed sessions
@@ -487,14 +501,23 @@ async def start_workers(
         return
     
     # Determine actual concurrency (can't have more runners than sessions)
-    actual_concurrency = session_pool.size() if ignore_concurrency_limit else min(settings.concurrency, session_pool.size())
-    logger.info(
-        "Spawning %d worker runners (pool size: %d, loaded: %d, banned: %d)",
-        actual_concurrency,
-        session_pool.size(),
-        session_pool.loaded_count,
-        session_pool.banned_count,
-    )
+    if ignore_concurrency_limit:
+        actual_concurrency = session_pool.size()
+        logger.info(
+            "Concurrency limit ignored: using all %d available sessions from pool (loaded: %d, banned: %d)",
+            actual_concurrency,
+            session_pool.loaded_count,
+            session_pool.banned_count,
+        )
+    else:
+        actual_concurrency = min(settings.concurrency, session_pool.size())
+        logger.info(
+            "Spawning %d worker runners (pool size: %d, loaded: %d, banned: %d)",
+            actual_concurrency,
+            session_pool.size(),
+            session_pool.loaded_count,
+            session_pool.banned_count,
+        )
     
     # Spawn exactly `actual_concurrency` worker runners
     runners = [

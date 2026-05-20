@@ -97,8 +97,18 @@ class BaseTelegramWorker:
         self.app_version = app_version
         self.lang_code = lang_code
         self.system_lang_code = system_lang_code
-        self.delay_min = delay_min if delay_min is not None else settings.parser_delay_min
-        self.delay_max = delay_max if delay_max is not None else settings.parser_delay_max
+        
+        # Fallback cascade: explicit argument -> settings config -> hardcoded safe defaults
+        self.delay_min = max(
+            0.1,  # Absolute structural minimum to prevent 0 delay
+            delay_min if delay_min is not None
+            else getattr(settings, "parser_delay_min", 1.0)
+        )
+        self.delay_max = max(
+            self.delay_min + 0.1,  # Max must always be strictly greater than min
+            delay_max if delay_max is not None
+            else getattr(settings, "parser_delay_max", 3.0)
+        )
         
         # Organic session heatup tracking
         self._start_time = time.time()

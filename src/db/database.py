@@ -34,19 +34,24 @@ class Database:
             echo: Enable SQL query logging (for debugging).
         """
 
-        # command_timeout is set to 120s to accommodate graph queries over
-        # high-latency VPN tunnels (Tailscale, 300ms+).  Individual graph
-        # operations are additionally guarded by Python-level asyncio.wait_for
-        # timeouts in GraphRepository (default 15s per label query).
+        # command_timeout is reduced to 60s for more responsive query termination.
+        # pool_timeout prevents infinite blocking when the connection pool is exhausted.
+        # server_settings configure PostgreSQL-level timeouts to avoid silent hangs
+        # on locks or idle transactions over high-latency VPN tunnels (Tailscale).
         self.engine = create_async_engine(
             db_url,
             echo=echo,
             pool_size=20,
             max_overflow=10,
+            pool_timeout=15.0,
             pool_pre_ping=True,
             pool_recycle=3600,
             connect_args={
-                "command_timeout": 120,
+                "command_timeout": 60,
+                "server_settings": {
+                    "lock_timeout": "10000",
+                    "idle_in_transaction_session_timeout": "30000",
+                },
             },
         )
 
