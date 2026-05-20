@@ -8,8 +8,10 @@ stores them in Apache AGE graph, and syncs entities to Qdrant for vector search.
 import asyncio
 import logging
 import signal
+from datetime import datetime, timezone
 
 from sqlalchemy.exc import OperationalError
+from sqlalchemy import text
 
 try:
     import asyncpg.exceptions
@@ -167,13 +169,44 @@ class ExtractionWorker:
                 qdrant=self.qdrant,
             )
         except Exception as e:
+            # Log the full traceback for unrecoverable errors (validation, JSON parsing, API failures)
             logger.error(
-                "Failed to extract knowledge for post id=%s: %s",
+                "Unrecoverable error extracting knowledge for post id=%s: %s",
                 post.id,
                 e,
                 exc_info=True,
             )
-            raise  # Re-raise to skip marking as extracted, will be retried later
+
+            # Append error information to raw_metadata to preserve failure context
+            # Uses PostgreSQL JSONB || operator and jsonb_build_object() to merge error info
+            try:
+                async with self.db.async_session() as session:
+                    await session.execute(
+                        text("""
+                            UPDATE posts
+                            SET raw_metadata = COALESCE(raw_metadata, '{}'::jsonb) ||
+                                jsonb_build_object('extraction_error', :error_msg, 'failed_at', :failed_at)
+                            WHERE id = :post_id
+                        """),
+                        {
+                            "post_id": post.id,
+                            "error_msg": str(e),
+                            "failed_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                    await session.commit()
+            except Exception as db_err:
+                # Log but don't crash - we still need to mark as extracted to prevent infinite loops
+                logger.error(
+                    "Failed to update raw_metadata for post id=%s: %s",
+                    post.id,
+                    db_err,
+                    exc_info=True,
+                )
+
+            # Always mark as extracted to remove from unextracted queue and prevent infinite LLM API token wastage
+            await self.db.mark_post_extracted(post.id)
+            return
 
         # Mark post as extracted only after successful processing
         await self.db.mark_post_extracted(post.id)

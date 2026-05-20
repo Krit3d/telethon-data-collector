@@ -571,14 +571,16 @@ class KnowledgeExtractor:
 
         logger.info("Processing post id=%s for knowledge extraction", post_id)
 
-        # Upsert Post node with standardized ID format first
+        # Step A: Standardize the Post node ID
         post_node_id = f"post_{post_id}"
+
+        # Step B: Create/Upsert the Post node
         try:
             await graph_repo.upsert_graph_node(
                 label="Post",
                 properties={
                     "id": post_node_id,
-                    "post_id": post_id,  # Keep original DB ID for reference
+                    "post_id": post_id,
                     "author_id": author_id,
                 },
                 merge_key="id",
@@ -593,17 +595,66 @@ class KnowledgeExtractor:
             )
             raise
 
-        # Extract triples from text
+        # Step C: Create/Upsert the Actor node for the channel/author
+        actor_node_id = f"actor_{author_id}"
+        try:
+            await graph_repo.upsert_graph_node(
+                label="Actor",
+                properties={
+                    "id": actor_node_id,
+                    "name": f"Channel {author_id}",  # Baseline fallback name
+                    "author_id": author_id,
+                },
+                merge_key="id",
+            )
+            logger.debug("Upserted Actor node: id=%s", actor_node_id)
+        except Exception as e:
+            logger.error(
+                "Failed to upsert Actor node (author_id=%s): %s",
+                author_id,
+                e,
+                exc_info=True,
+            )
+            raise
+
+        # Step D: Create/Upsert the POSTED relationship
+        try:
+            await graph_repo.upsert_graph_edge(
+                start_label="Actor",
+                start_merge_key="id",
+                start_merge_val=actor_node_id,
+                edge_label="POSTED",
+                end_label="Post",
+                end_merge_key="id",
+                end_merge_val=post_node_id,
+                edge_properties={},
+            )
+            logger.debug(
+                "Created POSTED relationship: Actor(%s)-[:POSTED]->Post(%s)",
+                actor_node_id,
+                post_node_id,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to create POSTED relationship (author_id=%s, post_id=%s): %s",
+                author_id,
+                post_id,
+                e,
+            )
+            # Do not raise - continue with extraction
+
+        # Step E: Call LLM extraction
         result = await self.extract_triplets(text, author_id, post_id)
 
         if result is None or (not result.entities and not result.relations):
             logger.warning(
-                "Empty extraction for post id=%s. Text snippet: %s",
+                "Empty extraction for post id=%s. Text snippet: %s. Core Post skeleton is saved.",
                 post_id,
                 text[:100],
             )
             return
 
+        # Step F: Process extracted entities and relations
         # Detailed logging after extraction (before upserting)
         logger.info(
             "Extracted %d entities and %d relations from post %d",
@@ -700,35 +751,6 @@ class KnowledgeExtractor:
                     "Failed to create MENTIONS relationship (post_id=%s, entity_id=%s): %s",
                     post_id,
                     entity.id,
-                    e,
-                )
-                # Do not raise - continue with other operations
-
-        # Create POSTED relationship: (Actor {id: author_id})-[:POSTED]->(Post) if author entity exists
-        author_entity_id = f"actor_{author_id}"
-        if author_entity_id in entity_id_to_label:
-            # The author entity was extracted from this post
-            try:
-                await graph_repo.upsert_graph_edge(
-                    start_label="Actor",
-                    start_merge_key="id",
-                    start_merge_val=author_entity_id,
-                    edge_label="POSTED",
-                    end_label="Post",
-                    end_merge_key="id",
-                    end_merge_val=post_node_id,  # Use standardized Post node ID
-                    edge_properties={},
-                )
-                logger.debug(
-                    "Created POSTED relationship: Actor(%s)-[:POSTED]->Post(%s)",
-                    author_entity_id,
-                    post_node_id,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to create POSTED relationship (author_id=%s, post_id=%s): %s",
-                    author_id,
-                    post_id,
                     e,
                 )
                 # Do not raise - continue with other operations
