@@ -5,7 +5,6 @@ from pathlib import Path
 
 from pydantic import (
     Field,
-    field_validator,
     ValidationError,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -141,6 +140,18 @@ class Settings(BaseSettings):
     organic_heatup_minutes: int = Field(
         default=30,
         description="Duration of organic session heatup in minutes (slow start period)",
+    )
+    parser_delay_min: float = Field(
+        default=1.0,
+        description="Minimum delay in seconds before API calls in parser (default: 1.0s)",
+    )
+    parser_delay_max: float = Field(
+        default=3.0,
+        description="Maximum delay in seconds before API calls in parser (default: 3.0s)",
+    )
+    enable_warmup: bool = Field(
+        default=False,
+        description="Flag to completely bypass organic session heatup if set to False",
     )
     log_level: str = Field(
         default="INFO",

@@ -7,6 +7,7 @@ and stores them in a database with knowledge graph extraction.
 import asyncio
 import logging
 import random
+import re
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +16,7 @@ from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyError,
     ChannelPrivateError,
+    FloodWaitError,
     RPCError,
     SessionRevokedError,
     UserDeactivatedError,
@@ -35,6 +37,7 @@ from src.parser.core.utils import (
     normalize_username,
 )
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,10 +52,9 @@ async def _extract_channel_metadata(
     """Extract channel metadata with comprehensive error handling.
 
     This function resolves the channel entity and fetches full channel info.
-    Implements Zero-Username policy:
-    if access_hash is available, use cheap InputPeerChannel resolution.
-    Only use username resolution when access_hash is missing (first encounter),
-    then immediately save the hash to the DB.
+    Relies on Telethon's native session-based caching for access_hash resolution.
+    Never stores access_hash in the global PostgreSQL database to avoid
+    cross-account token poisoning and FloodWait errors.
 
     Args:
         client: Telethon client instance.
@@ -63,39 +65,27 @@ async def _extract_channel_metadata(
         entity_cache: Optional per-worker entity cache for cheap lookups.
     """
     channel_id = channel.id
-
-    # ZERO-USERNAME POLICY: Prioritize cheap ID+hash resolution to avoid FloodWait
     entity = None
 
-    # First, try cheap resolution with access_hash if available (NO USERNAME)
-    if channel.access_hash is not None:
-        result = await get_channel_entity_safe(
-            client,
+    # Try direct ID-based resolution first (cheap if session has cached the entity)
+    result = await get_channel_entity_safe(
+        client,
+        channel_id,
+        safe_api_call=safe_api_call,
+        entity_cache=entity_cache,
+    )
+    if result.is_success() and result.entity is not None:
+        entity = result.entity
+        logger.info(
+            "Channel id=%s resolved via ID (using Telethon session cache)",
             channel_id,
-            safe_api_call=safe_api_call,
-            access_hash=channel.access_hash,
-            entity_cache=entity_cache,
         )
-        if result.is_success() and result.entity is not None:
-            entity = result.entity
-            logger.info(
-                "Channel id=%s resolved via access_hash (cheap, no FloodWait)",
-                channel_id,
-            )
-        else:
-            # Cheap resolution failed - could be invalid hash or account restrictions
-            logger.debug(
-                "Cheap resolution failed for channel id=%s with access_hash. Error: %s",
-                channel_id,
-                result.reason or "unknown",
-            )
-            entity = None
 
-    # Fallback: Only if access_hash is missing OR cheap resolution failed, try username
-    # WARNING: This is EXPENSIVE and can trigger FloodWait!
+    # Fallback: If ID resolution failed, try username resolution (expensive)
+    # This typically only happens once per session per channel
     if entity is None and channel.username:
         logger.info(
-            "Channel id=%s: access_hash missing or invalid, falling back to username resolution (EXPENSIVE)",
+            "Channel id=%s: ID resolution failed, falling back to username resolution",
             channel_id,
         )
         result = await get_channel_entity_safe(
@@ -106,23 +96,6 @@ async def _extract_channel_metadata(
         )
         if result.is_success() and result.entity is not None:
             entity = result.entity
-            # IMMEDIATELY save the access_hash to DB for future cheap resolution
-            try:
-                resolved_hash = getattr(entity, "access_hash", None)
-                if resolved_hash is not None:
-                    await db.update_channel_access_hash(
-                        channel_id, resolved_hash
-                    )
-                    logger.info(
-                        "Updated access_hash for channel id=%s from username resolution",
-                        channel_id,
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to update access_hash for channel id=%s: %s",
-                    channel_id,
-                    e,
-                )
         else:
             # Username resolution failed
             if result.shadowbanned:
@@ -133,9 +106,14 @@ async def _extract_channel_metadata(
             return None
 
     if entity is None:
-        # Both cheap (hash) and expensive (username) resolution failed
+        # Both ID and username resolution failed
         await db.mark_channel_rejected(channel_id)
         await asyncio.sleep(random.uniform(10, 20))
+        return None
+
+    # Check if entity is actually a Channel (not a User, PeerUser, or other type)
+    if not isinstance(entity, TlChannel):
+        logger.warning("Entity is not a channel, skipping")
         return None
 
     # Get full channel info using shared utility
@@ -149,7 +127,6 @@ async def _extract_channel_metadata(
         "title": getattr(entity, "title", "") or "",
         "description": description,
         "subscribers_count": subscribers_count,
-        "access_hash": getattr(entity, "access_hash", None),
     }
 
     return channel_data, entity
@@ -165,7 +142,9 @@ async def _process_message(
     """Process a single message: save to PostgreSQL and return its ID.
 
     Enriched metadata extraction for OpenSPG knowledge graph integration.
-    Extracts author, forward information, grouped_id, media flags, and geo data.
+    Extracts author, forward information, grouped_id, media flags, geo data,
+    and builds a structured metadata JSONB field with additional attributes
+    for domain-specific processing.
 
     Args:
         msg: Telethon message object.
@@ -178,6 +157,17 @@ async def _process_message(
         Post ID if successfully processed, None otherwise.
     """
     if msg.id is None or msg.date is None:
+        return None
+
+    # Skip system messages (messages with action) that don't help the OpenSPG graph
+    # Use getattr to safely access action attribute (Pylance may not recognize it)
+    msg_action = getattr(msg, 'action', None)
+    if msg_action is not None:
+        return None
+
+    # Skip empty messages without content
+    msg_content = getattr(msg, 'message', None)
+    if not msg_content:
         return None
 
     published_at = msg.date
@@ -198,6 +188,68 @@ async def _process_message(
             geo_lat = getattr(geo, "lat", None)
             geo_long = getattr(geo, "long", None)
 
+    # Extract reply information
+    reply_to_msg_id: int | None = None
+    if msg.reply_to and hasattr(msg.reply_to, "reply_to_msg_id"):
+        reply_to_msg_id = getattr(msg.reply_to, "reply_to_msg_id", None)
+
+    # Detect language (placeholder - in production, use a language detection library)
+    # Telethon doesn't provide language detection natively
+    language: str | None = getattr(msg, "lang", None)
+
+    # Extract numeric metrics and patterns from message text
+    text_content = msg_content or ""
+    numeric_metrics: dict[str, Any] = {}
+
+    # Extract numbers (prices, amounts, etc.)
+    # Match patterns like $100, 100$, 100 USD, etc.
+    price_patterns = re.findall(
+        r'(?:\$|USD|EUR|GBP|RUB|₽)?\s*[\d,]+(?:\.\d+)?\s*(?:\$|USD|EUR|GBP|RUB|₽)?',
+        text_content
+    )
+    if price_patterns:
+        numeric_metrics["price_patterns"] = price_patterns
+
+    # Extract standalone numbers (integers and floats)
+    numbers = re.findall(r'\b\d+(?:\.\d+)?\b', text_content)
+    if numbers:
+        numeric_metrics["numbers"] = [float(n) if '.' in n else int(n) for n in numbers]
+
+    # Count links in the message
+    link_count = len(re.findall(r'https?://\S+', text_content))
+    if link_count > 0:
+        numeric_metrics["link_count"] = link_count
+
+    # Count mentions (Telegram mentions start with @)
+    mention_count = len(re.findall(r'@\w+', text_content))
+    numeric_metrics["mention_count"] = mention_count
+
+    # Count hashtags
+    hashtag_count = len(re.findall(r'#\w+', text_content))
+    numeric_metrics["hashtag_count"] = hashtag_count
+
+    # Count words and characters
+    numeric_metrics["word_count"] = len(text_content.split())
+    numeric_metrics["char_count"] = len(text_content)
+
+    # Build the metadata dictionary for JSONB column
+    metadata: dict[str, Any] = {
+        "language": language,
+        "geo": {
+            "lat": geo_lat,
+            "long": geo_long,
+        } if geo_lat is not None or geo_long is not None else None,
+        "reply_to_msg_id": reply_to_msg_id,
+        "numeric_metrics": numeric_metrics if numeric_metrics else None,
+        # Domain-specific flags can be added here based on content analysis
+        "has_links": link_count > 0,
+        "has_mentions": mention_count > 0,
+        "has_hashtags": hashtag_count > 0,
+    }
+
+    # Remove None values from metadata to keep it clean
+    metadata = {k: v for k, v in metadata.items() if v is not None}
+
     post_data: dict[str, Any] = {
         "channel_id": int(entity.id),
         "message_id": int(msg.id),
@@ -207,13 +259,16 @@ async def _process_message(
         "comments_count": count_message_comments(msg),
         "shares_count": getattr(msg, "forwards", None),
         "reactions_count": count_message_reactions(msg),
-        # Enriched metadata for OpenSPG knowledge graph
+        # Enriched metadata for OpenSPG knowledge graph (backward compatible)
         "author": getattr(msg, "post_author", None),
         "fwd_from_channel_id": fwd_from_channel_id,
         "grouped_id": getattr(msg, "grouped_id", None),
         "has_media": bool(msg.media),  # Boolean flag only, no downloads
         "geo_lat": geo_lat,
         "geo_long": geo_long,
+        "language": language,
+        # JSONB raw_metadata column for OpenSPG raw metadata extraction
+        "raw_metadata": metadata if metadata else None,
     }
 
     post = await db.upsert_post(post_data)
@@ -308,6 +363,12 @@ class ParserWorker(BaseTelegramWorker):
         Implements controlled chunk-based fetching to avoid burst requests that trigger
         FloodWait bans. Messages are fetched in small chunks with natural delays between
         requests.
+
+        When a FloodWaitError (or shadowban/network error caused by it) is bubbled up
+        from safe_api_call:
+        - Catch it, log it, and safely return the channel to the queue
+        - Ensure all local DB resources/sessions are closed
+        - Propagate the exception to _worker_runner so the runner knows this session is in cooldown
 
         Args:
             channel: Channel object from database with id and username.
@@ -406,10 +467,11 @@ class ParserWorker(BaseTelegramWorker):
                 # Use offset_id to get messages older than the last fetched message
                 # Note: offset_id=None means "start from the most recent message"
                 # Use min_id to skip messages we already have (optimization)
+                # Clean lambda - no conditional default value evaluation traps
                 messages = await self.safe_api_call(
                     f"get_messages(channel_id={channel_id}, chunk_size={current_chunk_size})",
-                    operation=lambda oid=last_msg_id if last_msg_id else 0, lim=current_chunk_size, lkid=latest_known_id: self.client.get_messages(  # type: ignore[attr-defined]
-                        entity, limit=lim, offset_id=oid, min_id=lkid
+                    operation=lambda: self.client.get_messages(  # type: ignore[attr-defined]
+                        entity, limit=current_chunk_size, offset_id=last_msg_id, min_id=latest_known_id
                     ),
                 )
 
@@ -482,8 +544,11 @@ class ParserWorker(BaseTelegramWorker):
                 if len(messages) < current_chunk_size:
                     break
 
-                # Apply natural delay between chunks to avoid rate limits
-                await asyncio.sleep(self.natural_delay(base_delay=3.0))
+                # Apply lighter delay between chunks to avoid rate limits
+                if self.settings.use_natural_delays:
+                    await asyncio.sleep(self.natural_delay(base_delay=1.5))
+                else:
+                    await asyncio.sleep(random.uniform(1.0, 2.5))
 
             await self.db.mark_channel_parsed(channel_id)
 
@@ -494,8 +559,27 @@ class ParserWorker(BaseTelegramWorker):
                 posts_saved,
             )
 
-            # Random delay between channels to avoid rate limits
-            await asyncio.sleep(random.uniform(5, 15))
+            # Reduced random delay between channels to avoid rate limits
+            await asyncio.sleep(random.uniform(2, 5))
+
+        except FloodWaitError as e:
+            # FloodWaitError bubbled up from safe_api_call
+            # The worker_base now raises FloodWaitError for delays > 5 seconds
+            # instead of sleeping indefinitely inside safe_api_call
+            delay = int(getattr(e, "seconds", 0)) or 1
+            logger.warning(
+                "Worker %d: FloodWaitError in channel %s (delay=%ds). "
+                "Marking channel as pending and propagating error.",
+                self.worker_id,
+                channel_id,
+                delay,
+            )
+            # Safely return channel to queue for later processing
+            await self.db.mark_channel_pending(channel_id)
+            # Close any local DB resources if needed
+            # (Database connections are managed by the pool, no explicit close needed here)
+            # Re-raise the exception so _worker_runner can handle session cooldown
+            raise
 
         except (
             ChannelPrivateError,
@@ -557,8 +641,8 @@ async def main() -> None:
     logger.info("=" * 60)
     logger.info("- Safe API calls: All API calls wrapped in safe_api_call (FloodWait handled by worker_base)")
     logger.info("- Smart skip: Enabled (min_id=latest_known_id to avoid re-fetching)")
-    logger.info("- Metadata enrichment: Enabled (author, fwd_from, grouped_id, has_media, geo)")
-    logger.info("- Exception cleanup: Redundant FloodWaitError blocks removed")
+    logger.info("- Metadata enrichment: Enabled (author, fwd_from, grouped_id, has_media, geo, JSONB metadata)")
+    logger.info("- FloodWait handling: Session-pool-friendly - sessions return to pool with cooldown")
     logger.info("- Posts limit per channel: %d", settings.posts_limit)
     logger.info("=" * 60)
 

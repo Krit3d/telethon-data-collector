@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from telethon.errors import AuthKeyError, UserDeactivatedError
+from telethon.errors.rpcerrorlist import FloodWaitError
 
 from src.config.config import Settings
 from .exceptions import SessionExpiredError
@@ -62,7 +63,7 @@ class SessionEntry:
         ready_at: Timestamp (from time.time()) when this session is ready to be used.
                   If 0 or in the past, the session is ready immediately.
     """
-
+    
     config: SessionConfig
     ready_at: float = field(default=0.0)
 
@@ -241,15 +242,20 @@ class SessionPool:
             cooldown: If True, put session in cooldown before it can be reused.
                       If the session already has a future ready_at, it will be preserved.
             cooldown_seconds: Custom cooldown period. Uses default if None.
+                If the entry already has a future ready_at (from FloodWait cooldown),
+                that timestamp will be preserved unless cooldown_seconds is provided.
         """
 
         if cooldown:
             # Only set cooldown if the entry doesn't already have a future ready_at
             # This preserves the original cooldown timestamp when returning a session
-            # that was already in cooldown
-            if entry.ready_at <= time.time():
+            # that was already in cooldown (e.g., from FloodWaitError handling)
+            current_time = time.time()
+            if entry.ready_at <= current_time:
+                # No existing future cooldown, set a new one
                 seconds = cooldown_seconds or self._cooldown_period
-                entry.ready_at = time.time() + seconds
+                entry.ready_at = current_time + seconds
+            # If entry.ready_at is already in the future, preserve it
             logger.debug(
                 "Session %s returned to pool with cooldown (ready at %.0f)",
                 entry.config.session_path.name,
@@ -296,7 +302,8 @@ async def _worker_runner(
     creating worker instances, and running them. If a worker completes
     normally, the session is returned to the pool for reuse. If a worker
     encounters a permanent ban error, the session is removed from the pool.
-    For other errors, the session is returned with a cooldown period.
+    For FloodWaitError, the session is returned with an appropriate cooldown
+    so other healthy sessions can be processed in its place.
     
     Args:
         runner_id: Unique identifier for this runner (used as worker_id).
@@ -306,7 +313,7 @@ async def _worker_runner(
         db: Database instance to pass to workers.
         worker_args: Additional arguments for worker constructor.
     """
-
+    
     logger.info("Worker runner %d started", runner_id)
     
     if worker_args is None:
@@ -392,6 +399,28 @@ async def _worker_runner(
             )
             # Return session to pool for reuse (ready immediately)
             await session_pool.return_session(entry, cooldown=False)
+        except FloodWaitError as e:
+            # FloodWaitError - session needs cooldown before reuse
+            delay = int(getattr(e, "seconds", 0)) or 1
+            logger.warning(
+                "Runner %d: Session %s rate limited by TG (FloodWait %ds). "
+                "Returning to pool with cooldown %ds.",
+                runner_id,
+                config.session_path.name,
+                delay,
+                delay + 10,
+            )
+            # Return session to pool with cooldown
+            # The worker's _flood_wait_cooldown_until should already be set,
+            # but we also set it here to ensure the pool has the correct ready_at
+            entry.ready_at = time.time() + delay + 10
+            await session_pool.return_session(entry, cooldown=True, cooldown_seconds=delay + 10)
+            # Exit the current worker run cleanly - the runner will pick up
+            # a different healthy session from the pool
+            logger.info(
+                "Worker runner %d: exiting after FloodWait, will pick new session",
+                runner_id,
+            )
         except (AuthKeyError, UserDeactivatedError, SessionExpiredError) as e:
             # Permanent ban - don't return session to pool
             logger.error(

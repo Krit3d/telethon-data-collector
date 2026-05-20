@@ -1,91 +1,102 @@
 """Centralized logging module for production-ready structured logging.
 
-This module provides JSON and TEXT logging formats with custom filters
-to suppress noisy Telethon RPC warnings in production.
+This module provides TEXT logging format optimized for production use.
+Supports optional colorized output while maintaining Docker log compatibility.
+Suppresses noisy external library logs (Telethon, asyncio, urllib3).
 """
 
-import json
 import logging
 import os
+import sys
+
+# Color codes for terminal output (only if TTY)
+if sys.stderr.isatty() and os.getenv("NO_COLOR") is None:
+    _CYAN = "\033[36m"
+    _GREEN = "\033[32m"
+    _YELLOW = "\033[33m"
+    _RED = "\033[31m"
+    _BOLD_RED = "\033[1;31m"
+    _RESET = "\033[0m"
+else:
+    _CYAN = _GREEN = _YELLOW = _RED = _BOLD_RED = _RESET = ""
 
 
-class JsonFormatter(logging.Formatter):
-    """Custom JSON formatter for structured logging."""
-    def format(self, record: logging.LogRecord) -> str:
-        log_object = {
-            "timestamp": self.formatTime(record, self.datefmt),
-            "level": record.levelname,
-            "name": record.name,
-            "message": record.getMessage(),
-        }
+class ColorFormatter(logging.Formatter):
+    """Custom formatter with colorized output and clean structured format.
 
-        # Include worker_id if present in the log record
-        worker_id = getattr(record, "worker_id", None)
-        if worker_id is not None:
-            log_object["worker_id"] = str(worker_id)
-
-        # Include exception info if present
-        if record.exc_info:
-            log_object["exc_info"] = self.formatException(record.exc_info)
-
-        return json.dumps(log_object, ensure_ascii=False)
-
-
-class TelethonNoiseFilter(logging.Filter):
-    """Filter to suppress noisy Telethon RPC error warnings.
-
-    This filter inspects log records and returns False if the record
-    comes from a telethon logger AND contains spammy messages like
-    "RPC error" or "Invalid channel object".
+    Format: timestamp | LEVEL    | message
+    No module paths in output for clean horizontal-space efficient logs.
     """
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        """Return True to keep the record, False to suppress it."""
-        # Check if the record is from telethon logger
-        if record.name.startswith("telethon"):
-            message = record.getMessage()
-            # Suppress RPC error warnings and invalid channel object messages
-            if "RPC error" in message or "Invalid channel object" in message:
-                return False
-        return True
+    LEVEL_COLORS = {
+        logging.DEBUG: _CYAN,
+        logging.INFO: _GREEN,
+        logging.WARNING: _YELLOW,
+        logging.ERROR: _RED,
+        logging.CRITICAL: _BOLD_RED,
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        # Colorize levelname
+        color = self.LEVEL_COLORS.get(record.levelno, _RESET)
+        levelname_colored = f"{color}{record.levelname:<8s}{_RESET}"
+
+        # Format timestamp
+        asctime = self.formatTime(record, self.datefmt)
+
+        # Build clean log line: timestamp | LEVEL | message
+        log_line = f"{asctime} | {levelname_colored} | {record.getMessage()}"
+
+        # Append exception info if present (only for errors)
+        if record.exc_info and record.levelno >= logging.WARNING:
+            log_line += "\n" + self.formatException(record.exc_info)
+
+        return log_line
+
+
+def _configure_external_loggers() -> None:
+    """Set appropriate log levels for noisy external libraries.
+
+    Suppresses spam from Telethon RPC warnings and other verbose libraries
+    while keeping errors visible.
+    """
+    noisy_loggers = [
+        "telethon",
+        "telethon.network",
+        "telethon.extensions",
+        "telethon.crypto",
+        "asyncio",
+        "urllib3",
+    ]
+
+    for logger_name in noisy_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def setup_logging(level: str) -> None:
-    """Configure global logging with a normalized log level and format.
-
-    Supports JSON and TEXT formats via LOG_FORMAT environment variable.
-    TEXT format includes service name and worker_id in the output.
-    Applies TelethonNoiseFilter to suppress noisy RPC warnings.
+    """Configure global logging with clean format and suppressed noise.
 
     Args:
         level: Logging level as a string (e.g., "INFO", "DEBUG").
     """
 
-    # Clear existing handlers to prevent duplicate logs and override library defaults
+    # Clear existing handlers to prevent duplicate logs
     root_logger = logging.getLogger()
     if root_logger.handlers:
         for handler in root_logger.handlers[:]:
             root_logger.removeHandler(handler)
 
-    log_format = os.getenv("LOG_FORMAT", "TEXT").upper()
     log_level = getattr(logging, level.upper(), logging.INFO)
     root_logger.setLevel(log_level)
 
-    # Create the stream handler
-    handler = logging.StreamHandler()
-
-    if log_format == "JSON":
-        # JSON structured logging
-        handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S.%fZ"))
-    else:
-        # TEXT format with worker_id support
-        formatter = logging.Formatter(
-            fmt="%(asctime)s | %(levelname)-8s | [%(name)s] | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        handler.setFormatter(formatter)
-
-    # Apply the Telethon noise filter to suppress RPC warnings
-    handler.addFilter(TelethonNoiseFilter())
-
+    # Create stream handler with clean formatter
+    handler = logging.StreamHandler(sys.stderr)
+    formatter = ColorFormatter(datefmt="%Y-%m-%d %H:%M:%S")
+    handler.setFormatter(formatter)
     root_logger.addHandler(handler)
+
+    # Suppress noisy external library logs
+    _configure_external_loggers()
+
+    # Disable propagation for external loggers to prevent double-logging
+    logging.getLogger("telethon").propagate = False

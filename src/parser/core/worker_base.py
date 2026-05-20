@@ -61,8 +61,8 @@ class BaseTelegramWorker:
         app_version: str = "4.16.8",
         lang_code: str = "en",
         system_lang_code: str = "en-US",
-        delay_min: float = 5.0,
-        delay_max: float = 15.0,
+        delay_min: float | None = None,
+        delay_max: float | None = None,
     ):
         """Initialize the base worker.
 
@@ -79,8 +79,10 @@ class BaseTelegramWorker:
             app_version: App version string.
             lang_code: Language code (e.g., 'en').
             system_lang_code: System language code (e.g., 'en-US').
-            delay_min: Minimum random delay in seconds before API calls (default: 5.0).
-            delay_max: Maximum random delay in seconds before API calls (default: 15.0).
+            delay_min: Minimum random delay in seconds before API calls.
+                If None, uses settings.parser_delay_min (default: 1.0).
+            delay_max: Maximum random delay in seconds before API calls.
+                If None, uses settings.parser_delay_max (default: 3.0).
         """
 
         self.worker_id = worker_id
@@ -95,8 +97,8 @@ class BaseTelegramWorker:
         self.app_version = app_version
         self.lang_code = lang_code
         self.system_lang_code = system_lang_code
-        self.delay_min = delay_min
-        self.delay_max = delay_max
+        self.delay_min = delay_min if delay_min is not None else settings.parser_delay_min
+        self.delay_max = delay_max if delay_max is not None else settings.parser_delay_max
         
         # Organic session heatup tracking
         self._start_time = time.time()
@@ -128,9 +130,16 @@ class BaseTelegramWorker:
         gradually increases its activity. Factor starts at 0.1 (10% speed)
         and asymptotically approaches 1.0 over the heatup period.
         
+        If `settings.enable_warmup` is False, returns 1.0 immediately to
+        bypass the slow start period for faster parsing.
+        
         Returns:
             Float between 0.1 and 1.0 representing current activity multiplier.
         """
+
+        # Bypass warmup if disabled in settings
+        if not self.settings.enable_warmup:
+            return 1.0
 
         elapsed = time.time() - self._start_time
         if elapsed >= self._heatup_duration_s:
@@ -366,10 +375,12 @@ class BaseTelegramWorker:
         base_delay_s: float | None = None,
         rpc_error_fatal: bool = False,
         max_flood_wait_s: int = 3600,
+        socket_timeout: float = 30.0,
     ) -> Any:
         """Execute a Telethon API call with comprehensive error handling.
 
         This method provides robust error handling for Telegram API calls, including:
+        - Socket timeout wrapping (30s default) to prevent infinite network hangs
         - Automatic retry logic for FloodWaitError with configurable maximum wait time
         - Exponential backoff for network errors (OSError, TimeoutError, ConnectionError)
         - Shadowban detection and mitigation with connection lifecycle management
@@ -388,14 +399,16 @@ class BaseTelegramWorker:
                 and None is returned for graceful degradation.
             max_flood_wait_s: Maximum cumulative FloodWait sleep time before giving up.
                 Prevents indefinite blocking from extreme rate limits. Default: 3600 seconds.
+            socket_timeout: Timeout in seconds for the API call to prevent infinite hangs.
+                Default: 30.0 seconds. Treated as transient error for retry logic.
 
         Returns:
             The result of the operation, or None if the operation failed gracefully
             (non-fatal RPC error, network error after retries exhausted, or other ValueError).
 
         Raises:
-            FloodWaitError: Re-raised when cumulative FloodWait exceeds max_flood_wait_s
-                or after sleeping and retrying within limits.
+            FloodWaitError: Re-raised when delay > 5 seconds (caller handles cooldown),
+                or when cumulative FloodWait exceeds max_flood_wait_s.
             RPCError: Re-raised if rpc_error_fatal=True or after retry limit.
             SessionExpiredError: Re-raised for session authentication errors.
             ShadowBanDetectedError: Raised when shadowban is confirmed (3 consecutive
@@ -465,19 +478,36 @@ class BaseTelegramWorker:
                     )
                 await asyncio.sleep(delay)
 
+                # Execute operation with socket timeout to prevent infinite hangs
                 result = operation()
 
                 if asyncio.iscoroutine(result):
-                    return await result
-
-                return result
+                    # Wrap coroutine in wait_for to enforce socket timeout
+                    try:
+                        return await asyncio.wait_for(result, timeout=socket_timeout)
+                    except asyncio.TimeoutError:
+                        # Treat socket timeout as transient network error
+                        self.logger.warning(
+                            "%s: Socket timeout after %.1fs, treating as transient error",
+                            operation_name,
+                            socket_timeout,
+                        )
+                        raise  # Re-raise to be caught by network error handler
+                else:
+                    # Sync operation - log that socket timeout is not enforced
+                    if socket_timeout > 0:
+                        self.logger.debug(
+                            "%s: Sync operation, socket timeout not enforced",
+                            operation_name,
+                        )
+                    return result
 
             except FloodWaitError as e:
                 delay = int(getattr(e, "seconds", 0)) or 1
                 flood_wait_total += delay
 
                 self.logger.warning(
-                    "%s: FloodWaitError, sleeping %ds (total: %ds)",
+                    "%s: FloodWaitError detected, delay=%ds (total: %ds)",
                     operation_name,
                     delay,
                     flood_wait_total,
@@ -522,6 +552,21 @@ class BaseTelegramWorker:
                     )
                     return  # Exit the operation and worker loop
 
+                # For delays > 5 seconds, raise immediately to caller for pool-friendly handling
+                # This prevents blocking the worker indefinitely inside safe_api_call
+                if delay > 5:
+                    self.logger.warning(
+                        "%s: FloodWait delay %ds > 5s, setting cooldown and raising to caller",
+                        operation_name,
+                        delay,
+                    )
+                    # Set cooldown timestamp for when this session should be available again
+                    self._flood_wait_cooldown_until = time.time() + delay + 10
+                    # Keep session alive - it will be returned to pool with cooldown
+                    self.is_alive = True
+                    # Re-raise FloodWaitError so caller can handle pool return
+                    raise
+
                 if flood_wait_total >= max_flood_wait_s:
                     self.logger.error(
                         "%s: Cumulative FloodWait %ds exceeds limit %ds. "
@@ -532,7 +577,13 @@ class BaseTelegramWorker:
                     )
                     raise
 
+                # For delays <= 5 seconds, sleep here and retry
                 # Add 10 second buffer to FloodWait delay for extra safety
+                self.logger.info(
+                    "%s: Sleeping %.1fs for FloodWait (delay <= 5s, will retry)",
+                    operation_name,
+                    delay + 10,
+                )
                 await asyncio.sleep(delay + 10)
                 # After sleeping, retry the operation (loop continues)
                 continue

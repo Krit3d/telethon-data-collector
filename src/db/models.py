@@ -3,6 +3,7 @@ SQLAlchemy models for channels and posts tables.
 """
 
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     DateTime,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -176,6 +178,14 @@ class Post(Base):
     )
     language: Mapped[str | None] = mapped_column(
         String(10), nullable=True, comment="Detected language code"
+    )
+
+    # JSONB raw_metadata column for OpenSPG raw metadata extraction
+    # Stores arbitrary nested attributes for different domains (it-sector, finance, blogging, etc.)
+    raw_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Arbitrary raw metadata for OpenSPG domain processing",
     )
 
     created_at: Mapped[datetime] = mapped_column(

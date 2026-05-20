@@ -8,12 +8,14 @@ from typing import Any, Callable
 from telethon import TelegramClient
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import Channel as TlChannel
-from telethon.tl.types import InputChannel, InputPeerChannel, Message
+from telethon.tl.types import InputChannel, Message
 
 logger = logging.getLogger(__name__)
 
 # Global in-memory cache for entity resolution (legacy, kept for backward compatibility)
-# Key: (channel_id, access_hash) tuple, Value: resolved TlChannel entity
+# Key: (channel_id, None) tuple, Value: resolved TlChannel entity
+# Note: access_hash is NOT used in the cache key to prevent cross-account token poisoning.
+# Each Telethon session stores its own access_hash in its .session SQLite file.
 # Limited to 10000 entries to prevent unbounded memory growth; oldest entries are evicted
 _entity_cache: dict[tuple[int, int | None], TlChannel] = {}
 _MAX_CACHE_SIZE = 10000
@@ -79,95 +81,61 @@ async def get_channel_entity_safe(
     access_hash: int | None = None,
     entity_cache: dict[tuple[int, int | None], Any] | None = None,
 ) -> ChannelResolutionResult:
-    """Safely get channel entity by ID or username with caching and cheap resolution.
+    """Safely get channel entity by ID or username using Telethon session cache.
 
-    This function attempts to resolve a channel entity. If safe_api_call is
-    provided, it uses that for error handling and retries. Otherwise, it
-    uses the client's get_entity directly.
+    This function resolves channel entities relying on Telethon's native SQLite
+    session cache for access_hash lookup. The access_hash parameter is ignored
+    to prevent cross-account token poisoning.
 
-    Optimizations:
-    - Checks worker's entity cache first (if provided), then global cache
-    - If access_hash is provided, constructs InputPeerChannel directly (cheap, no FloodWait)
-    - Falls back to username-based resolution only when necessary
+    Resolution flow:
+    1. Check worker's in-memory entity_cache using (channel_id, None)
+    2. Try direct client.get_entity(channel_id) - cheap if session has cached the entity
+    3. Fall back to username resolution if ID-only resolution fails (expensive)
 
     Args:
         client: Telethon client instance.
         channel_id: Channel ID (int) or username (str).
         safe_api_call: Optional async function that wraps API calls with
             retry logic and error handling. Format: safe_api_call(name, callable).
-        access_hash: Optional access_hash for cheap resolution via InputPeerChannel.
+        access_hash: Ignored. Kept for signature compatibility only.
         entity_cache: Optional per-worker entity cache dict to check before global cache.
 
     Returns:
         ChannelResolutionResult containing the entity or error status.
     """
+    # access_hash is ignored to prevent cross-account token poisoning.
+    # Telethon's native session cache handles access_hash lookup internally.
 
     # Check worker's entity cache first if provided (per-worker cache)
+    # Use (channel_id, None) as cache key to avoid access_hash poisoning
     if entity_cache is not None and isinstance(channel_id, int):
-        cache_key = (channel_id, access_hash)
+        cache_key = (channel_id, None)
         if cache_key in entity_cache:
             cached_entity = entity_cache[cache_key]
-            logger.info(
-                "Cache HIT for channel id=%s (Cheap - from worker cache)",
+            logger.debug(
+                "Cache HIT for channel id=%s (from worker cache)",
                 channel_id,
             )
             return ChannelResolutionResult(entity=cached_entity)
 
     # Check global cache next (shared across workers)
     if isinstance(channel_id, int):
-        cache_key = (channel_id, access_hash)
+        cache_key = (channel_id, None)
         if cache_key in _entity_cache:
             cached_entity = _entity_cache[cache_key]
-            logger.info(
-                "Cache HIT for channel id=%s (Cheap - from global cache)",
+            logger.debug(
+                "Cache HIT for channel id=%s (from global cache)",
                 channel_id,
             )
             return ChannelResolutionResult(entity=cached_entity)
 
-    # Try cheap resolution first if we have access_hash
-    if access_hash is not None and isinstance(channel_id, int):
-        try:
-            input_peer = InputPeerChannel(channel_id, access_hash)
-            # We need to fetch the full entity, but using InputPeerChannel is cheap
-            # Let's use client.get_entity with the InputPeer directly
-            if safe_api_call:
-                entity = await safe_api_call(
-                    f"get_entity(InputPeerChannel({channel_id}, hash))",
-                    lambda: client.get_entity(input_peer),
-                )
-            else:
-                entity = await client.get_entity(input_peer)
-
-            if isinstance(entity, TlChannel) and getattr(
-                entity, "broadcast", False
-            ):
-                logger.info(
-                    "Resolved entity by ID+HASH (Cheap): id=%s",
-                    channel_id,
-                )
-                # Cache with the access_hash we used in both global and worker cache
-                if isinstance(channel_id, int) and access_hash is not None:
-                    cache_key_with_hash = (channel_id, access_hash)
-                    _entity_cache[cache_key_with_hash] = entity
-                    if entity_cache is not None:
-                        entity_cache[cache_key_with_hash] = entity
-                    # Simple eviction: if cache exceeds max size, clear it (oldest entries dropped)
-                    if len(_entity_cache) > _MAX_CACHE_SIZE:
-                        _entity_cache.clear()
-                return ChannelResolutionResult(entity=entity)
-            return ChannelResolutionResult(
-                entity=None, reason="not_a_broadcast_channel"
-            )
-        except Exception as e:
-            # Cheap resolution failed, fall through to username or ID-only resolution
-            logger.debug(
-                "Cheap resolution failed for id=%s: %s. Will try other methods.",
-                channel_id,
-                e,
-            )
-
+    # Resolve entity: Telethon will use its session cache for cheap lookup
     async def _fetch_entity() -> Any:
         """Internal helper to fetch entity using the appropriate method."""
+        if isinstance(channel_id, int):
+            # Offline SQLite cache lookup by ID: no network call needed, skip safe_api_call
+            return await client.get_entity(channel_id)
+        # Username-based lookup requires network call; use safe_api_call for retry/error handling
         if safe_api_call:
             return await safe_api_call(
                 f"get_entity({channel_id})",
@@ -181,23 +149,23 @@ async def get_channel_entity_safe(
         if isinstance(entity, TlChannel) and getattr(
             entity, "broadcast", False
         ):
-            # Determine if this was a username-based resolution (expensive)
+            # Log resolution method
             if isinstance(channel_id, str):
-                logger.info(
-                    "Resolving entity by USERNAME (Expensive!): %s",
+                logger.debug(
+                    "Resolved entity by username: %s",
                     channel_id,
                 )
             else:
-                logger.info(
-                    "Resolving entity by ID-only (Expensive!): id=%s",
+                logger.debug(
+                    "Resolved entity by ID (using session cache): id=%s",
                     channel_id,
                 )
-            # Cache the result for future use if we got an access_hash
-            if isinstance(channel_id, int) and getattr(entity, "access_hash", None):
-                cache_key_with_hash = (channel_id, entity.access_hash)
-                _entity_cache[cache_key_with_hash] = entity
+            # Cache the result using (channel_id, None) to avoid access_hash poisoning
+            if isinstance(channel_id, int):
+                cache_key = (channel_id, None)
+                _entity_cache[cache_key] = entity
                 if entity_cache is not None:
-                    entity_cache[cache_key_with_hash] = entity
+                    entity_cache[cache_key] = entity
                 # Simple eviction: if cache exceeds max size, clear it
                 if len(_entity_cache) > _MAX_CACHE_SIZE:
                     _entity_cache.clear()

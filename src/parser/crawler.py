@@ -42,6 +42,7 @@ from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.models import Channel as ChannelModel
 from src.parser.core.utils import (
+    get_channel_entity_safe,
     get_full_channel_info,
 )
 from src.parser.core.worker_base import BaseTelegramWorker
@@ -107,6 +108,8 @@ class Worker(BaseTelegramWorker):
         self.delay_max = delay_max
         self.processed_count = 0
         self.DAILY_LIMIT = 850
+        # Per-worker entity cache to avoid cross-account access_hash poisoning
+        self._entity_cache: dict[tuple[int, int | None], Any] = {}
 
     async def _check_author_content(
         self,
@@ -220,8 +223,7 @@ class Worker(BaseTelegramWorker):
 
         await self.db.upsert_channel(channel_data)
         logger.info(
-            "Worker %d: Saved channel %s (id=%s, author=%s, subs=%s)",
-            self.worker_id,
+            "Saved channel @%s (id=%s, author=%s, subs=%s)",
             username or channel_id,
             channel_id,
             is_author_blog,
@@ -259,7 +261,7 @@ class Worker(BaseTelegramWorker):
         )
 
         if subscribers_count is None:
-            logger.info(
+            logger.debug(
                 "Worker %d: Channel %s has no subscriber count, skipping",
                 self.worker_id,
                 channel_name,
@@ -268,7 +270,7 @@ class Worker(BaseTelegramWorker):
             return False
 
         if subscribers_count < self.min_subscribers:
-            logger.info(
+            logger.debug(
                 "Worker %d: Channel %s has %d subscribers (<%d), skipping",
                 self.worker_id,
                 channel_name,
@@ -310,7 +312,7 @@ class Worker(BaseTelegramWorker):
             if isinstance(entity, InputChannel):
                 input_channel = entity
             elif entity.access_hash is None:
-                logger.warning(
+                logger.debug(
                     "Worker %d: Channel %s has no access_hash, cannot get recommendations",
                     self.worker_id,
                     getattr(entity, "username", "unknown"),
@@ -328,16 +330,16 @@ class Worker(BaseTelegramWorker):
                     ),
                 )
             except ChannelInvalidError:
-                logger.warning(
-                    "Worker %d: Channel id=%s is invalid (ChannelInvalidError), rejecting task",
+                logger.info(
+                    "Worker %d: Channel id=%s is invalid, rejecting task",
                     self.worker_id,
                     channel_id,
                 )
                 raise ChannelTaskRejected(f"Channel {channel_id} is invalid")
             except RPCError as e:
                 if "Invalid channel" in str(e):
-                    logger.warning(
-                        "Worker %d: Channel id=%s is invalid (RPCError: Invalid channel), rejecting task",
+                    logger.info(
+                        "Worker %d: Channel id=%s is invalid, rejecting task",
                         self.worker_id,
                         channel_id,
                     )
@@ -373,7 +375,8 @@ class Worker(BaseTelegramWorker):
             error_text = str(e)
             if "method that is not available for frozen accounts" in error_text:
                 logger.critical(
-                    f"Worker {self.worker_id}: ACCOUNT FROZEN by Telegram. Raising SessionExpiredError."
+                    "Worker %d: ACCOUNT FROZEN by Telegram",
+                    self.worker_id,
                 )
                 raise SessionExpiredError("Account frozen by Telegram")
             logger.error(
@@ -541,66 +544,41 @@ class Worker(BaseTelegramWorker):
                             await asyncio.sleep(30)
                         continue
 
-                    # Resolve entity with access_hash-first priority (more reliable)
+                    # Resolve entity using session-aware safe lookup
                     entity = None
-                    resolved_entity_type = None  # 'hash' or 'username'
+                    recommendations: list[Channel] = []
 
-                    # Step 1: Try to resolve by access_hash first (faster, no rate limits)
-                    if channel.access_hash is not None:
-                        try:
-                            input_channel = InputChannel(channel.id, channel.access_hash)
-                            # Test the access_hash by calling _get_recommendations directly
-                            recommendations = await self._get_recommendations(
-                                input_channel, channel.id, operation_name="resolve_by_hash"
-                            )
-                            # Success - use the InputChannel as entity
-                            entity = input_channel
-                            resolved_entity_type = 'hash'
-                        except (RPCError, ValueError, ChannelTaskRejected) as e:
-                            # The stored access_hash is invalid/stale or other RPC error
-                            logger.warning(
-                                "Worker %d: Access hash failed for channel %s, switching to PLAN B (resolve by username)",
-                                self.worker_id,
-                                channel.username or channel.id,
-                            )
-                            entity = None
+                    # Step 1: Resolve entity using session-aware safe lookup
+                    result = await get_channel_entity_safe(
+                        self.client,
+                        channel.id,
+                        safe_api_call=self.safe_api_call,
+                        entity_cache=self._entity_cache,
+                    )
 
-                    # Step 2: Fallback to username resolution if hash failed or not available
-                    if entity is None and channel.username:
-                        try:
-                            # Resolve by username using safe_api_call directly
-                            entity = await self.safe_api_call(
-                                "resolve_by_username",
-                                lambda: self.client.get_entity(channel.username)  # type: ignore[arg-type]
-                            )
-                            # Check if entity is a broadcast channel
-                            if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
-                                resolved_entity_type = 'username'
-                                # Fetch recommendations separately after successful username resolution
-                                recommendations = await self._get_recommendations(
-                                    entity, channel.id, operation_name="get_recommendations"
-                                )
-                            else:
-                                # Not a broadcast channel or invalid
-                                logger.error(
-                                    "Worker %d: PLAN B failed. Channel %s is unreachable.",
-                                    self.worker_id,
-                                    channel.username or channel.id,
-                                )
-                                await self._mark_processed(channel.id)
-                                continue
-                        except (RPCError, ValueError, ChannelTaskRejected) as e:
-                            # Username resolution also failed
-                            logger.error(
-                                "Worker %d: PLAN B failed. Channel %s is unreachable.",
-                                self.worker_id,
-                                channel.username or channel.id,
-                            )
-                            await self._mark_processed(channel.id)
-                            continue
+                    # Fallback to username only if ID resolution failed and username exists
+                    if not result.is_success() and channel.username:
+                        result = await get_channel_entity_safe(
+                            self.client,
+                            channel.username,
+                            safe_api_call=self.safe_api_call,
+                            entity_cache=self._entity_cache,
+                        )
 
-                    if entity is None:
-                        # Could not resolve channel by any method (no access_hash and no username)
+                    entity = result.entity
+
+                    # If entity is resolved successfully, fetch the recommendations
+                    if entity is not None:
+                        recommendations = await self._get_recommendations(
+                            entity, channel.id, operation_name="get_recommendations"
+                        )
+                    else:
+                        # Could not resolve channel by any method
+                        logger.info(
+                            "Worker %d: Channel %s could not be resolved, marking as processed",
+                            self.worker_id,
+                            channel.username or channel.id,
+                        )
                         await self._mark_processed(channel.id)
                         continue
 
@@ -633,27 +611,8 @@ class Worker(BaseTelegramWorker):
                     await self._mark_processed(channel.id)
                     self.processed_count += 1
 
-                    # IMPORTANT: Update the channel's access_hash in the database
-                    # with the session-local correct hash from the resolved entity.
-                    # This ensures future workers use the correct hash for this session.
-                    if hasattr(entity, 'access_hash') and entity.access_hash is not None:
-                        try:
-                            await self.db.update_channel_access_hash(
-                                channel.id,
-                                entity.access_hash
-                            )
-                            logger.debug(
-                                "Worker %d: Updated access_hash for channel %s in DB",
-                                self.worker_id,
-                                channel.id,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "Worker %d: Failed to update access_hash for %s: %s",
-                                self.worker_id,
-                                channel.id,
-                                e,
-                            )
+                    # Database access_hash update removed to prevent cache thrashing.
+                    # Telethon's native session cache handles access_hash lookup internally.
 
                 except FloodWaitError as e:
                     if channel:
@@ -680,7 +639,10 @@ class Worker(BaseTelegramWorker):
 
         except (AuthKeyError, UserDeactivatedError, SessionRevokedError) as e:
             logger.critical(
-                f"Worker {self.worker_id}: SESSION DEAD. Error: {type(e).__name__}. File: {self.session_path}"
+                "Worker %d: SESSION DEAD. Error: %s. File: %s",
+                self.worker_id,
+                type(e).__name__,
+                self.session_path,
             )
             self.is_alive = False
             return
@@ -703,7 +665,7 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     def global_exception_handler(loop, context):
         msg = context.get("exception", context["message"])
-        logging.getLogger("asyncio_global").critical(f"Unhandled asyncio exception: {msg}")
+        logging.getLogger("asyncio_global").critical("Unhandled asyncio exception: %s", msg)
     loop.set_exception_handler(global_exception_handler)
 
     logger.info("Starting distributed crawler via core runner...")

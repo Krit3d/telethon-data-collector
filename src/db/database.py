@@ -349,6 +349,7 @@ class Database:
             "geo_lat": stmt.excluded.geo_lat,
             "geo_long": stmt.excluded.geo_long,
             "language": stmt.excluded.language,
+            "raw_metadata": stmt.excluded.raw_metadata,
             "updated_at": stmt.excluded.updated_at,
         }
 
