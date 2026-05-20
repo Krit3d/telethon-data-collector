@@ -25,6 +25,7 @@ from src.db.graph_repo import GraphRepository
 from src.db.models import Post
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.extractor import KnowledgeExtractor
+from src.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -187,13 +188,6 @@ async def run_extractor() -> None:
     This function is intended to be called from the main() block.
     """
     settings = load_settings()
-
-    # Initialize logging
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | [%(name)s] | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
 
     logger.info("Starting knowledge extraction worker")
 

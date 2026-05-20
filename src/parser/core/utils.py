@@ -160,7 +160,7 @@ async def get_channel_entity_safe(
             )
         except Exception as e:
             # Cheap resolution failed, fall through to username or ID-only resolution
-            logger.warning(
+            logger.debug(
                 "Cheap resolution failed for id=%s: %s. Will try other methods.",
                 channel_id,
                 e,
@@ -208,12 +208,12 @@ async def get_channel_entity_safe(
 
     except ValueError as e:
         if "No user has" in str(e):
-            logger.warning(
+            logger.debug(
                 "Shadowban suspected for global search. Target: %s",
                 channel_id,
             )
             return ChannelResolutionResult(shadowbanned=True)
-        logger.warning(
+        logger.debug(
             "ValueError resolving %s: %s",
             channel_id,
             e,
@@ -227,7 +227,7 @@ async def get_channel_entity_safe(
             or isinstance(e, (ConnectionError, OSError))
         ):
             raise
-        logger.warning(
+        logger.debug(
             "Failed to resolve channel %s: %s",
             channel_id,
             e,
@@ -285,7 +285,7 @@ async def get_full_channel_info(
 
         return participants_count, description
     except Exception as e:
-        logger.warning(
+        logger.debug(
             "Error getting full channel for %s: %s",
             getattr(entity, "username", "unknown"),
             e,

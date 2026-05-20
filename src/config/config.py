@@ -1,5 +1,4 @@
 import argparse
-import json
 import logging
 import os
 from pathlib import Path
@@ -10,6 +9,8 @@ from pydantic import (
     ValidationError,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from src.utils.logger import setup_logging
 
 
 class Settings(BaseSettings):
@@ -192,63 +193,7 @@ class Settings(BaseSettings):
 
         return c
 
-class JsonFormatter(logging.Formatter):
-    """Custom JSON formatter for structured logging."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        log_object = {
-            "timestamp": self.formatTime(record, self.datefmt),
-            "level": record.levelname,
-            "name": record.name,
-            "message": record.getMessage(),
-        }
-
-        # Include worker_id if present in the log record
-        worker_id = getattr(record, "worker_id", None)
-        if worker_id is not None:
-            log_object["worker_id"] = str(worker_id)
-
-        # Include exception info if present
-        if record.exc_info:
-            log_object["exc_info"] = self.formatException(record.exc_info)
-
-        return json.dumps(log_object, ensure_ascii=False)
-
-
 # ----- Helper functions -----
-
-
-def _setup_logging(level: str) -> None:
-    """Configure global logging with a normalised log level and format.
-
-    Supports JSON and TEXT formats via LOG_FORMAT environment variable.
-    TEXT format includes service name and worker_id in the output.
-    """
-
-    # Clear existing handlers to prevent duplicate logs and override library defaults
-    root_logger = logging.getLogger()
-    if root_logger.handlers:
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-
-    log_format = os.getenv("LOG_FORMAT", "TEXT").upper()
-    log_level = getattr(logging, level.upper(), logging.INFO)
-    root_logger.setLevel(log_level)
-
-    if log_format == "JSON":
-        # JSON structured logging
-        handler = logging.StreamHandler()
-        handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S.%fZ"))
-        root_logger.addHandler(handler)
-    else:
-        # TEXT format with worker_id support
-        formatter = logging.Formatter(
-            fmt="%(asctime)s | %(levelname)-8s | [%(name)s] | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
-        root_logger.addHandler(handler)
 
 
 def _load_channels_from_file(path: Path) -> list[str]:
@@ -339,7 +284,7 @@ def load_settings() -> Settings:
         help="Logging level",
     )
     args, _ = parser.parse_known_args()
-    _setup_logging(args.log_level)
+    setup_logging(args.log_level)
 
     # Collect CLI overrides – only non‑None values are forwarded so that
     # environment variables (and defaults) can still act as fallbacks.

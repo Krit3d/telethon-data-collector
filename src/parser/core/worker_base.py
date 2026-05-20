@@ -452,14 +452,14 @@ class BaseTelegramWorker:
                 # Apply natural or uniform delay before API call to avoid rate limiting
                 if self.settings.use_natural_delays:
                     delay = self.natural_delay()
-                    self.logger.info(
+                    self.logger.debug(
                         "Natural delay: sleeping for %.1f seconds (heatup_factor=%.2f)",
                         delay,
                         self._calculate_heatup_factor(),
                     )
                 else:
                     delay = random.uniform(self.delay_min, self.delay_max)
-                    self.logger.info(
+                    self.logger.debug(
                         "Sleeping for %.1f seconds before API call",
                         delay,
                     )

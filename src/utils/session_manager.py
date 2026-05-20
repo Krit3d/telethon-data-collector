@@ -15,12 +15,15 @@ from telethon.errors import (
     FloodWaitError,
     RPCError,
 )
-from telethon.network.connection.tcpintermediate import ConnectionTcpIntermediate
+from telethon.network.connection.tcpintermediate import (
+    ConnectionTcpIntermediate,
+)
 from telethon.network.connection.tcpmtproxy import (
     ConnectionTcpMTProxyRandomizedIntermediate,
 )
 
 from src.utils.proxy import build_telethon_proxy
+from src.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +110,9 @@ async def process_sessions(
         try:
             api_id = int(api_id)
         except (ValueError, TypeError):
-            logger.error(f"Invalid api_id for {account_name}: {api_id} (must be int)")
+            logger.error(
+                f"Invalid api_id for {account_name}: {api_id} (must be int)"
+            )
             invalid_count += 1
             continue
 
@@ -119,7 +124,11 @@ async def process_sessions(
             continue
 
         # Log credentials (masked) for debugging
-        masked_hash = api_hash[:6] + "****" + api_hash[-4:] if len(api_hash) > 10 else "****"
+        masked_hash = (
+            api_hash[:6] + "****" + api_hash[-4:]
+            if len(api_hash) > 10
+            else "****"
+        )
         logger.info(
             f"Account {account_name}: api_id={api_id}, api_hash={masked_hash}, "
             f"has_2FA={'Yes' if password else 'No'}"
@@ -181,7 +190,9 @@ async def process_sessions(
 
         client = None
         try:
-            logger.info(f"Loading TDATA for {account_name} from {tdata_path}...")
+            logger.info(
+                f"Loading TDATA for {account_name} from {tdata_path}..."
+            )
             td = TDesktop(str(tdata_path))
 
             # Handle 2FA/password if present
@@ -195,15 +206,15 @@ async def process_sessions(
                     )
 
             # Initialize API with validated credentials
-            api_instance = API.TelegramDesktop(
-                api_id=api_id, api_hash=api_hash
-            )
+            api_instance = API.TelegramDesktop(api_id=api_id, api_hash=api_hash)
 
-            logger.info(f"Converting TDATA to Telethon client for {account_name}...")
+            logger.info(
+                f"Converting TDATA to Telethon client for {account_name}..."
+            )
             totelethon_kwargs = dict(client_kwargs)
             if proxy_kwargs:
                 totelethon_kwargs.update(proxy_kwargs)
-            
+
             client = await td.ToTelethon(
                 session=str(dest_session_base),
                 flag=UseCurrentSession,
@@ -217,7 +228,9 @@ async def process_sessions(
             # Check authorization status
             is_authorized = await client.is_user_authorized()
             if not is_authorized:
-                logger.warning(f"Session {account_name} is not authorized. Attempting to get detailed error...")
+                logger.warning(
+                    f"Session {account_name} is not authorized. Attempting to get detailed error..."
+                )
                 try:
                     # This will trigger the actual auth check and return specific error
                     me = await client.get_me()
@@ -251,7 +264,9 @@ async def process_sessions(
                 dest_session_file.unlink()
         except (AuthKeyError, UserDeactivatedError, SessionRevokedError) as e:
             error_type = type(e).__name__
-            logger.error(f"Account {account_name}: Telegram error ({error_type}): {e}")
+            logger.error(
+                f"Account {account_name}: Telegram error ({error_type}): {e}"
+            )
             invalid_count += 1
             if dest_session_file.exists():
                 dest_session_file.unlink()
@@ -264,12 +279,16 @@ async def process_sessions(
             if dest_session_file.exists():
                 dest_session_file.unlink()
         except RPCError as e:
-            logger.error(f"Account {account_name}: RPCError ({type(e).__name__}): {e}")
+            logger.error(
+                f"Account {account_name}: RPCError ({type(e).__name__}): {e}"
+            )
             invalid_count += 1
             if dest_session_file.exists():
                 dest_session_file.unlink()
         except Exception as e:
-            logger.error(f"Failed to process {account_name}: {type(e).__name__}: {e}")
+            logger.error(
+                f"Failed to process {account_name}: {type(e).__name__}: {e}"
+            )
             invalid_count += 1
             if dest_session_file.exists():
                 dest_session_file.unlink()
@@ -290,18 +309,7 @@ def main() -> None:
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
-    # Clear existing handlers to prevent duplicate logs and override library defaults
-    root_logger = logging.getLogger()
-    if root_logger.handlers:
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True
-    )
+    setup_logging(args.log_level)
 
     raw_dir = Path(args.raw_folder).resolve()
     proxies_file = Path(args.proxies_file).resolve()

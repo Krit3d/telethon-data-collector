@@ -84,7 +84,7 @@ async def _extract_channel_metadata(
             )
         else:
             # Cheap resolution failed - could be invalid hash or account restrictions
-            logger.warning(
+            logger.debug(
                 "Cheap resolution failed for channel id=%s with access_hash. Error: %s",
                 channel_id,
                 result.reason or "unknown",
@@ -336,7 +336,7 @@ class ParserWorker(BaseTelegramWorker):
 
             await self.db.upsert_channel(channel_data)
 
-            logger.info(
+            logger.debug(
                 "Channel saved: id=%s username=%s title=%s",
                 channel_data["id"],
                 channel_data["username"],
@@ -543,20 +543,6 @@ class ParserWorker(BaseTelegramWorker):
 async def main() -> None:
     """Entry point: discover sessions, read individual configs, spawn worker tasks."""
     settings = load_settings()
-    
-    # Configure logging with cleaner format
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    
-    # Silence noisy third-party libraries
-    logging.getLogger("telethon").setLevel(logging.WARNING)
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-    logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
-    
-    logger = logging.getLogger(__name__)
 
     # Print summary of changes/features enabled
     logger.info("=" * 60)

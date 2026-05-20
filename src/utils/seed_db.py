@@ -5,23 +5,12 @@ from telethon.tl.types import Channel as TlChannel
 
 from src.config.config import load_settings
 from src.db.database import Database
+from src.utils.logger import setup_logging
 
 
 async def main():
     settings = load_settings()
-    
-    # Clear existing handlers to prevent duplicate logs and override library defaults
-    root_logger = logging.getLogger()
-    if root_logger.handlers:
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True
-    )
+    setup_logging(settings.log_level)
     logger = logging.getLogger(__name__)
 
     if not settings.channels:

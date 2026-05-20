@@ -26,6 +26,7 @@ from telethon.network.connection.tcpmtproxy import (
 
 from src.config.config import load_settings
 from src.utils.proxy import build_telethon_proxy
+from src.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -35,22 +36,6 @@ SYSTEM_VERSION = "Windows 10"
 APP_VERSION = "4.16.8"
 LANG_CODE = "en"
 SYSTEM_LANG_CODE = "en-US"
-
-
-def setup_logging(level: str = "INFO") -> None:
-    """Configure logging with a consistent format."""
-    # Clear existing handlers to prevent duplicate logs and override library defaults
-    root_logger = logging.getLogger()
-    if root_logger.handlers:
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True
-    )
 
 
 def prompt_text(field_name: str, default: str | None = None) -> str:
