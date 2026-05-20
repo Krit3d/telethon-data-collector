@@ -48,12 +48,15 @@ class Property(BaseModel):
 
         This validator allows passing type as a string (e.g., "text") which
         is automatically converted to the corresponding PropertyType enum value.
+        If the string is not a valid PropertyType member, falls back to
+        PropertyType.TEXT to prevent Pydantic ValidationError.
 
         Args:
             data: Raw input data before model validation.
 
         Returns:
-            Modified data with type converted to PropertyType enum if it was a string.
+            Modified data with type converted to PropertyType enum if it was a string,
+            or PropertyType.TEXT if the string was invalid.
         """
         if isinstance(data, dict) and "type" in data:
             type_value = data["type"]
@@ -61,7 +64,8 @@ class Property(BaseModel):
                 try:
                     data["type"] = PropertyType(type_value)
                 except ValueError:
-                    pass  # Let Pydantic raise the appropriate error for invalid types
+                    # Fallback to TEXT for invalid type strings to ensure resilience
+                    data["type"] = PropertyType.TEXT
         return data
 
     @model_validator(mode="before")
@@ -70,7 +74,11 @@ class Property(BaseModel):
         """Coerce value types to match PropertyType expectations for resilience.
 
         This validator automatically converts common type mismatches caused by LLM output:
-        - TEXT: converts non-string values (bool, int, float) to strings
+        - Boolean values: handled based on prop_type:
+          - TEXT: converts to "true" or "false" strings
+          - NUMERIC: converts to 1 or 0 integers
+          - Other types: falls back to string conversion and sets type to TEXT
+        - TEXT: converts non-string values (int, float) to strings
         - NUMERIC: converts numeric strings to int or float
 
         This ensures the extractor does not crash on minor type mistakes while
@@ -88,6 +96,18 @@ class Property(BaseModel):
             value = data.get("value")
 
             if prop_type is None or value is None:
+                return data
+
+            # Handle boolean values first to avoid misclassification as integers
+            if isinstance(value, bool):
+                if prop_type == PropertyType.TEXT:
+                    data["value"] = "true" if value else "false"
+                elif prop_type == PropertyType.NUMERIC:
+                    data["value"] = 1 if value else 0
+                else:
+                    # Fallback: convert to string and set type to TEXT
+                    data["value"] = str(value)
+                    data["type"] = PropertyType.TEXT
                 return data
 
             # Handle TEXT type: convert any non-string to string
