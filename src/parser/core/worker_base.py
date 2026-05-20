@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import time
@@ -11,6 +12,7 @@ from typing import Any, Callable
 
 try:
     import numpy as np
+
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
@@ -97,19 +99,26 @@ class BaseTelegramWorker:
         self.app_version = app_version
         self.lang_code = lang_code
         self.system_lang_code = system_lang_code
-        
+
         # Fallback cascade: explicit argument -> settings config -> hardcoded safe defaults
         self.delay_min = max(
             0.1,  # Absolute structural minimum to prevent 0 delay
-            delay_min if delay_min is not None
-            else getattr(settings, "parser_delay_min", 1.0)
+            (
+                delay_min
+                if delay_min is not None
+                else getattr(settings, "parser_delay_min", 1.0)
+            ),
         )
         self.delay_max = max(
-            self.delay_min + 0.1,  # Max must always be strictly greater than min
-            delay_max if delay_max is not None
-            else getattr(settings, "parser_delay_max", 3.0)
+            self.delay_min
+            + 0.1,  # Max must always be strictly greater than min
+            (
+                delay_max
+                if delay_max is not None
+                else getattr(settings, "parser_delay_max", 3.0)
+            ),
         )
-        
+
         # Organic session heatup tracking
         self._start_time = time.time()
         self._heatup_duration_s = settings.organic_heatup_minutes * 60
@@ -119,30 +128,41 @@ class BaseTelegramWorker:
         self.client: TelegramClient | None = None
         self.consecutive_shadowbans = 0
         self.safe_mode = False
-        self.is_alive = True  # Flag to indicate if worker should continue running
-        self._flood_wait_cooldown_until = 0  # Timestamp for standard FloodWait cooldown
-        self._severe_flood_wait_until = 0  # Timestamp for severe FloodWait (>3600s) 12h cooldown
-        self._entity_cache: dict[tuple[int, int | None], Any] = {}  # In-memory entity cache: (channel_id, access_hash) -> entity
-        
+        self.is_alive = (
+            True  # Flag to indicate if worker should continue running
+        )
+        self.last_activity: float = (
+            time.time()
+        )  # Timestamp of last API call activity
+        self._flood_wait_cooldown_until = (
+            0  # Timestamp for standard FloodWait cooldown
+        )
+        self._severe_flood_wait_until = (
+            0  # Timestamp for severe FloodWait (>3600s) 12h cooldown
+        )
+        self._entity_cache: dict[tuple[int, int | None], Any] = (
+            {}
+        )  # In-memory entity cache: (channel_id, access_hash) -> entity
+
         # Logger with worker_id context for structured logging
         self.logger = logging.LoggerAdapter(
             logging.getLogger(self.__class__.__name__),
-            {"worker_id": self.worker_id}
+            {"worker_id": self.worker_id},
         )
         # Track last proxy rotation time to avoid excessive rotations
         self._last_rotation_time = 0
         self._rotation_cooldown_s = 300  # 5 minutes between rotations minimum
-    
+
     def _calculate_heatup_factor(self) -> float:
         """Calculate the current heatup factor for organic session warmup.
-        
+
         During the first `organic_heatup_minutes` of operation, the worker
         gradually increases its activity. Factor starts at 0.1 (10% speed)
         and asymptotically approaches 1.0 over the heatup period.
-        
+
         If `settings.enable_warmup` is False, returns 1.0 immediately to
         bypass the slow start period for faster parsing.
-        
+
         Returns:
             Float between 0.1 and 1.0 representing current activity multiplier.
         """
@@ -155,39 +175,41 @@ class BaseTelegramWorker:
         if elapsed >= self._heatup_duration_s:
             self._is_heatup_complete = True
             return 1.0
-        
+
         # Smooth exponential growth: factor = 0.1 + 0.9 * (elapsed / duration)^2
         # This gives a gentle start that accelerates over time
         ratio = elapsed / self._heatup_duration_s
-        factor = 0.1 + 0.9 * (ratio ** 2)
+        factor = 0.1 + 0.9 * (ratio**2)
         return max(0.1, min(1.0, factor))
-    
+
     def natural_delay(self, base_delay: float | None = None) -> float:
         """Generate a human-like delay using Pareto/Gamma distribution.
-        
+
         Instead of uniform random delays, this mimics natural human reading
         patterns with occasional longer pauses (Pareto distribution heavy tail).
-        
+
         Args:
             base_delay: Base delay in seconds to scale. If None, uses settings
                 or heatup-adjusted value.
-        
+
         Returns:
             Delay in seconds (always >= 1.0 for safety).
         """
-        
+
         # Apply heatup factor to base delay
         heatup_factor = self._calculate_heatup_factor()
-        
+
         if base_delay is None:
             # Use settings but scale by heatup factor (slower during heatup)
             base_min = self.settings.crawler_delay_min
             base_max = self.settings.crawler_delay_max
             base_delay = random.uniform(base_min, base_max)
-        
+
         # Scale by heatup factor (longer delays during warmup)
-        scaled_delay = base_delay / heatup_factor if heatup_factor < 1.0 else base_delay
-        
+        scaled_delay = (
+            base_delay / heatup_factor if heatup_factor < 1.0 else base_delay
+        )
+
         # Apply Pareto distribution for heavy-tail effect (human-like pauses)
         # Pareto shape parameter alpha=3 gives ~80% short, ~20% long delays
         if HAS_NUMPY:
@@ -195,41 +217,45 @@ class BaseTelegramWorker:
         else:
             # random.paretovariate(alpha) returns Pareto type I (xm=1, alpha>=1), equivalent to np.random.pareto(alpha) + 1
             pareto_factor = random.paretovariate(3)
-        
+
         # Combine: base scaled delay * Pareto factor
         natural_delay = scaled_delay * pareto_factor
-        
+
         # Clamp to reasonable bounds (1-300 seconds)
         return max(1.0, min(300.0, natural_delay))
 
     async def _rotate_mobile_proxy(self) -> bool:
         """Rotate mobile proxy IP by calling the rotation URL.
-        
+
         Uses the mobile_proxy_rotation_url from settings to request a new
         IP address from the proxy provider. Respects a cooldown period to
         avoid excessive rotations.
-        
+
         Returns:
             True if rotation was successful, False otherwise.
         """
-        
+
         rotation_url = self.settings.mobile_proxy_rotation_url
         if not rotation_url:
             return False
-        
+
         current_time = time.time()
         if current_time - self._last_rotation_time < self._rotation_cooldown_s:
             self.logger.warning(
                 "Proxy rotation skipped: cooldown period not elapsed (%.0fs remaining)",
-                self._rotation_cooldown_s - (current_time - self._last_rotation_time),
+                self._rotation_cooldown_s
+                - (current_time - self._last_rotation_time),
             )
             return False
-        
+
         try:
             from aiohttp import ClientSession, ClientTimeout
+
             timeout = ClientTimeout(total=10)
             async with ClientSession() as session:
-                async with session.get(rotation_url, timeout=timeout) as response:
+                async with session.get(
+                    rotation_url, timeout=timeout
+                ) as response:
                     if response.status == 200:
                         self._last_rotation_time = current_time
                         self.logger.info(
@@ -425,6 +451,9 @@ class BaseTelegramWorker:
                 "No user has" errors). The worker will disconnect, sleep 3 hours,
                 and reconnect before raising.
         """
+        self.last_activity = (
+            time.time()
+        )  # Update activity at start of safe_api_call
 
         if network_retries is None:
             network_retries = self.settings.network_retries
@@ -457,7 +486,7 @@ class BaseTelegramWorker:
                         remaining,
                     )
                     return  # Exit the operation and worker loop
-                
+
                 # Check if we're in a standard FloodWait cooldown period
                 if current_time < self._flood_wait_cooldown_until:
                     remaining = self._flood_wait_cooldown_until - current_time
@@ -469,7 +498,9 @@ class BaseTelegramWorker:
                     # Ensure client is disconnected during cooldown to avoid holding TCP
                     if self.client and self.client.is_connected():
                         await self.disconnect()
-                    await asyncio.sleep(min(remaining, 60))  # Wake up every 60s to recheck
+                    await asyncio.sleep(
+                        min(remaining, 60)
+                    )  # Wake up every 60s to recheck
                     continue  # Retry after cooldown expires
 
                 # Apply natural or uniform delay before API call to avoid rate limiting
@@ -489,13 +520,22 @@ class BaseTelegramWorker:
                 await asyncio.sleep(delay)
 
                 # Execute operation with socket timeout to prevent infinite hangs
+                self.last_activity = (
+                    time.time()
+                )  # Update activity right before API call
                 result = operation()
 
-                if asyncio.iscoroutine(result):
-                    # Wrap coroutine in wait_for to enforce socket timeout
+                if inspect.isawaitable(result):
+                    # Wrap awaitable in wait_for to enforce socket timeout
                     try:
-                        return await asyncio.wait_for(result, timeout=socket_timeout)
-                    except asyncio.TimeoutError:
+                        await_result = await asyncio.wait_for(
+                            result, timeout=socket_timeout
+                        )
+                        self.last_activity = (
+                            time.time()
+                        )  # Update activity after successful await
+                        return await_result
+                    except (asyncio.TimeoutError, TimeoutError):
                         # Treat socket timeout as transient network error
                         self.logger.warning(
                             "%s: Socket timeout after %.1fs, treating as transient error",
@@ -510,6 +550,9 @@ class BaseTelegramWorker:
                             "%s: Sync operation, socket timeout not enforced",
                             operation_name,
                         )
+                    self.last_activity = (
+                        time.time()
+                    )  # Update activity after successful sync call
                     return result
 
             except FloodWaitError as e:
@@ -624,7 +667,8 @@ class BaseTelegramWorker:
                 # Check for fatal account errors
                 error_text = str(e)
                 if (
-                    "method that is not available for frozen accounts" in error_text
+                    "method that is not available for frozen accounts"
+                    in error_text
                     or isinstance(e, (AuthKeyError, UserDeactivatedError))
                 ):
                     self.logger.critical(

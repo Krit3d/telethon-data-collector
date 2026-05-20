@@ -27,11 +27,15 @@ from .worker_base import BaseTelegramWorker
 
 logger = logging.getLogger(__name__)
 
+# Global thread-safe registry of active workers
+# Maps runner_id to worker instance for watchdog monitoring
+_active_workers: dict[int, BaseTelegramWorker] = {}
+
 
 @dataclass
 class SessionConfig:
     """Configuration for a single Telegram session.
-    
+
     Attributes:
         session_path: Path to the .session file.
         api_id: Telegram API ID.
@@ -43,6 +47,7 @@ class SessionConfig:
         lang_code: Language code (e.g., 'en').
         system_lang_code: System language code (e.g., 'en-US').
     """
+
     session_path: Path
     api_id: int
     api_hash: str
@@ -57,28 +62,28 @@ class SessionConfig:
 @dataclass
 class SessionEntry:
     """A session entry in the pool with its config and cooldown state.
-    
+
     Attributes:
         config: The session configuration.
         ready_at: Timestamp (from time.time()) when this session is ready to be used.
                   If 0 or in the past, the session is ready immediately.
     """
-    
+
     config: SessionConfig
     ready_at: float = field(default=0.0)
 
 
 class SessionPool:
     """Manages a pool of available Telegram sessions using asyncio.Queue.
-    
+
     Sessions are loaded from the sessions directory and made available via a queue.
     Failed sessions can be put back with a cooldown period.
     Permanently banned sessions are removed from the pool.
     """
-    
+
     def __init__(self, cooldown_period: float = 300.0) -> None:
         """Initialize the session pool.
-        
+
         Args:
             cooldown_period: Default cooldown period in seconds for failed sessions.
         """
@@ -86,13 +91,13 @@ class SessionPool:
         self._cooldown_period = cooldown_period
         self._loaded_count = 0
         self._banned_count = 0
-        
+
     async def load_sessions(self, settings: Settings) -> int:
         """Scan sessions directory and load all .session files with their configs.
-        
+
         Args:
             settings: Global settings containing session_dir and default values.
-            
+
         Returns:
             Number of sessions successfully loaded into the pool.
         """
@@ -101,32 +106,36 @@ class SessionPool:
         if not sessions_dir.exists():
             logger.error("Sessions directory %s does not exist", sessions_dir)
             return 0
-            
+
         session_files = sorted(sessions_dir.glob("*.session"))
         if not session_files:
             logger.error("No .session files found in %s", sessions_dir)
             return 0
-            
-        logger.info("Found %d session files in %s", len(session_files), sessions_dir)
-        
+
+        logger.info(
+            "Found %d session files in %s", len(session_files), sessions_dir
+        )
+
         for session_path in session_files:
             config = self._load_session_config(session_path, settings)
             entry = SessionEntry(config=config)
             await self._queue.put(entry)
             self._loaded_count += 1
-            
+
         logger.info("Loaded %d sessions into pool", self._loaded_count)
         return self._loaded_count
-    
-    def _load_session_config(self, session_path: Path, settings: Settings) -> SessionConfig:
+
+    def _load_session_config(
+        self, session_path: Path, settings: Settings
+    ) -> SessionConfig:
         """Load configuration for a single session file.
-        
+
         Reads the accompanying .json config file if present, otherwise uses global settings.
-        
+
         Args:
             session_path: Path to the .session file.
             settings: Global settings for default values.
-            
+
         Returns:
             SessionConfig with values from json config or defaults.
         """
@@ -140,14 +149,14 @@ class SessionPool:
         app_version = "4.16.8"
         lang_code = "en"
         system_lang_code = "en-US"
-        
+
         # Override with per-session config if present
         json_path = session_path.with_suffix(".json")
         if json_path.exists():
             try:
                 with json_path.open(encoding="utf-8") as f:
                     config_data = json.load(f)
-                
+
                 # Extract API credentials
                 api_id = (
                     config_data.get("api_id")
@@ -159,11 +168,11 @@ class SessionPool:
                     or config_data.get("app_hash")
                     or api_hash
                 )
-                
+
                 # Extract proxy URL if present in config
                 if "proxy_url" in config_data:
                     proxy_url = config_data["proxy_url"]
-                    
+
                 # Extract device/system info
                 device_model = (
                     config_data.get("device_model")
@@ -180,17 +189,17 @@ class SessionPool:
                 system_lang_code = config_data.get(
                     "system_lang_code", system_lang_code
                 )
-                
+
                 # Validate api_id
                 try:
                     api_id = int(api_id)
                 except (ValueError, TypeError):
                     api_id = settings.api_id
-                    
+
                 # Validate api_hash
                 if not isinstance(api_hash, str):
                     api_hash = settings.api_hash
-                    
+
                 logger.debug(
                     "Loaded config for session %s (api_id=%s, proxy=%s)",
                     session_path.name,
@@ -203,7 +212,7 @@ class SessionPool:
                     session_path.name,
                     e,
                 )
-        
+
         return SessionConfig(
             session_path=session_path,
             api_id=api_id,
@@ -215,10 +224,10 @@ class SessionPool:
             lang_code=lang_code,
             system_lang_code=system_lang_code,
         )
-    
+
     async def get_session(self) -> SessionEntry | None:
         """Get an available session from the pool.
-        
+
         Returns:
             SessionEntry if available, None if the pool is empty.
         """
@@ -228,15 +237,15 @@ class SessionPool:
             return await asyncio.wait_for(self._queue.get(), timeout=0.5)
         except asyncio.TimeoutError:
             return None
-    
+
     async def return_session(
-        self, 
-        entry: SessionEntry, 
+        self,
+        entry: SessionEntry,
         cooldown: bool = False,
         cooldown_seconds: float | None = None,
     ) -> None:
         """Return a session to the pool.
-        
+
         Args:
             entry: The session entry to return.
             cooldown: If True, put session in cooldown before it can be reused.
@@ -268,20 +277,20 @@ class SessionPool:
                 entry.config.session_path.name,
             )
         await self._queue.put(entry)
-    
+
     def size(self) -> int:
         """Return the number of sessions currently in the pool."""
         return self._queue.qsize()
-    
+
     def mark_banned(self) -> None:
         """Mark a session as permanently banned (removed from pool)."""
         self._banned_count += 1
-    
+
     @property
     def loaded_count(self) -> int:
         """Total number of sessions loaded into the pool."""
         return self._loaded_count
-    
+
     @property
     def banned_count(self) -> int:
         """Number of sessions that have been permanently banned."""
@@ -297,14 +306,14 @@ async def _worker_runner(
     worker_args: dict[str, Any] | None = None,
 ) -> None:
     """Worker runner task that continuously processes sessions from the pool.
-    
+
     This function runs in a loop, picking up sessions from the pool,
     creating worker instances, and running them. If a worker completes
     normally, the session is returned to the pool for reuse. If a worker
     encounters a permanent ban error, the session is removed from the pool.
     For FloodWaitError, the session is returned with an appropriate cooldown
     so other healthy sessions can be processed in its place.
-    
+
     Args:
         runner_id: Unique identifier for this runner (used as worker_id).
         session_pool: The session pool to pick sessions from.
@@ -313,19 +322,21 @@ async def _worker_runner(
         db: Database instance to pass to workers.
         worker_args: Additional arguments for worker constructor.
     """
-    
+
     logger.info("Worker runner %d started", runner_id)
-    
+
     if worker_args is None:
         worker_args = {}
-    
+
     while True:
         # Get a session from the pool
         entry = await session_pool.get_session()
         if entry is None:
             # No sessions available right now (all checked out or in cooldown)
             # Check if all loaded sessions have been permanently banned
-            active_sessions = session_pool.loaded_count - session_pool.banned_count
+            active_sessions = (
+                session_pool.loaded_count - session_pool.banned_count
+            )
             if active_sessions <= 0:
                 logger.info(
                     "Worker runner %d: all sessions have been permanently banned, stopping",
@@ -342,7 +353,7 @@ async def _worker_runner(
             )
             await asyncio.sleep(2.0)
             continue
-        
+
         # Check if session is in cooldown
         now = time.time()
         if entry.ready_at > now:
@@ -360,7 +371,7 @@ async def _worker_runner(
             await session_pool.return_session(entry, cooldown=True)
             await asyncio.sleep(min(wait_time, 5.0))  # Wait up to 5 seconds
             continue
-        
+
         # Create worker instance
         config = entry.config
         try:
@@ -390,66 +401,133 @@ async def _worker_runner(
             # Return session to pool with cooldown
             await session_pool.return_session(entry, cooldown=True)
             continue
-        
+
+        # Register worker in global registry for watchdog monitoring
+        _active_workers[runner_id] = worker
+
         logger.info(
             "Worker runner %d: starting session %s",
             runner_id,
             config.session_path.name,
         )
-        
+
         try:
-            await worker.run()
-            # Worker completed normally
-            logger.info(
-                "Worker runner %d: session %s completed normally, returning to pool",
-                runner_id,
-                config.session_path.name,
-            )
-            # Return session to pool for reuse (ready immediately)
-            await session_pool.return_session(entry, cooldown=False)
-        except FloodWaitError as e:
-            # FloodWaitError - session needs cooldown before reuse
-            delay = int(getattr(e, "seconds", 0)) or 1
-            logger.warning(
-                "Runner %d: Session %s rate limited by TG (FloodWait %ds). "
-                "Returning to pool with cooldown %ds.",
-                runner_id,
-                config.session_path.name,
-                delay,
-                delay + 10,
-            )
-            # Return session to pool with cooldown
-            # The worker's _flood_wait_cooldown_until should already be set,
-            # but we also set it here to ensure the pool has the correct ready_at
-            entry.ready_at = time.time() + delay + 10
-            await session_pool.return_session(entry, cooldown=True, cooldown_seconds=delay + 10)
-            # Exit the current worker run cleanly - the runner will pick up
-            # a different healthy session from the pool
-            logger.info(
-                "Worker runner %d: exiting after FloodWait, will pick new session",
-                runner_id,
-            )
-        except (AuthKeyError, UserDeactivatedError, SessionExpiredError) as e:
-            # Permanent ban - don't return session to pool
-            logger.error(
-                "Worker runner %d: session %s permanently banned: %s",
-                runner_id,
-                config.session_path.name,
-                e,
-            )
-            session_pool.mark_banned()
-        except Exception as e:
-            # Transient error - return session to pool with cooldown
-            logger.error(
-                "Worker runner %d: session %s failed with error: %s",
-                runner_id,
-                config.session_path.name,
-                e,
-                exc_info=True,
-            )
-            await session_pool.return_session(entry, cooldown=True)
-    
+            try:
+                await worker.run()
+                # Worker completed normally
+                logger.info(
+                    "Worker runner %d: session %s completed normally, returning to pool",
+                    runner_id,
+                    config.session_path.name,
+                )
+                # Return session to pool for reuse (ready immediately)
+                await session_pool.return_session(entry, cooldown=False)
+            except FloodWaitError as e:
+                # FloodWaitError - session needs cooldown before reuse
+                delay = int(getattr(e, "seconds", 0)) or 1
+                logger.warning(
+                    "Runner %d: Session %s rate limited by TG (FloodWait %ds). "
+                    "Returning to pool with cooldown %ds.",
+                    runner_id,
+                    config.session_path.name,
+                    delay,
+                    delay + 10,
+                )
+                # Return session to pool with cooldown
+                # The worker's _flood_wait_cooldown_until should already be set,
+                # but we also set it here to ensure the pool has the correct ready_at
+                entry.ready_at = time.time() + delay + 10
+                await session_pool.return_session(
+                    entry, cooldown=True, cooldown_seconds=delay + 10
+                )
+                # Exit the current worker run cleanly - the runner will pick up
+                # a different healthy session from the pool
+                logger.info(
+                    "Worker runner %d: exiting after FloodWait, will pick new session",
+                    runner_id,
+                )
+            except (
+                AuthKeyError,
+                UserDeactivatedError,
+                SessionExpiredError,
+            ) as e:
+                # Permanent ban - don't return session to pool
+                logger.error(
+                    "Worker runner %d: session %s permanently banned: %s",
+                    runner_id,
+                    config.session_path.name,
+                    e,
+                )
+                session_pool.mark_banned()
+            except Exception as e:
+                # Transient error - return session to pool with cooldown
+                logger.error(
+                    "Worker runner %d: session %s failed with error: %s",
+                    runner_id,
+                    config.session_path.name,
+                    e,
+                    exc_info=True,
+                )
+                await session_pool.return_session(entry, cooldown=True)
+        finally:
+            # Unregister worker from global registry
+            _active_workers.pop(runner_id, None)
+
     logger.info("Worker runner %d stopped", runner_id)
+
+
+async def _watchdog_task(settings: Settings) -> None:
+    """Watchdog task that monitors active workers for deadlocks.
+
+    Runs in an infinite loop, checking every 30 seconds if any worker
+    has been inactive for more than 10 minutes (600 seconds).
+    The 10-minute safe timeout is strictly greater than any natural delay capped at 300s.
+    If a frozen worker is detected, forces disconnect to break deadlocks.
+    """
+
+    logger.info("Liveness Watchdog started - monitoring workers for deadlocks")
+    timeout_seconds = 600  # 10 minutes safe timeout, strictly greater than any natural delay capped at 300s
+
+    try:
+        while True:
+            await asyncio.sleep(30)  # Check every 30 seconds
+
+            current_time = time.time()
+            # Iterate over a copy of values to avoid modification during iteration
+            for worker in list(_active_workers.values()):
+                try:
+                    inactive_duration = current_time - worker.last_activity
+                    if inactive_duration > timeout_seconds:
+                        logger.critical(
+                            "Watchdog: Worker %d (session: %s) is inactive for %.0fs! "
+                            "Suspected deadlock. Force-disconnecting...",
+                            worker.worker_id,
+                            worker.session_path.name,
+                            inactive_duration,
+                        )
+                        try:
+                            await worker.disconnect()
+                        except Exception as e:
+                            logger.error(
+                                "Watchdog: Failed to disconnect worker %d: %s",
+                                worker.worker_id,
+                                e,
+                                exc_info=True,
+                            )
+                        # Mark worker as not alive to prevent further loops
+                        worker.is_alive = False
+                        # Remove from registry
+                        _active_workers.pop(worker.worker_id, None)
+                except Exception as e:
+                    logger.error(
+                        "Watchdog: Error checking worker %s: %s",
+                        getattr(worker, "worker_id", "unknown"),
+                        e,
+                        exc_info=True,
+                    )
+    except asyncio.CancelledError:
+        logger.info("Liveness Watchdog stopped")
+        raise
 
 
 async def start_workers(
@@ -461,14 +539,14 @@ async def start_workers(
     ignore_concurrency_limit: bool = False,
 ) -> None:
     """Start worker tasks with session pool management.
-    
+
     This function implements a Session Pool Manager that:
     - Limits concurrent workers to settings.concurrency
     - Uses a pool of sessions that workers can pick up
     - Automatically respawns workers with new sessions when one dies
     - Implements cooldown for failed sessions
     - Handles permanent bans by removing sessions from the pool
-    
+
     Args:
         worker_class: The worker class to instantiate (must inherit from BaseTelegramWorker).
         settings: Global settings configuration.
@@ -476,10 +554,10 @@ async def start_workers(
         worker_args: Additional arguments to pass to worker constructor.
         ignore_concurrency_limit: If True, use all available sessions ignoring settings.concurrency.
     """
-    
+
     if worker_args is None:
         worker_args = {}
-    
+
     if ignore_concurrency_limit:
         logger.info(
             "Starting workers with class %s (ignoring concurrency limit, using all available sessions)",
@@ -491,15 +569,17 @@ async def start_workers(
             worker_class.__name__,
             settings.concurrency,
         )
-    
+
     # Create session pool and load sessions
-    session_pool = SessionPool(cooldown_period=300.0)  # 5 minute cooldown for failed sessions
+    session_pool = SessionPool(
+        cooldown_period=300.0
+    )  # 5 minute cooldown for failed sessions
     loaded = await session_pool.load_sessions(settings)
-    
+
     if loaded == 0:
         logger.error("No sessions loaded. Check your session directory.")
         return
-    
+
     # Determine actual concurrency (can't have more runners than sessions)
     if ignore_concurrency_limit:
         actual_concurrency = session_pool.size()
@@ -518,7 +598,7 @@ async def start_workers(
             session_pool.loaded_count,
             session_pool.banned_count,
         )
-    
+
     # Spawn exactly `actual_concurrency` worker runners
     runners = [
         asyncio.create_task(
@@ -534,7 +614,14 @@ async def start_workers(
         )
         for i in range(actual_concurrency)
     ]
-    
+
+    # Start the liveness watchdog task
+    watchdog_task = asyncio.create_task(
+        _watchdog_task(settings),
+        name="liveness-watchdog",
+    )
+    logger.info("Liveness Watchdog task spawned")
+
     try:
         results = await asyncio.gather(*runners, return_exceptions=True)
     except KeyboardInterrupt:
@@ -555,6 +642,14 @@ async def start_workers(
                     exc_info=True,
                 )
     finally:
+        # Cancel the watchdog task
+        if not watchdog_task.done():
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                logger.info("Liveness Watchdog task cancelled")
+
         logger.info(
             "All worker runners have stopped (sessions loaded: %d, banned: %d)",
             session_pool.loaded_count,

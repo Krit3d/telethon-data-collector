@@ -8,6 +8,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -37,7 +38,6 @@ from src.parser.core.utils import (
     get_full_channel_info,
     normalize_username,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -162,12 +162,12 @@ async def _process_message(
 
     # Skip system messages (messages with action) that don't help the OpenSPG graph
     # Use getattr to safely access action attribute (Pylance may not recognize it)
-    msg_action = getattr(msg, 'action', None)
+    msg_action = getattr(msg, "action", None)
     if msg_action is not None:
         return None
 
     # Skip empty messages without content
-    msg_content = getattr(msg, 'message', None)
+    msg_content = getattr(msg, "message", None)
     if not msg_content:
         return None
 
@@ -205,28 +205,30 @@ async def _process_message(
     # Extract numbers (prices, amounts, etc.)
     # Match patterns like $100, 100$, 100 USD, etc.
     price_patterns = re.findall(
-        r'(?:\$|USD|EUR|GBP|RUB|₽)?\s*[\d,]+(?:\.\d+)?\s*(?:\$|USD|EUR|GBP|RUB|₽)?',
-        text_content
+        r"(?:\$|USD|EUR|GBP|RUB|₽)?\s*[\d,]+(?:\.\d+)?\s*(?:\$|USD|EUR|GBP|RUB|₽)?",
+        text_content,
     )
     if price_patterns:
         numeric_metrics["price_patterns"] = price_patterns
 
     # Extract standalone numbers (integers and floats)
-    numbers = re.findall(r'\b\d+(?:\.\d+)?\b', text_content)
+    numbers = re.findall(r"\b\d+(?:\.\d+)?\b", text_content)
     if numbers:
-        numeric_metrics["numbers"] = [float(n) if '.' in n else int(n) for n in numbers]
+        numeric_metrics["numbers"] = [
+            float(n) if "." in n else int(n) for n in numbers
+        ]
 
     # Count links in the message
-    link_count = len(re.findall(r'https?://\S+', text_content))
+    link_count = len(re.findall(r"https?://\S+", text_content))
     if link_count > 0:
         numeric_metrics["link_count"] = link_count
 
     # Count mentions (Telegram mentions start with @)
-    mention_count = len(re.findall(r'@\w+', text_content))
+    mention_count = len(re.findall(r"@\w+", text_content))
     numeric_metrics["mention_count"] = mention_count
 
     # Count hashtags
-    hashtag_count = len(re.findall(r'#\w+', text_content))
+    hashtag_count = len(re.findall(r"#\w+", text_content))
     numeric_metrics["hashtag_count"] = hashtag_count
 
     # Count words and characters
@@ -306,6 +308,8 @@ class ParserWorker(BaseTelegramWorker):
             lang_code=lang_code,
             system_lang_code=system_lang_code,
         )
+        # Initialize last activity timestamp for Watchdog liveness signaling
+        self.last_activity = time.time()
 
     async def run(self) -> None:
         """Main worker loop: continuously fetch and parse channels from DB queue."""
@@ -315,6 +319,8 @@ class ParserWorker(BaseTelegramWorker):
 
         try:
             while True:
+                # Signal liveness to Watchdog at the start of each loop iteration
+                self.last_activity = time.time()
                 if not self.is_alive:
                     logger.info(
                         "Worker %d: is_alive=False, terminating worker loop",
@@ -341,7 +347,13 @@ class ParserWorker(BaseTelegramWorker):
 
                     await self._parse_single_channel(channel)
 
-                except (FloodWaitError, AuthKeyError, UserDeactivatedError, SessionExpiredError, SessionRevokedError) as e:
+                except (
+                    FloodWaitError,
+                    AuthKeyError,
+                    UserDeactivatedError,
+                    SessionExpiredError,
+                    SessionRevokedError,
+                ) as e:
                     # Propagate critical exceptions to _worker_runner for session cooldown/ban handling
                     raise
                 except Exception as e:
@@ -448,7 +460,9 @@ class ParserWorker(BaseTelegramWorker):
 
             # SMART SKIP: Fetch the latest known message ID from DB to avoid re-fetching
             # This saves API limits by not requesting messages we already have
-            latest_known_id = await self.db.get_latest_message_id(channel_id) or 0
+            latest_known_id = (
+                await self.db.get_latest_message_id(channel_id) or 0
+            )
             if latest_known_id > 0:
                 self.logger.info(
                     "Channel %s: Latest known message ID is %d, will skip older messages",
@@ -469,9 +483,14 @@ class ParserWorker(BaseTelegramWorker):
                 messages = await self.safe_api_call(
                     f"get_messages(channel_id={channel_id}, chunk_size={current_chunk_size})",
                     operation=lambda: self.client.get_messages(  # type: ignore[attr-defined]
-                        entity, limit=current_chunk_size, offset_id=last_msg_id, min_id=latest_known_id
+                        entity,
+                        limit=current_chunk_size,
+                        offset_id=last_msg_id,
+                        min_id=latest_known_id,
                     ),
                 )
+                # Signal liveness to Watchdog after fetching a chunk of messages
+                self.last_activity = time.time()
 
                 # Handle API call failure
                 if messages is None:
@@ -505,7 +524,9 @@ class ParserWorker(BaseTelegramWorker):
                             latest_known_id,
                         )
                         # Break out of the for loop
-                        posts_saved = posts_limit  # Set to limit to exit while loop
+                        posts_saved = (
+                            posts_limit  # Set to limit to exit while loop
+                        )
                         break
 
                     post_id = await _process_message(
@@ -514,6 +535,8 @@ class ParserWorker(BaseTelegramWorker):
                         self.db,
                         safe_api_call=self.safe_api_call,
                     )
+                    # Signal liveness to Watchdog after processing an individual message
+                    self.last_activity = time.time()
                     if post_id is None:
                         continue
 
@@ -587,7 +610,13 @@ class ParserWorker(BaseTelegramWorker):
             SessionExpiredError,
         ) as e:
             if isinstance(
-                e, (UserDeactivatedError, AuthKeyError, SessionRevokedError, SessionExpiredError)
+                e,
+                (
+                    UserDeactivatedError,
+                    AuthKeyError,
+                    SessionRevokedError,
+                    SessionExpiredError,
+                ),
             ):
                 logger.critical(
                     "Worker %d: Account is DEAD/FROZEN (%s). Terminating worker to protect proxy.",
@@ -629,19 +658,31 @@ async def main() -> None:
 
     # Install global asyncio exception handler to prevent silent crashes
     loop = asyncio.get_running_loop()
+
     def global_exception_handler(loop, context):
         msg = context.get("exception", context["message"])
-        logging.getLogger("asyncio_global").critical(f"Unhandled asyncio exception: {msg}")
+        logging.getLogger("asyncio_global").critical(
+            f"Unhandled asyncio exception: {msg}"
+        )
+
     loop.set_exception_handler(global_exception_handler)
 
     # Print summary of changes/features enabled
     logger.info("=" * 60)
     logger.info("PARSER INITIALIZATION SUMMARY")
     logger.info("=" * 60)
-    logger.info("- Safe API calls: All API calls wrapped in safe_api_call (FloodWait handled by worker_base)")
-    logger.info("- Smart skip: Enabled (min_id=latest_known_id to avoid re-fetching)")
-    logger.info("- Metadata enrichment: Enabled (author, fwd_from, grouped_id, has_media, geo, JSONB metadata)")
-    logger.info("- FloodWait handling: Session-pool-friendly - sessions return to pool with cooldown")
+    logger.info(
+        "- Safe API calls: All API calls wrapped in safe_api_call (FloodWait handled by worker_base)"
+    )
+    logger.info(
+        "- Smart skip: Enabled (min_id=latest_known_id to avoid re-fetching)"
+    )
+    logger.info(
+        "- Metadata enrichment: Enabled (author, fwd_from, grouped_id, has_media, geo, JSONB metadata)"
+    )
+    logger.info(
+        "- FloodWait handling: Session-pool-friendly - sessions return to pool with cooldown"
+    )
     logger.info("- Posts limit per channel: %d", settings.posts_limit)
     logger.info("=" * 60)
 
