@@ -194,6 +194,9 @@ async def _process_message(
     if msg.reply_to and hasattr(msg.reply_to, "reply_to_msg_id"):
         reply_to_msg_id = getattr(msg.reply_to, "reply_to_msg_id", None)
 
+    # Extract author from post (if available)
+    author: str | None = getattr(msg, "post_author", None)
+
     # Detect language (placeholder - in production, use a language detection library)
     # Telethon doesn't provide language detection natively
     language: str | None = getattr(msg, "lang", None)
@@ -242,10 +245,19 @@ async def _process_message(
         "has_links": link_count > 0,
         "has_mentions": mention_count > 0,
         "has_hashtags": hashtag_count > 0,
+        "author": author,
+        "geo_lat": geo_lat,
+        "geo_long": geo_long,
+        "language": language,
     }
 
-    # Remove None values from metadata to keep it clean
-    metadata = {k: v for k, v in metadata.items() if v is not None}
+    # Remove None values from metadata to keep it clean, but retain volatile metadata keys
+    volatile_metadata_keys = {"author", "geo_lat", "geo_long", "language"}
+    metadata = {
+        k: v
+        for k, v in metadata.items()
+        if v is not None or k in volatile_metadata_keys
+    }
 
     post_data: dict[str, Any] = {
         "channel_id": int(entity.id),
@@ -256,14 +268,10 @@ async def _process_message(
         "comments_count": count_message_comments(msg),
         "shares_count": getattr(msg, "forwards", None),
         "reactions_count": count_message_reactions(msg),
-        # Enriched metadata for OpenSPG knowledge graph (backward compatible)
-        "author": getattr(msg, "post_author", None),
+        # Dedicated columns for OpenSPG knowledge graph metadata
         "fwd_from_channel_id": fwd_from_channel_id,
         "grouped_id": getattr(msg, "grouped_id", None),
         "has_media": bool(msg.media),  # Boolean flag only, no downloads
-        "geo_lat": geo_lat,
-        "geo_long": geo_long,
-        "language": language,
         # JSONB raw_metadata column for OpenSPG raw metadata extraction
         "raw_metadata": metadata if metadata else None,
     }
@@ -666,25 +674,6 @@ async def main() -> None:
         )
 
     loop.set_exception_handler(global_exception_handler)
-
-    # Print summary of changes/features enabled
-    logger.info("=" * 60)
-    logger.info("PARSER INITIALIZATION SUMMARY")
-    logger.info("=" * 60)
-    logger.info(
-        "- Safe API calls: All API calls wrapped in safe_api_call (FloodWait handled by worker_base)"
-    )
-    logger.info(
-        "- Smart skip: Enabled (min_id=latest_known_id to avoid re-fetching)"
-    )
-    logger.info(
-        "- Metadata enrichment: Enabled (author, fwd_from, grouped_id, has_media, geo, JSONB metadata)"
-    )
-    logger.info(
-        "- FloodWait handling: Session-pool-friendly - sessions return to pool with cooldown"
-    )
-    logger.info("- Posts limit per channel: %d", settings.posts_limit)
-    logger.info("=" * 60)
 
     logger.info(
         "Starting parser (posts_limit=%d, concurrency from session count)",

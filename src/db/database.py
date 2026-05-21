@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import joinedload
 
-
 from src.db.models import Base, Channel, Post
 
 logger = logging.getLogger(__name__)
@@ -144,7 +143,9 @@ class Database:
                                 )
                             except Exception as e:
                                 logger.warning(
-                                    "Failed to create vertex label %s: %s", label, e
+                                    "Failed to create vertex label %s: %s",
+                                    label,
+                                    e,
                                 )
 
                         logger.info(
@@ -349,11 +350,9 @@ class Database:
             "comments_count": stmt.excluded.comments_count,
             "shares_count": stmt.excluded.shares_count,
             "reactions_count": stmt.excluded.reactions_count,
-            "author": stmt.excluded.author,
+            "fwd_from_channel_id": stmt.excluded.fwd_from_channel_id,
+            "grouped_id": stmt.excluded.grouped_id,
             "has_media": stmt.excluded.has_media,
-            "geo_lat": stmt.excluded.geo_lat,
-            "geo_long": stmt.excluded.geo_long,
-            "language": stmt.excluded.language,
             "raw_metadata": stmt.excluded.raw_metadata,
             "updated_at": stmt.excluded.updated_at,
         }
@@ -688,9 +687,8 @@ class Database:
             The highest message_id for the channel, or None if no posts exist.
         """
         async with self.async_session() as session:
-            stmt = (
-                select(func.max(Post.message_id))
-                .where(Post.channel_id == channel_id)
+            stmt = select(func.max(Post.message_id)).where(
+                Post.channel_id == channel_id
             )
             result = await session.execute(stmt)
             return result.scalar()  # Returns None if no rows exist
