@@ -200,10 +200,8 @@ class BaseTelegramWorker:
         heatup_factor = self._calculate_heatup_factor()
 
         if base_delay is None:
-            # Use settings but scale by heatup factor (slower during heatup)
-            base_min = self.settings.crawler_delay_min
-            base_max = self.settings.crawler_delay_max
-            base_delay = random.uniform(base_min, base_max)
+            # Use worker-specific delays (parser or crawler) and scale by heatup factor
+            base_delay = random.uniform(self.delay_min, self.delay_max)
 
         # Scale by heatup factor (longer delays during warmup)
         scaled_delay = (
@@ -323,7 +321,7 @@ class BaseTelegramWorker:
             "connection": ConnectionTcpIntermediate,
             "connection_retries": self.settings.network_retries,
             "retry_delay": self.settings.network_retry_base_delay_s,
-            "flood_sleep_threshold": 0,
+            "flood_sleep_threshold": 24,
         }
 
         if proxy_config:

@@ -559,10 +559,7 @@ async def start_workers(
         worker_args = {}
 
     if ignore_concurrency_limit:
-        logger.info(
-            "Starting workers with class %s (ignoring concurrency limit, using all available sessions)",
-            worker_class.__name__,
-        )
+        logger.info("Initializing distributed crawler session pool...")
     else:
         logger.info(
             "Starting workers with class %s (concurrency=%d)",
@@ -584,11 +581,12 @@ async def start_workers(
     if ignore_concurrency_limit:
         actual_concurrency = session_pool.size()
         logger.info(
-            "Concurrency limit ignored: using all %d available sessions from pool (loaded: %d, banned: %d)",
+            "Crawler initialized: active session pool size is %d (loaded: %d, banned: %d)",
             actual_concurrency,
             session_pool.loaded_count,
             session_pool.banned_count,
         )
+        logger.info("Spawning %d concurrent discovery tasks...", actual_concurrency)
     else:
         actual_concurrency = min(settings.concurrency, session_pool.size())
         logger.info(

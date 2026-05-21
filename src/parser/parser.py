@@ -588,8 +588,10 @@ class ParserWorker(BaseTelegramWorker):
                 posts_saved,
             )
 
-            # Reduced random delay between channels to avoid rate limits
-            await asyncio.sleep(random.uniform(2, 5))
+            # Human-like delay between channels to respect Telegram rate limits
+            channel_delay = random.uniform(15.0, 45.0)
+            logger.info("Sleeping %.1fs between channel parsing", channel_delay)
+            await asyncio.sleep(channel_delay)
 
         except FloodWaitError as e:
             # FloodWaitError bubbled up from safe_api_call
