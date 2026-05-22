@@ -25,6 +25,7 @@ from telethon.errors import (
 )
 from telethon.tl.types import Channel as TlChannel
 from telethon.tl.types import Message
+from telethon.tl.types import PeerChannel
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
@@ -40,6 +41,34 @@ from src.parser.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_language(text: str) -> str:
+    """Detect language based on character ranges in text.
+
+    Analyzes Cyrillic vs Latin character counts to determine language.
+    If Cyrillic character count (range '\\u0400' to '\\u04FF') is greater
+    than Latin character count, returns "ru", otherwise returns "en".
+
+    Args:
+        text: Text content to analyze.
+
+    Returns:
+        "ru" if Cyrillic characters dominate, "en" otherwise.
+    """
+    if not text:
+        return "en"
+
+    cyrillic_count = 0
+    latin_count = 0
+
+    for char in text:
+        if '\\u0400' <= char <= '\\u04FF':
+            cyrillic_count += 1
+        elif ('a' <= char.lower() <= 'z') or ('A' <= char <= 'Z'):
+            latin_count += 1
+
+    return "ru" if cyrillic_count > latin_count else "en"
 
 
 async def _extract_channel_metadata(
@@ -195,8 +224,10 @@ async def _process_message(
 
     # Extract forward information if available
     fwd_from_channel_id: int | None = None
-    if msg.fwd_from and hasattr(msg.fwd_from, "channel_id"):
-        fwd_from_channel_id = getattr(msg.fwd_from, "channel_id", None)
+    if msg.fwd_from and msg.fwd_from.from_id:
+        # Check if the forward source is a PeerChannel
+        if isinstance(msg.fwd_from.from_id, PeerChannel):
+            fwd_from_channel_id = msg.fwd_from.from_id.channel_id
 
     # Extract geo data if available
     geo_lat: float | None = None
@@ -215,13 +246,12 @@ async def _process_message(
     # Extract author from post (if available)
     author: str | None = getattr(msg, "post_author", None)
 
-    # Detect language (placeholder - in production, use a language detection library)
-    # Telethon doesn't provide language detection natively
-    language: str | None = getattr(msg, "lang", None)
-
     # Extract numeric metrics and patterns from message text
     text_content = msg_content or ""
     numeric_metrics: dict[str, Any] = {}
+
+    # Detect language using character analysis
+    language: str = _detect_language(text_content)
 
     # Extract numbers (prices, amounts, etc.)
     # Match patterns like $100, 100$, 100 USD, etc.
@@ -345,6 +375,8 @@ class ParserWorker(BaseTelegramWorker):
         )
         # Initialize last activity timestamp for Watchdog liveness signaling
         self.last_activity = time.time()
+        # Initialize channel parse counter for session rotation
+        self.channels_parsed_count = 0
 
     async def run(self) -> None:
         """Main worker loop: continuously fetch and parse channels from DB queue."""
@@ -370,6 +402,19 @@ class ParserWorker(BaseTelegramWorker):
                         self.worker_id,
                     )
                     return
+
+                # Check session rotation limit to prevent FloodWait errors
+                # Use custom settings limit if present, otherwise default to 5
+                session_limit = getattr(self.settings, "channels_per_session_limit", 5)
+                if self.channels_parsed_count >= session_limit:
+                    logger.info(
+                        "Worker %d: Completed maximum channel quota (%d channels) for this session. "
+                        "Exiting to allow session rotation and cooldown.",
+                        self.worker_id,
+                        session_limit,
+                    )
+                    return
+
                 try:
                     channel = await self.db.get_channel_for_parsing()
 
@@ -389,6 +434,9 @@ class ParserWorker(BaseTelegramWorker):
                     )
 
                     await self._parse_single_channel(channel)
+
+                    # Increment channel parse counter after successful parsing
+                    self.channels_parsed_count += 1
 
                 except (
                     FloodWaitError,

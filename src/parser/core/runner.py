@@ -420,8 +420,31 @@ async def _worker_runner(
                     runner_id,
                     config.session_path.name,
                 )
-                # Return session to pool for reuse (ready immediately)
-                await session_pool.return_session(entry, cooldown=False)
+                # Optimized session return logic for clean worker exit
+                # Use getattr to safely check for channels_parsed_count attribute
+                channels_parsed = getattr(worker, 'channels_parsed_count', None)
+                if channels_parsed is not None:
+                    # This is a parser worker - check if it reached channel quota
+                    session_limit = getattr(settings, "channels_per_session_limit", 5)
+                    if channels_parsed >= session_limit:
+                        # Parser reached its channel quota - return session with cooldown
+                        logger.info(
+                            "Worker runner %d: session %s reached channel quota (%d/%d), "
+                            "returning to pool with cooldown (300s)",
+                            runner_id,
+                            config.session_path.name,
+                            channels_parsed,
+                            session_limit,
+                        )
+                        await session_pool.return_session(
+                            entry, cooldown=True, cooldown_seconds=300.0
+                        )
+                    else:
+                        # Parser didn't reach quota - return session for immediate reuse
+                        await session_pool.return_session(entry, cooldown=False)
+                else:
+                    # Crawler or other short-lived task - return session for immediate reuse
+                    await session_pool.return_session(entry, cooldown=False)
             except FloodWaitError as e:
                 # FloodWaitError - session needs cooldown before reuse
                 delay = int(getattr(e, "seconds", 0)) or 1
@@ -472,6 +495,17 @@ async def _worker_runner(
         finally:
             # Unregister worker from global registry
             _active_workers.pop(runner_id, None)
+            
+            # Guarantee session disconnection to release SQLite database file locks
+            try:
+                await worker.disconnect()
+            except Exception as disconnect_error:
+                logger.error(
+                    "Worker runner %d: failed to disconnect session %s during cleanup: %s",
+                    runner_id,
+                    config.session_path.name,
+                    disconnect_error,
+                )
 
     logger.info("Worker runner %d stopped", runner_id)
 
@@ -559,7 +593,7 @@ async def start_workers(
         worker_args = {}
 
     if ignore_concurrency_limit:
-        logger.info("Initializing distributed crawler session pool...")
+        pass
     else:
         logger.info(
             "Starting workers with class %s (concurrency=%d)",
@@ -581,12 +615,9 @@ async def start_workers(
     if ignore_concurrency_limit:
         actual_concurrency = session_pool.size()
         logger.info(
-            "Crawler initialized: active session pool size is %d (loaded: %d, banned: %d)",
+            "Starting distributed discovery tasks (active session pool size = %d)",
             actual_concurrency,
-            session_pool.loaded_count,
-            session_pool.banned_count,
         )
-        logger.info("Spawning %d concurrent discovery tasks...", actual_concurrency)
     else:
         actual_concurrency = min(settings.concurrency, session_pool.size())
         logger.info(
@@ -655,7 +686,7 @@ async def start_workers(
                 logger.info("Liveness Watchdog task cancelled")
 
         logger.info(
-            "All worker runners have stopped (sessions loaded: %d, banned: %d)",
+            "All tasks have stopped (sessions loaded: %d, banned: %d)",
             session_pool.loaded_count,
             session_pool.banned_count,
         )

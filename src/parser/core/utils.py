@@ -136,16 +136,18 @@ async def get_channel_entity_safe(
         if isinstance(channel_id, int):
             # Offline SQLite cache lookup by ID: no network call needed, skip safe_api_call
             return await client.get_entity(channel_id)
-        # Username-based lookup requires network call; use safe_api_call for retry/error handling
+        # Username-based lookup requires network call
         if safe_api_call:
+            # safe_api_call internally handles pre-request sleep and enforces its own strict socket-level timeout
             return await safe_api_call(
                 f"get_entity({channel_id})",
                 lambda: client.get_entity(channel_id),
             )
-        return await client.get_entity(channel_id)
+        # No safe_api_call provided: wrap raw call to protect against socket hangs
+        return await asyncio.wait_for(client.get_entity(channel_id), timeout=30.0)
 
     try:
-        entity = await asyncio.wait_for(_fetch_entity(), timeout=30.0)
+        entity = await _fetch_entity()
 
         if isinstance(entity, TlChannel) and getattr(
             entity, "broadcast", False
@@ -237,15 +239,14 @@ async def get_full_channel_info(
             entity_id = entity.id
 
         if safe_api_call:
-            full = await asyncio.wait_for(
-                safe_api_call(
-                    f"GetFullChannelRequest({entity_id})",
-                    lambda: client(GetFullChannelRequest(input_channel)),
-                    rpc_error_fatal=True,
-                ),
-                timeout=30.0,
+            # safe_api_call internally handles pre-request sleep and enforces its own strict socket-level timeout
+            full = await safe_api_call(
+                f"GetFullChannelRequest({entity_id})",
+                lambda: client(GetFullChannelRequest(input_channel)),
+                rpc_error_fatal=True,
             )
         else:
+            # No safe_api_call provided: wrap raw call to protect against socket hangs
             full = await asyncio.wait_for(
                 client(GetFullChannelRequest(input_channel)),
                 timeout=30.0,
