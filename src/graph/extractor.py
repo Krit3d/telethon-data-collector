@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 import aiohttp
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from src.config.config import Settings
 from src.db.graph_repo import GraphRepository
@@ -268,6 +268,8 @@ def _sanitize_key(key: Any) -> str:
 
     Converts the key to string, replaces spaces and hyphens with underscores,
     removes special characters, and converts to lowercase.
+    Handles keys like 'geo_lat' or 'geo_long' to ensure they remain
+    as valid Cypher identifiers (alphanumeric and underscores only).
 
     Args:
         key: The original key value.
@@ -275,7 +277,6 @@ def _sanitize_key(key: Any) -> str:
     Returns:
         Sanitized key string.
     """
-    
     if not isinstance(key, str):
         key = str(key)
     # Convert hyphens and spaces to underscores
@@ -287,26 +288,84 @@ def _sanitize_key(key: Any) -> str:
     return key if key else "unknown_property"
 
 
+def _convert_to_dict(obj: Any) -> dict[str, Any]:
+    """Convert a Pydantic model or other object to a dictionary safely.
+
+    Handles Pydantic models (v1 and v2), dataclasses, and falls back
+    to dict conversion or empty dict if conversion fails.
+
+    Args:
+        obj: The object to convert.
+
+    Returns:
+        Dictionary representation of the object, or empty dict if conversion fails.
+    """
+    if obj is None:
+        return {}
+    
+    # Handle Pydantic models (v2 and v1 compatibility)
+    if isinstance(obj, BaseModel):
+        try:
+            return obj.model_dump(exclude_none=True)
+        except AttributeError:
+            # Fallback for Pydantic v1
+            try:
+                return obj.dict(exclude_none=True)
+            except AttributeError:
+                logger.warning("Failed to convert Pydantic model to dict")
+                return {}
+    
+    # Handle dictionaries directly
+    if isinstance(obj, dict):
+        return obj
+    
+    # Handle objects with __dict__ attribute (dataclasses, regular objects)
+    if hasattr(obj, '__dict__'):
+        try:
+            return dict(obj.__dict__)
+        except (TypeError, ValueError):
+            pass
+    
+    logger.warning("Cannot convert object of type %s to dict", type(obj).__name__)
+    return {}
+
+
 def _merge_metadata_into_properties(
     base_props: dict[str, Any],
-    metadata: dict[str, Any] | None,
+    metadata: dict[str, Any] | BaseModel | None,
 ) -> dict[str, Any]:
-    """Merge metadata dictionary into base properties with key sanitization.
+    """Merge metadata dictionary or Pydantic model into base properties with key sanitization.
+
+    This function handles both dictionary and Pydantic model inputs for metadata.
+    All keys are sanitized to be Cypher-safe snake_case identifiers.
+    Existing keys in base_props are overwritten by metadata values.
 
     Args:
         base_props: Base properties dictionary.
-        metadata: Metadata dictionary to merge (keys will be sanitized).
+        metadata: Metadata dictionary or Pydantic model to merge (keys will be sanitized).
+                  Can be None, in which case base_props is returned unchanged.
 
     Returns:
-        Merged properties dictionary.
+        Merged properties dictionary with sanitized keys.
     """
     if metadata is None:
         return base_props
 
+    # Convert Pydantic models or other objects to dict
+    metadata_dict = _convert_to_dict(metadata)
+    
+    if not metadata_dict:
+        return base_props
+
     merged = base_props.copy()
-    for key, value in metadata.items():
+    for key, value in metadata_dict.items():
         sanitized_key = _sanitize_key(key)
-        merged[sanitized_key] = value
+        # Only merge if value is not None (skip None values to keep existing ones)
+        if value is not None:
+            merged[sanitized_key] = value
+        elif sanitized_key not in merged:
+            # Only set None if the key doesn't exist in merged
+            merged[sanitized_key] = None
     return merged
 
 
@@ -336,6 +395,8 @@ class KnowledgeExtractor:
             author_id: Telegram user ID of the post author (used for author node).
             post_id: Database ID of the post (used for logging and context).
             metadata: Optional pre-collected metadata to pass to the LLM prompt.
+                      Fields like 'language', 'location', 'geo' in this metadata
+                      will be excluded from LLM extraction via prompt instructions.
 
         Returns:
             OpenSPGExtractionResult containing extracted entities and relations.
@@ -350,6 +411,7 @@ class KnowledgeExtractor:
             self._session = aiohttp.ClientSession()
 
         # Construct the OpenSPG prompt with optional metadata
+        # The prompt now includes explicit instructions to skip pre-extracted fields
         prompt = get_open_spg_llm_prompt(text, author_id, metadata)
 
         max_retries = 2
@@ -586,13 +648,15 @@ class KnowledgeExtractor:
         metadata: dict | None = None,
     ) -> OpenSPGExtractionResult | None:
         """
-        Extract knowledge triples from the given text using LLM.
+        Extract knowledge triplets from the given text using LLM.
 
         Args:
             text: Input text to analyze.
             author_id: Telegram user ID of the post author.
             post_id: Database ID of the post (for logging).
             metadata: Optional pre-collected metadata to pass to the LLM.
+                      Fields in metadata (language, location, geo) will be
+                      excluded from LLM extraction via prompt instructions.
 
         Returns:
             OpenSPGExtractionResult containing extracted entities and relations.
@@ -615,11 +679,19 @@ class KnowledgeExtractor:
         author_id: int,
         graph_repo: GraphRepository,
         qdrant: QdrantService | None = None,
-        post_metrics: dict | None = None,
-        raw_metadata: dict | None = None,
+        post_metrics: dict | BaseModel | None = None,
+        raw_metadata: dict | BaseModel | None = None,
     ) -> None:
         """
         Process a single post: extract knowledge triples and persist to AGE graph.
+
+        This method handles the complete pipeline:
+        1. Upsert Post node with merged metrics and raw_metadata
+        2. Upsert Actor node for the author
+        3. Create POSTED relationship
+        4. Extract knowledge via LLM (excluding pre-extracted fields)
+        5. Upsert extracted entities and relations to graph
+        6. Sync to Qdrant for vector search
 
         Args:
             post_id: Database ID of the post.
@@ -627,10 +699,11 @@ class KnowledgeExtractor:
             author_id: Telegram user ID of the post author.
             graph_repo: GraphRepository instance for AGE graph persistence operations.
             qdrant: Optional QdrantService for syncing entities to vector store.
-            post_metrics: Optional dictionary containing post metrics (views, reactions, etc.).
-            raw_metadata: Optional dictionary containing pre-extracted metadata (language, geo, etc.).
+            post_metrics: Optional dictionary or Pydantic model containing post metrics (views, reactions, etc.).
+            raw_metadata: Optional dictionary or Pydantic model containing pre-extracted metadata 
+                         (language, geo, location, etc.). This metadata will be merged into the Post node
+                         and excluded from LLM extraction.
         """
-
         logger.info("Processing post id=%s for knowledge extraction", post_id)
 
         # Step A: Standardize the Post node ID
@@ -646,11 +719,14 @@ class KnowledgeExtractor:
             }
 
             # Merge post_metrics (views, comments, reactions) into properties
+            # Handle both dict and Pydantic model inputs
             post_properties = _merge_metadata_into_properties(post_properties, post_metrics)
 
             # Merge raw_metadata into properties
+            # This ensures all pre-extracted metadata is stored in the Post node
             post_properties = _merge_metadata_into_properties(post_properties, raw_metadata)
 
+            # Upsert the Post node with all properties
             await graph_repo.upsert_graph_node(
                 label="Post",
                 properties=post_properties,
@@ -715,7 +791,10 @@ class KnowledgeExtractor:
             # Do not raise - continue with extraction
 
         # Step E: Call LLM extraction with raw_metadata
-        result = await self.extract_triplets(text, author_id, post_id, raw_metadata)
+        # The LLM prompt will instruct the model to skip pre-extracted fields
+        # Convert raw_metadata to dict if it's a Pydantic model
+        raw_metadata_dict = _convert_to_dict(raw_metadata) if raw_metadata else None
+        result = await self.extract_triplets(text, author_id, post_id, raw_metadata_dict)
 
         if result is None or (not result.entities and not result.relations):
             logger.warning(

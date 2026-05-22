@@ -397,8 +397,13 @@ class BaseTelegramWorker:
         """Disconnect the Telegram client if connected."""
         client = self.client
         if client and client.is_connected():
-            await client.disconnect()  # type: ignore
-            self.logger.info("Disconnected")
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=10.0)  # type: ignore
+                self.logger.info("Disconnected")
+            except asyncio.TimeoutError:
+                self.logger.warning("Disconnection timed out after 10 seconds")
+            except Exception as e:
+                self.logger.warning("Error during disconnection: %s", e)
 
     async def safe_api_call(
         self,

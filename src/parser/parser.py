@@ -1,7 +1,7 @@
-"""Telegram channel parser for scraping and storing channel data.
+"""Telegram channel parser.
 
-This module parses Telegram channels, extracts channel metadata and posts,
-and stores them in a database with knowledge graph extraction.
+Scrapes channel metadata and posts via Telethon, stores to PostgreSQL,
+and triggers knowledge graph extraction.
 """
 
 import asyncio
@@ -43,19 +43,26 @@ from src.parser.core.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _preprocess_text_for_regex(text: str, max_length: int = 4096) -> str:
+    """Sanitize text to prevent ReDoS: truncate, remove invalid chars, normalize whitespace."""
+    if not text:
+        return ""
+
+    text = text[:max_length]
+
+    # Remove null bytes and control characters, keep newlines and tabs
+    text = "".join(
+        char for char in text if char.isprintable() or char in ("\n", "\t")
+    )
+
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text
+
+
 def _detect_language(text: str) -> str:
-    """Detect language based on character ranges in text.
-
-    Analyzes Cyrillic vs Latin character counts to determine language.
-    If Cyrillic character count (range '\\u0400' to '\\u04FF') is greater
-    than Latin character count, returns "ru", otherwise returns "en".
-
-    Args:
-        text: Text content to analyze.
-
-    Returns:
-        "ru" if Cyrillic characters dominate, "en" otherwise.
-    """
+    """Detect text language: returns 'ru' if Cyrillic chars outnumber Latin, else 'en'."""
     if not text:
         return "en"
 
@@ -63,9 +70,10 @@ def _detect_language(text: str) -> str:
     latin_count = 0
 
     for char in text:
-        if '\\u0400' <= char <= '\\u04FF':
+        cp = ord(char)
+        if 0x0400 <= cp <= 0x04FF:  # Cyrillic Unicode block
             cyrillic_count += 1
-        elif ('a' <= char.lower() <= 'z') or ('A' <= char <= 'Z'):
+        elif ("a" <= char.lower() <= "z") or ("A" <= char <= "Z"):
             latin_count += 1
 
     return "ru" if cyrillic_count > latin_count else "en"
@@ -79,25 +87,10 @@ async def _extract_channel_metadata(
     safe_api_call: Callable[..., Any],
     entity_cache: dict[tuple[int, int | None], Any] | None = None,
 ) -> tuple[dict[str, Any], TlChannel] | None:
-    """Extract channel metadata with comprehensive error handling.
-
-    This function resolves the channel entity and fetches full channel info.
-    Relies on Telethon's native session-based caching for access_hash resolution.
-    Never stores access_hash in the global PostgreSQL database to avoid
-    cross-account token poisoning and FloodWait errors.
-
-    Args:
-        client: Telethon client instance.
-        channel: Channel object from database with id and username.
-        db: Database service for marking channel status.
-        safe_api_call: Async function that wraps API calls with retry logic
-            and error handling. Format: safe_api_call(name, callable).
-        entity_cache: Optional per-worker entity cache for cheap lookups.
-    """
+    """Resolve channel entity, fetch metadata (subscribers, description), return data and TL entity."""
     channel_id = channel.id
     entity = None
 
-    # Try direct ID-based resolution first (cheap if session has cached the entity)
     result = await get_channel_entity_safe(
         client,
         channel_id,
@@ -106,18 +99,10 @@ async def _extract_channel_metadata(
     )
     if result.is_success() and result.entity is not None:
         entity = result.entity
-        logger.info(
-            "Channel id=%s resolved via ID (using Telethon session cache)",
-            channel_id,
-        )
+        logger.info("Channel id=%s resolved via ID", channel_id)
 
-    # Fallback: If ID resolution failed, try username resolution (expensive)
-    # This typically only happens once per session per channel
     if entity is None and channel.username:
-        logger.info(
-            "Channel id=%s: ID resolution failed, falling back to username resolution",
-            channel_id,
-        )
+        logger.info("Channel id=%s: falling back to username", channel_id)
         result = await get_channel_entity_safe(
             client,
             channel.username,
@@ -127,44 +112,41 @@ async def _extract_channel_metadata(
         if result.is_success() and result.entity is not None:
             entity = result.entity
         else:
-            # Username resolution failed
             if result.shadowbanned:
                 try:
-                    await asyncio.wait_for(db.mark_channel_pending(channel_id), timeout=15.0)
+                    await asyncio.wait_for(
+                        db.mark_channel_pending(channel_id), timeout=15.0
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Database operation 'mark_channel_pending' timed out for channel %s",
-                        channel_id,
+                        "DB timeout: mark_channel_pending %s", channel_id
                     )
             else:
                 try:
-                    await asyncio.wait_for(db.mark_channel_rejected(channel_id), timeout=15.0)
+                    await asyncio.wait_for(
+                        db.mark_channel_rejected(channel_id), timeout=15.0
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Database operation 'mark_channel_rejected' timed out for channel %s",
-                        channel_id,
+                        "DB timeout: mark_channel_rejected %s", channel_id
                     )
                 await asyncio.sleep(random.uniform(10, 20))
             return None
 
     if entity is None:
-        # Both ID and username resolution failed
         try:
-            await asyncio.wait_for(db.mark_channel_rejected(channel_id), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Database operation 'mark_channel_rejected' timed out for channel %s",
-                channel_id,
+            await asyncio.wait_for(
+                db.mark_channel_rejected(channel_id), timeout=15.0
             )
+        except asyncio.TimeoutError:
+            logger.warning("DB timeout: mark_channel_rejected %s", channel_id)
         await asyncio.sleep(random.uniform(10, 20))
         return None
 
-    # Check if entity is actually a Channel (not a User, PeerUser, or other type)
     if not isinstance(entity, TlChannel):
         logger.warning("Entity is not a channel, skipping")
         return None
 
-    # Get full channel info using shared utility
     subscribers_count, description = await get_full_channel_info(
         client, entity, safe_api_call=safe_api_call
     )
@@ -187,33 +169,13 @@ async def _process_message(
     *,
     safe_api_call: Callable[..., Any] | None = None,
 ) -> int | None:
-    """Process a single message: save to PostgreSQL and return its ID.
-
-    Enriched metadata extraction for OpenSPG knowledge graph integration.
-    Extracts author, forward information, grouped_id, media flags, geo data,
-    and builds a structured metadata JSONB field with additional attributes
-    for domain-specific processing.
-
-    Args:
-        msg: Telethon message object.
-        entity: Channel entity.
-        db: Database service.
-        safe_api_call: Optional async function that wraps API calls with
-            retry logic and error handling.
-
-    Returns:
-        Post ID if successfully processed, None otherwise.
-    """
+    """Process a Telegram message: extract content/metadata, upsert to DB, return post ID or None."""
     if msg.id is None or msg.date is None:
         return None
 
-    # Skip system messages (messages with action) that don't help the OpenSPG graph
-    # Use getattr to safely access action attribute (Pylance may not recognize it)
-    msg_action = getattr(msg, "action", None)
-    if msg_action is not None:
+    if getattr(msg, "action", None) is not None:
         return None
 
-    # Skip empty messages without content
     msg_content = getattr(msg, "message", None)
     if not msg_content:
         return None
@@ -222,91 +184,156 @@ async def _process_message(
     if published_at.tzinfo is None:
         published_at = published_at.replace(tzinfo=timezone.utc)
 
-    # Extract forward information if available
+    # Dedicated DB columns (not in raw_metadata)
     fwd_from_channel_id: int | None = None
     if msg.fwd_from and msg.fwd_from.from_id:
-        # Check if the forward source is a PeerChannel
         if isinstance(msg.fwd_from.from_id, PeerChannel):
             fwd_from_channel_id = msg.fwd_from.from_id.channel_id
 
-    # Extract geo data if available
-    geo_lat: float | None = None
-    geo_long: float | None = None
+    # Geo-coordinates as a dictionary
+    geo: dict[str, float] | None = None
     if msg.media and hasattr(msg.media, "geo"):
-        geo = getattr(msg.media, "geo", None)
-        if geo:
-            geo_lat = getattr(geo, "lat", None)
-            geo_long = getattr(geo, "long", None)
+        geo_obj = getattr(msg.media, "geo", None)
+        if geo_obj:
+            lat = getattr(geo_obj, "lat", None)
+            long_val = getattr(geo_obj, "long", None)
+            if lat is not None and long_val is not None:
+                geo = {"lat": lat, "long": long_val}
 
-    # Extract reply information
     reply_to_msg_id: int | None = None
     if msg.reply_to and hasattr(msg.reply_to, "reply_to_msg_id"):
         reply_to_msg_id = getattr(msg.reply_to, "reply_to_msg_id", None)
 
-    # Extract author from post (if available)
     author: str | None = getattr(msg, "post_author", None)
 
-    # Extract numeric metrics and patterns from message text
-    text_content = msg_content or ""
+    # Pre-process text to prevent ReDoS
+    try:
+        text_content = _preprocess_text_for_regex(msg_content, max_length=4096)
+    except Exception as e:
+        logger.warning(
+            "Text pre-processing failed for message_id=%s: %s", msg.id, e
+        )
+        text_content = ""
+
+    try:
+        language: str = _detect_language(text_content)
+    except Exception as e:
+        logger.warning(
+            "Language detection failed for message_id=%s: %s", msg.id, e
+        )
+        language = "en"
+
+    # Text metrics
+    text_metrics: dict[str, int] = {}
+    try:
+        text_metrics["word_count"] = len(text_content.split())
+        text_metrics["char_count"] = len(text_content)
+    except Exception as e:
+        logger.warning(
+            "Word/char count failed for message_id=%s: %s", msg.id, e
+        )
+
+    try:
+        text_metrics["link_count"] = len(
+            re.findall(r"https?://[^\s<>]{1,500}", text_content)
+        )
+    except Exception as e:
+        logger.warning("Link counting failed for message_id=%s: %s", msg.id, e)
+        text_metrics["link_count"] = 0
+
+    try:
+        text_metrics["mention_count"] = len(
+            re.findall(r"@\w{1,50}", text_content)
+        )
+    except Exception as e:
+        logger.warning(
+            "Mention counting failed for message_id=%s: %s", msg.id, e
+        )
+        text_metrics["mention_count"] = 0
+
+    try:
+        text_metrics["hashtag_count"] = len(
+            re.findall(r"#\w{1,50}", text_content)
+        )
+    except Exception as e:
+        logger.warning(
+            "Hashtag counting failed for message_id=%s: %s", msg.id, e
+        )
+        text_metrics["hashtag_count"] = 0
+
+    # Numeric metrics
     numeric_metrics: dict[str, Any] = {}
 
-    # Detect language using character analysis
-    language: str = _detect_language(text_content)
-
-    # Extract numbers (prices, amounts, etc.)
-    # Match patterns like $100, 100$, 100 USD, etc.
-    price_patterns = re.findall(
-        r"(?:\$|USD|EUR|GBP|RUB|₽)?\s*[\d,]+(?:\.\d+)?\s*(?:\$|USD|EUR|GBP|RUB|₽)?",
-        text_content,
-    )
-    if price_patterns:
-        numeric_metrics["price_patterns"] = price_patterns
-
-    # Extract standalone numbers (integers and floats)
-    numbers = re.findall(r"\b\d+(?:\.\d+)?\b", text_content)
-    if numbers:
-        numeric_metrics["numbers"] = [
-            float(n) if "." in n else int(n) for n in numbers
+    # Extract price patterns (as strings)
+    try:
+        price_patterns: list[str] = []
+        # Match prices with currency symbol/prefix first
+        price_patterns.extend(
+            re.findall(
+                r"(?:[$₽]|USD|EUR|GBP|RUB)\s*\d{1,10}(?:[.,]\d{1,2})?",
+                text_content,
+            )
+        )
+        # Match prices with currency symbol/suffix
+        price_patterns.extend(
+            re.findall(
+                r"\d{1,10}(?:[.,]\d{1,2})?\s*(?:[$₽]|USD|EUR|GBP|RUB)",
+                text_content,
+            )
+        )
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_prices = [
+            p for p in price_patterns if not (p in seen or seen.add(p))
         ]
+        if unique_prices:
+            numeric_metrics["prices"] = unique_prices
+    except Exception as e:
+        logger.warning(
+            "Price pattern extraction failed for message_id=%s: %s", msg.id, e
+        )
 
-    # Count links in the message
-    link_count = len(re.findall(r"https?://\S+", text_content))
-    if link_count > 0:
-        numeric_metrics["link_count"] = link_count
+    # Extract numbers with validation
+    try:
+        numbers = re.findall(r"\b\d{1,10}(?:\.\d{1,5})?\b", text_content)
+        if numbers:
+            parsed_numbers: list[float | int] = []
+            for n in numbers[:100]:  # Limit to 100 numbers for performance
+                try:
+                    if "." in n:
+                        val = float(n)
+                    else:
+                        val = int(n)
+                    if -1e15 < val < 1e15:
+                        parsed_numbers.append(val)
+                except (ValueError, OverflowError):
+                    continue
+            if parsed_numbers:
+                numeric_metrics["numbers"] = parsed_numbers
+    except Exception as e:
+        logger.warning(
+            "Number extraction failed for message_id=%s: %s", msg.id, e
+        )
 
-    # Count mentions (Telegram mentions start with @)
-    mention_count = len(re.findall(r"@\w+", text_content))
-    numeric_metrics["mention_count"] = mention_count
-
-    # Count hashtags
-    hashtag_count = len(re.findall(r"#\w+", text_content))
-    numeric_metrics["hashtag_count"] = hashtag_count
-
-    # Count words and characters
-    numeric_metrics["word_count"] = len(text_content.split())
-    numeric_metrics["char_count"] = len(text_content)
-
-    # Build the metadata dictionary for JSONB column (only non-redundant fields for OpenSPG)
+    # Build raw_metadata for JSONB column
     metadata: dict[str, Any] = {
-        "reply_to_msg_id": reply_to_msg_id,
-        "numeric_metrics": numeric_metrics if numeric_metrics else None,
-        "has_links": link_count > 0,
-        "has_mentions": mention_count > 0,
-        "has_hashtags": hashtag_count > 0,
-        "author": author,
-        "geo_lat": geo_lat,
-        "geo_long": geo_long,
         "language": language,
+        "geo": geo,
+        "author": author,
+        "text_metrics": text_metrics if text_metrics else None,
+        "numeric_metrics": numeric_metrics if numeric_metrics else None,
+        "reply_to_msg_id": reply_to_msg_id,
     }
 
-    # Remove None values from metadata to keep it clean, but retain volatile metadata keys
-    volatile_metadata_keys = {"author", "geo_lat", "geo_long", "language"}
+    # Filter out None values, but keep "language" and "author" even if None
+    volatile_metadata_keys = {"author", "language"}
     metadata = {
         k: v
         for k, v in metadata.items()
         if v is not None or k in volatile_metadata_keys
     }
 
+    # Build post data with dedicated columns
     post_data: dict[str, Any] = {
         "channel_id": int(entity.id),
         "message_id": int(msg.id),
@@ -316,21 +343,28 @@ async def _process_message(
         "comments_count": count_message_comments(msg),
         "shares_count": getattr(msg, "forwards", None),
         "reactions_count": count_message_reactions(msg),
-        # Dedicated columns for OpenSPG knowledge graph metadata
         "fwd_from_channel_id": fwd_from_channel_id,
         "grouped_id": getattr(msg, "grouped_id", None),
-        "has_media": bool(msg.media),  # Boolean flag only, no downloads
-        # JSONB raw_metadata column for OpenSPG raw metadata extraction
+        "has_media": bool(msg.media),
         "raw_metadata": metadata if metadata else None,
     }
 
+    # Database insert with 15.0s timeout
     try:
         post = await asyncio.wait_for(db.upsert_post(post_data), timeout=15.0)
     except asyncio.TimeoutError:
         logger.warning(
-            "Inserting/updating post message_id=%s in channel %s timed out",
+            "Database timeout for message_id=%s in channel %s",
             post_data.get("message_id"),
             post_data.get("channel_id"),
+        )
+        return None
+    except Exception as e:
+        logger.error(
+            "Database error for message_id=%s: %s",
+            post_data.get("message_id"),
+            e,
+            exc_info=True,
         )
         return None
 
@@ -341,7 +375,7 @@ async def _process_message(
 
 
 class ParserWorker(BaseTelegramWorker):
-    """Async worker that parses channels and extracts knowledge."""
+    """Telethon worker that parses channels from DB, fetches posts, and stores to PostgreSQL."""
 
     def __init__(
         self,
@@ -358,7 +392,7 @@ class ParserWorker(BaseTelegramWorker):
         lang_code: str = "en",
         system_lang_code: str = "en-US",
     ):
-        """Initialize the parser worker."""
+        """Initialize parser worker with session, DB, and Telegram client configuration."""
         super().__init__(
             worker_id=worker_id,
             session_path=session_path,
@@ -373,20 +407,15 @@ class ParserWorker(BaseTelegramWorker):
             lang_code=lang_code,
             system_lang_code=system_lang_code,
         )
-        # Initialize last activity timestamp for Watchdog liveness signaling
         self.last_activity = time.time()
-        # Initialize channel parse counter for session rotation
         self.channels_parsed_count = 0
 
     async def run(self) -> None:
-        """Main worker loop: continuously fetch and parse channels from DB queue."""
+        """Main loop: process channels from DB, handle rate limits and auth errors."""
         try:
             await asyncio.wait_for(self.connect(), timeout=45.0)
         except asyncio.TimeoutError:
-            logger.critical(
-                "Worker %d: Telethon client connection timed out after 45 seconds",
-                self.worker_id,
-            )
+            logger.critical("Worker %d: Connection timeout", self.worker_id)
             self.is_alive = False
             return
 
@@ -394,48 +423,47 @@ class ParserWorker(BaseTelegramWorker):
 
         try:
             while True:
-                # Signal liveness to Watchdog at the start of each loop iteration
                 self.last_activity = time.time()
                 if not self.is_alive:
-                    logger.info(
-                        "Worker %d: is_alive=False, terminating worker loop",
-                        self.worker_id,
-                    )
+                    logger.info("Worker %d: Terminating loop", self.worker_id)
                     return
 
-                # Check session rotation limit to prevent FloodWait errors
-                # Use custom settings limit if present, otherwise default to 5
-                session_limit = getattr(self.settings, "channels_per_session_limit", 5)
+                session_limit = getattr(
+                    self.settings, "channels_per_session_limit", 5
+                )
                 if self.channels_parsed_count >= session_limit:
                     logger.info(
-                        "Worker %d: Completed maximum channel quota (%d channels) for this session. "
-                        "Exiting to allow session rotation and cooldown.",
-                        self.worker_id,
-                        session_limit,
+                        "Worker %d: Session quota reached", self.worker_id
                     )
                     return
 
                 try:
-                    channel = await self.db.get_channel_for_parsing()
+                    try:
+                        channel = await asyncio.wait_for(
+                            self.db.get_channel_for_parsing(), timeout=15.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Worker %d: DB timeout get_channel", self.worker_id
+                        )
+                        await asyncio.sleep(10)
+                        continue
 
                     if channel is None:
                         logger.debug(
-                            "Worker %d: No channels ready for parsing, sleeping 30s",
-                            self.worker_id,
+                            "Worker %d: No channels, sleeping", self.worker_id
                         )
                         await asyncio.sleep(30)
                         continue
 
                     logger.info(
-                        "Worker %d: Processing channel id=%s username=%s",
+                        "Worker %d: Processing channel %s",
                         self.worker_id,
                         channel.id,
-                        channel.username,
                     )
 
                     await self._parse_single_channel(channel)
 
-                    # Increment channel parse counter after successful parsing
                     self.channels_parsed_count += 1
 
                 except (
@@ -445,42 +473,18 @@ class ParserWorker(BaseTelegramWorker):
                     SessionExpiredError,
                     SessionRevokedError,
                 ) as e:
-                    # Propagate critical exceptions to _worker_runner for session cooldown/ban handling
                     raise
                 except Exception as e:
                     logger.error(
-                        "Worker %d: Unexpected error in loop: %s",
-                        self.worker_id,
-                        e,
-                        exc_info=True,
+                        "Worker %d: Error: %s", self.worker_id, e, exc_info=True
                     )
                     await asyncio.sleep(30)
         finally:
-            logger.info("Worker %d: Cleanup complete", self.worker_id)
+            logger.info("Worker %d: Cleanup", self.worker_id)
 
     async def _parse_single_channel(self, channel: Channel) -> None:
-        """Fetch, normalize, and persist one channel with its recent posts using safe pagination.
-
-        Implements controlled chunk-based fetching to avoid burst requests that trigger
-        FloodWait bans. Messages are fetched in small chunks with natural delays between
-        requests.
-
-        When a FloodWaitError (or shadowban/network error caused by it) is bubbled up
-        from safe_api_call:
-        - Catch it, log it, and safely return the channel to the queue
-        - Ensure all local DB resources/sessions are closed
-        - Propagate the exception to _worker_runner so the runner knows this session is in cooldown
-
-        Args:
-            channel: Channel object from database with id and username.
-        """
-
+        """Parse single channel: upsert metadata, fetch recent posts, update channel status in DB."""
         channel_id = channel.id
-        logger.info(
-            "Start channel parse: id=%s username=%s",
-            channel_id,
-            channel.username,
-        )
 
         try:
             result = await _extract_channel_metadata(
@@ -488,7 +492,7 @@ class ParserWorker(BaseTelegramWorker):
                 channel,
                 self.db,
                 safe_api_call=self.safe_api_call,
-                entity_cache=self._entity_cache,  # Pass per-worker entity cache
+                entity_cache=self._entity_cache,
             )
             if result is None:
                 return
@@ -496,112 +500,76 @@ class ParserWorker(BaseTelegramWorker):
             channel_data, entity = result
 
             try:
-                await asyncio.wait_for(self.db.upsert_channel(channel_data), timeout=15.0)
+                await asyncio.wait_for(
+                    self.db.upsert_channel(channel_data), timeout=15.0
+                )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: Database operation 'upsert_channel' timed out for channel %s",
+                    "Worker %d: DB timeout upsert_channel %s",
                     self.worker_id,
                     channel_id,
                 )
                 try:
-                    await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)
+                    await asyncio.wait_for(
+                        self.db.mark_channel_pending(channel_id), timeout=15.0
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                        "Worker %d: DB timeout mark_pending %s",
                         self.worker_id,
                         channel_id,
                     )
                 return
 
-            logger.debug(
-                "Channel saved: id=%s username=%s title=%s",
-                channel_data["id"],
-                channel_data["username"],
-                channel_data["title"],
-            )
-
-            # NATIVE-LIKE EXPLORATION: Occasionally simulate "opening" the channel view
-            # by fetching a single message first, mimicking human browsing behavior
-            if random.random() < 0.3:  # 30% chance to do an exploration fetch
+            # Occasional native exploration (30% chance)
+            if random.random() < 0.3:
                 try:
-                    logger.debug(
-                        "Worker %d: Native exploration - fetching latest message from channel %s",
-                        self.worker_id,
-                        channel_id,
-                    )
-                    # Wrap API call in safe_api_call to handle FloodWaitError properly
                     exploration_msg = await self.safe_api_call(
                         "exploration_fetch",
                         lambda: self.client.get_messages(  # type: ignore[attr-defined]
                             entity, limit=1
                         ),
                     )
-                    # Small delay to simulate reading
                     await asyncio.sleep(random.uniform(1, 3))
-                    # Count messages (handle both single Message and list responses)
-                    msg_count = 1 if exploration_msg else 0
-                    if isinstance(exploration_msg, list):
-                        msg_count = len(exploration_msg)
-                    self.logger.debug(
-                        "Worker %d: Exploration complete - found %d messages",
-                        self.worker_id,
-                        msg_count,
-                    )
                 except Exception as e:
-                    # Non-critical - log but continue with main parsing
                     self.logger.warning(
-                        "Worker %d: Native exploration failed for channel %s: %s",
-                        self.worker_id,
-                        channel_id,
-                        e,
+                        "Worker %d: Exploration failed: %s", self.worker_id, e
                     )
 
-            # SAFE PAGINATION: Fetch messages in controlled chunks to avoid burst requests
             posts_saved = 0
-            chunk_size = 20  # Safe chunk size to avoid triggering FloodWait
-            last_msg_id: int = (
-                0  # Track last message ID for pagination (initialized to integer 0)
-            )
+            chunk_size = 20
+            last_msg_id: int = 0
             posts_limit = self.settings.posts_limit
 
-            # SMART SKIP: Fetch the latest known message ID from DB to avoid re-fetching
-            # This saves API limits by not requesting messages we already have
             try:
                 latest_known_id = (
-                    await asyncio.wait_for(self.db.get_latest_message_id(channel_id), timeout=15.0) or 0
+                    await asyncio.wait_for(
+                        self.db.get_latest_message_id(channel_id), timeout=15.0
+                    )
+                    or 0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: Database operation 'get_latest_message_id' timed out for channel %s",
+                    "Worker %d: DB timeout get_latest_id %s",
                     self.worker_id,
                     channel_id,
                 )
                 try:
-                    await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)
+                    await asyncio.wait_for(
+                        self.db.mark_channel_pending(channel_id), timeout=15.0
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                        "Worker %d: DB timeout mark_pending %s",
                         self.worker_id,
                         channel_id,
                     )
                 return
-            if latest_known_id > 0:
-                self.logger.info(
-                    "Channel %s: Latest known message ID is %d, will skip older messages",
-                    channel_id,
-                    latest_known_id,
-                )
 
             while posts_saved < posts_limit:
-                # Calculate how many messages to fetch in this chunk
                 remaining = posts_limit - posts_saved
                 current_chunk_size = min(chunk_size, remaining)
 
-                # Fetch a chunk of messages with manual pagination
-                # Use offset_id to get messages older than the last fetched message
-                # Note: offset_id=None means "start from the most recent message"
-                # Use min_id to skip messages we already have (optimization)
-                # Clean lambda - no conditional default value evaluation traps
                 messages = await self.safe_api_call(
                     f"get_messages(channel_id={channel_id}, chunk_size={current_chunk_size})",
                     operation=lambda: self.client.get_messages(  # type: ignore[attr-defined]
@@ -611,44 +579,23 @@ class ParserWorker(BaseTelegramWorker):
                         min_id=latest_known_id,
                     ),
                 )
-                # Signal liveness to Watchdog after fetching a chunk of messages
                 self.last_activity = time.time()
 
-                # Handle API call failure
                 if messages is None:
-                    self.logger.warning(
-                        "Worker %d: Failed to fetch messages for channel %s",
-                        self.worker_id,
-                        channel_id,
-                    )
                     break
 
-                # Normalize to list (get_messages may return a single Message or a list)
                 if not isinstance(messages, list):
                     messages = [messages]
 
-                # If no messages returned, we've reached the end
                 if not messages:
                     break
 
-                # Process messages in this chunk
                 for msg in messages:
                     if not isinstance(msg, Message):
                         continue
 
-                    # SMART SKIP: Early exit if we encounter messages we already have
-                    # This prevents wasting API limits on already-processed content
                     if msg.id is not None and msg.id <= latest_known_id:
-                        self.logger.info(
-                            "Channel %s: Reached already known message ID %d (latest known: %d). Stopping pagination.",
-                            channel_id,
-                            msg.id,
-                            latest_known_id,
-                        )
-                        # Break out of the for loop
-                        posts_saved = (
-                            posts_limit  # Set to limit to exit while loop
-                        )
+                        posts_saved = posts_limit
                         break
 
                     post_id = await _process_message(
@@ -657,95 +604,81 @@ class ParserWorker(BaseTelegramWorker):
                         self.db,
                         safe_api_call=self.safe_api_call,
                     )
-                    # Signal liveness to Watchdog after processing an individual message
                     self.last_activity = time.time()
                     if post_id is None:
                         continue
 
                     posts_saved += 1
 
-                    # Check if we've reached the limit
                     if posts_saved >= posts_limit:
                         break
 
-                # If we broke out due to smart skip, exit the while loop
                 if posts_saved >= posts_limit:
                     break
 
-                # Update last_msg_id for pagination (get messages older than oldest in chunk)
                 if messages:
-                    oldest_msg = messages[
-                        -1
-                    ]  # Last message in list is the oldest
+                    oldest_msg = messages[-1]
                     if (
                         isinstance(oldest_msg, Message)
                         and oldest_msg.id is not None
                     ):
                         last_msg_id = oldest_msg.id
 
-                # If we got fewer messages than requested, we've reached the end
                 if len(messages) < current_chunk_size:
                     break
 
-                # Apply lighter delay between chunks to avoid rate limits
                 if self.settings.use_natural_delays:
                     await asyncio.sleep(self.natural_delay(base_delay=1.5))
                 else:
                     await asyncio.sleep(random.uniform(1.0, 2.5))
 
             try:
-                await asyncio.wait_for(self.db.mark_channel_parsed(channel_id), timeout=15.0)
+                await asyncio.wait_for(
+                    self.db.mark_channel_parsed(channel_id), timeout=15.0
+                )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: Database operation 'mark_channel_parsed' timed out for channel %s",
+                    "Worker %d: DB timeout mark_parsed %s",
                     self.worker_id,
                     channel_id,
                 )
                 try:
-                    await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)
+                    await asyncio.wait_for(
+                        self.db.mark_channel_pending(channel_id), timeout=15.0
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                        "Worker %d: DB timeout mark_pending %s",
                         self.worker_id,
                         channel_id,
                     )
 
             logger.info(
-                "Done channel: id=%s username=%s (posts saved: %s)",
-                channel_id,
-                channel.username,
-                posts_saved,
-            )
-
-            # Human-like delay between channels to respect Telegram rate limits
-            channel_delay = random.uniform(15.0, 45.0)
-            logger.info("Sleeping %.1fs between channel parsing", channel_delay)
-            await asyncio.sleep(channel_delay)
-
-        except FloodWaitError as e:
-            # FloodWaitError bubbled up from safe_api_call
-            # The worker_base now raises FloodWaitError for delays > 5 seconds
-            # instead of sleeping indefinitely inside safe_api_call
-            delay = int(getattr(e, "seconds", 0)) or 1
-            logger.warning(
-                "Worker %d: FloodWaitError in channel %s (delay=%ds). "
-                "Marking channel as pending and propagating error.",
+                "Worker %d: Done channel %s (%d posts)",
                 self.worker_id,
                 channel_id,
-                delay,
+                posts_saved,
             )
-            # Safely return channel to queue for later processing
+            await asyncio.sleep(random.uniform(15.0, 45.0))
+
+        except FloodWaitError as e:
+            delay = int(getattr(e, "seconds", 0)) or 1
+            logger.warning(
+                "Worker %d: FloodWait %ds, channel %s",
+                self.worker_id,
+                delay,
+                channel_id,
+            )
             try:
-                await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)
+                await asyncio.wait_for(
+                    self.db.mark_channel_pending(channel_id), timeout=15.0
+                )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                    "Worker %d: DB timeout mark_pending %s",
                     self.worker_id,
                     channel_id,
                 )
-            # Close any local DB resources if needed
-            # (Database connections are managed by the pool, no explicit close needed here)
-            # Re-raise the exception so _worker_runner can handle session cooldown
             raise
 
         except (
@@ -765,79 +698,95 @@ class ParserWorker(BaseTelegramWorker):
                 ),
             ):
                 logger.critical(
-                    "Worker %d: Account is DEAD/FROZEN (%s). Terminating worker to protect proxy.",
+                    "Worker %d: Account DEAD/FROZEN (%s)",
                     self.worker_id,
                     type(e).__name__,
                 )
                 self.is_alive = False
                 try:
-                    await asyncio.wait_for(self.db.mark_channel_rejected(channel_id), timeout=15.0)
+                    await asyncio.wait_for(
+                        self.db.mark_channel_rejected(channel_id), timeout=15.0
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Worker %d: Database operation 'mark_channel_rejected' timed out for channel %s",
+                        "Worker %d: DB timeout mark_rejected %s",
                         self.worker_id,
                         channel_id,
                     )
-                raise  # Re-raise to propagate fatal session error
+                raise
             logger.warning(
-                "Channel %s: access denied (%s), marking as rejected",
+                "Worker %d: Access denied %s: %s",
+                self.worker_id,
                 channel_id,
                 type(e).__name__,
             )
             try:
-                await asyncio.wait_for(self.db.mark_channel_rejected(channel_id), timeout=15.0)
+                await asyncio.wait_for(
+                    self.db.mark_channel_rejected(channel_id), timeout=15.0
+                )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: Database operation 'mark_channel_rejected' timed out for channel %s",
+                    "Worker %d: DB timeout mark_rejected %s",
                     self.worker_id,
                     channel_id,
                 )
 
         except (OSError, asyncio.TimeoutError, ConnectionError) as e:
             logger.exception(
-                "Channel %s: network error (%s)", channel_id, type(e).__name__
+                "Worker %d: Network error %s: %s",
+                self.worker_id,
+                channel_id,
+                type(e).__name__,
             )
             try:
-                await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)  # Return to queue
+                await asyncio.wait_for(
+                    self.db.mark_channel_pending(channel_id), timeout=15.0
+                )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                    "Worker %d: DB timeout mark_pending %s",
                     self.worker_id,
                     channel_id,
                 )
 
         except RPCError as e:
             logger.exception(
-                "Channel %s: Telethon RPCError (%s)",
+                "Worker %d: RPCError %s: %s",
+                self.worker_id,
                 channel_id,
                 type(e).__name__,
             )
             try:
-                await asyncio.wait_for(self.db.mark_channel_rejected(channel_id), timeout=15.0)  # Permanently block
+                await asyncio.wait_for(
+                    self.db.mark_channel_rejected(channel_id), timeout=15.0
+                )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: Database operation 'mark_channel_rejected' timed out for channel %s",
+                    "Worker %d: DB timeout mark_rejected %s",
                     self.worker_id,
                     channel_id,
                 )
 
         except Exception:
-            logger.exception("Channel %s: unexpected error", channel_id)
+            logger.exception(
+                "Worker %d: Unexpected error %s", self.worker_id, channel_id
+            )
             try:
-                await asyncio.wait_for(self.db.mark_channel_rejected(channel_id), timeout=15.0)  # Permanently block
+                await asyncio.wait_for(
+                    self.db.mark_channel_rejected(channel_id), timeout=15.0
+                )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: Database operation 'mark_channel_rejected' timed out for channel %s",
+                    "Worker %d: DB timeout mark_rejected %s",
                     self.worker_id,
                     channel_id,
                 )
 
 
 async def main() -> None:
-    """Entry point: discover sessions, read individual configs, spawn worker tasks."""
+    """Entry point: load config, initialize DB, and start parser workers."""
     settings = load_settings()
 
-    # Install global asyncio exception handler to prevent silent crashes
     loop = asyncio.get_running_loop()
 
     def global_exception_handler(loop, context):
@@ -848,15 +797,10 @@ async def main() -> None:
 
     loop.set_exception_handler(global_exception_handler)
 
-    logger.info(
-        "Starting parser (posts_limit=%d, concurrency from session count)",
-        settings.posts_limit,
-    )
+    logger.info("Starting parser (posts_limit=%d)", settings.posts_limit)
 
-    # Database is assumed to be initialized by the migration script
     db = Database(settings.db_url)
 
-    # Use the shared runner to start workers
     await start_workers(
         worker_class=ParserWorker,
         settings=settings,

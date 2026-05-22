@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from telethon.errors import AuthKeyError, UserDeactivatedError
+from telethon.errors import AuthKeyError, SessionRevokedError, UserDeactivatedError
 from telethon.errors.rpcerrorlist import FloodWaitError
 
 from src.config.config import Settings
@@ -473,6 +473,7 @@ async def _worker_runner(
                 AuthKeyError,
                 UserDeactivatedError,
                 SessionExpiredError,
+                SessionRevokedError,
             ) as e:
                 # Permanent ban - don't return session to pool
                 logger.error(
@@ -497,8 +498,15 @@ async def _worker_runner(
             _active_workers.pop(runner_id, None)
             
             # Guarantee session disconnection to release SQLite database file locks
+            # Use strict timeout to prevent runners from hanging indefinitely
             try:
-                await worker.disconnect()
+                await asyncio.wait_for(worker.disconnect(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker runner %d: session %s disconnection timed out after 10 seconds",
+                    runner_id,
+                    config.session_path.name,
+                )
             except Exception as disconnect_error:
                 logger.error(
                     "Worker runner %d: failed to disconnect session %s during cleanup: %s",
@@ -539,8 +547,17 @@ async def _watchdog_task(settings: Settings) -> None:
                             worker.session_path.name,
                             inactive_duration,
                         )
+                        # Wrap disconnect in wait_for to prevent watchdog deadlock
+                        # if the underlying socket is frozen
                         try:
-                            await worker.disconnect()
+                            await asyncio.wait_for(worker.disconnect(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Watchdog: Disconnect timed out for worker %d (session: %s). "
+                                "Proceeding with deadlock recovery.",
+                                worker.worker_id,
+                                worker.session_path.name,
+                            )
                         except Exception as e:
                             logger.error(
                                 "Watchdog: Failed to disconnect worker %d: %s",

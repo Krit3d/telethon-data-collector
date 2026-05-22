@@ -511,15 +511,30 @@ def get_open_spg_llm_prompt(
     metadata_json_str = ""
     if metadata is not None and len(metadata) > 0:
         metadata_json_str = json.dumps(metadata, ensure_ascii=False, indent=2)
+        
+        # Check which fields are present in metadata to customize instructions
+        excluded_fields = []
+        if "language" in metadata:
+            excluded_fields.append("'language' (2-letter code)")
+        if "location" in metadata:
+            excluded_fields.append("'location' (human-readable location)")
+        # Handle both 'geo' (list) and separate 'geo_lat'/'geo_long' keys
+        if "geo" in metadata or "geo_lat" in metadata or "geo_long" in metadata:
+            excluded_fields.append("'geo'/'geo_lat'/'geo_long' (coordinates)")
+        
+        excluded_text = ", ".join(excluded_fields) if excluded_fields else "none"
+        
         metadata_instruction = f"""
 PRE-EXTRACTED METADATA (DO NOT RE-EXTRACT):
 The following metadata has been pre-collected from the post and is already available in the database:
 {metadata_json_str}
 
 CRITICAL INSTRUCTION FOR PRE-EXTRACTED METADATA:
-- If 'language', 'location', or 'geo' are already present in the provided pre-extracted metadata above, DO NOT extract them again from the text.
-- Focus strictly on extracting business logic entities (Actors, Entities, Events, Places) and their relations from the text.
+- The following fields are ALREADY PRESENT in the pre-extracted metadata: {excluded_text}
+- STRICTLY FORBIDDEN: DO NOT extract or include any of these pre-extracted fields in your output.
+- Focus strictly on extracting NEW business logic entities (Actors, Entities, Events, Places) and their relations from the text.
 - The pre-extracted metadata will be merged into the Post node automatically; you do NOT need to include these as properties in your extraction output.
+- If you see information in the text that matches pre-extracted metadata (e.g., language, location, coordinates), IGNORE it completely and do NOT add it to your extraction.
 """
 
     prompt = f"""You are an OpenSPG (Semantic Parsing Graph) incremental knowledge accumulation engine. Your task is to extract or update knowledge entities and relationships from the provided text, treating the graph as a persistent state that grows incrementally across any domain (IT, politics, lifestyle, science, etc.).

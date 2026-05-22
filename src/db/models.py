@@ -158,13 +158,23 @@ class Post(Base):
 
     # OpenSPG Knowledge Graph metadata fields
     fwd_from_channel_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="Forwarded from channel ID"
+        BigInteger,
+        nullable=True,
+        index=True,
+        comment="Forwarded from channel ID",
     )
     grouped_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="Grouped ID for grouped messages"
+        BigInteger,
+        nullable=True,
+        index=True,
+        comment="Grouped ID for grouped messages",
     )
     has_media: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default="false", comment="Whether the post contains media"
+        Boolean,
+        default=False,
+        server_default="false",
+        index=True,
+        comment="Whether the post contains media",
     )
 
     # JSONB raw_metadata column for OpenSPG raw metadata extraction

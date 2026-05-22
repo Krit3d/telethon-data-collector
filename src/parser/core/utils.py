@@ -134,8 +134,8 @@ async def get_channel_entity_safe(
     async def _fetch_entity() -> Any:
         """Internal helper to fetch entity using the appropriate method."""
         if isinstance(channel_id, int):
-            # Offline SQLite cache lookup by ID: no network call needed, skip safe_api_call
-            return await client.get_entity(channel_id)
+            # SQLite session cache lookup by ID: cache miss triggers a network request, wrap in wait_for to prevent hangs
+            return await asyncio.wait_for(client.get_entity(channel_id), timeout=30.0)
         # Username-based lookup requires network call
         if safe_api_call:
             # safe_api_call internally handles pre-request sleep and enforces its own strict socket-level timeout
