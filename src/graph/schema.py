@@ -5,10 +5,17 @@ for flexible entity and relationship attributes.
 """
 
 from enum import Enum
+import json
 import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class PropertyType(str, Enum):
@@ -34,7 +41,9 @@ class Property(BaseModel):
     """
 
     key: str = Field(..., description="Property name/key")
-    value: Any = Field(..., description="Property value (validated based on type)")
+    value: Any = Field(
+        ..., description="Property value (validated based on type)"
+    )
     type: PropertyType = Field(
         ..., description="Property type category from PropertyType enum"
     )
@@ -120,7 +129,9 @@ class Property(BaseModel):
                 stripped = value.strip()
                 try:
                     # Try to convert to int first for whole numbers (including negative)
-                    if stripped.isdigit() or (stripped.startswith('-') and stripped[1:].isdigit()):
+                    if stripped.isdigit() or (
+                        stripped.startswith("-") and stripped[1:].isdigit()
+                    ):
                         data["value"] = int(stripped)
                     else:
                         # Try float for decimal numbers or scientific notation
@@ -144,7 +155,7 @@ class Property(BaseModel):
         # Convert hyphens and spaces to underscores
         v = v.replace("-", "_").replace(" ", "_")
         # Remove non-alphanumeric and non-underscore characters
-        v = re.sub(r'[^A-Za-z0-9_]', '', v)
+        v = re.sub(r"[^A-Za-z0-9_]", "", v)
         # Convert to lowercase
         v = v.lower()
         return v if v else "unknown_property"
@@ -166,7 +177,7 @@ class Property(BaseModel):
         Raises:
             ValueError: If the value does not match the type constraints.
         """
-        
+
         prop_type = self.type
         value = self.value
 
@@ -187,7 +198,9 @@ class Property(BaseModel):
                 )
 
         elif prop_type == PropertyType.LANGUAGE:
-            if not (isinstance(value, str) and len(value) == 2 and value.isalpha()):
+            if not (
+                isinstance(value, str) and len(value) == 2 and value.isalpha()
+            ):
                 raise ValueError(
                     f"Property '{self.key}' with type LANGUAGE must be a 2-letter alphabetic string, got {value!r}"
                 )
@@ -214,11 +227,18 @@ class ExtractedEntity(BaseModel):
     ID, a type label, a display name, and a list of typed properties.
     """
 
-    id: str = Field(..., description="Unique standardized identifier (e.g., 'person_pavel_durov')")
-    label: str = Field(..., description="Entity type (e.g., 'Person', 'Organization', 'Location')")
+    id: str = Field(
+        ...,
+        description="Unique standardized identifier (e.g., 'person_pavel_durov')",
+    )
+    label: str = Field(
+        ...,
+        description="Entity type (e.g., 'Person', 'Organization', 'Location')",
+    )
     name: str = Field(..., description="Display name for the entity")
     properties: list[Property] = Field(
-        default_factory=list, description="List of typed properties (age, coordinates, language, etc.)"
+        default_factory=list,
+        description="List of typed properties (age, coordinates, language, etc.)",
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -231,7 +251,9 @@ class ExtractedEntity(BaseModel):
         """
         return {prop.key: prop.value for prop in self.properties}
 
-    def add_property(self, key: str, value: Any, type: str | PropertyType) -> None:
+    def add_property(
+        self, key: str, value: Any, type: str | PropertyType
+    ) -> None:
         """Add a typed property to the entity.
 
         Args:
@@ -254,11 +276,13 @@ class ExtractedRelation(BaseModel):
 
     source_id: str = Field(..., description="ID of the source entity")
     relation_type: str = Field(
-        ..., description="Strict relationship type (e.g., 'LOCATED_IN', 'WORKS_AT', 'DISCUSSES')"
+        ...,
+        description="Strict relationship type (e.g., 'LOCATED_IN', 'WORKS_AT', 'DISCUSSES')",
     )
     target_id: str = Field(..., description="ID of the target entity")
     properties: list[Property] = Field(
-        default_factory=list, description="Optional list of typed relation properties"
+        default_factory=list,
+        description="Optional list of typed relation properties",
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -271,7 +295,9 @@ class ExtractedRelation(BaseModel):
         """
         return {prop.key: prop.value for prop in self.properties}
 
-    def add_property(self, key: str, value: Any, type: str | PropertyType) -> None:
+    def add_property(
+        self, key: str, value: Any, type: str | PropertyType
+    ) -> None:
         """Add a typed property to the relation.
 
         Args:
@@ -308,6 +334,7 @@ class OpenSPGExtractionResult(BaseModel):
 # with existing code (database operations, Qdrant service). New code should use
 # ExtractedEntity and ExtractedRelation. Conversion functions are provided to
 # migrate between formats.
+
 
 class SPGNode(BaseModel):
     """Represents a graph node in the knowledge graph.
@@ -391,6 +418,7 @@ class LLMExtractionResult(BaseModel):
 # Conversion Functions (Backward Compatibility)
 # ---------------------------------------------------------------------------
 
+
 def entity_to_spg_node(entity: ExtractedEntity) -> SPGNode:
     """Convert an ExtractedEntity to a legacy SPGNode.
 
@@ -430,7 +458,9 @@ def relation_to_spg_edge(relation: ExtractedRelation) -> SPGEdge:
     )
 
 
-def open_spg_result_to_extraction_result(open_spg_result: OpenSPGExtractionResult) -> ExtractionResult:
+def open_spg_result_to_extraction_result(
+    open_spg_result: OpenSPGExtractionResult,
+) -> ExtractionResult:
     """Convert an OpenSPGExtractionResult to a legacy ExtractionResult.
 
     This allows existing code that expects SPGNode/SPGEdge to work with
@@ -443,7 +473,9 @@ def open_spg_result_to_extraction_result(open_spg_result: OpenSPGExtractionResul
         A new ExtractionResult containing SPGNode and SPGEdge objects.
     """
     nodes = [entity_to_spg_node(entity) for entity in open_spg_result.entities]
-    edges = [relation_to_spg_edge(relation) for relation in open_spg_result.relations]
+    edges = [
+        relation_to_spg_edge(relation) for relation in open_spg_result.relations
+    ]
     return ExtractionResult(nodes=nodes, edges=edges)
 
 
@@ -451,7 +483,10 @@ def open_spg_result_to_extraction_result(open_spg_result: OpenSPGExtractionResul
 # LLM Prompt Helper
 # ---------------------------------------------------------------------------
 
-def get_open_spg_llm_prompt(text: str, author_id: int | None = None) -> str:
+
+def get_open_spg_llm_prompt(
+    text: str, author_id: int | None = None, metadata: dict | None = None
+) -> str:
     """Generate the OpenSPG extraction prompt for LLM.
 
     This prompt instructs the LLM to output structured OpenSPG data with
@@ -460,6 +495,8 @@ def get_open_spg_llm_prompt(text: str, author_id: int | None = None) -> str:
     Args:
         text: The input text to extract from.
         author_id: Optional Telegram user ID to assign to an Author entity.
+        metadata: Optional pre-collected metadata dictionary (e.g., language, geo, location).
+                  If provided, the LLM will be instructed not to re-extract these fields.
 
     Returns:
         Formatted prompt string for the LLM.
@@ -468,6 +505,22 @@ def get_open_spg_llm_prompt(text: str, author_id: int | None = None) -> str:
     if author_id is not None:
         author_instruction = f"""5. If the text EXPLICITLY mentions or references the author by name (Telegram user ID: {author_id}), OR if the author performs specific actions described in the text, create an Actor node with id "actor_{author_id}" and name based on the author's displayed name (if available) or "Author {author_id}". Include a property {{'key': 'telegram_id', 'value': {author_id}, 'type': 'numeric'}}. If the author is only implied or not directly mentioned, DO NOT create an author node.
 6. """
+
+    # Build metadata instruction section if metadata is provided
+    metadata_instruction = ""
+    metadata_json_str = ""
+    if metadata is not None and len(metadata) > 0:
+        metadata_json_str = json.dumps(metadata, ensure_ascii=False, indent=2)
+        metadata_instruction = f"""
+PRE-EXTRACTED METADATA (DO NOT RE-EXTRACT):
+The following metadata has been pre-collected from the post and is already available in the database:
+{metadata_json_str}
+
+CRITICAL INSTRUCTION FOR PRE-EXTRACTED METADATA:
+- If 'language', 'location', or 'geo' are already present in the provided pre-extracted metadata above, DO NOT extract them again from the text.
+- Focus strictly on extracting business logic entities (Actors, Entities, Events, Places) and their relations from the text.
+- The pre-extracted metadata will be merged into the Post node automatically; you do NOT need to include these as properties in your extraction output.
+"""
 
     prompt = f"""You are an OpenSPG (Semantic Parsing Graph) incremental knowledge accumulation engine. Your task is to extract or update knowledge entities and relationships from the provided text, treating the graph as a persistent state that grows incrementally across any domain (IT, politics, lifestyle, science, etc.).
 
@@ -485,7 +538,7 @@ OpenSPG Principles:
 
 Text to analyze:
 {text}
-
+{metadata_instruction}
 Extraction Instructions:
 
 1. UNIVERSAL ENTITY TYPES (use EXACTLY these four labels):
@@ -542,10 +595,10 @@ Extraction Instructions:
    - Numeric properties can be updated (e.g., if children_count increases, extract the new value).
    - Text properties can be extended (e.g., add new 'alternate_name' or 'description').
    - Always prefer extracting concrete, factual properties over vague ones.
-   - MANDATORY PROPERTY EXTRACTION: ALWAYS extract the following property types if present in the text:
-     * Language: 2-letter language code (e.g., "en", "ru", "zh") with type "language"
-     * Location: human-readable location string (e.g., "Moscow, Russia") with type "location"
-     * Geo: coordinates as [latitude, longitude] array with type "geo"
+   - MANDATORY PROPERTY EXTRACTION: ALWAYS extract the following property types if present in the text AND NOT already provided in pre-extracted metadata:
+     * Language: 2-letter language code (e.g., "en", "ru", "zh") with type "language" - SKIP if already in metadata
+     * Location: human-readable location string (e.g., "Moscow, Russia") with type "location" - SKIP if already in metadata
+     * Geo: coordinates as [latitude, longitude] array with type "geo" - SKIP if already in metadata
      * Text: any textual data (names, descriptions, etc.) with type "text"
      * Numeric: counts, ages, years, quantities with type "numeric"
      These properties are essential for maintaining a rich, queryable knowledge graph state.

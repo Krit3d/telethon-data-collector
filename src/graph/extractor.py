@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from typing import Any
 
 import aiohttp
 from pydantic import ValidationError
@@ -262,6 +263,53 @@ def _repair_json(content: str) -> str:
     return original
 
 
+def _sanitize_key(key: Any) -> str:
+    """Sanitize dictionary keys to be Cypher-safe snake_case.
+
+    Converts the key to string, replaces spaces and hyphens with underscores,
+    removes special characters, and converts to lowercase.
+
+    Args:
+        key: The original key value.
+
+    Returns:
+        Sanitized key string.
+    """
+    
+    if not isinstance(key, str):
+        key = str(key)
+    # Convert hyphens and spaces to underscores
+    key = key.replace("-", "_").replace(" ", "_")
+    # Remove non-alphanumeric and non-underscore characters
+    key = re.sub(r'[^A-Za-z0-9_]', '', key)
+    # Convert to lowercase
+    key = key.lower()
+    return key if key else "unknown_property"
+
+
+def _merge_metadata_into_properties(
+    base_props: dict[str, Any],
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge metadata dictionary into base properties with key sanitization.
+
+    Args:
+        base_props: Base properties dictionary.
+        metadata: Metadata dictionary to merge (keys will be sanitized).
+
+    Returns:
+        Merged properties dictionary.
+    """
+    if metadata is None:
+        return base_props
+
+    merged = base_props.copy()
+    for key, value in metadata.items():
+        sanitized_key = _sanitize_key(key)
+        merged[sanitized_key] = value
+    return merged
+
+
 class KnowledgeExtractor:
     """Extracts knowledge triples (nodes and edges) from text content using LLM."""
 
@@ -275,7 +323,11 @@ class KnowledgeExtractor:
         self._session: aiohttp.ClientSession | None = None
 
     async def _call_llm(
-        self, text: str, author_id: int, post_id: int
+        self,
+        text: str,
+        author_id: int,
+        post_id: int,
+        metadata: dict | None = None,
     ) -> OpenSPGExtractionResult | None:
         """Call the LLM API to extract knowledge triples from text with retry logic.
 
@@ -283,6 +335,7 @@ class KnowledgeExtractor:
             text: Input text to analyze.
             author_id: Telegram user ID of the post author (used for author node).
             post_id: Database ID of the post (used for logging and context).
+            metadata: Optional pre-collected metadata to pass to the LLM prompt.
 
         Returns:
             OpenSPGExtractionResult containing extracted entities and relations.
@@ -296,8 +349,8 @@ class KnowledgeExtractor:
         if self._session is None:
             self._session = aiohttp.ClientSession()
 
-        # Construct the OpenSPG prompt
-        prompt = get_open_spg_llm_prompt(text, author_id)
+        # Construct the OpenSPG prompt with optional metadata
+        prompt = get_open_spg_llm_prompt(text, author_id, metadata)
 
         max_retries = 2
         last_error = None
@@ -407,7 +460,7 @@ class KnowledgeExtractor:
                             )
                             # Modify prompt for retry
                             prompt = (
-                                get_open_spg_llm_prompt(text, author_id)
+                                get_open_spg_llm_prompt(text, author_id, metadata)
                                 + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
                             )
                             continue
@@ -456,7 +509,7 @@ class KnowledgeExtractor:
                             )
                             # Modify prompt for retry
                             prompt = (
-                                get_open_spg_llm_prompt(text, author_id)
+                                get_open_spg_llm_prompt(text, author_id, metadata)
                                 + "\n\nIMPORTANT: Your previous response was truncated or invalid. Ensure you return ONLY valid JSON with the exact structure specified in the prompt. Limit to 5-7 most important entities."
                             )
                             continue
@@ -526,7 +579,11 @@ class KnowledgeExtractor:
         return None
 
     async def extract_triplets(
-        self, text: str, author_id: int, post_id: int
+        self,
+        text: str,
+        author_id: int,
+        post_id: int,
+        metadata: dict | None = None,
     ) -> OpenSPGExtractionResult | None:
         """
         Extract knowledge triples from the given text using LLM.
@@ -535,13 +592,14 @@ class KnowledgeExtractor:
             text: Input text to analyze.
             author_id: Telegram user ID of the post author.
             post_id: Database ID of the post (for logging).
+            metadata: Optional pre-collected metadata to pass to the LLM.
 
         Returns:
             OpenSPGExtractionResult containing extracted entities and relations.
             Returns None if extraction failed completely.
         """
-        logger.debug("Extracting triples from text: %s", text[:100])
-        return await self._call_llm(text, author_id, post_id)
+        logger.debug("Extracting triplets from text: %s", text[:100])
+        return await self._call_llm(text, author_id, post_id, metadata)
 
     async def close(self) -> None:
         """Close the aiohttp session and clean up resources."""
@@ -557,6 +615,8 @@ class KnowledgeExtractor:
         author_id: int,
         graph_repo: GraphRepository,
         qdrant: QdrantService | None = None,
+        post_metrics: dict | None = None,
+        raw_metadata: dict | None = None,
     ) -> None:
         """
         Process a single post: extract knowledge triples and persist to AGE graph.
@@ -567,6 +627,8 @@ class KnowledgeExtractor:
             author_id: Telegram user ID of the post author.
             graph_repo: GraphRepository instance for AGE graph persistence operations.
             qdrant: Optional QdrantService for syncing entities to vector store.
+            post_metrics: Optional dictionary containing post metrics (views, reactions, etc.).
+            raw_metadata: Optional dictionary containing pre-extracted metadata (language, geo, etc.).
         """
 
         logger.info("Processing post id=%s for knowledge extraction", post_id)
@@ -574,15 +636,24 @@ class KnowledgeExtractor:
         # Step A: Standardize the Post node ID
         post_node_id = f"post_{post_id}"
 
-        # Step B: Create/Upsert the Post node
+        # Step B: Create/Upsert the Post node with merged metrics and metadata
         try:
+            # Start with base properties
+            post_properties: dict[str, Any] = {
+                "id": post_node_id,
+                "post_id": post_id,
+                "author_id": author_id,
+            }
+
+            # Merge post_metrics (views, comments, reactions) into properties
+            post_properties = _merge_metadata_into_properties(post_properties, post_metrics)
+
+            # Merge raw_metadata into properties
+            post_properties = _merge_metadata_into_properties(post_properties, raw_metadata)
+
             await graph_repo.upsert_graph_node(
                 label="Post",
-                properties={
-                    "id": post_node_id,
-                    "post_id": post_id,
-                    "author_id": author_id,
-                },
+                properties=post_properties,
                 merge_key="id",
             )
             logger.debug("Upserted Post node: id=%s", post_node_id)
@@ -643,8 +714,8 @@ class KnowledgeExtractor:
             )
             # Do not raise - continue with extraction
 
-        # Step E: Call LLM extraction
-        result = await self.extract_triplets(text, author_id, post_id)
+        # Step E: Call LLM extraction with raw_metadata
+        result = await self.extract_triplets(text, author_id, post_id, raw_metadata)
 
         if result is None or (not result.entities and not result.relations):
             logger.warning(

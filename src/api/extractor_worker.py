@@ -18,16 +18,14 @@ try:
 
     PostgresError = asyncpg.exceptions.PostgresError
 except ImportError:
-    # asyncpg may not be installed in all environments
     PostgresError = Exception  # Fallback to base Exception
 
-from src.config.config import load_settings
+from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.graph_repo import GraphRepository
 from src.db.models import Post
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.extractor import KnowledgeExtractor
-from src.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +42,7 @@ class ExtractionWorker:
         graph_repo: GraphRepository,
         qdrant: QdrantService,
         extractor: KnowledgeExtractor,
+        settings: Settings,
         batch_size: int = 20,
         poll_interval: int = 5,
     ) -> None:
@@ -54,6 +53,7 @@ class ExtractionWorker:
             graph_repo: GraphRepository for Apache AGE graph operations.
             qdrant: QdrantService for entity embedding sync.
             extractor: KnowledgeExtractor for LLM-based extraction.
+            settings: Application settings containing concurrency configuration.
             batch_size: Number of posts to fetch per poll.
             poll_interval: Sleep interval in seconds when no posts are found.
         """
@@ -61,6 +61,7 @@ class ExtractionWorker:
         self.graph_repo = graph_repo
         self.qdrant = qdrant
         self.extractor = extractor
+        self.settings = settings
         self.batch_size = batch_size
         self.poll_interval = poll_interval
         self.priority_mode: bool = False
@@ -118,18 +119,28 @@ class ExtractionWorker:
                     "Processing batch of %d unextracted posts", len(posts)
                 )
 
-                # Process each post sequentially (could be parallelized with semaphore)
-                for post in posts:
-                    try:
+                # Configure concurrency semaphore with extractor-specific limit
+                semaphore = asyncio.Semaphore(self.settings.extractor_concurrency)
+
+                async def process_with_semaphore(post: Post) -> None:
+                    """Process a single post with semaphore-based rate limiting."""
+                    async with semaphore:
                         await self._process_single_post(post)
-                    except Exception as e:
+
+                # Process posts concurrently, return exceptions instead of raising
+                tasks = [process_with_semaphore(post) for post in posts]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Log any unhandled exceptions that escaped _process_single_post
+                for idx, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        post = posts[idx]
                         logger.error(
-                            "Failed to process post id=%s: %s",
+                            "Unhandled exception processing post id=%s: %s",
                             post.id,
-                            e,
-                            exc_info=True,
+                            result,
+                            exc_info=result,
                         )
-                        # Continue with next post - do not crash the loop
 
                 # Small delay between batches to avoid overwhelming the system
                 await asyncio.sleep(1)
@@ -160,11 +171,26 @@ class ExtractionWorker:
 
         logger.debug("Extracting knowledge from post id=%s", post.id)
 
+        # Extract post metrics directly from SQL model
+        post_metrics: dict[str, int | None] = {
+            "views": post.views,
+            "reactions_count": post.reactions_count,
+            "comments_count": post.comments_count,
+            "shares_count": post.shares_count,
+        }
+
+        # Extract raw metadata directly from SQL model
+        raw_metadata: dict = (
+            post.raw_metadata if post.raw_metadata is not None else {}
+        )
+
         try:
             await self.extractor.process_post(
                 post_id=post.id,
                 text=post.content,
                 author_id=post.channel_id,
+                post_metrics=post_metrics,
+                raw_metadata=raw_metadata,
                 graph_repo=self.graph_repo,
                 qdrant=self.qdrant,
             )
@@ -192,7 +218,7 @@ class ExtractionWorker:
                             "post_id": post.id,
                             "error_msg": str(e),
                             "failed_at": datetime.now(timezone.utc).isoformat(),
-                        }
+                        },
                     )
                     await session.commit()
             except Exception as db_err:
@@ -252,7 +278,8 @@ async def run_extractor() -> None:
         graph_repo=graph_repo,
         qdrant=qdrant,
         extractor=extractor,
-        batch_size=20,
+        settings=settings,
+        batch_size=settings.extractor_batch_size,
         poll_interval=5,
     )
     # Set priority mode from configuration (default: True for recent posts first)

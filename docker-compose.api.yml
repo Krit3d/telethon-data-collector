@@ -67,6 +67,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
+      EXTRACTOR_CONCURRENCY: ${EXTRACTOR_CONCURRENCY:-5}
+      EXTRACTOR_BATCH_SIZE: ${EXTRACTOR_BATCH_SIZE:-20}
     depends_on:
       - qdrant
     networks:

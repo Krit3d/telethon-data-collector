@@ -163,6 +163,14 @@ class Settings(BaseSettings):
         default=True,
         description="If True, process most recent posts first (ordered by published_at DESC). If False, process oldest posts first (ordered by id ASC).",
     )
+    extractor_concurrency: int = Field(
+        default=5,
+        description="Maximum number of posts extracted in parallel by the extraction worker",
+    )
+    extractor_batch_size: int = Field(
+        default=20,
+        description="Number of unextracted posts to fetch per poll in the extraction worker",
+    )
 
     # ---- API server settings ----
     api_host: str = Field(
