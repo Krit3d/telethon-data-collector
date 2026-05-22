@@ -100,15 +100,33 @@ async def _extract_channel_metadata(
         else:
             # Username resolution failed
             if result.shadowbanned:
-                await db.mark_channel_pending(channel_id)
+                try:
+                    await asyncio.wait_for(db.mark_channel_pending(channel_id), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Database operation 'mark_channel_pending' timed out for channel %s",
+                        channel_id,
+                    )
             else:
-                await db.mark_channel_rejected(channel_id)
+                try:
+                    await asyncio.wait_for(db.mark_channel_rejected(channel_id), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Database operation 'mark_channel_rejected' timed out for channel %s",
+                        channel_id,
+                    )
                 await asyncio.sleep(random.uniform(10, 20))
             return None
 
     if entity is None:
         # Both ID and username resolution failed
-        await db.mark_channel_rejected(channel_id)
+        try:
+            await asyncio.wait_for(db.mark_channel_rejected(channel_id), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Database operation 'mark_channel_rejected' timed out for channel %s",
+                channel_id,
+            )
         await asyncio.sleep(random.uniform(10, 20))
         return None
 
@@ -276,7 +294,16 @@ async def _process_message(
         "raw_metadata": metadata if metadata else None,
     }
 
-    post = await db.upsert_post(post_data)
+    try:
+        post = await asyncio.wait_for(db.upsert_post(post_data), timeout=15.0)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Inserting/updating post message_id=%s in channel %s timed out",
+            post_data.get("message_id"),
+            post_data.get("channel_id"),
+        )
+        return None
+
     if not (post and post.id and post.content):
         return None
 
@@ -321,7 +348,15 @@ class ParserWorker(BaseTelegramWorker):
 
     async def run(self) -> None:
         """Main worker loop: continuously fetch and parse channels from DB queue."""
-        await self.connect()
+        try:
+            await asyncio.wait_for(self.connect(), timeout=45.0)
+        except asyncio.TimeoutError:
+            logger.critical(
+                "Worker %d: Telethon client connection timed out after 45 seconds",
+                self.worker_id,
+            )
+            self.is_alive = False
+            return
 
         logger.info("Worker %d: Starting parser loop", self.worker_id)
 
@@ -408,12 +443,27 @@ class ParserWorker(BaseTelegramWorker):
                 entity_cache=self._entity_cache,  # Pass per-worker entity cache
             )
             if result is None:
-                await self.db.mark_channel_rejected(channel_id)
                 return
 
             channel_data, entity = result
 
-            await self.db.upsert_channel(channel_data)
+            try:
+                await asyncio.wait_for(self.db.upsert_channel(channel_data), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker %d: Database operation 'upsert_channel' timed out for channel %s",
+                    self.worker_id,
+                    channel_id,
+                )
+                try:
+                    await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                        self.worker_id,
+                        channel_id,
+                    )
+                return
 
             logger.debug(
                 "Channel saved: id=%s username=%s title=%s",
@@ -468,9 +518,25 @@ class ParserWorker(BaseTelegramWorker):
 
             # SMART SKIP: Fetch the latest known message ID from DB to avoid re-fetching
             # This saves API limits by not requesting messages we already have
-            latest_known_id = (
-                await self.db.get_latest_message_id(channel_id) or 0
-            )
+            try:
+                latest_known_id = (
+                    await asyncio.wait_for(self.db.get_latest_message_id(channel_id), timeout=15.0) or 0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker %d: Database operation 'get_latest_message_id' timed out for channel %s",
+                    self.worker_id,
+                    channel_id,
+                )
+                try:
+                    await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                        self.worker_id,
+                        channel_id,
+                    )
+                return
             if latest_known_id > 0:
                 self.logger.info(
                     "Channel %s: Latest known message ID is %d, will skip older messages",
@@ -579,7 +645,22 @@ class ParserWorker(BaseTelegramWorker):
                 else:
                     await asyncio.sleep(random.uniform(1.0, 2.5))
 
-            await self.db.mark_channel_parsed(channel_id)
+            try:
+                await asyncio.wait_for(self.db.mark_channel_parsed(channel_id), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker %d: Database operation 'mark_channel_parsed' timed out for channel %s",
+                    self.worker_id,
+                    channel_id,
+                )
+                try:
+                    await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                        self.worker_id,
+                        channel_id,
+                    )
 
             logger.info(
                 "Done channel: id=%s username=%s (posts saved: %s)",
@@ -606,7 +687,14 @@ class ParserWorker(BaseTelegramWorker):
                 delay,
             )
             # Safely return channel to queue for later processing
-            await self.db.mark_channel_pending(channel_id)
+            try:
+                await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                    self.worker_id,
+                    channel_id,
+                )
             # Close any local DB resources if needed
             # (Database connections are managed by the pool, no explicit close needed here)
             # Re-raise the exception so _worker_runner can handle session cooldown
@@ -634,20 +722,41 @@ class ParserWorker(BaseTelegramWorker):
                     type(e).__name__,
                 )
                 self.is_alive = False
-                await self.db.mark_channel_rejected(channel_id)
+                try:
+                    await asyncio.wait_for(self.db.mark_channel_rejected(channel_id), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Worker %d: Database operation 'mark_channel_rejected' timed out for channel %s",
+                        self.worker_id,
+                        channel_id,
+                    )
                 raise  # Re-raise to propagate fatal session error
             logger.warning(
                 "Channel %s: access denied (%s), marking as rejected",
                 channel_id,
                 type(e).__name__,
             )
-            await self.db.mark_channel_rejected(channel_id)
+            try:
+                await asyncio.wait_for(self.db.mark_channel_rejected(channel_id), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker %d: Database operation 'mark_channel_rejected' timed out for channel %s",
+                    self.worker_id,
+                    channel_id,
+                )
 
         except (OSError, asyncio.TimeoutError, ConnectionError) as e:
             logger.exception(
                 "Channel %s: network error (%s)", channel_id, type(e).__name__
             )
-            await self.db.mark_channel_pending(channel_id)  # Return to queue
+            try:
+                await asyncio.wait_for(self.db.mark_channel_pending(channel_id), timeout=15.0)  # Return to queue
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker %d: Database operation 'mark_channel_pending' timed out for channel %s",
+                    self.worker_id,
+                    channel_id,
+                )
 
         except RPCError as e:
             logger.exception(
@@ -655,11 +764,25 @@ class ParserWorker(BaseTelegramWorker):
                 channel_id,
                 type(e).__name__,
             )
-            await self.db.mark_channel_rejected(channel_id)  # Permanently block
+            try:
+                await asyncio.wait_for(self.db.mark_channel_rejected(channel_id), timeout=15.0)  # Permanently block
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker %d: Database operation 'mark_channel_rejected' timed out for channel %s",
+                    self.worker_id,
+                    channel_id,
+                )
 
         except Exception:
             logger.exception("Channel %s: unexpected error", channel_id)
-            await self.db.mark_channel_rejected(channel_id)  # Permanently block
+            try:
+                await asyncio.wait_for(self.db.mark_channel_rejected(channel_id), timeout=15.0)  # Permanently block
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker %d: Database operation 'mark_channel_rejected' timed out for channel %s",
+                    self.worker_id,
+                    channel_id,
+                )
 
 
 async def main() -> None:

@@ -597,9 +597,24 @@ async def start_workers(
             session_pool.banned_count,
         )
 
+    def handle_task_result(task: asyncio.Task) -> None:
+        """Handle task completion immediately, logging exceptions or cancellations."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.info("Task %s was cancelled", task.get_name())
+        except Exception as e:
+            logger.critical(
+                "CRITICAL: Task %s died with unhandled exception: %s",
+                task.get_name(),
+                e,
+                exc_info=True
+            )
+
     # Spawn exactly `actual_concurrency` worker runners
-    runners = [
-        asyncio.create_task(
+    runners = []
+    for i in range(actual_concurrency):
+        task = asyncio.create_task(
             _worker_runner(
                 runner_id=i,
                 session_pool=session_pool,
@@ -610,35 +625,26 @@ async def start_workers(
             ),
             name=f"worker-runner-{i}",
         )
-        for i in range(actual_concurrency)
-    ]
+        task.add_done_callback(handle_task_result)
+        runners.append(task)
 
     # Start the liveness watchdog task
     watchdog_task = asyncio.create_task(
         _watchdog_task(settings),
         name="liveness-watchdog",
     )
+    watchdog_task.add_done_callback(handle_task_result)
     logger.info("Liveness Watchdog task spawned")
 
     try:
-        results = await asyncio.gather(*runners, return_exceptions=True)
+        await asyncio.gather(*runners, return_exceptions=True)
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, stopping workers...")
         # Cancel all runner tasks
         for task in runners:
             task.cancel()
         # Wait for all tasks to complete (with cancellation exceptions)
-        results = await asyncio.gather(*runners, return_exceptions=True)
-    else:
-        # Log any exceptions returned by worker tasks
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.critical(
-                    "Worker runner %d died with unhandled exception: %s",
-                    i,
-                    result,
-                    exc_info=True,
-                )
+        await asyncio.gather(*runners, return_exceptions=True)
     finally:
         # Cancel the watchdog task
         if not watchdog_task.done():

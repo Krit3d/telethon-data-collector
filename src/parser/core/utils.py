@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from typing import Any, Callable
 
 from telethon import TelegramClient
@@ -144,7 +145,7 @@ async def get_channel_entity_safe(
         return await client.get_entity(channel_id)
 
     try:
-        entity = await _fetch_entity()
+        entity = await asyncio.wait_for(_fetch_entity(), timeout=30.0)
 
         if isinstance(entity, TlChannel) and getattr(
             entity, "broadcast", False
@@ -173,6 +174,10 @@ async def get_channel_entity_safe(
         return ChannelResolutionResult(
             entity=None, reason="not_a_broadcast_channel"
         )
+
+    except asyncio.TimeoutError:
+        logger.warning("Entity resolution timed out for channel %s after 30 seconds", channel_id)
+        return ChannelResolutionResult(entity=None, reason="timeout")
 
     except ValueError as e:
         if "No user has" in str(e):
@@ -232,13 +237,19 @@ async def get_full_channel_info(
             entity_id = entity.id
 
         if safe_api_call:
-            full = await safe_api_call(
-                f"GetFullChannelRequest({entity_id})",
-                lambda: client(GetFullChannelRequest(input_channel)),
-                rpc_error_fatal=True,
+            full = await asyncio.wait_for(
+                safe_api_call(
+                    f"GetFullChannelRequest({entity_id})",
+                    lambda: client(GetFullChannelRequest(input_channel)),
+                    rpc_error_fatal=True,
+                ),
+                timeout=30.0,
             )
         else:
-            full = await client(GetFullChannelRequest(input_channel))
+            full = await asyncio.wait_for(
+                client(GetFullChannelRequest(input_channel)),
+                timeout=30.0,
+            )
 
         if full is None:
             return None, None
@@ -252,6 +263,12 @@ async def get_full_channel_info(
             participants_count = None
 
         return participants_count, description
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Fetching full channel info timed out for entity %s after 30 seconds",
+            getattr(entity, "username", entity_id),
+        )
+        return None, None
     except Exception as e:
         logger.debug(
             "Error getting full channel for %s: %s",
