@@ -11,6 +11,7 @@ This module implements a robust session pool that:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -46,6 +47,8 @@ class SessionConfig:
         app_version: App version string.
         lang_code: Language code (e.g., 'en').
         system_lang_code: System language code (e.g., 'en-US').
+        session_index: Stable partition index for this session (default: 0).
+        total_sessions: Total number of sessions in the pool (default: 1).
     """
 
     session_path: Path
@@ -57,6 +60,8 @@ class SessionConfig:
     app_version: str
     lang_code: str
     system_lang_code: str
+    session_index: int = 0
+    total_sessions: int = 1
 
 
 @dataclass
@@ -67,10 +72,13 @@ class SessionEntry:
         config: The session configuration.
         ready_at: Timestamp (from time.time()) when this session is ready to be used.
                   If 0 or in the past, the session is ready immediately.
+        consecutive_failures: Number of consecutive connection failures for this session.
+                              Used to apply escalating penalty cooldowns when >=3.
     """
 
     config: SessionConfig
     ready_at: float = field(default=0.0)
+    consecutive_failures: int = field(default=0)
 
 
 class SessionPool:
@@ -112,12 +120,15 @@ class SessionPool:
             logger.error("No .session files found in %s", sessions_dir)
             return 0
 
+        total_sessions = len(session_files)
         logger.info(
-            "Found %d session files in %s", len(session_files), sessions_dir
+            "Found %d session files in %s", total_sessions, sessions_dir
         )
 
-        for session_path in session_files:
-            config = self._load_session_config(session_path, settings)
+        for session_index, session_path in enumerate(session_files):
+            config = self._load_session_config(
+                session_path, settings, session_index, total_sessions
+            )
             entry = SessionEntry(config=config)
             await self._queue.put(entry)
             self._loaded_count += 1
@@ -126,7 +137,11 @@ class SessionPool:
         return self._loaded_count
 
     def _load_session_config(
-        self, session_path: Path, settings: Settings
+        self,
+        session_path: Path,
+        settings: Settings,
+        session_index: int = 0,
+        total_sessions: int = 1,
     ) -> SessionConfig:
         """Load configuration for a single session file.
 
@@ -135,6 +150,8 @@ class SessionPool:
         Args:
             session_path: Path to the .session file.
             settings: Global settings for default values.
+            session_index: Stable partition index for this session.
+            total_sessions: Total number of sessions in the pool.
 
         Returns:
             SessionConfig with values from json config or defaults.
@@ -223,6 +240,8 @@ class SessionPool:
             app_version=app_version,
             lang_code=lang_code,
             system_lang_code=system_lang_code,
+            session_index=session_index,
+            total_sessions=total_sessions,
         )
 
     async def get_session(self) -> SessionEntry | None:
@@ -243,6 +262,7 @@ class SessionPool:
         entry: SessionEntry,
         cooldown: bool = False,
         cooldown_seconds: float | None = None,
+        is_failure: bool = False,
     ) -> None:
         """Return a session to the pool.
 
@@ -253,29 +273,60 @@ class SessionPool:
             cooldown_seconds: Custom cooldown period. Uses default if None.
                 If the entry already has a future ready_at (from FloodWait cooldown),
                 that timestamp will be preserved unless cooldown_seconds is provided.
+            is_failure: If True, increment consecutive failure count. If count >=3,
+                        apply escalating penalty cooldown. If False and cooldown is False,
+                        reset failure count to 0.
         """
 
+        current_time = time.time()
+
+        # Handle failure tracking and penalty cooldowns
+        if is_failure:
+            entry.consecutive_failures += 1
+            if entry.consecutive_failures >= 3:
+                # Calculate escalating penalty: 1h, 2h, 3h, 4h max
+                penalty_multiplier = min(entry.consecutive_failures - 2, 4)
+                penalty_seconds = 3600 * penalty_multiplier
+                entry.ready_at = current_time + penalty_seconds
+                logger.error(
+                    "Session %s has %d consecutive failures (>=3). Applying heavy penalty cooldown of %d seconds (ready at %.0f, ~%s). Proxy may be dead.",
+                    entry.config.session_path.name,
+                    entry.consecutive_failures,
+                    penalty_seconds,
+                    entry.ready_at,
+                    time.ctime(entry.ready_at),
+                )
+        else:
+            # is_failure is False: reset failure count only if no cooldown requested
+            if not cooldown:
+                entry.consecutive_failures = 0
+
+        # Handle normal cooldown logic (preserves existing future ready_at)
         if cooldown:
             # Only set cooldown if the entry doesn't already have a future ready_at
-            # This preserves the original cooldown timestamp when returning a session
-            # that was already in cooldown (e.g., from FloodWaitError handling)
-            current_time = time.time()
             if entry.ready_at <= current_time:
                 # No existing future cooldown, set a new one
                 seconds = cooldown_seconds or self._cooldown_period
                 entry.ready_at = current_time + seconds
-            # If entry.ready_at is already in the future, preserve it
+            # Log cooldown status
             logger.debug(
-                "Session %s returned to pool with cooldown (ready at %.0f)",
+                "Session %s returned to pool with cooldown (ready at %.0f, consecutive failures: %d)",
                 entry.config.session_path.name,
                 entry.ready_at,
+                entry.consecutive_failures,
             )
         else:
-            entry.ready_at = 0.0  # Ready immediately
+            # No cooldown requested: set ready immediately
+            # Don't overwrite if a penalty was just applied (defensive check)
+            if not (is_failure and entry.consecutive_failures >= 3):
+                entry.ready_at = 0.0
             logger.debug(
-                "Session %s returned to pool (ready immediately)",
+                "Session %s returned to pool (ready at %.0f, consecutive failures: %d)",
                 entry.config.session_path.name,
+                entry.ready_at,
+                entry.consecutive_failures,
             )
+
         await self._queue.put(entry)
 
     def size(self) -> int:
@@ -372,24 +423,49 @@ async def _worker_runner(
             await asyncio.sleep(min(wait_time, 5.0))  # Wait up to 5 seconds
             continue
 
-        # Create worker instance
+        # Create worker instance with signature inspection for backward compatibility
         config = entry.config
         try:
-            worker = worker_class(
-                worker_id=runner_id,
-                session_path=config.session_path,
-                db=db,
-                settings=settings,
-                api_id=config.api_id,
-                api_hash=config.api_hash,
-                proxy_url=config.proxy_url,
-                device_model=config.device_model,
-                system_version=config.system_version,
-                app_version=config.app_version,
-                lang_code=config.lang_code,
-                system_lang_code=config.system_lang_code,
-                **worker_args,
+            # Build base arguments that all workers accept
+            worker_kwargs = {
+                "worker_id": runner_id,
+                "session_path": config.session_path,
+                "db": db,
+                "settings": settings,
+                "api_id": config.api_id,
+                "api_hash": config.api_hash,
+                "proxy_url": config.proxy_url,
+                "device_model": config.device_model,
+                "system_version": config.system_version,
+                "app_version": config.app_version,
+                "lang_code": config.lang_code,
+                "system_lang_code": config.system_lang_code,
+            }
+
+            # Inspect worker class signature to determine which arguments it accepts
+            # This allows backward compatibility with older worker classes that don't
+            # support session_index and total_sessions parameters
+            init_signature = inspect.signature(worker_class.__init__)
+            init_params = init_signature.parameters
+
+            # Check if the worker class accepts session_index and total_sessions
+            # Either explicitly in the signature or via **kwargs (VAR_KEYWORD)
+            accepts_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in init_params.values()
             )
+
+            if "session_index" in init_params or accepts_var_keyword:
+                worker_kwargs["session_index"] = config.session_index
+
+            if "total_sessions" in init_params or accepts_var_keyword:
+                worker_kwargs["total_sessions"] = config.total_sessions
+
+            # Add any additional worker-specific arguments
+            if worker_args:
+                worker_kwargs.update(worker_args)
+
+            worker = worker_class(**worker_kwargs)
         except Exception as e:
             logger.error(
                 "Worker runner %d: failed to create worker for session %s: %s",
@@ -398,8 +474,8 @@ async def _worker_runner(
                 e,
                 exc_info=True,
             )
-            # Return session to pool with cooldown
-            await session_pool.return_session(entry, cooldown=True)
+            # Return session to pool with cooldown and mark as failure
+            await session_pool.return_session(entry, cooldown=True, is_failure=True)
             continue
 
         # Register worker in global registry for watchdog monitoring
@@ -441,10 +517,10 @@ async def _worker_runner(
                         )
                     else:
                         # Parser didn't reach quota - return session for immediate reuse
-                        await session_pool.return_session(entry, cooldown=False)
+                        await session_pool.return_session(entry, cooldown=False, is_failure=False)
                 else:
                     # Crawler or other short-lived task - return session for immediate reuse
-                    await session_pool.return_session(entry, cooldown=False)
+                    await session_pool.return_session(entry, cooldown=False, is_failure=False)
             except FloodWaitError as e:
                 # FloodWaitError - session needs cooldown before reuse
                 delay = int(getattr(e, "seconds", 0)) or 1
@@ -484,7 +560,7 @@ async def _worker_runner(
                 )
                 session_pool.mark_banned()
             except Exception as e:
-                # Transient error - return session to pool with cooldown
+                # Transient error - return session to pool with cooldown and mark as failure
                 logger.error(
                     "Worker runner %d: session %s failed with error: %s",
                     runner_id,
@@ -492,7 +568,7 @@ async def _worker_runner(
                     e,
                     exc_info=True,
                 )
-                await session_pool.return_session(entry, cooldown=True)
+                await session_pool.return_session(entry, cooldown=True, is_failure=True)
         finally:
             # Unregister worker from global registry
             _active_workers.pop(runner_id, None)

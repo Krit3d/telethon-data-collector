@@ -65,6 +65,8 @@ class BaseTelegramWorker:
         system_lang_code: str = "en-US",
         delay_min: float | None = None,
         delay_max: float | None = None,
+        session_index: int = 0,
+        total_sessions: int = 1,
     ):
         """Initialize the base worker.
 
@@ -85,6 +87,8 @@ class BaseTelegramWorker:
                 If None, uses settings.parser_delay_min (default: 1.0).
             delay_max: Maximum random delay in seconds before API calls.
                 If None, uses settings.parser_delay_max (default: 3.0).
+            session_index: Stable partition index for this session (default: 0).
+            total_sessions: Total number of sessions in the pool (default: 1).
         """
 
         self.worker_id = worker_id
@@ -99,6 +103,8 @@ class BaseTelegramWorker:
         self.app_version = app_version
         self.lang_code = lang_code
         self.system_lang_code = system_lang_code
+        self.session_index = session_index
+        self.total_sessions = total_sessions
 
         # Fallback cascade: explicit argument -> settings config -> hardcoded safe defaults
         self.delay_min = max(

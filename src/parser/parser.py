@@ -385,6 +385,8 @@ class ParserWorker(BaseTelegramWorker):
         settings: Settings,
         api_id: int,
         api_hash: str,
+        session_index: int = 0,
+        total_sessions: int = 1,
         proxy_url: str | None = None,
         device_model: str = "PC 64bit",
         system_version: str = "Windows 10",
@@ -407,6 +409,8 @@ class ParserWorker(BaseTelegramWorker):
             lang_code=lang_code,
             system_lang_code=system_lang_code,
         )
+        self.session_index = session_index
+        self.total_sessions = total_sessions
         self.last_activity = time.time()
         self.channels_parsed_count = 0
 
@@ -414,12 +418,17 @@ class ParserWorker(BaseTelegramWorker):
         """Main loop: process channels from DB, handle rate limits and auth errors."""
         try:
             await asyncio.wait_for(self.connect(), timeout=45.0)
-        except asyncio.TimeoutError:
-            logger.critical("Worker %d: Connection timeout", self.worker_id)
+        except asyncio.TimeoutError as e:
+            logger.critical("Worker %d: Connection timeout during worker startup", self.worker_id)
             self.is_alive = False
-            return
+            raise ConnectionError("Connection timed out during worker startup") from e
 
-        logger.info("Worker %d: Starting parser loop", self.worker_id)
+        logger.info(
+            "Worker %d: Starting parser loop (session %d/%d)",
+            self.worker_id,
+            self.session_index,
+            self.total_sessions,
+        )
 
         try:
             while True:
@@ -438,9 +447,19 @@ class ParserWorker(BaseTelegramWorker):
                     return
 
                 try:
+                    logger.info(
+                        "Worker %d (session %d/%d): Requesting channel for parsing",
+                        self.worker_id,
+                        self.session_index,
+                        self.total_sessions,
+                    )
                     try:
                         channel = await asyncio.wait_for(
-                            self.db.get_channel_for_parsing(), timeout=15.0
+                            self.db.get_channel_for_parsing(
+                                session_index=self.session_index,
+                                total_sessions=self.total_sessions,
+                            ),
+                            timeout=15.0,
                         )
                     except asyncio.TimeoutError:
                         logger.warning(
@@ -451,7 +470,10 @@ class ParserWorker(BaseTelegramWorker):
 
                     if channel is None:
                         logger.debug(
-                            "Worker %d: No channels, sleeping", self.worker_id
+                            "Worker %d (session %d/%d): No channels in shard, sleeping",
+                            self.worker_id,
+                            self.session_index,
+                            self.total_sessions,
                         )
                         await asyncio.sleep(30)
                         continue
@@ -473,6 +495,14 @@ class ParserWorker(BaseTelegramWorker):
                     SessionExpiredError,
                     SessionRevokedError,
                 ) as e:
+                    raise
+                except (OSError, ConnectionError, asyncio.TimeoutError) as e:
+                    logger.critical(
+                        "Worker %d: Connection-level error, propagating to runner: %s",
+                        self.worker_id,
+                        e,
+                        exc_info=True,
+                    )
                     raise
                 except Exception as e:
                     logger.error(

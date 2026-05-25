@@ -580,15 +580,62 @@ class Database:
                     channel.status = "rejected"
                     logger.debug("Marked channel id=%s as rejected", channel_id)
 
-    async def get_channel_for_parsing(self) -> Channel | None:
+    async def get_channel_for_parsing(
+        self, session_index: int | None = None, total_sessions: int | None = None
+    ) -> Channel | None:
         """Fetch a channel ready for POST PARSING and mark as processing.
 
-        Only returns channels that have an access_hash to avoid global search
-        rate limits and potential account bans.
+        Implements session-channel sharding to reuse Telethon's local SQLite cache
+        and avoid FloodWait on username resolution. Each session claims channels
+        from its shard first, then falls back to any available channel.
+
+        Args:
+            session_index: Optional zero-based index of the current session (0 to total_sessions-1).
+            total_sessions: Optional total number of sessions for sharding.
+
+        Returns:
+            The claimed Channel entity, or None if no channels are available.
         """
         async with self.async_session() as session:
             async with session.begin():
-                stmt = (
+                channel = None
+
+                # Stage 1: Try to claim a channel from this session's shard
+                if session_index is not None and total_sessions is not None and total_sessions > 0:
+                    shard_stmt = (
+                        select(Channel)
+                        .where(Channel.status == "ready_for_parsing")
+                        .where(Channel.is_author_blog == True)  # noqa: E712
+                        .where(Channel.access_hash.is_not(None))
+                        # Shard condition: Channel.id % total_sessions == session_index
+                        .where(func.mod(Channel.id, total_sessions) == session_index)
+                        .order_by(func.random())
+                        .limit(1)
+                        .with_for_update(skip_locked=True)
+                    )
+                    result = await session.execute(shard_stmt)
+                    channel = result.scalar_one_or_none()
+
+                    if channel:
+                        channel.status = "processing"
+                        logger.debug(
+                            "Parser claimed shard channel id=%s username=%s (session_index=%s/%s)",
+                            channel.id,
+                            channel.username,
+                            session_index,
+                            total_sessions,
+                        )
+                        return channel
+
+                    logger.debug(
+                        "No channels available in shard %s/%s, trying fallback",
+                        session_index,
+                        total_sessions,
+                    )
+
+                # Stage 2: Fallback - claim ANY available channel
+                # This prevents idle workers when some sessions are in cooldown
+                fallback_stmt = (
                     select(Channel)
                     .where(Channel.status == "ready_for_parsing")
                     .where(Channel.is_author_blog == True)  # noqa: E712
@@ -597,16 +644,18 @@ class Database:
                     .limit(1)
                     .with_for_update(skip_locked=True)
                 )
-                result = await session.execute(stmt)
+                result = await session.execute(fallback_stmt)
                 channel = result.scalar_one_or_none()
 
                 if channel:
                     channel.status = "processing"
                     logger.debug(
-                        "Parser claimed channel id=%s username=%s (has access_hash)",
+                        "Parser claimed channel (fallback) id=%s username=%s (has access_hash)",
                         channel.id,
                         channel.username,
                     )
+                else:
+                    logger.debug("No pending channels available for parsing")
 
                 return channel
 
