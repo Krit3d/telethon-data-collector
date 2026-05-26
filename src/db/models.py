@@ -25,6 +25,12 @@ class Base(DeclarativeBase):
     pass
 
 
+def get_platform_id_default(context):
+    """Dynamic default for platform_id: extracts 'id' from insert parameters and casts to string."""
+    params = context.get_current_parameters()
+    return str(params.get('id')) if params.get('id') is not None else None
+
+
 class Account(Base):
     """Table storing platform account information (e.g., Telegram channels)."""
 
@@ -39,12 +45,14 @@ class Account(Base):
         String(50),
         nullable=False,
         index=True,
+        default='TELEGRAM',
         comment="Platform name (e.g., 'TELEGRAM', 'YOUTUBE')",
     )
     platform_id: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
         index=True,
+        default=get_platform_id_default,
         comment="Account ID on the platform (as string)",
     )
     username: Mapped[str | None] = mapped_column(
@@ -314,3 +322,7 @@ class Comment(Base):
 
     def __repr__(self) -> str:
         return f"<Comment(content_id={self.content_id}, platform_comment_id={self.platform_comment_id})>"
+
+
+# Backward compatibility alias for legacy Channel class references
+Channel = Account
