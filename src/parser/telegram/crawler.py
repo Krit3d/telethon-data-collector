@@ -35,13 +35,13 @@ from telethon.tl.types import (
 from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.models import Account as AccountModel
-from src.parser.core.utils import (
+from src.parser.telegram.core.utils import (
     get_channel_entity_safe,
     get_full_channel_info,
 )
-from src.parser.core.worker_base import BaseTelegramWorker
-from src.parser.core.runner import start_workers
-from src.parser.core.exceptions import (
+from src.parser.telegram.core.worker_base import BaseTelegramWorker
+from src.parser.telegram.core.runner import start_workers
+from src.parser.telegram.core.exceptions import (
     ChannelTaskRejected,
     SessionExpiredError,
     WorkerError,

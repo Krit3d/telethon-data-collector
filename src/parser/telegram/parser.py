@@ -30,9 +30,9 @@ from telethon.tl.types import PeerChannel
 from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.models import Account
-from src.parser.core.runner import start_workers
-from src.parser.core.worker_base import BaseTelegramWorker
-from src.parser.core.utils import (
+from src.parser.telegram.core.runner import start_workers
+from src.parser.telegram.core.worker_base import BaseTelegramWorker
+from src.parser.telegram.core.utils import (
     count_message_comments,
     count_message_reactions,
     get_channel_entity_safe,

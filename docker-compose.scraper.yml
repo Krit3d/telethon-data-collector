@@ -51,7 +51,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: python -m src.parser.crawler
+    command: python -m src.parser.telegram.crawler
     volumes:
       - .:/app
       - ./sessions:/app/sessions
@@ -82,7 +82,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: python -m src.parser.parser
+    command: python -m src.parser.telegram.parser
     volumes:
       - .:/app
       - ./sessions:/app/sessions
