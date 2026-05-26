@@ -166,15 +166,32 @@ class EmbeddingWorker:
         failed_ids: list[int] = []
 
         for post in posts:
-            if not post.content or not post.content.strip():
+            # Build text to embed from content and/or transcription
+            text_to_embed = ""
+
+            # Get stripped values, handling None cases
+            content_text = post.content.strip() if post.content else ""
+            transcription_text = post.transcription.strip() if post.transcription else ""
+
+            has_content = bool(content_text)
+            has_transcription = bool(transcription_text)
+
+            if has_content and has_transcription:
+                text_to_embed = f"Description: {content_text}\nTranscription: {transcription_text}"
+            elif has_content:
+                text_to_embed = content_text
+            elif has_transcription:
+                text_to_embed = transcription_text
+
+            if not text_to_embed:
                 logger.debug(
-                    "Content id=%s has no valid text content, skipping embedding",
+                    "Content id=%s has no valid text content or transcription, skipping embedding",
                     post.id,
                 )
                 failed_ids.append(post.id)
                 continue
 
-            points.append((post.id, post.content, post.account_id))
+            points.append((post.id, text_to_embed, post.account_id))
 
         if not points:
             logger.debug("No valid content to embed in this batch")

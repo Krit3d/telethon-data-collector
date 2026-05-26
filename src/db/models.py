@@ -122,7 +122,7 @@ class Content(Base):
     __tablename__ = "content"
     __table_args__ = (
         UniqueConstraint(
-            "account_id", "message_id", name="uq_content_account_message"
+            "account_id", "platform_content_id", name="uq_content_account_platform_id"
         ),
     )
 
@@ -143,10 +143,10 @@ class Content(Base):
         back_populates="content",
         lazy="joined",
     )
-    message_id: Mapped[int] = mapped_column(
+    message_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        nullable=False,
-        comment="Platform message ID (unique within an account)",
+        nullable=True,
+        comment="Platform message ID (unique within an account, nullable for non-Telegram platforms)",
     )
     platform_content_id: Mapped[str] = mapped_column(
         String(255),

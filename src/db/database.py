@@ -333,7 +333,7 @@ class Database:
         """
         Insert or update a content record.
 
-        Conflict is detected on the composite unique key (account_id, message_id).
+        Conflict is detected on the composite unique key (account_id, platform_content_id).
         On conflict, only metrics (views, comments, shares, reactions) are updated.
         Content and published_at are preserved to avoid overwriting existing data.
 
@@ -359,7 +359,7 @@ class Database:
         }
 
         stmt = stmt.on_conflict_do_update(
-            constraint="uq_content_account_message",
+            constraint="uq_content_account_platform_id",
             set_=update_columns,
         )
 
@@ -371,7 +371,7 @@ class Database:
                 content = await self._get_content_by_unique(
                     session,
                     content_data["account_id"],
-                    content_data["message_id"],
+                    content_data["platform_content_id"],
                 )
 
                 if content is None:
@@ -384,11 +384,12 @@ class Database:
                 return content
 
     async def _get_content_by_unique(
-        self, session: AsyncSession, account_id: int, message_id: int
+        self, session: AsyncSession, account_id: int, platform_content_id: str
     ) -> Content | None:
         """Helper method to fetch a content by its composite natural key."""
         stmt = select(Content).where(
-            Content.account_id == account_id, Content.message_id == message_id
+            Content.account_id == account_id,
+            Content.platform_content_id == platform_content_id,
         )
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
@@ -890,16 +891,22 @@ class Database:
 
         This is used to implement smart skip logic in the parser,
         allowing us to avoid re-fetching messages we already have.
+        Only considers rows where message_id is not NULL.
 
         Args:
             account_id: Telegram account ID.
 
         Returns:
-            The highest message_id for the account, or None if no content exist.
+            The highest message_id for the account, or None if no content exist
+            or all message_id values are NULL.
         """
         async with self.async_session() as session:
-            stmt = select(func.max(Content.message_id)).where(
-                Content.account_id == account_id
+            stmt = (
+                select(func.max(Content.message_id))
+                .where(
+                    Content.account_id == account_id,
+                    Content.message_id.isnot(None),
+                )
             )
             result = await session.execute(stmt)
             return result.scalar()  # Returns None if no rows exist

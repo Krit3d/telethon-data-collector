@@ -92,6 +92,24 @@ class Settings(BaseSettings):
         description="Model name to use for LLM extraction",
     )
 
+    # ---- Scrape Creators API settings ----
+    scrape_creators_api_key: str | None = Field(
+        default=None,
+        description="API key for Scrape Creators service (TikTok/Instagram/YouTube Shorts scraping)",
+    )
+    scrape_creators_base_url: str = Field(
+        default="https://api.scrapecreators.com",
+        description="Base URL for Scrape Creators API",
+    )
+    scrape_creators_header_name: str = Field(
+        default="Authorization",
+        description="Header name for API key authentication (e.g., 'Authorization' or 'x-api-key')",
+    )
+    scrape_creators_auth_scheme: str = Field(
+        default="Bearer",
+        description="Authentication scheme prefix (e.g., 'Bearer' or empty string for none)",
+    )
+
     # Crawler settings
     crawler_delay_min: int = Field(
         default=45,

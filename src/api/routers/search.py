@@ -280,16 +280,28 @@ async def search_content(
             # Apply RRF/Boost formula: asymptotically approach 1.0 without exceeding it
             final_score: float = base_score + (1.0 - base_score) * boost
 
-            # Build URL: use account username if available, otherwise fall back to account_id
+            # Build URL based on platform and available IDs
             account_username = (
                 getattr(content.account, "username", None)
                 if content.account
                 else None
             )
-            if account_username:
-                url = f"https://t.me/{account_username}/{content.message_id}"
+            platform = (
+                getattr(content.account, "platform", "TELEGRAM")
+                if content.account
+                else "TELEGRAM"
+            )
+
+            if platform == "TELEGRAM" and content.message_id is not None:
+                # Telegram-specific URL format
+                if account_username:
+                    url = f"https://t.me/{account_username}/{content.message_id}"
+                else:
+                    url = f"https://t.me/c/{content.account_id}/{content.message_id}"
             else:
-                url = f"https://t.me/c/{content.account_id}/{content.message_id}"
+                # For non-Telegram platforms or when message_id is None,
+                # use platform_content_id or provide a generic URL
+                url = f"https://platform/{platform.lower()}/content/{content.platform_content_id}"
 
             merged_results.append(
                 {
