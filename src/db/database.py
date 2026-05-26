@@ -5,6 +5,7 @@ Asynchronous CRUD operations for accounts and content using SQLAlchemy 2.0.
 import asyncio
 import logging
 import random
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import case, func, select, update, text
@@ -368,7 +369,9 @@ class Database:
 
                 # Retrieve the saved object
                 content = await self._get_content_by_unique(
-                    session, content_data["account_id"], content_data["message_id"]
+                    session,
+                    content_data["account_id"],
+                    content_data["message_id"],
                 )
 
                 if content is None:
@@ -414,7 +417,9 @@ class Database:
             accounts = result.scalars().all()
             return {acc.id: acc for acc in accounts}
 
-    async def get_content_by_ids(self, content_ids: list[int]) -> dict[int, Content]:
+    async def get_content_by_ids(
+        self, content_ids: list[int]
+    ) -> dict[int, Content]:
         """
         Fetch content by a list of content IDs with their associated accounts eagerly loaded.
 
@@ -444,6 +449,80 @@ class Database:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def get_unembedded_content(
+        self, limit: int, priority_mode: bool
+    ) -> list[Content]:
+        """
+        Fetch content that has not yet been embedded for vector search.
+
+        Queries the content table for records where is_embedded = False and
+        content is not NULL/empty.
+
+        Args:
+            limit: Maximum number of content items to return.
+            priority_mode: If True, sort by published_at DESC (most recent first).
+                           If False, sort by published_at ASC (oldest first).
+
+        Returns:
+            List of Content objects where is_embedded is False and content is not empty.
+        """
+
+        async with self.async_session() as session:
+            # Build base query: is_embedded = False and content is not NULL/empty
+            stmt = select(Content).where(
+                Content.is_embedded == False,  # noqa: E712
+                Content.content.isnot(None),
+                Content.content != "",  # Filter out empty strings
+            )
+
+            # Apply sorting based on priority_mode
+            if priority_mode:
+                # Priority mode: process most recent content first
+                stmt = stmt.order_by(Content.published_at.desc())
+            else:
+                # Default: process oldest content first (FIFO)
+                stmt = stmt.order_by(Content.published_at.asc())
+
+            stmt = stmt.limit(limit)
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def mark_content_embedded(self, content_ids: list[int]) -> None:
+        """Mark multiple content items as embedded in a single batch update.
+
+        Updates multiple records at once, setting is_embedded = True and
+        updated_at = datetime.now(timezone.utc).
+
+        Args:
+            content_ids: List of content IDs to mark as embedded.
+        """
+
+        if not content_ids:
+            return
+
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    update(Content)
+                    .where(Content.id.in_(content_ids))
+                    .values(
+                        is_embedded=True,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                result = await session.execute(stmt)
+
+                if result.rowcount > 0:  # type: ignore[attr-defined]
+                    logger.debug(
+                        "Marked %d content items as embedded",
+                        result.rowcount,  # type: ignore[attr-defined]
+                    )
+                else:
+                    logger.warning(
+                        "No content items found to mark as embedded for IDs: %s",
+                        content_ids[:10],  # Log first 10 IDs to avoid huge logs
+                    )
+
     async def get_unextracted_content(
         self, limit: int = 50, priority_mode: bool = False
     ) -> list[Content]:
@@ -460,7 +539,9 @@ class Database:
         """
 
         async with self.async_session() as session:
-            stmt = select(Content).where(Content.is_graph_extracted == False)  # noqa: E712
+            stmt = select(Content).where(
+                Content.is_graph_extracted == False
+            )  # noqa: E712
 
             if priority_mode:
                 # Priority mode: process most recent content first (for search relevance)
@@ -468,6 +549,44 @@ class Database:
             else:
                 # Default: process oldest content first (FIFO)
                 stmt = stmt.order_by(Content.id.asc())
+
+            stmt = stmt.limit(limit)
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def get_ungraphed_content(
+        self, limit: int, priority_mode: bool
+    ) -> list[Content]:
+        """
+        Fetch content that has not yet been processed for knowledge graph extraction.
+
+        Queries the content table for records where is_graph_extracted = False and
+        content is not NULL/empty.
+
+        Args:
+            limit: Maximum number of content items to return.
+            priority_mode: If True, sort by published_at DESC (most recent first).
+                           If False, sort by published_at ASC (oldest first).
+
+        Returns:
+            List of Content objects where is_graph_extracted is False and content is not empty.
+        """
+
+        async with self.async_session() as session:
+            # Build base query: is_graph_extracted = False and content is not NULL/empty
+            stmt = select(Content).where(
+                Content.is_graph_extracted == False,  # noqa: E712
+                Content.content.isnot(None),
+                Content.content != "",  # Filter out empty strings
+            )
+
+            # Apply sorting based on priority_mode
+            if priority_mode:
+                # Priority mode: process most recent content first
+                stmt = stmt.order_by(Content.published_at.desc())
+            else:
+                # Default: process oldest content first (FIFO)
+                stmt = stmt.order_by(Content.published_at.asc())
 
             stmt = stmt.limit(limit)
             result = await session.execute(stmt)
@@ -493,10 +612,42 @@ class Database:
                 result = await session.execute(stmt)
 
                 if result.rowcount > 0:  # type: ignore[attr-defined]
-                    logger.debug("Marked content id=%s as extracted", content_id)
+                    logger.debug(
+                        "Marked content id=%s as extracted", content_id
+                    )
                 else:
                     logger.warning(
                         "Content id=%s not found when marking as extracted",
+                        content_id,
+                    )
+
+    async def mark_content_graphed(self, content_id: int) -> None:
+        """Mark a content as processed for knowledge graph (is_graph_extracted = True).
+
+        Updates a single record setting is_graph_extracted = True and
+        updated_at = datetime.now(timezone.utc).
+
+        Args:
+            content_id: The database ID of the content to mark as graphed.
+        """
+
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    update(Content)
+                    .where(Content.id == content_id)
+                    .values(
+                        is_graph_extracted=True,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                result = await session.execute(stmt)
+
+                if result.rowcount > 0:  # type: ignore[attr-defined]
+                    logger.debug("Marked content id=%s as graphed", content_id)
+                else:
+                    logger.warning(
+                        "Content id=%s not found when marking as graphed",
                         content_id,
                     )
 
@@ -562,7 +713,9 @@ class Database:
 
                 if account is not None:
                     account.status = "ready_for_parsing"
-                    logger.debug("Marked account id=%s as processed", account_id)
+                    logger.debug(
+                        "Marked account id=%s as processed", account_id
+                    )
 
     async def mark_account_rejected(self, account_id: int) -> None:
         """Mark an account as rejected (status='rejected')."""
@@ -581,7 +734,9 @@ class Database:
                     logger.debug("Marked account id=%s as rejected", account_id)
 
     async def get_account_for_parsing(
-        self, session_index: int | None = None, total_sessions: int | None = None
+        self,
+        session_index: int | None = None,
+        total_sessions: int | None = None,
     ) -> Account | None:
         """Fetch an account ready for CONTENT PARSING and mark as processing.
 
@@ -601,14 +756,21 @@ class Database:
                 account = None
 
                 # Stage 1: Try to claim an account from this session's shard
-                if session_index is not None and total_sessions is not None and total_sessions > 0:
+                if (
+                    session_index is not None
+                    and total_sessions is not None
+                    and total_sessions > 0
+                ):
                     shard_stmt = (
                         select(Account)
                         .where(Account.status == "ready_for_parsing")
                         .where(Account.is_author_blog == True)  # noqa: E712
                         .where(Account.access_hash.is_not(None))
                         # Shard condition: Account.id % total_sessions == session_index
-                        .where(func.mod(Account.id, total_sessions) == session_index)
+                        .where(
+                            func.mod(Account.id, total_sessions)
+                            == session_index
+                        )
                         .order_by(func.random())
                         .limit(1)
                         .with_for_update(skip_locked=True)

@@ -172,6 +172,16 @@ class Settings(BaseSettings):
         description="Number of unextracted posts to fetch per poll in the extraction worker",
     )
 
+    # ---- Embedding worker settings ----
+    embedding_priority_mode: bool = Field(
+        default=True,
+        description="If True, process most recent posts first for embedding (ordered by published_at DESC). If False, process oldest posts first (ordered by published_at ASC).",
+    )
+    embedding_batch_size: int = Field(
+        default=64,
+        description="Number of unembedded posts to fetch per poll in the embedding worker",
+    )
+
     # ---- API server settings ----
     api_host: str = Field(
         default="0.0.0.0",

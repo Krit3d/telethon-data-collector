@@ -1,8 +1,9 @@
-"""Background worker for knowledge extraction from unextracted content.
+"""Background worker for knowledge graph extraction from ungraphed content.
 
-This worker runs independently from the scraper service. It polls the database
-for content where is_extracted=False, extracts knowledge triples using LLM,
-stores them in Apache AGE graph, and syncs entities to Qdrant for vector search.
+This worker runs independently from the scraper service and embedding worker.
+It polls the database for content where is_graph_extracted=False, extracts
+knowledge triples using LLM, stores them in Apache AGE graph, and syncs
+extracted entities to Qdrant for vector search.
 """
 
 import asyncio
@@ -33,25 +34,25 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_COOLDOWN = 60
 
 
-class ExtractionWorker:
-    """Background worker that processes unextracted content."""
+class GraphExtractionWorker:
+    """Background worker that processes ungraphed content for knowledge graph extraction."""
 
     def __init__(
         self,
         db: Database,
         graph_repo: GraphRepository,
-        qdrant: QdrantService,
+        qdrant: QdrantService | None,
         extractor: KnowledgeExtractor,
         settings: Settings,
         batch_size: int = 20,
         poll_interval: int = 5,
     ) -> None:
-        """Initialize the extraction worker.
+        """Initialize the graph extraction worker.
 
         Args:
             db: Database instance for data access.
             graph_repo: GraphRepository for Apache AGE graph operations.
-            qdrant: QdrantService for entity embedding sync.
+            qdrant: Optional QdrantService for entity embedding sync.
             extractor: KnowledgeExtractor for LLM-based extraction.
             settings: Application settings containing concurrency configuration.
             batch_size: Number of content items to fetch per poll.
@@ -69,13 +70,13 @@ class ExtractionWorker:
 
     def handle_shutdown(self, *args: object) -> None:
         """Signal handler for graceful shutdown."""
-        logger.info("Shutdown signal received, stopping worker...")
+        logger.info("Shutdown signal received, stopping graph extraction worker...")
         self._shutdown_event.set()
 
     async def run(self) -> None:
-        """Main worker loop: continuously poll and process unextracted content."""
+        """Main worker loop: continuously poll and process ungraphed content."""
         logger.info(
-            "Extraction worker started (batch_size=%d, poll_interval=%ds, priority_mode=%s)",
+            "Graph extraction worker started (batch_size=%d, poll_interval=%ds, priority_mode=%s)",
             self.batch_size,
             self.poll_interval,
             self.priority_mode,
@@ -83,9 +84,9 @@ class ExtractionWorker:
 
         while not self._shutdown_event.is_set():
             try:
-                # Fetch batch of unextracted content
+                # Fetch batch of ungraphed content
                 try:
-                    posts = await self.db.get_unextracted_content(
+                    posts = await self.db.get_ungraphed_content(
                         limit=self.batch_size, priority_mode=self.priority_mode
                     )
                 except (OperationalError, PostgresError) as e:
@@ -109,14 +110,14 @@ class ExtractionWorker:
 
                 if not posts:
                     logger.debug(
-                        "No unextracted content found, sleeping %ds",
+                        "No ungraphed content found, sleeping %ds",
                         self.poll_interval,
                     )
                     await asyncio.sleep(self.poll_interval)
                     continue
 
                 logger.info(
-                    "Processing batch of %d unextracted content items", len(posts)
+                    "Processing batch of %d ungraphed content items", len(posts)
                 )
 
                 # Configure concurrency semaphore with extractor-specific limit
@@ -146,30 +147,30 @@ class ExtractionWorker:
                 await asyncio.sleep(1)
 
             except asyncio.CancelledError:
-                logger.info("Worker task cancelled")
+                logger.info("Graph extraction worker task cancelled")
                 break
             except Exception as e:
                 logger.error(
-                    "Unexpected error in worker loop: %s", e, exc_info=True
+                    "Unexpected error in graph extraction worker loop: %s", e, exc_info=True
                 )
                 await asyncio.sleep(5)  # Back off on unexpected errors
 
-        logger.info("Extraction worker stopped")
+        logger.info("Graph extraction worker stopped")
 
     async def _process_single_post(self, post: Content) -> None:
-        """Process a single content item: extract knowledge and mark as extracted.
+        """Process a single content item: extract knowledge graph and mark as graphed.
 
         Args:
             post: Content object from database.
         """
         if not post.content or not post.content.strip():
             logger.debug(
-                "Content id=%s has no content, skipping extraction", post.id
+                "Content id=%s has no content, skipping graph extraction", post.id
             )
-            await self.db.mark_content_extracted(post.id)
+            await self.db.mark_content_graphed(post.id)
             return
 
-        logger.debug("Extracting knowledge from content id=%s", post.id)
+        logger.debug("Extracting knowledge graph from content id=%s", post.id)
 
         # Extract content metrics directly from SQL model
         post_metrics: dict[str, int | None] = {
@@ -197,7 +198,7 @@ class ExtractionWorker:
         except Exception as e:
             # Log the full traceback for unrecoverable errors (validation, JSON parsing, API failures)
             logger.error(
-                "Unrecoverable error extracting knowledge for content id=%s: %s",
+                "Unrecoverable error extracting knowledge graph for content id=%s: %s",
                 post.id,
                 e,
                 exc_info=True,
@@ -211,7 +212,7 @@ class ExtractionWorker:
                         text("""
                             UPDATE content
                             SET raw_metadata = COALESCE(raw_metadata, '{}'::jsonb) ||
-                                jsonb_build_object('extraction_error', :error_msg, 'failed_at', :failed_at)
+                                jsonb_build_object('graph_extraction_error', :error_msg, 'graph_failed_at', :failed_at)
                             WHERE id = :post_id
                         """),
                         {
@@ -222,7 +223,7 @@ class ExtractionWorker:
                     )
                     await session.commit()
             except Exception as db_err:
-                # Log but don't crash - we still need to mark as extracted to prevent infinite loops
+                # Log but don't crash - we still need to mark as graphed to prevent infinite loops
                 logger.error(
                     "Failed to update raw_metadata for content id=%s: %s",
                     post.id,
@@ -230,33 +231,34 @@ class ExtractionWorker:
                     exc_info=True,
                 )
 
-            # Always mark as extracted to remove from unextracted queue and prevent infinite LLM API token wastage
-            await self.db.mark_content_extracted(post.id)
+            # Always mark as graphed to remove from ungraphed queue and prevent infinite loops
+            await self.db.mark_content_graphed(post.id)
             return
 
-        # Mark content as extracted only after successful processing
-        await self.db.mark_content_extracted(post.id)
+        # Mark content as graphed only after successful processing
+        await self.db.mark_content_graphed(post.id)
 
-        logger.info("Completed content id=%s", post.id)
+        logger.info("Completed graph extraction for content id=%s", post.id)
 
 
-async def run_extractor() -> None:
-    """Entry point for the extraction worker service.
+async def run_graph_extractor() -> None:
+    """Entry point for the graph extraction worker service.
 
     Initializes all dependencies and starts the worker loop.
     This function is intended to be called from the main() block.
     """
     settings = load_settings()
 
-    logger.info("Starting knowledge extraction worker")
+    logger.info("Starting knowledge graph extraction worker")
 
     # Initialize database
     db = Database(settings.db_url)
     await db.init_db()
 
-    # Initialize Qdrant service
-    qdrant = QdrantService(settings)
+    # Initialize Qdrant service (optional for graph extraction)
+    qdrant = None
     try:
+        qdrant = QdrantService(settings)
         await qdrant.initialize()
         logger.info("Qdrant service initialized")
     except Exception as e:
@@ -264,7 +266,7 @@ async def run_extractor() -> None:
         logger.warning(
             "Continuing without Qdrant - entity embeddings will be disabled"
         )
-        # Qdrant is optional for extraction; we can still extract to AGE graph
+        # Qdrant is optional for graph extraction; we can still extract to AGE graph
 
     # Initialize knowledge extractor
     extractor = KnowledgeExtractor(settings)
@@ -273,7 +275,7 @@ async def run_extractor() -> None:
     graph_repo = GraphRepository(db.async_session)
 
     # Create and run worker with optimized settings
-    worker = ExtractionWorker(
+    worker = GraphExtractionWorker(
         db=db,
         graph_repo=graph_repo,
         qdrant=qdrant,
@@ -294,10 +296,11 @@ async def run_extractor() -> None:
     finally:
         # Cleanup
         await extractor.close()
-        await qdrant.close()
+        if qdrant:
+            await qdrant.close()
         await db.close()
         logger.info("Resources cleaned up")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_extractor())
+    asyncio.run(run_graph_extractor())
