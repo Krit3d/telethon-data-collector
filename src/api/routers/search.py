@@ -21,20 +21,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/search", tags=["Search"])
 
 
-def _clean_post_id(node_id: Any) -> int | None:
+def _clean_content_id(node_id: Any) -> int | None:
     """
-    Clean and convert a graph node ID to a PostgreSQL-compatible integer post ID.
+    Clean and convert a graph node ID to a PostgreSQL-compatible integer content ID.
 
     Handles cases where the node ID is:
     - An integer (returned as-is)
-    - A string with "post_" prefix (e.g., "post_12345" -> 12345)
+    - A string with "content_" prefix (e.g., "content_12345" -> 12345)
     - A plain numeric string (e.g., "12345" -> 12345)
 
     Args:
         node_id: The node ID from graph edge data (source_id or target_id).
 
     Returns:
-        Integer post ID if conversion succeeds, None otherwise.
+        Integer content ID if conversion succeeds, None otherwise.
 
     Raises:
         No exceptions; all conversion errors are caught and logged.
@@ -45,9 +45,9 @@ def _clean_post_id(node_id: Any) -> int | None:
     # Convert to string for prefix checking
     node_id_str = str(node_id)
 
-    # Strip "post_" prefix if present
-    if node_id_str.startswith("post_"):
-        node_id_str = node_id_str[5:]  # Remove "post_" prefix
+    # Strip "content_" prefix if present
+    if node_id_str.startswith("content_"):
+        node_id_str = node_id_str[8:]  # Remove "content_" prefix
 
     # Try to convert to integer
     try:
@@ -63,19 +63,19 @@ def _clean_post_id(node_id: Any) -> int | None:
 
 
 @router.post("", response_model=SearchResponse)
-async def search_posts(
+async def search_content(
     payload: SearchRequest,
     qdrant: QdrantService = Depends(get_qdrant),
     db: Database = Depends(get_db),
     graph_repo: GraphRepository = Depends(get_graph_repo),
 ) -> SearchResponse:
-    """Hybrid search for posts with graph entities and intelligent ranking.
+    """Hybrid search for content with graph entities and intelligent ranking.
 
-    Performs concurrent semantic search for posts and entities, then:
-    - Applies Reciprocal Rank Fusion to combine post and entity relevance scores
-    - Boosts posts that have associated highly relevant entities
+    Performs concurrent semantic search for content and entities, then:
+    - Applies Reciprocal Rank Fusion to combine content and entity relevance scores
+    - Boosts content that has associated highly relevant entities
     - Fetches graph relationships and groups them by entity
-    - Optionally includes author (Actor) node details for found posts
+    - Optionally includes author (Actor) node details for found content
 
     Args:
         payload: Search request with query, limit, score_threshold, and include_author_info.
@@ -194,15 +194,15 @@ async def search_posts(
                     source_label: str = edge["source_label"]
                     target_label: str = edge["target_label"]
 
-                    # Identify Post nodes (label should be 'Post')
-                    # The graph connects entities to posts via relationships
-                    # Clean post IDs by stripping "post_" prefix and converting to int
-                    # Use case-insensitive comparison to handle variations like "POST", "post", etc.
+                    # Identify Content nodes (label should be 'Content')
+                    # The graph connects entities to content via relationships
+                    # Clean content IDs by stripping "content_" prefix and converting to int
+                    # Use case-insensitive comparison to handle variations like "CONTENT", "content", etc.
                     if (
-                        source_label.lower() == "post"
+                        source_label.lower() == "content"
                         and target_id in entity_ids
                     ):
-                        cleaned_source_id = _clean_post_id(source_id)
+                        cleaned_source_id = _clean_content_id(source_id)
                         if cleaned_source_id is not None:
                             connected_post_ids.add(cleaned_source_id)
                             if target_id not in entity_to_connected_posts:
@@ -212,10 +212,10 @@ async def search_posts(
                             )
 
                     if (
-                        target_label.lower() == "post"
+                        target_label.lower() == "content"
                         and source_id in entity_ids
                     ):
-                        cleaned_target_id = _clean_post_id(target_id)
+                        cleaned_target_id = _clean_content_id(target_id)
                         if cleaned_target_id is not None:
                             connected_post_ids.add(cleaned_target_id)
                             if source_id not in entity_to_connected_posts:
@@ -230,42 +230,42 @@ async def search_posts(
                     exc_info=e,
                 )
 
-        # Combine vector post IDs and graph-connected post IDs
-        all_post_ids: set[int] = set(vector_scores.keys()) | connected_post_ids
+        # Combine vector content IDs and graph-connected content IDs
+        all_content_ids: set[int] = set(vector_scores.keys()) | connected_post_ids
 
         # Log ID sets for debugging
-        logger.info("Vector search post IDs: %s", list(vector_scores.keys()))
-        logger.info("Graph connected post IDs: %s", connected_post_ids)
-        logger.info("Union of all post IDs: %s", all_post_ids)
+        logger.info("Vector search content IDs: %s", list(vector_scores.keys()))
+        logger.info("Graph connected content IDs: %s", connected_post_ids)
+        logger.info("Union of all content IDs: %s", all_content_ids)
 
-        # Fetch ALL these posts from the database
+        # Fetch ALL these content from the database
         posts_dict: dict[int, Any] = (
-            await db.get_posts_by_ids(list(all_post_ids)) if all_post_ids else {}
+            await db.get_content_by_ids(list(all_content_ids)) if all_content_ids else {}
         )
 
-        # Build merged results from all_post_ids
+        # Build merged results from all_content_ids
         merged_results: list[dict[str, Any]] = []
-        for post_id in all_post_ids:
-            post = posts_dict.get(post_id)
-            if post is None:
+        for content_id in all_content_ids:
+            content = posts_dict.get(content_id)
+            if content is None:
                 logger.warning(
-                    "Post ID %d from combined results not found in PostgreSQL",
-                    post_id,
+                    "Content ID %d from combined results not found in PostgreSQL",
+                    content_id,
                 )
                 continue
 
             # Get base score from vector search (0.0 if not in vector results)
-            base_score: float = vector_scores.get(post_id, 0.0)
+            base_score: float = vector_scores.get(content_id, 0.0)
 
-            # Calculate boost if post is connected to high-scoring entities
+            # Calculate boost if content is connected to high-scoring entities
             boost: float = 0.0
-            if post_id in connected_post_ids:
+            if content_id in connected_post_ids:
                 connected_entity_scores: list[float] = []
                 for (
                     entity_id,
                     connected_posts,
                 ) in entity_to_connected_posts.items():
-                    if post_id in connected_posts:
+                    if content_id in connected_posts:
                         entity_score: float = entity_id_to_score.get(
                             entity_id, 0.0
                         )
@@ -280,35 +280,35 @@ async def search_posts(
             # Apply RRF/Boost formula: asymptotically approach 1.0 without exceeding it
             final_score: float = base_score + (1.0 - base_score) * boost
 
-            # Build URL: use channel username if available, otherwise fall back to channel_id
-            channel_username = (
-                getattr(post.channel, "username", None)
-                if post.channel
+            # Build URL: use account username if available, otherwise fall back to account_id
+            account_username = (
+                getattr(content.account, "username", None)
+                if content.account
                 else None
             )
-            if channel_username:
-                url = f"https://t.me/{channel_username}/{post.message_id}"
+            if account_username:
+                url = f"https://t.me/{account_username}/{content.message_id}"
             else:
-                url = f"https://t.me/c/{post.channel_id}/{post.message_id}"
+                url = f"https://t.me/c/{content.account_id}/{content.message_id}"
 
             merged_results.append(
                 {
-                    "post_obj": post,
+                    "content_obj": content,
                     "score": final_score,
                     "url": url,
-                    "channel_id": post.channel_id,
-                    "text": post.content or "",
-                    "created_at": post.created_at,
-                    "post_id": post.id,
-                    "channel": post.channel,  # Include channel for author info
+                    "account_id": content.account_id,
+                    "text": content.content or "",
+                    "created_at": content.created_at,
+                    "content_id": content.id,
+                    "account": content.account,  # Include account for author info
                     "boosted": boost > 0,
                 }
             )
 
             if boost > 0:
                 logger.info(
-                    "Post %d: base score %.4f, final score %.4f, boost amount %.4f",
-                    post_id, base_score, final_score, boost
+                    "Content %d: base score %.4f, final score %.4f, boost amount %.4f",
+                    content_id, base_score, final_score, boost
                 )
 
         # Re-sort by final score
@@ -320,24 +320,24 @@ async def search_posts(
         # Build SearchResultItem objects with optional author info
         final_results: list[SearchResultItem] = []
         for result in merged_results:
-            post = result["post_obj"]
-            channel = post.channel  # Eager-loaded channel
+            content = result["content_obj"]
+            account = content.account  # Eager-loaded account (Account model)
 
             # Determine author info if requested
             author_id = None
             author_name = None
             if payload.include_author_info:
-                if channel:
-                    author_id = channel.id
-                    author_name = channel.title
+                if account:
+                    author_id = account.id
+                    author_name = account.title
                 else:
-                    # Gracefully handle missing channel
-                    author_id = post.channel_id
+                    # Gracefully handle missing account
+                    author_id = content.account_id
                     author_name = "Unknown"
 
             item = SearchResultItem(
-                post_id=result["post_id"],
-                channel_id=result["channel_id"],
+                post_id=result["content_id"],
+                account_id=result["account_id"],
                 text=result["text"],
                 score=result["score"],
                 created_at=result["created_at"],

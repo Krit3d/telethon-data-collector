@@ -17,7 +17,7 @@ class SearchRequest(BaseModel):
 
 class SearchResultItem(BaseModel):
     post_id: int
-    channel_id: int
+    account_id: int
     text: str
     score: float
     created_at: datetime

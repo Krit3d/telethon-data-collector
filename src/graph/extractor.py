@@ -686,7 +686,7 @@ class KnowledgeExtractor:
         Process a single post: extract knowledge triples and persist to AGE graph.
 
         This method handles the complete pipeline:
-        1. Upsert Post node with merged metrics and raw_metadata
+        1. Upsert Content node with merged metrics and raw_metadata
         2. Upsert Actor node for the author
         3. Create POSTED relationship
         4. Extract knowledge via LLM (excluding pre-extracted fields)
@@ -694,48 +694,48 @@ class KnowledgeExtractor:
         6. Sync to Qdrant for vector search
 
         Args:
-            post_id: Database ID of the post.
-            text: Text content of the post.
-            author_id: Telegram user ID of the post author.
+            post_id: Database ID of the content.
+            text: Text content of the content.
+            author_id: Telegram user ID of the content author.
             graph_repo: GraphRepository instance for AGE graph persistence operations.
             qdrant: Optional QdrantService for syncing entities to vector store.
-            post_metrics: Optional dictionary or Pydantic model containing post metrics (views, reactions, etc.).
-            raw_metadata: Optional dictionary or Pydantic model containing pre-extracted metadata 
-                         (language, geo, location, etc.). This metadata will be merged into the Post node
+            post_metrics: Optional dictionary or Pydantic model containing content metrics (views, reactions, etc.).
+            raw_metadata: Optional dictionary or Pydantic model containing pre-extracted metadata
+                         (language, geo, location, etc.). This metadata will be merged into the Content node
                          and excluded from LLM extraction.
         """
         logger.info("Processing post id=%s for knowledge extraction", post_id)
 
-        # Step A: Standardize the Post node ID
-        post_node_id = f"post_{post_id}"
+        # Step A: Standardize the Content node ID
+        content_node_id = f"content_{post_id}"
 
-        # Step B: Create/Upsert the Post node with merged metrics and metadata
+        # Step B: Create/Upsert the Content node with merged metrics and metadata
         try:
             # Start with base properties
-            post_properties: dict[str, Any] = {
-                "id": post_node_id,
+            content_properties: dict[str, Any] = {
+                "id": content_node_id,
                 "post_id": post_id,
                 "author_id": author_id,
             }
 
             # Merge post_metrics (views, comments, reactions) into properties
             # Handle both dict and Pydantic model inputs
-            post_properties = _merge_metadata_into_properties(post_properties, post_metrics)
+            content_properties = _merge_metadata_into_properties(content_properties, post_metrics)
 
             # Merge raw_metadata into properties
-            # This ensures all pre-extracted metadata is stored in the Post node
-            post_properties = _merge_metadata_into_properties(post_properties, raw_metadata)
+            # This ensures all pre-extracted metadata is stored in the Content node
+            content_properties = _merge_metadata_into_properties(content_properties, raw_metadata)
 
-            # Upsert the Post node with all properties
+            # Upsert the Content node with all properties
             await graph_repo.upsert_graph_node(
-                label="Post",
-                properties=post_properties,
+                label="Content",
+                properties=content_properties,
                 merge_key="id",
             )
-            logger.debug("Upserted Post node: id=%s", post_node_id)
+            logger.debug("Upserted Content node: id=%s", content_node_id)
         except Exception as e:
             logger.error(
-                "Failed to upsert Post node (post_id=%s): %s",
+                "Failed to upsert Content node (post_id=%s): %s",
                 post_id,
                 e,
                 exc_info=True,
@@ -771,15 +771,15 @@ class KnowledgeExtractor:
                 start_merge_key="id",
                 start_merge_val=actor_node_id,
                 edge_label="POSTED",
-                end_label="Post",
+                end_label="Content",
                 end_merge_key="id",
-                end_merge_val=post_node_id,
+                end_merge_val=content_node_id,
                 edge_properties={},
             )
             logger.debug(
-                "Created POSTED relationship: Actor(%s)-[:POSTED]->Post(%s)",
+                "Created POSTED relationship: Actor(%s)-[:POSTED]->Content(%s)",
                 actor_node_id,
-                post_node_id,
+                content_node_id,
             )
         except Exception as e:
             logger.error(
@@ -798,7 +798,7 @@ class KnowledgeExtractor:
 
         if result is None or (not result.entities and not result.relations):
             logger.warning(
-                "Empty extraction for post id=%s. Text snippet: %s. Core Post skeleton is saved.",
+                "Empty extraction for content id=%s. Text snippet: %s. Core Content skeleton is saved.",
                 post_id,
                 text[:100],
             )
@@ -807,20 +807,20 @@ class KnowledgeExtractor:
         # Step F: Process extracted entities and relations
         # Detailed logging after extraction (before upserting)
         logger.info(
-            "Extracted %d entities and %d relations from post %d",
+            "Extracted %d entities and %d relations from content %d",
             len(result.entities),
             len(result.relations),
             post_id,
         )
 
-        # Index post embedding in Qdrant (non-critical, does not block extraction)
+        # Index content embedding in Qdrant (non-critical, does not block extraction)
         if qdrant is not None:
             try:
                 await qdrant.upsert_post_embedding(
-                    post_id=post_id, text=text, channel_id=author_id
+                    post_id=post_id, text=text, account_id=author_id
                 )
                 logger.debug(
-                    "Indexed post embedding in Qdrant for post_id=%s",
+                    "Indexed content embedding in Qdrant for post_id=%s",
                     post_id,
                 )
             except Exception as e:
@@ -877,13 +877,13 @@ class KnowledgeExtractor:
                 )
                 raise
 
-        # Create MENTIONS relationship: (Post)-[:MENTIONS]->(Entity) for each extracted entity
+        # Create MENTIONS relationship: (Content)-[:MENTIONS]->(Entity) for each extracted entity
         for entity in result.entities:
             try:
                 await graph_repo.upsert_graph_edge(
-                    start_label="Post",
+                    start_label="Content",
                     start_merge_key="id",
-                    start_merge_val=post_node_id,  # Use standardized Post node ID
+                    start_merge_val=content_node_id,  # Use standardized Content node ID
                     edge_label="MENTIONS",
                     end_label=entity.label,
                     end_merge_key="id",
@@ -891,8 +891,8 @@ class KnowledgeExtractor:
                     edge_properties={},
                 )
                 logger.debug(
-                    "Created MENTIONS relationship: Post(%s)-[:MENTIONS]->%s(%s)",
-                    post_node_id,
+                    "Created MENTIONS relationship: Content(%s)-[:MENTIONS]->%s(%s)",
+                    content_node_id,
                     entity.label,
                     entity.id,
                 )
@@ -952,7 +952,7 @@ class KnowledgeExtractor:
                 # Do not raise - Qdrant failure should not crash the pipeline
 
         logger.info(
-            "Completed processing post id=%s: %d entities, %d relations",
+            "Completed processing content id=%s: %d entities, %d relations",
             post_id,
             len(result.entities),
             len(result.relations),

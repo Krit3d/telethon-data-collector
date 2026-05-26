@@ -1,6 +1,6 @@
-"""Telegram channel parser.
+"""Telegram account parser.
 
-Scrapes channel metadata and posts via Telethon, stores to PostgreSQL,
+Scrapes account metadata and content via Telethon, stores to PostgreSQL,
 and triggers knowledge graph extraction.
 """
 
@@ -29,7 +29,7 @@ from telethon.tl.types import PeerChannel
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
-from src.db.models import Channel
+from src.db.models import Account
 from src.parser.core.runner import start_workers
 from src.parser.core.worker_base import BaseTelegramWorker
 from src.parser.core.utils import (
@@ -79,33 +79,33 @@ def _detect_language(text: str) -> str:
     return "ru" if cyrillic_count > latin_count else "en"
 
 
-async def _extract_channel_metadata(
+async def _extract_account_metadata(
     client: TelegramClient,
-    channel: Channel,
+    account: Account,
     db: Database,
     *,
     safe_api_call: Callable[..., Any],
     entity_cache: dict[tuple[int, int | None], Any] | None = None,
 ) -> tuple[dict[str, Any], TlChannel] | None:
-    """Resolve channel entity, fetch metadata (subscribers, description), return data and TL entity."""
-    channel_id = channel.id
+    """Resolve account entity, fetch metadata (subscribers, description), return data and TL entity."""
+    account_id = account.id
     entity = None
 
     result = await get_channel_entity_safe(
         client,
-        channel_id,
+        account_id,
         safe_api_call=safe_api_call,
         entity_cache=entity_cache,
     )
     if result.is_success() and result.entity is not None:
         entity = result.entity
-        logger.info("Channel id=%s resolved via ID", channel_id)
+        logger.info("Account id=%s resolved via ID", account_id)
 
-    if entity is None and channel.username:
-        logger.info("Channel id=%s: falling back to username", channel_id)
+    if entity is None and account.username:
+        logger.info("Account id=%s: falling back to username", account_id)
         result = await get_channel_entity_safe(
             client,
-            channel.username,
+            account.username,
             safe_api_call=safe_api_call,
             entity_cache=entity_cache,
         )
@@ -115,20 +115,20 @@ async def _extract_channel_metadata(
             if result.shadowbanned:
                 try:
                     await asyncio.wait_for(
-                        db.mark_channel_pending(channel_id), timeout=15.0
+                        db.mark_account_pending(account_id), timeout=15.0
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "DB timeout: mark_channel_pending %s", channel_id
+                        "DB timeout: mark_account_pending %s", account_id
                     )
             else:
                 try:
                     await asyncio.wait_for(
-                        db.mark_channel_rejected(channel_id), timeout=15.0
+                        db.mark_account_rejected(account_id), timeout=15.0
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "DB timeout: mark_channel_rejected %s", channel_id
+                        "DB timeout: mark_account_rejected %s", account_id
                     )
                 await asyncio.sleep(random.uniform(10, 20))
             return None
@@ -136,10 +136,10 @@ async def _extract_channel_metadata(
     if entity is None:
         try:
             await asyncio.wait_for(
-                db.mark_channel_rejected(channel_id), timeout=15.0
+                db.mark_account_rejected(account_id), timeout=15.0
             )
         except asyncio.TimeoutError:
-            logger.warning("DB timeout: mark_channel_rejected %s", channel_id)
+            logger.warning("DB timeout: mark_account_rejected %s", account_id)
         await asyncio.sleep(random.uniform(10, 20))
         return None
 
@@ -151,7 +151,7 @@ async def _extract_channel_metadata(
         client, entity, safe_api_call=safe_api_call
     )
 
-    channel_data: dict[str, Any] = {
+    account_data: dict[str, Any] = {
         "id": int(entity.id),
         "username": normalize_username(getattr(entity, "username", None)),
         "title": getattr(entity, "title", "") or "",
@@ -159,7 +159,7 @@ async def _extract_channel_metadata(
         "subscribers_count": subscribers_count,
     }
 
-    return channel_data, entity
+    return account_data, entity
 
 
 async def _process_message(
@@ -169,7 +169,7 @@ async def _process_message(
     *,
     safe_api_call: Callable[..., Any] | None = None,
 ) -> int | None:
-    """Process a Telegram message: extract content/metadata, upsert to DB, return post ID or None."""
+    """Process a Telegram message: extract content/metadata, upsert to DB, return content ID or None."""
     if msg.id is None or msg.date is None:
         return None
 
@@ -333,9 +333,9 @@ async def _process_message(
         if v is not None or k in volatile_metadata_keys
     }
 
-    # Build post data with dedicated columns
-    post_data: dict[str, Any] = {
-        "channel_id": int(entity.id),
+    # Build content data with dedicated columns
+    content_data: dict[str, Any] = {
+        "account_id": int(entity.id),
         "message_id": int(msg.id),
         "content": getattr(msg, "message", None),
         "published_at": published_at,
@@ -351,31 +351,31 @@ async def _process_message(
 
     # Database insert with 15.0s timeout
     try:
-        post = await asyncio.wait_for(db.upsert_post(post_data), timeout=15.0)
+        content = await asyncio.wait_for(db.upsert_content(content_data), timeout=15.0)
     except asyncio.TimeoutError:
         logger.warning(
-            "Database timeout for message_id=%s in channel %s",
-            post_data.get("message_id"),
-            post_data.get("channel_id"),
+            "Database timeout for message_id=%s in account %s",
+            content_data.get("message_id"),
+            content_data.get("account_id"),
         )
         return None
     except Exception as e:
         logger.error(
             "Database error for message_id=%s: %s",
-            post_data.get("message_id"),
+            content_data.get("message_id"),
             e,
             exc_info=True,
         )
         return None
 
-    if not (post and post.id and post.content):
+    if not (content and content.id and content.content):
         return None
 
-    return int(post.id)
+    return int(content.id)
 
 
 class ParserWorker(BaseTelegramWorker):
-    """Telethon worker that parses channels from DB, fetches posts, and stores to PostgreSQL."""
+    """Telethon worker that parses accounts from DB, fetches content, and stores to PostgreSQL."""
 
     def __init__(
         self,
@@ -415,7 +415,7 @@ class ParserWorker(BaseTelegramWorker):
         self.channels_parsed_count = 0
 
     async def run(self) -> None:
-        """Main loop: process channels from DB, handle rate limits and auth errors."""
+        """Main loop: process accounts from DB, handle rate limits and auth errors."""
         try:
             await asyncio.wait_for(self.connect(), timeout=45.0)
         except asyncio.TimeoutError as e:
@@ -448,14 +448,14 @@ class ParserWorker(BaseTelegramWorker):
 
                 try:
                     logger.info(
-                        "Worker %d (session %d/%d): Requesting channel for parsing",
+                        "Worker %d (session %d/%d): Requesting account for parsing",
                         self.worker_id,
                         self.session_index,
                         self.total_sessions,
                     )
                     try:
-                        channel = await asyncio.wait_for(
-                            self.db.get_channel_for_parsing(
+                        account = await asyncio.wait_for(
+                            self.db.get_account_for_parsing(
                                 session_index=self.session_index,
                                 total_sessions=self.total_sessions,
                             ),
@@ -463,14 +463,14 @@ class ParserWorker(BaseTelegramWorker):
                         )
                     except asyncio.TimeoutError:
                         logger.warning(
-                            "Worker %d: DB timeout get_channel", self.worker_id
+                            "Worker %d: DB timeout get_account", self.worker_id
                         )
                         await asyncio.sleep(10)
                         continue
 
-                    if channel is None:
+                    if account is None:
                         logger.debug(
-                            "Worker %d (session %d/%d): No channels in shard, sleeping",
+                            "Worker %d (session %d/%d): No accounts in shard, sleeping",
                             self.worker_id,
                             self.session_index,
                             self.total_sessions,
@@ -479,12 +479,12 @@ class ParserWorker(BaseTelegramWorker):
                         continue
 
                     logger.info(
-                        "Worker %d: Processing channel %s",
+                        "Worker %d: Processing account %s",
                         self.worker_id,
-                        channel.id,
+                        account.id,
                     )
 
-                    await self._parse_single_channel(channel)
+                    await self._parse_single_account(account)
 
                     self.channels_parsed_count += 1
 
@@ -512,14 +512,14 @@ class ParserWorker(BaseTelegramWorker):
         finally:
             logger.info("Worker %d: Cleanup", self.worker_id)
 
-    async def _parse_single_channel(self, channel: Channel) -> None:
-        """Parse single channel: upsert metadata, fetch recent posts, update channel status in DB."""
-        channel_id = channel.id
+    async def _parse_single_account(self, account: Account) -> None:
+        """Parse single account: upsert metadata, fetch recent content, update account status in DB."""
+        account_id = account.id
 
         try:
-            result = await _extract_channel_metadata(
+            result = await _extract_account_metadata(
                 self.client,  # type: ignore[attr-defined]
-                channel,
+                account,
                 self.db,
                 safe_api_call=self.safe_api_call,
                 entity_cache=self._entity_cache,
@@ -527,27 +527,27 @@ class ParserWorker(BaseTelegramWorker):
             if result is None:
                 return
 
-            channel_data, entity = result
+            account_data, entity = result
 
             try:
                 await asyncio.wait_for(
-                    self.db.upsert_channel(channel_data), timeout=15.0
+                    self.db.upsert_account(account_data), timeout=15.0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker %d: DB timeout upsert_channel %s",
+                    "Worker %d: DB timeout upsert_account %s",
                     self.worker_id,
-                    channel_id,
+                    account_id,
                 )
                 try:
                     await asyncio.wait_for(
-                        self.db.mark_channel_pending(channel_id), timeout=15.0
+                        self.db.mark_account_pending(account_id), timeout=15.0
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Worker %d: DB timeout mark_pending %s",
                         self.worker_id,
-                        channel_id,
+                        account_id,
                     )
                 return
 
@@ -566,15 +566,15 @@ class ParserWorker(BaseTelegramWorker):
                         "Worker %d: Exploration failed: %s", self.worker_id, e
                     )
 
-            posts_saved = 0
+            content_saved = 0
             chunk_size = 20
             last_msg_id: int = 0
-            posts_limit = self.settings.posts_limit
+            content_limit = self.settings.posts_limit
 
             try:
                 latest_known_id = (
                     await asyncio.wait_for(
-                        self.db.get_latest_message_id(channel_id), timeout=15.0
+                        self.db.get_latest_message_id(account_id), timeout=15.0
                     )
                     or 0
                 )
@@ -582,26 +582,26 @@ class ParserWorker(BaseTelegramWorker):
                 logger.warning(
                     "Worker %d: DB timeout get_latest_id %s",
                     self.worker_id,
-                    channel_id,
+                    account_id,
                 )
                 try:
                     await asyncio.wait_for(
-                        self.db.mark_channel_pending(channel_id), timeout=15.0
+                        self.db.mark_account_pending(account_id), timeout=15.0
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Worker %d: DB timeout mark_pending %s",
                         self.worker_id,
-                        channel_id,
+                        account_id,
                     )
                 return
 
-            while posts_saved < posts_limit:
-                remaining = posts_limit - posts_saved
+            while content_saved < content_limit:
+                remaining = content_limit - content_saved
                 current_chunk_size = min(chunk_size, remaining)
 
                 messages = await self.safe_api_call(
-                    f"get_messages(channel_id={channel_id}, chunk_size={current_chunk_size})",
+                    f"get_messages(account_id={account_id}, chunk_size={current_chunk_size})",
                     operation=lambda: self.client.get_messages(  # type: ignore[attr-defined]
                         entity,
                         limit=current_chunk_size,
@@ -625,25 +625,25 @@ class ParserWorker(BaseTelegramWorker):
                         continue
 
                     if msg.id is not None and msg.id <= latest_known_id:
-                        posts_saved = posts_limit
+                        content_saved = content_limit
                         break
 
-                    post_id = await _process_message(
+                    content_id = await _process_message(
                         msg,
                         entity,
                         self.db,
                         safe_api_call=self.safe_api_call,
                     )
                     self.last_activity = time.time()
-                    if post_id is None:
+                    if content_id is None:
                         continue
 
-                    posts_saved += 1
+                    content_saved += 1
 
-                    if posts_saved >= posts_limit:
+                    if content_saved >= content_limit:
                         break
 
-                if posts_saved >= posts_limit:
+                if content_saved >= content_limit:
                     break
 
                 if messages:
@@ -664,50 +664,50 @@ class ParserWorker(BaseTelegramWorker):
 
             try:
                 await asyncio.wait_for(
-                    self.db.mark_channel_parsed(channel_id), timeout=15.0
+                    self.db.mark_account_parsed(account_id), timeout=15.0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Worker %d: DB timeout mark_parsed %s",
                     self.worker_id,
-                    channel_id,
+                    account_id,
                 )
                 try:
                     await asyncio.wait_for(
-                        self.db.mark_channel_pending(channel_id), timeout=15.0
+                        self.db.mark_account_pending(account_id), timeout=15.0
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Worker %d: DB timeout mark_pending %s",
                         self.worker_id,
-                        channel_id,
+                        account_id,
                     )
 
             logger.info(
-                "Worker %d: Done channel %s (%d posts)",
+                "Worker %d: Done account %s (%d content items)",
                 self.worker_id,
-                channel_id,
-                posts_saved,
+                account_id,
+                content_saved,
             )
             await asyncio.sleep(random.uniform(15.0, 45.0))
 
         except FloodWaitError as e:
             delay = int(getattr(e, "seconds", 0)) or 1
             logger.warning(
-                "Worker %d: FloodWait %ds, channel %s",
+                "Worker %d: FloodWait %ds, account %s",
                 self.worker_id,
                 delay,
-                channel_id,
+                account_id,
             )
             try:
                 await asyncio.wait_for(
-                    self.db.mark_channel_pending(channel_id), timeout=15.0
+                    self.db.mark_account_pending(account_id), timeout=15.0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Worker %d: DB timeout mark_pending %s",
                     self.worker_id,
-                    channel_id,
+                    account_id,
                 )
             raise
 
@@ -735,81 +735,81 @@ class ParserWorker(BaseTelegramWorker):
                 self.is_alive = False
                 try:
                     await asyncio.wait_for(
-                        self.db.mark_channel_rejected(channel_id), timeout=15.0
+                        self.db.mark_account_rejected(account_id), timeout=15.0
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Worker %d: DB timeout mark_rejected %s",
                         self.worker_id,
-                        channel_id,
+                        account_id,
                     )
                 raise
             logger.warning(
                 "Worker %d: Access denied %s: %s",
                 self.worker_id,
-                channel_id,
+                account_id,
                 type(e).__name__,
             )
             try:
                 await asyncio.wait_for(
-                    self.db.mark_channel_rejected(channel_id), timeout=15.0
+                    self.db.mark_account_rejected(account_id), timeout=15.0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Worker %d: DB timeout mark_rejected %s",
                     self.worker_id,
-                    channel_id,
+                    account_id,
                 )
 
         except (OSError, asyncio.TimeoutError, ConnectionError) as e:
             logger.exception(
                 "Worker %d: Network error %s: %s",
                 self.worker_id,
-                channel_id,
+                account_id,
                 type(e).__name__,
             )
             try:
                 await asyncio.wait_for(
-                    self.db.mark_channel_pending(channel_id), timeout=15.0
+                    self.db.mark_account_pending(account_id), timeout=15.0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Worker %d: DB timeout mark_pending %s",
                     self.worker_id,
-                    channel_id,
+                    account_id,
                 )
 
         except RPCError as e:
             logger.exception(
                 "Worker %d: RPCError %s: %s",
                 self.worker_id,
-                channel_id,
+                account_id,
                 type(e).__name__,
             )
             try:
                 await asyncio.wait_for(
-                    self.db.mark_channel_rejected(channel_id), timeout=15.0
+                    self.db.mark_account_rejected(account_id), timeout=15.0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Worker %d: DB timeout mark_rejected %s",
                     self.worker_id,
-                    channel_id,
+                    account_id,
                 )
 
         except Exception:
             logger.exception(
-                "Worker %d: Unexpected error %s", self.worker_id, channel_id
+                "Worker %d: Unexpected error %s", self.worker_id, account_id
             )
             try:
                 await asyncio.wait_for(
-                    self.db.mark_channel_rejected(channel_id), timeout=15.0
+                    self.db.mark_account_rejected(account_id), timeout=15.0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
                     "Worker %d: DB timeout mark_rejected %s",
                     self.worker_id,
-                    channel_id,
+                    account_id,
                 )
 
 

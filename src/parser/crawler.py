@@ -1,8 +1,8 @@
-"""Distributed Telegram channel crawler using multiple sessions.
+"""Distributed Telegram account crawler using multiple sessions.
 
-This crawler discovers new channels based on recommendations from known channels.
+This crawler discovers new accounts based on recommendations from known accounts.
 It uses multiple Telegram sessions (from sessions/ directory) with individual proxies
-to parallelize the discovery process. Qualifying channels are saved to PostgreSQL
+to parallelize the discovery process. Qualifying accounts are saved to PostgreSQL
 with authorship detection.
 """
 
@@ -34,7 +34,7 @@ from telethon.tl.types import (
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
-from src.db.models import Channel as ChannelModel
+from src.db.models import Account as AccountModel
 from src.parser.core.utils import (
     get_channel_entity_safe,
     get_full_channel_info,
@@ -200,9 +200,9 @@ class Worker(BaseTelegramWorker):
             )
             return False
 
-    async def _save_channel_to_db(
+    async def _save_account_to_db(
         self,
-        channel_id: int,
+        account_id: int,
         username: str | None,
         title: str,
         description: str | None,
@@ -210,9 +210,9 @@ class Worker(BaseTelegramWorker):
         is_author_blog: bool,
         access_hash: int | None = None,
     ) -> None:
-        """Save or update channel in database."""
-        channel_data = {
-            "id": channel_id,
+        """Save or update account in database."""
+        account_data = {
+            "id": account_id,
             "username": username,
             "title": title,
             "description": description,
@@ -222,11 +222,11 @@ class Worker(BaseTelegramWorker):
             "access_hash": access_hash,
         }
 
-        await self.db.upsert_channel(channel_data)
+        await self.db.upsert_account(account_data)
         logger.info(
-            "Saved channel @%s (id=%s, author=%s, subs=%s)",
-            username or channel_id,
-            channel_id,
+            "Saved account @%s (id=%s, author=%s, subs=%s)",
+            username or account_id,
+            account_id,
             is_author_blog,
             subscribers_count or "hidden",
         )
@@ -235,13 +235,13 @@ class Worker(BaseTelegramWorker):
         self, rec_channel: Channel, client: TelegramClient | None = None
     ) -> bool:
         """
-        Process a recommended channel: check filters and save to DB.
+        Process a recommended account: check filters and save to DB.
 
         Args:
-            rec_channel: The recommended channel to process.
+            rec_channel: The recommended channel to process (Telethon Channel type).
             client: Optional TelegramClient to use. If None, uses self.client.
 
-        Returns True if channel was saved, False otherwise.
+        Returns True if account was saved, False otherwise.
         """
         channel_name = rec_channel.username or str(rec_channel.id)
         active_client = client or self.client
@@ -249,15 +249,15 @@ class Worker(BaseTelegramWorker):
         if not active_client:
             raise RuntimeError("Telegram client is not initialized")
 
-        # Check if channel already exists in DB
+        # Check if account already exists in DB
         async with self.db.async_session() as session:
-            stmt = select(ChannelModel).where(ChannelModel.id == rec_channel.id)
+            stmt = select(AccountModel).where(AccountModel.id == rec_channel.id)
             result = await session.execute(stmt)
             existing = result.scalar_one_or_none()
 
             if existing is not None:
                 logger.debug(
-                    "Worker %d: Channel %s already in DB, skipping",
+                    "Worker %d: Account %s already in DB, skipping",
                     self.worker_id,
                     channel_name,
                 )
@@ -273,7 +273,7 @@ class Worker(BaseTelegramWorker):
 
         if subscribers_count is None:
             logger.debug(
-                "Worker %d: Channel %s has no subscriber count, skipping",
+                "Worker %d: Account %s has no subscriber count, skipping",
                 self.worker_id,
                 channel_name,
             )
@@ -282,7 +282,7 @@ class Worker(BaseTelegramWorker):
 
         if subscribers_count < self.min_subscribers:
             logger.debug(
-                "Worker %d: Channel %s has %d subscribers (<%d), skipping",
+                "Worker %d: Account %s has %d subscribers (<%d), skipping",
                 self.worker_id,
                 channel_name,
                 subscribers_count,
@@ -297,8 +297,8 @@ class Worker(BaseTelegramWorker):
         )
 
         # Save to DB with access_hash
-        await self._save_channel_to_db(
-            channel_id=rec_channel.id,
+        await self._save_account_to_db(
+            account_id=rec_channel.id,
             username=rec_channel.username,
             title=getattr(rec_channel, "title", ""),
             description=description,
@@ -401,40 +401,40 @@ class Worker(BaseTelegramWorker):
             )
             raise
 
-    async def _claim_channel(
+    async def _claim_account(
         self, require_hash: bool = False
-    ) -> ChannelModel | None:
+    ) -> AccountModel | None:
         """
-        Claim a random pending channel from the database for processing.
+        Claim a random pending account from the database for processing.
 
-        Marks the channel as 'processing' to prevent other workers from
+        Marks the account as 'processing' to prevent other workers from
         claiming it simultaneously.
 
         Args:
-            require_hash: If True, only claim channels with non-null access_hash.
+            require_hash: If True, only claim accounts with non-null access_hash.
         """
-        channel = await self.db.get_random_pending_channel(
+        account = await self.db.get_random_pending_account(
             require_hash=require_hash
         )
-        if channel is None:
+        if account is None:
             return None
 
         logger.info(
-            "Worker %d: Claimed channel id=%s username=%s for processing",
+            "Worker %d: Claimed account id=%s username=%s for processing",
             self.worker_id,
-            channel.id,
-            channel.username,
+            account.id,
+            account.username,
         )
 
-        return channel
+        return account
 
-    async def _mark_processed(self, channel_id: int) -> None:
-        """Mark a channel as successfully processed."""
-        await self.db.mark_channel_processed(channel_id)
+    async def _mark_processed(self, account_id: int) -> None:
+        """Mark an account as successfully processed."""
+        await self.db.mark_account_processed(account_id)
 
-    async def _mark_rejected(self, channel_id: int) -> None:
-        """Mark a channel as rejected (could not be processed)."""
-        await self.db.mark_channel_rejected(channel_id)
+    async def _mark_rejected(self, account_id: int) -> None:
+        """Mark an account as rejected (could not be processed)."""
+        await self.db.mark_account_rejected(account_id)
 
     async def run(self) -> None:
         """Main worker loop: claim channels, get recommendations, process them."""
@@ -471,15 +471,15 @@ class Worker(BaseTelegramWorker):
                     )
                     return
 
-                channel = None
+                account = None
 
                 try:
-                    # Claim a random pending channel
-                    channel = await self._claim_channel(
+                    # Claim a random pending account
+                    account = await self._claim_account(
                         require_hash=self.safe_mode
                     )
 
-                    if channel is None:
+                    if account is None:
                         if self.safe_mode:
                             logger.info(
                                 "Worker %d: Safe mode cooldown - sleeping for 300 seconds",
@@ -489,7 +489,7 @@ class Worker(BaseTelegramWorker):
                             self.safe_mode = False
                         else:
                             logger.info(
-                                "Worker %d: No pending channels available, waiting...",
+                                "Worker %d: No pending accounts available, waiting...",
                                 self.worker_id,
                             )
                             await asyncio.sleep(30)
@@ -502,16 +502,16 @@ class Worker(BaseTelegramWorker):
                     # Step 1: Resolve entity using session-aware safe lookup
                     result = await get_channel_entity_safe(
                         client,
-                        channel.id,
+                        account.id,
                         safe_api_call=self.safe_api_call,
                         entity_cache=self._entity_cache,
                     )
 
                     # Fallback to username only if ID resolution failed and username exists
-                    if not result.is_success() and channel.username:
+                    if not result.is_success() and account.username:
                         result = await get_channel_entity_safe(
                             client,
-                            channel.username,
+                            account.username,
                             safe_api_call=self.safe_api_call,
                             entity_cache=self._entity_cache,
                         )
@@ -522,17 +522,17 @@ class Worker(BaseTelegramWorker):
                     if entity is not None:
                         recommendations = await self._get_recommendations(
                             entity,
-                            channel.id,
+                            account.id,
                             operation_name="get_recommendations",
                         )
                     else:
-                        # Could not resolve channel by any method
+                        # Could not resolve account by any method
                         logger.info(
-                            "Worker %d: Channel %s could not be resolved, marking as processed",
+                            "Worker %d: Account %s could not be resolved, marking as processed",
                             self.worker_id,
-                            channel.username or channel.id,
+                            account.username or account.id,
                         )
-                        await self._mark_processed(channel.id)
+                        await self._mark_processed(account.id)
                         continue
 
                     # Process each recommendation
@@ -554,20 +554,20 @@ class Worker(BaseTelegramWorker):
                             )
 
                     logger.info(
-                        "Worker %d: Processed channel id=%s, saved %d new channels",
+                        "Worker %d: Processed account id=%s, saved %d new accounts",
                         self.worker_id,
-                        channel.id,
+                        account.id,
                         saved_count,
                     )
 
-                    # Mark original channel as processed
-                    await self._mark_processed(channel.id)
+                    # Mark original account as processed
+                    await self._mark_processed(account.id)
                     self.processed_count += 1
 
                 except FloodWaitError as e:
-                    # Revert channel to pending and re-raise for session pool runner to handle
-                    if channel:
-                        await self.db.mark_channel_pending(channel.id)
+                    # Revert account to pending and re-raise for session pool runner to handle
+                    if account:
+                        await self.db.mark_account_pending(account.id)
 
                     logger.warning(
                         "Worker %d: FloodWaitError, re-raising for pool runner",
@@ -581,12 +581,12 @@ class Worker(BaseTelegramWorker):
                     raise
 
                 except Exception as e:
-                    # Revert channel to pending for transient/non-fatal errors
-                    if channel:
-                        await self.db.mark_channel_pending(channel.id)
+                    # Revert account to pending for transient/non-fatal errors
+                    if account:
+                        await self.db.mark_account_pending(account.id)
 
                     logger.error(
-                        "Worker %d: Error in loop (reverted channel to pending): %s",
+                        "Worker %d: Error in loop (reverted account to pending): %s",
                         self.worker_id,
                         type(e).__name__,
                     )
@@ -616,7 +616,7 @@ async def main() -> None:
 
     # Database is assumed to be initialized by the migration script
     db = Database(settings.db_url)
-    await db.reset_orphaned_processing_channels()
+    await db.reset_orphaned_processing_accounts()
 
     worker_args = {
         "min_subscribers": 3000,

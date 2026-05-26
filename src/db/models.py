@@ -1,5 +1,5 @@
 """
-SQLAlchemy models for channels and posts tables.
+SQLAlchemy models for accounts, content, and comments tables.
 """
 
 from datetime import datetime, timezone
@@ -25,27 +25,39 @@ class Base(DeclarativeBase):
     pass
 
 
-class Channel(Base):
-    """Table storing Telegram channel information."""
+class Account(Base):
+    """Table storing platform account information (e.g., Telegram channels)."""
 
-    __tablename__ = "channels"
+    __tablename__ = "accounts"
 
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
-        comment="Telegram channel ID (can be negative for supergroups)",
+        comment="Platform account ID (e.g., Telegram channel ID, can be negative for supergroups)",
+    )
+    platform: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        index=True,
+        comment="Platform name (e.g., 'TELEGRAM', 'YOUTUBE')",
+    )
+    platform_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Account ID on the platform (as string)",
     )
     username: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
         index=True,
-        comment="Channel username without @",
+        comment="Account username without @",
     )
     title: Mapped[str] = mapped_column(
-        String(255), nullable=False, comment="Channel title"
+        String(255), nullable=False, comment="Account title/name"
     )
     description: Mapped[str | None] = mapped_column(
-        Text, nullable=True, comment="Channel description"
+        Text, nullable=True, comment="Account description"
     )
     subscribers_count: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="Number of subscribers (may be hidden)"
@@ -53,7 +65,7 @@ class Channel(Base):
     access_hash: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
-        comment="Telegram access_hash for direct entity resolving",
+        comment="Platform-specific access hash for direct entity resolving",
     )
 
     status: Mapped[str] = mapped_column(
@@ -61,13 +73,13 @@ class Channel(Base):
         default="pending",
         server_default="pending",
         nullable=False,
-        index=True,  # index for faster search of pending channels
+        index=True,
         comment="Lifecycle status: pending, processing, parsed, rejected",
     )
     is_author_blog: Mapped[bool | None] = mapped_column(
         Boolean,
         nullable=True,
-        comment="True if channel has video notes or author keywords",
+        comment="True if account has video notes or author keywords",
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -84,22 +96,25 @@ class Channel(Base):
         comment="Timestamp of the last record update",
     )
 
-    # Relationship back to posts
-    posts: Mapped[list["Post"]] = relationship(
-        back_populates="channel", cascade="all, delete-orphan"
+    # Relationship back to content
+    content: Mapped[list["Content"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+    comments: Mapped[list["Comment"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
     )
 
     def __repr__(self) -> str:
-        return f"<Channel(id={self.id}, username={self.username})>"
+        return f"<Account(id={self.id}, platform={self.platform}, platform_id={self.platform_id})>"
 
 
-class Post(Base):
-    """Table storing posts from Telegram channels."""
+class Content(Base):
+    """Table storing content from platform accounts (e.g., Telegram posts)."""
 
-    __tablename__ = "posts"
+    __tablename__ = "content"
     __table_args__ = (
         UniqueConstraint(
-            "channel_id", "message_id", name="uq_post_channel_message"
+            "account_id", "message_id", name="uq_content_account_message"
         ),
     )
 
@@ -109,38 +124,52 @@ class Post(Base):
         autoincrement=True,
         comment="Surrogate primary key",
     )
-    is_extracted: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        server_default="false",
-        index=True,
-        comment="True if knowledge graph and embeddings are extracted",
-    )
-    channel_id: Mapped[int] = mapped_column(
+    account_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("channels.id", ondelete="CASCADE"),
+        ForeignKey("accounts.id", ondelete="CASCADE"),
         nullable=False,
-        comment="Foreign key referencing the channel",
+        comment="Foreign key referencing the account",
     )
-    # Relationship to Channel for eager loading and access to channel data
-    channel: Mapped["Channel"] = relationship(
-        back_populates="posts",
-        lazy="joined",  # Eager load by default when querying posts
+    # Relationship to Account for eager loading and access to account data
+    account: Mapped["Account"] = relationship(
+        back_populates="content",
+        lazy="joined",
     )
     message_id: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
-        comment="Telegram message ID (unique within a channel)",
+        comment="Platform message ID (unique within an account)",
+    )
+    platform_content_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="Content ID on the platform (as string)",
     )
 
     content: Mapped[str | None] = mapped_column(
         Text, nullable=True, comment="Text content of the post"
     )
+    transcription: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="Transcribed text from media"
+    )
     published_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         index=True,
-        comment="Publication date of the post in Telegram",
+        comment="Publication date of the content on the platform",
+    )
+
+    is_embedded: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        comment="True if vector embeddings are generated",
+    )
+    is_graph_extracted: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        comment="True if knowledge graph is extracted",
     )
 
     views: Mapped[int | None] = mapped_column(
@@ -174,7 +203,7 @@ class Post(Base):
         default=False,
         server_default="false",
         index=True,
-        comment="Whether the post contains media",
+        comment="Whether the content contains media",
     )
 
     # JSONB raw_metadata column for OpenSPG raw metadata extraction
@@ -189,7 +218,7 @@ class Post(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
-        comment="Timestamp when the post was first saved",
+        comment="Timestamp when the content was first saved",
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -199,5 +228,89 @@ class Post(Base):
         comment="Timestamp of the last update (metrics/content)",
     )
 
+    # Relationship to comments
+    comments: Mapped[list["Comment"]] = relationship(
+        back_populates="content", cascade="all, delete-orphan"
+    )
+
     def __repr__(self) -> str:
-        return f"<Post(channel_id={self.channel_id}, message_id={self.message_id})>"
+        return f"<Content(account_id={self.account_id}, message_id={self.message_id})>"
+
+
+class Comment(Base):
+    """Table storing comments on content."""
+
+    __tablename__ = "comments"
+    __table_args__ = (
+        UniqueConstraint(
+            "content_id", "platform_comment_id", name="uq_comment_content_platform"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+        comment="Surrogate primary key",
+    )
+    content_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("content.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="Foreign key referencing the content",
+    )
+    # Relationship to Content
+    content: Mapped["Content"] = relationship(
+        back_populates="comments",
+        lazy="joined",
+    )
+    account_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="Foreign key referencing the comment author account",
+    )
+    # Relationship to Account (comment author)
+    account: Mapped["Account | None"] = relationship(
+        back_populates="comments",
+    )
+    platform_comment_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="Comment ID on the platform (as string)",
+    )
+    text: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="Text content of the comment"
+    )
+    author_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="Platform ID of the comment author",
+    )
+    author_username: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Username of the comment author",
+    )
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Publication date of the comment on the platform",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        comment="Timestamp when the comment was first saved",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        comment="Timestamp of the last update",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Comment(content_id={self.content_id}, platform_comment_id={self.platform_comment_id})>"

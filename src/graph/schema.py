@@ -533,7 +533,7 @@ CRITICAL INSTRUCTION FOR PRE-EXTRACTED METADATA:
 - The following fields are ALREADY PRESENT in the pre-extracted metadata: {excluded_text}
 - STRICTLY FORBIDDEN: DO NOT extract or include any of these pre-extracted fields in your output.
 - Focus strictly on extracting NEW business logic entities (Actors, Entities, Events, Places) and their relations from the text.
-- The pre-extracted metadata will be merged into the Post node automatically; you do NOT need to include these as properties in your extraction output.
+- The pre-extracted metadata will be merged into the Content node automatically; you do NOT need to include these as properties in your extraction output.
 - If you see information in the text that matches pre-extracted metadata (e.g., language, location, coordinates), IGNORE it completely and do NOT add it to your extraction.
 """
 

@@ -119,7 +119,7 @@ class QdrantService:
                 )
                 await self.client.create_payload_index(
                     collection_name=posts_collection,
-                    field_name="channel_id",
+                    field_name="account_id",
                     field_schema=PayloadSchemaType.INTEGER,
                 )
                 logger.info(
@@ -238,7 +238,7 @@ class QdrantService:
         """Upsert multiple post embeddings in a single batch.
 
         Args:
-            points: List of (post_id, text, channel_id) tuples.
+            points: List of (post_id, text, account_id) tuples.
         """
 
         if not points:
@@ -256,7 +256,7 @@ class QdrantService:
                 PointStruct(
                     id=post_id,
                     vector=embedding.tolist(),
-                    payload={"channel_id": channel_id, "text": text},
+                    payload={"account_id": channel_id, "text": text},
                 )
                 for (post_id, text, channel_id), embedding in zip(
                     points, embeddings
@@ -320,12 +320,12 @@ class QdrantService:
                 # Build text representation: "Label: name"
                 # Optionally append properties of type TEXT or LOCATION
                 text_parts = [f"{node.label}: {node.name}"]
-                
+
                 # Append relevant properties
                 for prop in node.properties:
                     if prop.type in (PropertyType.TEXT, PropertyType.LOCATION):
                         text_parts.append(f", {prop.key}: {prop.value}")
-                
+
                 text = "".join(text_parts)
 
                 if not text.strip():
@@ -390,14 +390,14 @@ class QdrantService:
             raise RuntimeError(f"Entity upsert failed: {e}") from e
 
     async def upsert_post_embedding(
-        self, post_id: int, text: str, channel_id: int
+        self, post_id: int, text: str, account_id: int
     ) -> None:
-        """Generate embedding for post text and upsert it into Qdrant.
+        """Generate embedding for content text and upsert it into Qdrant.
 
         Args:
-            post_id: PostgreSQL post ID (used as Qdrant point ID).
-            text: Post text to generate embedding for.
-            channel_id: Telegram channel ID stored in payload.
+            post_id: PostgreSQL content ID (used as Qdrant point ID).
+            text: Content text to generate embedding for.
+            account_id: Telegram account ID stored in payload.
 
         Raises:
             ValueError: If text is empty or invalid.
@@ -425,7 +425,7 @@ class QdrantService:
             point = PointStruct(
                 id=post_id,
                 vector=embedding.tolist(),
-                payload={"channel_id": channel_id, "text": text},
+                payload={"account_id": account_id, "text": text},
             )
 
             await self.client.upsert(  # type: ignore[attr-defined]
@@ -433,15 +433,15 @@ class QdrantService:
             )
 
             logger.debug(
-                "Post embedding upserted successfully",
-                extra={"post_id": post_id, "channel_id": channel_id},
+                "Content embedding upserted successfully",
+                extra={"post_id": post_id, "account_id": account_id},
             )
 
         except Exception as e:
             logger.error(
                 "Failed to upsert post embedding",
                 exc_info=e,
-                extra={"post_id": post_id, "channel_id": channel_id},
+                extra={"post_id": post_id, "account_id": account_id},
             )
             raise RuntimeError(
                 f"Failed to upsert embedding for post {post_id}: {e}"
@@ -529,7 +529,7 @@ class QdrantService:
             score_threshold: Minimum similarity score threshold (0-1).
 
         Returns:
-            List of dictionaries containing post_id, score, text, and channel_id.
+            List of dictionaries containing post_id, score, text, and account_id.
 
         Raises:
             RuntimeError: If service is not initialized or search fails.
@@ -565,7 +565,7 @@ class QdrantService:
                     "post_id": hit.id,
                     "score": hit.score,
                     "text": hit.payload.get("text", "") if hit.payload else "",
-                    "channel_id": hit.payload.get("channel_id", 0) if hit.payload else 0,
+                    "account_id": hit.payload.get("account_id", 0) if hit.payload else 0,
                 }
                 for hit in response.points
             ]
@@ -599,7 +599,7 @@ class QdrantService:
         except Exception as e:
             logger.warning("Error closing Qdrant client", exc_info=e)
 
-    async def __aenter__(self) -> QdrantService:
+    async def __aenter__(self) -> "QdrantService":
         """Async context manager entry."""
 
         await self.initialize()

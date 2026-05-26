@@ -120,9 +120,9 @@ if [ $ELAPSED -ge $MAX_WAIT ]; then
     exit 1
 fi
 
-# Step 3c: Run database migration in an ephemeral container
-echo "Running database migration..."
-docker compose -f $COMPOSE_FILE run --rm parser python -m src.db.migrate
+# Step 3c: Run database migration using Alembic
+echo "Running database migration with Alembic..."
+docker compose -f $COMPOSE_FILE run --rm parser alembic upgrade head
 
 # Step 3d: Start crawler service with --no-deps to avoid triggering DB restarts
 echo "Starting crawler service..."

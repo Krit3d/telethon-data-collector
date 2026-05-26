@@ -1,5 +1,5 @@
 """
-Asynchronous CRUD operations for channels and posts using SQLAlchemy 2.0.
+Asynchronous CRUD operations for accounts and content using SQLAlchemy 2.0.
 """
 
 import asyncio
@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import joinedload
 
-from src.db.models import Base, Channel, Post
+from src.db.models import Base, Account, Content
 
 logger = logging.getLogger(__name__)
 
@@ -120,8 +120,8 @@ class Database:
                             "Entity",
                             "Event",
                             "Place",
-                            "Channel",
-                            "Post",
+                            "Account",
+                            "Content",
                         ]
                         for label in vertex_labels:
                             try:
@@ -166,8 +166,8 @@ class Database:
                         "Entity",
                         "Event",
                         "Place",
-                        "Channel",
-                        "Post",
+                        "Account",
+                        "Content",
                     ]
                     for label in labels:
                         try:
@@ -247,16 +247,16 @@ class Database:
                 )
                 await asyncio.sleep(total_delay)
 
-    async def reset_orphaned_processing_channels(self) -> None:
-        """Reset all channels with status='processing' back to 'pending'.
+    async def reset_orphaned_processing_accounts(self) -> None:
+        """Reset all accounts with status='processing' back to 'pending'.
 
-        This recovers from crashes/restarts where channels were left in processing state.
+        This recovers from crashes/restarts where accounts were left in processing state.
         """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    update(Channel)
-                    .where(Channel.status == "processing")
+                    update(Account)
+                    .where(Account.status == "processing")
                     .values(status="pending")
                 )
                 result = await session.execute(stmt)
@@ -264,33 +264,33 @@ class Database:
 
                 if count > 0:
                     logger.info(
-                        "Reset orphaned processing channels back to pending: %d channels",
+                        "Reset orphaned processing accounts back to pending: %d accounts",
                         count,
                     )
                 else:
-                    logger.debug("No orphaned processing channels found")
+                    logger.debug("No orphaned processing accounts found")
 
     async def close(self) -> None:
         """Close all database connections."""
         await self.engine.dispose()
         logger.info("Database connections closed")
 
-    async def upsert_channel(self, channel_data: dict[str, Any]) -> Channel:
+    async def upsert_account(self, account_data: dict[str, Any]) -> Account:
         """
-        Insert or update a channel record.
+        Insert or update an account record.
 
         Conflict is detected on the id field (Telegram channel_id).
         On conflict, all mutable fields except the primary key are updated.
         Status is preserved if it's already 'parsed' or 'ready_for_parsing'.
 
         Args:
-            channel_data: Dictionary with fields matching the Channel model.
+            account_data: Dictionary with fields matching the Account model.
 
         Returns:
-            The persisted Channel object.
+            The persisted Account object.
         """
 
-        stmt = insert(Channel).values(**channel_data)
+        stmt = insert(Account).values(**account_data)
         update_columns = {
             "username": stmt.excluded.username,
             "title": stmt.excluded.title,
@@ -301,8 +301,8 @@ class Database:
             "updated_at": stmt.excluded.updated_at,
             "status": case(
                 (
-                    Channel.status.in_(["parsed", "ready_for_parsing"]),
-                    Channel.status,
+                    Account.status.in_(["parsed", "ready_for_parsing"]),
+                    Account.status,
                 ),
                 else_=stmt.excluded.status,
             ),
@@ -316,34 +316,34 @@ class Database:
             async with session.begin():
                 await session.execute(stmt)
                 # Retrieve the current record (may have existed already)
-                channel = await session.get(Channel, channel_data["id"])
+                account = await session.get(Account, account_data["id"])
 
-                if channel is None:
+                if account is None:
                     # Fallback manual creation (should not happen under normal circumstances)
-                    channel = Channel(**channel_data)
-                    session.add(channel)
+                    account = Account(**account_data)
+                    session.add(account)
                     await session.flush()
 
-                logger.debug("Upserted channel: %s", channel)
+                logger.debug("Upserted account: %s", account)
 
-                return channel
+                return account
 
-    async def upsert_post(self, post_data: dict[str, Any]) -> Post:
+    async def upsert_content(self, content_data: dict[str, Any]) -> Content:
         """
-        Insert or update a post record.
+        Insert or update a content record.
 
-        Conflict is detected on the composite unique key (channel_id, message_id).
+        Conflict is detected on the composite unique key (account_id, message_id).
         On conflict, only metrics (views, comments, shares, reactions) are updated.
         Content and published_at are preserved to avoid overwriting existing data.
 
         Args:
-            post_data: Dictionary with fields matching the Post model.
+            content_data: Dictionary with fields matching the Content model.
 
         Returns:
-            The persisted Post object.
+            The persisted Content object.
         """
 
-        stmt = insert(Post).values(**post_data)
+        stmt = insert(Content).values(**content_data)
 
         update_columns = {
             "views": stmt.excluded.views,
@@ -358,7 +358,7 @@ class Database:
         }
 
         stmt = stmt.on_conflict_do_update(
-            constraint="uq_post_channel_message",
+            constraint="uq_content_account_message",
             set_=update_columns,
         )
 
@@ -367,377 +367,377 @@ class Database:
                 await session.execute(stmt)
 
                 # Retrieve the saved object
-                post = await self._get_post_by_unique(
-                    session, post_data["channel_id"], post_data["message_id"]
+                content = await self._get_content_by_unique(
+                    session, content_data["account_id"], content_data["message_id"]
                 )
 
-                if post is None:
+                if content is None:
                     # Fallback manual creation if upsert failed unexpectedly
-                    post = Post(**post_data)
-                    session.add(post)
+                    content = Content(**content_data)
+                    session.add(content)
                     await session.flush()
 
-                logger.debug("Upserted post: %s", post)
-                return post
+                logger.debug("Upserted content: %s", content)
+                return content
 
-    async def _get_post_by_unique(
-        self, session: AsyncSession, channel_id: int, message_id: int
-    ) -> Post | None:
-        """Helper method to fetch a post by its composite natural key."""
-        stmt = select(Post).where(
-            Post.channel_id == channel_id, Post.message_id == message_id
+    async def _get_content_by_unique(
+        self, session: AsyncSession, account_id: int, message_id: int
+    ) -> Content | None:
+        """Helper method to fetch a content by its composite natural key."""
+        stmt = select(Content).where(
+            Content.account_id == account_id, Content.message_id == message_id
         )
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def get_channels_batch(
-        self, channel_ids: Sequence[int]
-    ) -> dict[int, Channel]:
+    async def get_accounts_batch(
+        self, account_ids: Sequence[int]
+    ) -> dict[int, Account]:
         """
-        Return a dictionary of existing channels by a list of IDs.
+        Return a dictionary of existing accounts by a list of IDs.
 
-        Useful for checking which channels are already in the DB before parsing.
+        Useful for checking which accounts are already in the DB before parsing.
 
         Args:
-            channel_ids: List of Telegram channel IDs.
+            account_ids: List of Telegram account IDs.
 
         Returns:
-            Dictionary mapping channel_id to Channel object.
+            Dictionary mapping account_id to Account object.
         """
 
-        if not channel_ids:
+        if not account_ids:
             return {}
 
         async with self.async_session() as session:
-            stmt = select(Channel).where(Channel.id.in_(channel_ids))
+            stmt = select(Account).where(Account.id.in_(account_ids))
             result = await session.execute(stmt)
-            channels = result.scalars().all()
-            return {ch.id: ch for ch in channels}
+            accounts = result.scalars().all()
+            return {acc.id: acc for acc in accounts}
 
-    async def get_posts_by_ids(self, post_ids: list[int]) -> dict[int, Post]:
+    async def get_content_by_ids(self, content_ids: list[int]) -> dict[int, Content]:
         """
-        Fetch posts by a list of post IDs with their associated channels eagerly loaded.
+        Fetch content by a list of content IDs with their associated accounts eagerly loaded.
 
         Args:
-            post_ids: List of PostgreSQL post IDs (primary keys).
+            content_ids: List of PostgreSQL content IDs (primary keys).
 
         Returns:
-            Dictionary mapping post_id to Post object (with .channel populated) for efficient lookup.
+            Dictionary mapping content_id to Content object (with .account populated) for efficient lookup.
         """
-        if not post_ids:
+        if not content_ids:
             return {}
 
         async with self.async_session() as session:
             stmt = (
-                select(Post)
-                .options(joinedload(Post.channel))
-                .where(Post.id.in_(post_ids))
+                select(Content)
+                .options(joinedload(Content.account))
+                .where(Content.id.in_(content_ids))
             )
             result = await session.execute(stmt)
-            posts = result.scalars().all()
-            return {post.id: post for post in posts}
+            content_items = result.scalars().all()
+            return {item.id: item for item in content_items}
 
-    async def get_recent_posts(self, limit: int = 100) -> list[Post]:
-        """Fetch recent posts from the database for indexing."""
+    async def get_recent_content(self, limit: int = 100) -> list[Content]:
+        """Fetch recent content from the database for indexing."""
         async with self.async_session() as session:
-            stmt = select(Post).order_by(Post.id.desc()).limit(limit)
+            stmt = select(Content).order_by(Content.id.desc()).limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    async def get_unextracted_posts(
+    async def get_unextracted_content(
         self, limit: int = 50, priority_mode: bool = False
-    ) -> list[Post]:
+    ) -> list[Content]:
         """
-        Fetch posts that have not yet been extracted to knowledge graph.
+        Fetch content that has not yet been extracted to knowledge graph.
 
         Args:
-            limit: Maximum number of posts to return.
+            limit: Maximum number of content to return.
             priority_mode: If True, order by published_at DESC (most recent first).
                           If False, order by id ASC (oldest first).
 
         Returns:
-            List of Post objects where is_extracted is False.
+            List of Content objects where is_graph_extracted is False.
         """
 
         async with self.async_session() as session:
-            stmt = select(Post).where(Post.is_extracted == False)  # noqa: E712
+            stmt = select(Content).where(Content.is_graph_extracted == False)  # noqa: E712
 
             if priority_mode:
-                # Priority mode: process most recent posts first (for search relevance)
-                stmt = stmt.order_by(Post.published_at.desc())
+                # Priority mode: process most recent content first (for search relevance)
+                stmt = stmt.order_by(Content.published_at.desc())
             else:
-                # Default: process oldest posts first (FIFO)
-                stmt = stmt.order_by(Post.id.asc())
+                # Default: process oldest content first (FIFO)
+                stmt = stmt.order_by(Content.id.asc())
 
             stmt = stmt.limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    async def mark_post_extracted(self, post_id: int) -> None:
-        """Mark a post as extracted (is_extracted = True).
+    async def mark_content_extracted(self, content_id: int) -> None:
+        """Mark a content as extracted (is_graph_extracted = True).
 
         Uses a direct atomic UPDATE statement to avoid FOR UPDATE issues
         with outer joins caused by lazy="joined" relationships.
 
         Args:
-            post_id: The database ID of the post to mark as extracted.
+            content_id: The database ID of the content to mark as extracted.
         """
 
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    update(Post)
-                    .where(Post.id == post_id)
-                    .values(is_extracted=True)
+                    update(Content)
+                    .where(Content.id == content_id)
+                    .values(is_graph_extracted=True)
                 )
                 result = await session.execute(stmt)
 
                 if result.rowcount > 0:  # type: ignore[attr-defined]
-                    logger.debug("Marked post id=%s as extracted", post_id)
+                    logger.debug("Marked content id=%s as extracted", content_id)
                 else:
                     logger.warning(
-                        "Post id=%s not found when marking as extracted",
-                        post_id,
+                        "Content id=%s not found when marking as extracted",
+                        content_id,
                     )
 
-    async def get_random_pending_channel(
+    async def get_random_pending_account(
         self, require_hash: bool = False
-    ) -> Channel | None:
+    ) -> Account | None:
         """
-        Fetch a random channel with status='pending' and mark it as 'processing'.
+        Fetch a random account with status='pending' and mark it as 'processing'.
 
         Uses FOR UPDATE SKIP LOCKED to avoid race conditions between workers.
-        After marking, the transaction is committed so the channel is immediately
+        After marking, the transaction is committed so the account is immediately
         visible to other workers as 'processing'.
 
         Args:
-            require_hash: If True, only return channels with non-null access_hash.
-                This allows "weak" accounts to fetch only channels that can be
+            require_hash: If True, only return accounts with non-null access_hash.
+                This allows "weak" accounts to fetch only accounts that can be
                 accessed directly without global search.
 
         Returns:
-            The selected Channel entity, or None if no pending channels exist.
+            The selected Account entity, or None if no pending accounts exist.
         """
 
         async with self.async_session() as session:
             # Start transaction with row-level lock
             async with session.begin():
                 # Build query with optional hash requirement
-                stmt = select(Channel).where(Channel.status == "pending")
+                stmt = select(Account).where(Account.status == "pending")
                 if require_hash:
-                    stmt = stmt.where(Channel.access_hash.is_not(None))
+                    stmt = stmt.where(Account.access_hash.is_not(None))
 
-                # Get random pending channel and lock it
+                # Get random pending account and lock it
                 stmt = (
                     stmt.order_by(func.random())
                     .limit(1)
                     .with_for_update(skip_locked=True)
                 )
                 result = await session.execute(stmt)
-                channel = result.scalar_one_or_none()
+                account = result.scalar_one_or_none()
 
-                if channel is not None:
-                    channel.status = "processing"
+                if account is not None:
+                    account.status = "processing"
                     logger.debug(
-                        "Claimed channel id=%s username=%s for processing",
-                        channel.id,
-                        channel.username,
+                        "Claimed account id=%s username=%s for processing",
+                        account.id,
+                        account.username,
                     )
                 else:
-                    logger.debug("No pending channels available")
+                    logger.debug("No pending accounts available")
 
-                return channel
+                return account
 
-    async def mark_channel_processed(self, channel_id: int) -> None:
-        """Mark a channel as successfully processed (status='parsed')."""
+    async def mark_account_processed(self, account_id: int) -> None:
+        """Mark an account as successfully processed (status='parsed')."""
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    select(Channel)
-                    .where(Channel.id == channel_id)
+                    select(Account)
+                    .where(Account.id == account_id)
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
-                channel = result.scalar_one_or_none()
+                account = result.scalar_one_or_none()
 
-                if channel is not None:
-                    channel.status = "ready_for_parsing"
-                    logger.debug("Marked channel id=%s as parsed", channel_id)
+                if account is not None:
+                    account.status = "ready_for_parsing"
+                    logger.debug("Marked account id=%s as processed", account_id)
 
-    async def mark_channel_rejected(self, channel_id: int) -> None:
-        """Mark a channel as rejected (status='rejected')."""
+    async def mark_account_rejected(self, account_id: int) -> None:
+        """Mark an account as rejected (status='rejected')."""
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    select(Channel)
-                    .where(Channel.id == channel_id)
+                    select(Account)
+                    .where(Account.id == account_id)
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
-                channel = result.scalar_one_or_none()
+                account = result.scalar_one_or_none()
 
-                if channel is not None:
-                    channel.status = "rejected"
-                    logger.debug("Marked channel id=%s as rejected", channel_id)
+                if account is not None:
+                    account.status = "rejected"
+                    logger.debug("Marked account id=%s as rejected", account_id)
 
-    async def get_channel_for_parsing(
+    async def get_account_for_parsing(
         self, session_index: int | None = None, total_sessions: int | None = None
-    ) -> Channel | None:
-        """Fetch a channel ready for POST PARSING and mark as processing.
+    ) -> Account | None:
+        """Fetch an account ready for CONTENT PARSING and mark as processing.
 
-        Implements session-channel sharding to reuse Telethon's local SQLite cache
-        and avoid FloodWait on username resolution. Each session claims channels
-        from its shard first, then falls back to any available channel.
+        Implements session-account sharding to reuse Telethon's local SQLite cache
+        and avoid FloodWait on username resolution. Each session claims accounts
+        from its shard first, then falls back to any available account.
 
         Args:
             session_index: Optional zero-based index of the current session (0 to total_sessions-1).
             total_sessions: Optional total number of sessions for sharding.
 
         Returns:
-            The claimed Channel entity, or None if no channels are available.
+            The claimed Account entity, or None if no accounts are available.
         """
         async with self.async_session() as session:
             async with session.begin():
-                channel = None
+                account = None
 
-                # Stage 1: Try to claim a channel from this session's shard
+                # Stage 1: Try to claim an account from this session's shard
                 if session_index is not None and total_sessions is not None and total_sessions > 0:
                     shard_stmt = (
-                        select(Channel)
-                        .where(Channel.status == "ready_for_parsing")
-                        .where(Channel.is_author_blog == True)  # noqa: E712
-                        .where(Channel.access_hash.is_not(None))
-                        # Shard condition: Channel.id % total_sessions == session_index
-                        .where(func.mod(Channel.id, total_sessions) == session_index)
+                        select(Account)
+                        .where(Account.status == "ready_for_parsing")
+                        .where(Account.is_author_blog == True)  # noqa: E712
+                        .where(Account.access_hash.is_not(None))
+                        # Shard condition: Account.id % total_sessions == session_index
+                        .where(func.mod(Account.id, total_sessions) == session_index)
                         .order_by(func.random())
                         .limit(1)
                         .with_for_update(skip_locked=True)
                     )
                     result = await session.execute(shard_stmt)
-                    channel = result.scalar_one_or_none()
+                    account = result.scalar_one_or_none()
 
-                    if channel:
-                        channel.status = "processing"
+                    if account:
+                        account.status = "processing"
                         logger.debug(
-                            "Parser claimed shard channel id=%s username=%s (session_index=%s/%s)",
-                            channel.id,
-                            channel.username,
+                            "Parser claimed shard account id=%s username=%s (session_index=%s/%s)",
+                            account.id,
+                            account.username,
                             session_index,
                             total_sessions,
                         )
-                        return channel
+                        return account
 
                     logger.debug(
-                        "No channels available in shard %s/%s, trying fallback",
+                        "No accounts available in shard %s/%s, trying fallback",
                         session_index,
                         total_sessions,
                     )
 
-                # Stage 2: Fallback - claim ANY available channel
+                # Stage 2: Fallback - claim ANY available account
                 # This prevents idle workers when some sessions are in cooldown
                 fallback_stmt = (
-                    select(Channel)
-                    .where(Channel.status == "ready_for_parsing")
-                    .where(Channel.is_author_blog == True)  # noqa: E712
-                    .where(Channel.access_hash.is_not(None))
+                    select(Account)
+                    .where(Account.status == "ready_for_parsing")
+                    .where(Account.is_author_blog == True)  # noqa: E712
+                    .where(Account.access_hash.is_not(None))
                     .order_by(func.random())
                     .limit(1)
                     .with_for_update(skip_locked=True)
                 )
                 result = await session.execute(fallback_stmt)
-                channel = result.scalar_one_or_none()
+                account = result.scalar_one_or_none()
 
-                if channel:
-                    channel.status = "processing"
+                if account:
+                    account.status = "processing"
                     logger.debug(
-                        "Parser claimed channel (fallback) id=%s username=%s (has access_hash)",
-                        channel.id,
-                        channel.username,
+                        "Parser claimed account (fallback) id=%s username=%s (has access_hash)",
+                        account.id,
+                        account.username,
                     )
                 else:
-                    logger.debug("No pending channels available for parsing")
+                    logger.debug("No pending accounts available for parsing")
 
-                return channel
+                return account
 
-    async def mark_channel_parsed(self, channel_id: int) -> None:
-        """Mark a channel as completely parsed (posts are saved)."""
+    async def mark_account_parsed(self, account_id: int) -> None:
+        """Mark an account as completely parsed (content are saved)."""
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    select(Channel)
-                    .where(Channel.id == channel_id)
+                    select(Account)
+                    .where(Account.id == account_id)
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
-                channel = result.scalar_one_or_none()
+                account = result.scalar_one_or_none()
 
-                if channel is not None:
-                    channel.status = "parsed"
+                if account is not None:
+                    account.status = "parsed"
                     logger.debug(
-                        "Marked channel id=%s as COMPLETELY PARSED", channel_id
+                        "Marked account id=%s as COMPLETELY PARSED", account_id
                     )
 
-    async def mark_channel_pending(self, channel_id: int) -> None:
-        """Return a channel to pending status (e.g., if a worker failed due to a shadowban)."""
+    async def mark_account_pending(self, account_id: int) -> None:
+        """Return an account to pending status (e.g., if a worker failed due to a shadowban)."""
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    select(Channel)
-                    .where(Channel.id == channel_id)
+                    select(Account)
+                    .where(Account.id == account_id)
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
-                channel = result.scalar_one_or_none()
+                account = result.scalar_one_or_none()
 
-                if channel is not None:
-                    channel.status = "pending"
+                if account is not None:
+                    account.status = "pending"
                     logger.debug(
-                        "Returned channel id=%s to pending state", channel_id
+                        "Returned account id=%s to pending state", account_id
                     )
 
-    async def update_channel_access_hash(
-        self, channel_id: int, access_hash: int
+    async def update_account_access_hash(
+        self, account_id: int, access_hash: int
     ) -> None:
-        """Update the access_hash for a channel.
+        """Update the access_hash for an account.
 
         This is used to store the session-local correct access_hash after
         successful resolution by username.
 
         Args:
-            channel_id: Telegram channel ID.
+            account_id: Telegram account ID.
             access_hash: The resolved access_hash for this session.
         """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    select(Channel)
-                    .where(Channel.id == channel_id)
+                    select(Account)
+                    .where(Account.id == account_id)
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
-                channel = result.scalar_one_or_none()
+                account = result.scalar_one_or_none()
 
-                if channel is not None:
-                    channel.access_hash = access_hash
+                if account is not None:
+                    account.access_hash = access_hash
                     logger.debug(
-                        "Updated access_hash for channel id=%s", channel_id
+                        "Updated access_hash for account id=%s", account_id
                     )
 
-    async def get_latest_message_id(self, channel_id: int) -> int | None:
-        """Fetch the latest (highest) message ID for a given channel.
+    async def get_latest_message_id(self, account_id: int) -> int | None:
+        """Fetch the latest (highest) message ID for a given account.
 
         This is used to implement smart skip logic in the parser,
         allowing us to avoid re-fetching messages we already have.
 
         Args:
-            channel_id: Telegram channel ID.
+            account_id: Telegram account ID.
 
         Returns:
-            The highest message_id for the channel, or None if no posts exist.
+            The highest message_id for the account, or None if no content exist.
         """
         async with self.async_session() as session:
-            stmt = select(func.max(Post.message_id)).where(
-                Post.channel_id == channel_id
+            stmt = select(func.max(Content.message_id)).where(
+                Content.account_id == account_id
             )
             result = await session.execute(stmt)
             return result.scalar()  # Returns None if no rows exist

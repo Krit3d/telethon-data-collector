@@ -1,7 +1,7 @@
-"""Background worker for knowledge extraction from unextracted posts.
+"""Background worker for knowledge extraction from unextracted content.
 
 This worker runs independently from the scraper service. It polls the database
-for posts where is_extracted=False, extracts knowledge triples using LLM,
+for content where is_extracted=False, extracts knowledge triples using LLM,
 stores them in Apache AGE graph, and syncs entities to Qdrant for vector search.
 """
 
@@ -23,7 +23,7 @@ except ImportError:
 from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.graph_repo import GraphRepository
-from src.db.models import Post
+from src.db.models import Content
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.extractor import KnowledgeExtractor
 
@@ -34,7 +34,7 @@ RATE_LIMIT_COOLDOWN = 60
 
 
 class ExtractionWorker:
-    """Background worker that processes unextracted posts."""
+    """Background worker that processes unextracted content."""
 
     def __init__(
         self,
@@ -54,8 +54,8 @@ class ExtractionWorker:
             qdrant: QdrantService for entity embedding sync.
             extractor: KnowledgeExtractor for LLM-based extraction.
             settings: Application settings containing concurrency configuration.
-            batch_size: Number of posts to fetch per poll.
-            poll_interval: Sleep interval in seconds when no posts are found.
+            batch_size: Number of content items to fetch per poll.
+            poll_interval: Sleep interval in seconds when no content is found.
         """
         self.db = db
         self.graph_repo = graph_repo
@@ -73,7 +73,7 @@ class ExtractionWorker:
         self._shutdown_event.set()
 
     async def run(self) -> None:
-        """Main worker loop: continuously poll and process unextracted posts."""
+        """Main worker loop: continuously poll and process unextracted content."""
         logger.info(
             "Extraction worker started (batch_size=%d, poll_interval=%ds, priority_mode=%s)",
             self.batch_size,
@@ -83,15 +83,15 @@ class ExtractionWorker:
 
         while not self._shutdown_event.is_set():
             try:
-                # Fetch batch of unextracted posts
+                # Fetch batch of unextracted content
                 try:
-                    posts = await self.db.get_unextracted_posts(
+                    posts = await self.db.get_unextracted_content(
                         limit=self.batch_size, priority_mode=self.priority_mode
                     )
                 except (OperationalError, PostgresError) as e:
                     # Database connection error - log warning, back off, and retry
                     logger.warning(
-                        "Database connection error while fetching posts: %s. "
+                        "Database connection error while fetching content: %s. "
                         "Retrying after backoff (%.1fs)...",
                         e,
                         self.poll_interval * 2,
@@ -109,25 +109,25 @@ class ExtractionWorker:
 
                 if not posts:
                     logger.debug(
-                        "No unextracted posts found, sleeping %ds",
+                        "No unextracted content found, sleeping %ds",
                         self.poll_interval,
                     )
                     await asyncio.sleep(self.poll_interval)
                     continue
 
                 logger.info(
-                    "Processing batch of %d unextracted posts", len(posts)
+                    "Processing batch of %d unextracted content items", len(posts)
                 )
 
                 # Configure concurrency semaphore with extractor-specific limit
                 semaphore = asyncio.Semaphore(self.settings.extractor_concurrency)
 
-                async def process_with_semaphore(post: Post) -> None:
-                    """Process a single post with semaphore-based rate limiting."""
+                async def process_with_semaphore(post: Content) -> None:
+                    """Process a single content item with semaphore-based rate limiting."""
                     async with semaphore:
                         await self._process_single_post(post)
 
-                # Process posts concurrently, return exceptions instead of raising
+                # Process content concurrently, return exceptions instead of raising
                 tasks = [process_with_semaphore(post) for post in posts]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -136,7 +136,7 @@ class ExtractionWorker:
                     if isinstance(result, Exception):
                         post = posts[idx]
                         logger.error(
-                            "Unhandled exception processing post id=%s: %s",
+                            "Unhandled exception processing content id=%s: %s",
                             post.id,
                             result,
                             exc_info=result,
@@ -156,22 +156,22 @@ class ExtractionWorker:
 
         logger.info("Extraction worker stopped")
 
-    async def _process_single_post(self, post: Post) -> None:
-        """Process a single post: extract knowledge and mark as extracted.
+    async def _process_single_post(self, post: Content) -> None:
+        """Process a single content item: extract knowledge and mark as extracted.
 
         Args:
-            post: Post object from database.
+            post: Content object from database.
         """
         if not post.content or not post.content.strip():
             logger.debug(
-                "Post id=%s has no content, skipping extraction", post.id
+                "Content id=%s has no content, skipping extraction", post.id
             )
-            await self.db.mark_post_extracted(post.id)
+            await self.db.mark_content_extracted(post.id)
             return
 
-        logger.debug("Extracting knowledge from post id=%s", post.id)
+        logger.debug("Extracting knowledge from content id=%s", post.id)
 
-        # Extract post metrics directly from SQL model
+        # Extract content metrics directly from SQL model
         post_metrics: dict[str, int | None] = {
             "views": post.views,
             "reactions_count": post.reactions_count,
@@ -188,7 +188,7 @@ class ExtractionWorker:
             await self.extractor.process_post(
                 post_id=post.id,
                 text=post.content,
-                author_id=post.channel_id,
+                author_id=post.account_id,
                 post_metrics=post_metrics,
                 raw_metadata=raw_metadata,
                 graph_repo=self.graph_repo,
@@ -197,7 +197,7 @@ class ExtractionWorker:
         except Exception as e:
             # Log the full traceback for unrecoverable errors (validation, JSON parsing, API failures)
             logger.error(
-                "Unrecoverable error extracting knowledge for post id=%s: %s",
+                "Unrecoverable error extracting knowledge for content id=%s: %s",
                 post.id,
                 e,
                 exc_info=True,
@@ -209,7 +209,7 @@ class ExtractionWorker:
                 async with self.db.async_session() as session:
                     await session.execute(
                         text("""
-                            UPDATE posts
+                            UPDATE content
                             SET raw_metadata = COALESCE(raw_metadata, '{}'::jsonb) ||
                                 jsonb_build_object('extraction_error', :error_msg, 'failed_at', :failed_at)
                             WHERE id = :post_id
@@ -224,20 +224,20 @@ class ExtractionWorker:
             except Exception as db_err:
                 # Log but don't crash - we still need to mark as extracted to prevent infinite loops
                 logger.error(
-                    "Failed to update raw_metadata for post id=%s: %s",
+                    "Failed to update raw_metadata for content id=%s: %s",
                     post.id,
                     db_err,
                     exc_info=True,
                 )
 
             # Always mark as extracted to remove from unextracted queue and prevent infinite LLM API token wastage
-            await self.db.mark_post_extracted(post.id)
+            await self.db.mark_content_extracted(post.id)
             return
 
-        # Mark post as extracted only after successful processing
-        await self.db.mark_post_extracted(post.id)
+        # Mark content as extracted only after successful processing
+        await self.db.mark_content_extracted(post.id)
 
-        logger.info("Completed post id=%s", post.id)
+        logger.info("Completed content id=%s", post.id)
 
 
 async def run_extractor() -> None:
@@ -282,7 +282,7 @@ async def run_extractor() -> None:
         batch_size=settings.extractor_batch_size,
         poll_interval=5,
     )
-    # Set priority mode from configuration (default: True for recent posts first)
+    # Set priority mode from configuration (default: True for recent content first)
     worker.priority_mode = settings.extraction_priority_mode
 
     # Register signal handlers for graceful shutdown

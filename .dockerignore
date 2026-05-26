@@ -10,6 +10,7 @@ lib/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
 
 # Ignoring secrets
 sessions/

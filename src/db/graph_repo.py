@@ -20,7 +20,7 @@ ID_PREFIX_TO_LABEL: dict[str, str] = {
     "entity_": "Entity",
     "event_": "Event",
     "place_": "Place",
-    "post_": "Post",
+    "content_": "Content",
 }
 
 
@@ -220,7 +220,7 @@ class GraphRepository:
         the "SET clause expects a map" error in Apache AGE.
 
         Args:
-            label: Graph node label (e.g., 'Channel', 'Post'). Must be alphanumeric.
+            label: Graph node label (e.g., 'Account', 'Content'). Must be alphanumeric.
             properties: Dictionary of node properties.
             merge_key: Property name to use for MERGE matching (default: 'id').
 
