@@ -1,78 +1,60 @@
 """
 Platform parser factory module.
 
-Provides a factory function to dynamically resolve and instantiate platform-specific
-parsers based on the platform string. Supports Instagram and TikTok platforms.
+Exposes `get_platform_parser` to dynamically instantiate platform-specific parsers
+for supported social media platforms.
 """
 
-import logging
-from typing import TYPE_CHECKING
-
-from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.config.config import Settings
-from src.parser.creators.platforms.base import BasePlatformParser
-
-if TYPE_CHECKING:
-    from src.parser.creators.sc_client import ScrapeCreatorsClient
-
-logger = logging.getLogger(__name__)
-
-# Supported platforms mapping
-SUPPORTED_PLATFORMS = {
-    "INSTAGRAM": "InstagramParser",
-    "TIKTOK": "TikTokParser",
-}
+from src.parser.creators.sc_client import ScrapeCreatorsClient
+from .base import BasePlatformParser
+from .instagram import InstagramPlatformParser
+from .threads import ThreadsPlatformParser
+from .tiktok import TikTokPlatformParser
+from .youtube import YouTubePlatformParser
 
 
 def get_platform_parser(
     platform: str,
     session_maker: async_sessionmaker[AsyncSession],
-    client: "ScrapeCreatorsClient",
+    client: ScrapeCreatorsClient,
     settings: Settings,
 ) -> BasePlatformParser:
-    """
-    Factory function to get the appropriate platform parser instance.
-
-    Normalizes the platform string to uppercase and returns the corresponding
-    platform parser instance initialized with the provided dependencies.
+    """Dynamically fetch and instantiate a platform parser for the given platform.
 
     Args:
-        platform: Platform name string (e.g., "instagram", "TIKTOK").
-        session_maker: SQLAlchemy async session maker for database operations.
-        client: ScrapeCreatorsClient instance for API requests.
-        settings: Application settings containing configuration values.
+        platform: Identifier for the target platform (e.g., "INSTAGRAM", "THREADS", "TIKTOK", "YOUTUBE").
+            Case-insensitive matching is applied.
+        session_maker: Async session maker for database transactions.
+        client: Client for ScrapeCreators API interactions.
+        settings: Application configuration settings.
 
     Returns:
-        An instance of the appropriate BasePlatformParser subclass.
+        An initialized platform parser instance matching the requested platform.
 
     Raises:
-        ValueError: If the platform is not supported.
+        ValueError: If the provided platform string is not supported.
     """
+    platform_registry = {
+        "INSTAGRAM": InstagramPlatformParser,
+        "THREADS": ThreadsPlatformParser,
+        "TIKTOK": TikTokPlatformParser,
+        "YOUTUBE": YouTubePlatformParser,
+    }
+
     normalized_platform = platform.upper()
+    parser_cls = platform_registry.get(normalized_platform)
 
-    if normalized_platform == "INSTAGRAM":
-        from src.parser.creators.platforms.instagram import InstagramParser
-
-        logger.debug(f"Creating InstagramParser for platform: {platform}")
-        return InstagramParser(
-            session_maker=session_maker,
-            client=client,
-            settings=settings,
+    if parser_cls is None:
+        supported_platforms = ", ".join(platform_registry.keys())
+        raise ValueError(
+            f"Unsupported platform '{platform}'. Supported platforms: {supported_platforms}"
         )
 
-    if normalized_platform == "TIKTOK":
-        from src.parser.creators.platforms.tiktok import TikTokParser
-
-        logger.debug(f"Creating TikTokParser for platform: {platform}")
-        return TikTokParser(
-            session_maker=session_maker,
-            client=client,
-            settings=settings,
-        )
-
-    logger.error(f"Unsupported platform requested: {platform}")
-    raise ValueError(
-        f"Unsupported platform: '{platform}'. "
-        f"Supported platforms are: {list(SUPPORTED_PLATFORMS.keys())}"
+    return parser_cls(
+        session_maker=session_maker,
+        client=client,
+        settings=settings,
     )

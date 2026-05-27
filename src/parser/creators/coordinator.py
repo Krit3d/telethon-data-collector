@@ -3,17 +3,22 @@ Multi-platform Ingestion Coordinator for creators scraping.
 
 Queries the database for pending accounts, processes them concurrently across
 different platforms (Instagram, TikTok), and updates their scraping status.
+
+This module is designed to run as a production-grade background daemon with
+graceful shutdown handling for OS signals (SIGTERM, SIGINT).
 """
 
 import asyncio
 import logging
+import signal
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from src.config.config import Settings
+from src.config.config import Settings, load_settings
 from src.db.models import Account
 from src.parser.creators.platforms import get_platform_parser
 from src.parser.creators.sc_client import ScrapeCreatorsClient
@@ -36,6 +41,9 @@ DEFAULT_STATUS_UPDATE_THRESHOLD_HOURS = 24
 # Minimum subscribers/followers threshold for processing
 MIN_SUBSCRIBERS_THRESHOLD = 3000
 
+# Default poll interval for the daemon loop (seconds)
+DEFAULT_CREATORS_POLL_INTERVAL_S = 300
+
 
 class CreatorsCoordinator:
     """
@@ -50,6 +58,7 @@ class CreatorsCoordinator:
         self,
         session_maker: async_sessionmaker[AsyncSession],
         settings: Settings,
+        shutdown_event: asyncio.Event | None = None,
     ) -> None:
         """
         Initialize the coordinator with database and settings.
@@ -57,21 +66,30 @@ class CreatorsCoordinator:
         Args:
             session_maker: SQLAlchemy async session maker for database operations.
             settings: Application settings containing configuration values.
+            shutdown_event: Optional asyncio.Event for graceful shutdown coordination.
         """
         self.session_maker = session_maker
         self.settings = settings
-        self.min_subscribers: int = getattr(
-            settings, "CREATORS_MIN_SUBSCRIBERS", MIN_SUBSCRIBERS_THRESHOLD
-        )
-        self.status_threshold_hours: int = getattr(
-            settings,
-            "CREATORS_STATUS_THRESHOLD_HOURS",
-            DEFAULT_STATUS_UPDATE_THRESHOLD_HOURS,
-        )
+        self._shutdown_event = shutdown_event
+        self.min_subscribers: int = settings.creators_min_subscribers
+        self.status_threshold_hours: int = settings.creators_status_threshold_hours
+        self.poll_interval_s: int = settings.creators_poll_interval_s
         logger.info(
             f"CreatorsCoordinator initialized with min_subscribers={self.min_subscribers}, "
-            f"status_threshold_hours={self.status_threshold_hours}"
+            f"status_threshold_hours={self.status_threshold_hours}, "
+            f"poll_interval_s={self.poll_interval_s}"
         )
+
+    def is_shutdown_requested(self) -> bool:
+        """
+        Check if a graceful shutdown has been requested.
+
+        Returns:
+            True if shutdown event is set, False otherwise.
+        """
+        if self._shutdown_event is None:
+            return False
+        return self._shutdown_event.is_set()
 
     async def run_once(
         self,
@@ -81,10 +99,10 @@ class CreatorsCoordinator:
         """
         Run a single ingestion cycle: query pending accounts and process them concurrently.
 
-        Queries the accounts table for accounts where platform is NOT "TELEGRAM"
-        AND status is "pending" or older than a configurable threshold (e.g., 24 hours),
-        ordered by updated_at ascending. Processes these accounts concurrently using
-        an asyncio.Semaphore.
+        Queries the accounts table for accounts where platform is in CREATOR_PLATFORMS
+        AND status is "pending" or "failed" with updated_at older than the configured
+        threshold, ordered by updated_at ascending. Processes these accounts concurrently
+        using an asyncio.Semaphore.
 
         Args:
             batch_size: Maximum number of accounts to process in this cycle.
@@ -310,3 +328,154 @@ class CreatorsCoordinator:
                 f"Failed to update account {account_id} status to '{status}': {e!r}",
                 exc_info=e,
             )
+
+
+async def _sleep_with_shutdown_check(
+    shutdown_event: asyncio.Event,
+    interval_s: int,
+    check_interval_s: int = 5,
+) -> bool:
+    """
+    Sleep for a specified interval, checking for shutdown requests periodically.
+
+    This function breaks the sleep into small chunks to allow responsive
+    shutdown handling without busy-waiting.
+
+    Args:
+        shutdown_event: Event to check for shutdown requests.
+        interval_s: Total sleep duration in seconds.
+        check_interval_s: Interval between shutdown checks in seconds.
+
+    Returns:
+        True if shutdown was requested, False if sleep completed normally.
+    """
+    elapsed: float = 0.0
+    while elapsed < interval_s:
+        if shutdown_event.is_set():
+            logger.info("Shutdown requested during sleep cycle, waking up early.")
+            return True
+        sleep_chunk: float = min(check_interval_s, interval_s - elapsed)
+        await asyncio.sleep(sleep_chunk)
+        elapsed += sleep_chunk
+    return False
+
+
+async def main() -> None:
+    """
+    Main async entrypoint for the creators coordinator daemon.
+
+    This function:
+    - Loads settings via load_settings()
+    - Initializes the database engine and session maker
+    - Sets up signal handlers for graceful shutdown (SIGTERM, SIGINT)
+    - Runs the coordinator in an infinite polling loop
+    - Ensures clean exit on shutdown signals
+    """
+    settings: Settings = load_settings()
+
+    # Initialize database engine and session maker
+    engine = create_async_engine(
+        settings.db_url,
+        echo=False,
+        pool_size=10,
+        max_overflow=5,
+        pool_timeout=15.0,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+    )
+    session_maker: async_sessionmaker[AsyncSession] = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+    # Create shutdown event for signal handling
+    shutdown_event: asyncio.Event = asyncio.Event()
+
+    # Instantiate the coordinator
+    coordinator: CreatorsCoordinator = CreatorsCoordinator(
+        session_maker=session_maker,
+        settings=settings,
+        shutdown_event=shutdown_event,
+    )
+
+    def _signal_handler(sig: int, frame: Any | None = None) -> None:
+        """
+        Handle OS termination signals (SIGTERM, SIGINT).
+
+        Sets the shutdown event to trigger graceful shutdown. The main loop
+        will finish the current batch and exit cleanly.
+        """
+        sig_name: str = signal.Signals(sig).name
+        logger.info(f"Received signal {sig_name}, initiating graceful shutdown...")
+        logger.info("Waiting for current batch to complete before shutting down...")
+        shutdown_event.set()
+
+    # Register signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, lambda s=sig: _signal_handler(s))
+        except NotImplementedError:
+            # Fallback for Windows or environments without add_signal_handler
+            signal.signal(sig, _signal_handler)
+
+    logger.info("Creators coordinator daemon started. Press Ctrl+C to stop.")
+
+    try:
+        while not shutdown_event.is_set():
+            # Check shutdown before starting a new batch
+            if shutdown_event.is_set():
+                logger.info("Shutdown requested before batch start, exiting.")
+                break
+
+            logger.info("Starting new ingestion batch...")
+            try:
+                # Run a single ingestion cycle
+                await coordinator.run_once(
+                    batch_size=settings.creators_batch_size,
+                    concurrency_limit=settings.creators_concurrency,
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Unexpected error in ingestion batch: {exc!r}",
+                    exc_info=exc,
+                )
+
+            # Check shutdown before sleeping
+            if shutdown_event.is_set():
+                logger.info("Shutdown requested after batch completion, exiting.")
+                break
+
+            # Sleep with periodic shutdown checks
+            logger.info(f"Sleeping for {coordinator.poll_interval_s}s until next batch...")
+            shutdown_during_sleep: bool = await _sleep_with_shutdown_check(
+                shutdown_event=shutdown_event,
+                interval_s=coordinator.poll_interval_s,
+            )
+            if shutdown_during_sleep:
+                logger.info("Shutdown requested during sleep, exiting.")
+                break
+
+    finally:
+        # Graceful shutdown: finish current processing, commit transactions, close connections
+        logger.info("Shutting down gracefully...")
+
+        # Close database engine
+        logger.info("Closing database connections...")
+        await engine.dispose()
+
+        logger.info("Creators coordinator daemon stopped cleanly.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received, exiting.")
+        sys.exit(0)
+    except SystemExit as e:
+        # Allow clean sys.exit(0)
+        raise
+    except Exception as e:
+        logger.error(f"Fatal error in coordinator daemon: {e!r}", exc_info=e)
+        sys.exit(1)

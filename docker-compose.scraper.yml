@@ -95,6 +95,35 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  creators:
+    build:
+      context: .
+      dockerfile: docker/scraper/Dockerfile
+    container_name: tg_parser_creators
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.creators.coordinator
+    volumes:
+      - .:/app
+      - ./sessions:/app/sessions
+      - ./proxies.txt:/app/proxies.txt
+    networks:
+      - scraper_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   llm_proxy:
     image: nginx:alpine
     container_name: tg_parser_llm_proxy

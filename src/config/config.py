@@ -190,6 +190,28 @@ class Settings(BaseSettings):
         description="Number of unextracted posts to fetch per poll in the extraction worker",
     )
 
+    # ---- Creators coordinator settings ----
+    creators_poll_interval_s: int = Field(
+        default=300,
+        description="Poll interval in seconds for the creators coordinator daemon loop",
+    )
+    creators_batch_size: int = Field(
+        default=10,
+        description="Number of creator accounts to process per batch",
+    )
+    creators_concurrency: int = Field(
+        default=3,
+        description="Maximum number of concurrent creator account processing tasks",
+    )
+    creators_min_subscribers: int = Field(
+        default=3000,
+        description="Minimum subscriber count for a creator account to be processed",
+    )
+    creators_status_threshold_hours: int = Field(
+        default=24,
+        description="Hours before a failed creator account can be re-processed",
+    )
+
     # ---- Embedding worker settings ----
     embedding_priority_mode: bool = Field(
         default=True,
@@ -239,6 +261,7 @@ class Settings(BaseSettings):
             c = c[: max(0, self.channels_limit)]
 
         return c
+
 
 # ----- Helper functions -----
 
@@ -333,7 +356,7 @@ def load_settings() -> Settings:
     args, _ = parser.parse_known_args()
     setup_logging(args.log_level)
 
-    # Collect CLI overrides – only non‑None values are forwarded so that
+    # Collect CLI overrides – only non-None values are forwarded so that
     # environment variables (and defaults) can still act as fallbacks.
     overrides: dict = {}
 
