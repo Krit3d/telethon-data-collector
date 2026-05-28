@@ -6,7 +6,8 @@ Extracts author profile metadata (external links, contacts, location, language)
 and stores it inside Content.raw_metadata under the "author_profile_metadata" key.
 
 Features:
-    - Profile parsing with account upsert to accounts table
+    - Single API request for both profile and posts (saves credits)
+    - Profile data caching to avoid redundant API calls
     - Minimum subscriber threshold enforcement (3000 followers)
     - Virtual profile post creation for semantic search over biographies
     - Content fetching from timeline and video edges with deduplication
@@ -17,10 +18,13 @@ Features:
     - Transcription support for video content
 """
 
+import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -35,12 +39,36 @@ logger = logging.getLogger(__name__)
 # Minimum subscriber threshold for Instagram accounts
 MIN_SUBSCRIBERS: int = 3000
 
+# Maximum subscriber threshold for Instagram accounts (micro-influencers)
+MAX_SUBSCRIBERS: int = 150000
+
+# Email extraction pattern
+EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+
+def is_russian_text(text: str | None) -> bool:
+    """Check if text contains any Cyrillic (Russian) characters.
+
+    Args:
+        text: Text to check, or None.
+
+    Returns:
+        True if text contains at least one Cyrillic character, False otherwise.
+    """
+    if not text:
+        return False
+    return bool(re.search(r'[а-яА-ЯёЁ]', text))
+
 
 class InstagramPlatformParser(BasePlatformParser):
     """Instagram platform parser for profile and content ingestion.
 
     Inherits from BasePlatformParser and implements Instagram-specific
     profile parsing and content upsert logic using the Scrape Creators API.
+
+    Uses a single API endpoint (/v1/instagram/profile) to fetch both
+    profile data and posts, caching the response to avoid redundant
+    API calls and credit consumption.
 
     All author-level metadata (external links, contacts, location, language)
     is stored inside each Content.raw_metadata JSONB column under the key
@@ -53,6 +81,8 @@ class InstagramPlatformParser(BasePlatformParser):
         session_maker: SQLAlchemy async session maker for database operations.
         client: ScrapeCreatorsClient instance for API requests.
         settings: Application settings containing configuration values.
+        _cached_profile_data: Cached raw profile API response.
+        _cached_handle: Handle associated with the cached profile data.
     """
 
     def __init__(
@@ -69,15 +99,20 @@ class InstagramPlatformParser(BasePlatformParser):
             settings: Application settings containing configuration values.
         """
         super().__init__(session_maker, client, settings)
+        self._cached_profile_data: dict[str, Any] | None = None
+        self._cached_handle: str | None = None
 
     async def parse_profile(self, handle: str) -> int | None:
         """Fetch Instagram profile, upsert account to database, return account ID.
 
-        Parses the Instagram profile for the given handle, checks if the account
-        meets the minimum subscriber threshold (3000), extracts author profile
-        metadata (external links, contacts, location, language), upserts the
-        account information to the accounts table, creates a virtual profile post
-        for semantic search, and returns the database ID.
+        Parses the Instagram profile for the given handle using a single API call,
+        checks if the account meets the minimum subscriber threshold (3000),
+        extracts author profile metadata (external links, contacts, location, language),
+        upserts the account information to the accounts table, creates a virtual
+        profile post for semantic search, and returns the database ID.
+
+        Caches the API response in self._cached_profile_data to avoid redundant
+        API calls when parse_content() is called subsequently.
 
         Args:
             handle: Instagram username (without @ prefix).
@@ -89,24 +124,11 @@ class InstagramPlatformParser(BasePlatformParser):
         logger.info("Starting Instagram profile parse for handle: %s", handle)
 
         try:
-            # Fetch profile data from Scrape Creators API
-            try:
-                response: dict[str, Any] = await self.client.get(
-                    endpoint="/v1/instagram/profile",
-                    params={"handle": handle},
-                )
-                logger.info(
-                    "API response status for profile %s: success, credits consumed: %s",
-                    handle,
-                    response.get("credits", "N/A"),
-                )
-            except Exception as e:
-                logger.error(
-                    "API request failed for Instagram profile %s: %s",
-                    handle,
-                    e,
-                    exc_info=True,
-                )
+            # Fetch profile data from Scrape Creators API (single call for profile + posts)
+            response: dict[str, Any] | None = await self._fetch_profile_data(handle)
+
+            if response is None:
+                logger.error("Failed to fetch profile data for handle: %s", handle)
                 return None
 
             # Validate response structure
@@ -121,20 +143,42 @@ class InstagramPlatformParser(BasePlatformParser):
                 return None
 
             # Extract user ID and subscriber count
-            user_id: str = str(user.get("id") or user.get("pk", ""))
+            user_id: str = str(user.get("id", ""))
             if not user_id:
                 logger.error("Could not extract user ID for Instagram handle %s", handle)
                 return None
 
             subscribers_count: int = self._extract_subscribers_count(user)
 
-            # Check if account meets minimum threshold
+            # Extract biography for Russian text check
+            biography: str | None = user.get("biography")
+
+            # Check if account meets subscriber thresholds
             if subscribers_count < MIN_SUBSCRIBERS:
                 logger.info(
-                    "Instagram handle %s has %d subscribers, below minimum %d. Rejecting.",
+                    "Instagram handle %s rejected: subscribers count %d below minimum %d",
                     handle,
                     subscribers_count,
                     MIN_SUBSCRIBERS,
+                )
+                await self._upsert_account(user, status="rejected")
+                return None
+
+            if subscribers_count > MAX_SUBSCRIBERS:
+                logger.info(
+                    "Instagram handle %s rejected: subscribers count %d above maximum %d",
+                    handle,
+                    subscribers_count,
+                    MAX_SUBSCRIBERS,
+                )
+                await self._upsert_account(user, status="rejected")
+                return None
+
+            # Check if profile is Russian (contains Cyrillic characters in bio)
+            if not is_russian_text(biography):
+                logger.info(
+                    "Instagram handle %s rejected: non-Russian profile",
+                    handle,
                 )
                 await self._upsert_account(user, status="rejected")
                 return None
@@ -150,6 +194,14 @@ class InstagramPlatformParser(BasePlatformParser):
 
             # Upsert virtual profile post for semantic search over biography
             await self._upsert_virtual_profile_post(account_id, user)
+
+            # Build contacts dictionary for queue expansion
+            external_url: str | None = user.get("external_url")
+            contacts_dict: dict[str, Any] = parse_profile_contacts(biography, external_url)
+
+            # Queue discovered accounts from contacts (cross-platform expansion)
+            async with self.session_maker() as session:
+                await self._queue_discovered_accounts(session, contacts_dict)
 
             return account_id
 
@@ -171,13 +223,15 @@ class InstagramPlatformParser(BasePlatformParser):
         """Fetch Instagram content and bulk upsert to content table.
 
         Retrieves content items from timeline and video edges for the given account
-        using the Scrape Creators API, parses the data, and performs a bulk
-        upsert into the content table using PostgreSQL ON CONFLICT DO UPDATE.
+        using cached profile data (from parse_profile) or a new API call if cache
+        is missing. Parses the data and performs a bulk upsert into the content
+        table using PostgreSQL ON CONFLICT DO UPDATE.
 
         The raw_metadata field contains:
             - "author_profile_metadata": Profile-level data (contacts, links, location, etc.)
             - "platform_metrics": Platform-specific engagement metrics
             - "video_download_url": Direct MP4 URL for GPU worker processing
+            - "raw_post_node": Original raw JSON of the post node
 
         Args:
             account_id: Database ID of the parent account record.
@@ -192,24 +246,11 @@ class InstagramPlatformParser(BasePlatformParser):
         )
 
         try:
-            # Fetch content data from Scrape Creators API
-            try:
-                response: dict[str, Any] = await self.client.get(
-                    endpoint="/v1/instagram/posts",
-                    params={"handle": platform_id, "limit": max_items},
-                )
-                logger.info(
-                    "API response status for content, platform_id %s: success, credits consumed: %s",
-                    platform_id,
-                    response.get("credits", "N/A"),
-                )
-            except Exception as e:
-                logger.error(
-                    "API request failed for Instagram content, platform_id %s: %s",
-                    platform_id,
-                    e,
-                    exc_info=True,
-                )
+            # Get profile data (use cache if available, otherwise fetch)
+            response: dict[str, Any] | None = await self._get_cached_or_fetch_profile(platform_id)
+
+            if response is None:
+                logger.error("Failed to get profile data for content parsing, platform_id: %s", platform_id)
                 return
 
             # Validate response structure
@@ -246,24 +287,69 @@ class InstagramPlatformParser(BasePlatformParser):
                 if isinstance(video_edges, list):
                     all_edges.extend(video_edges)
 
-            # Deduplicate by post ID (using shortcode or id from node)
+            # Deduplicate by post ID (using node -> id)
             seen_ids: set[str] = set()
             unique_edges: list[dict[str, Any]] = []
             for edge in all_edges:
                 node = edge.get("node", {})
                 if not isinstance(node, dict):
                     continue
-                post_id: str = str(node.get("shortcode") or node.get("id", ""))
+                post_id: str = str(node.get("id", ""))
                 if post_id and post_id not in seen_ids:
                     seen_ids.add(post_id)
                     unique_edges.append(edge)
 
-            # Limit to max_items
+            # Sort by taken_at_timestamp descending (newest first)
+            def get_timestamp(edge: dict[str, Any]) -> int:
+                node = edge.get("node", {})
+                timestamp = node.get("taken_at_timestamp", 0)
+                return int(timestamp) if timestamp else 0
+
+            unique_edges.sort(key=get_timestamp, reverse=True)
+
+            # Slice the list to max_items
             unique_edges = unique_edges[:max_items]
 
             if not unique_edges:
                 logger.info("No Instagram content found for account_id: %d", account_id)
                 return
+
+            # Fetch transcriptions for video posts concurrently
+            video_edges_with_shortcode: list[tuple[dict[str, Any], str]] = []
+            for edge in unique_edges:
+                node = edge.get("node", {})
+                if not isinstance(node, dict):
+                    continue
+                is_video = node.get("is_video")
+                shortcode = node.get("shortcode")
+                if is_video is True and isinstance(shortcode, str) and shortcode:
+                    video_edges_with_shortcode.append((edge, shortcode))
+
+            if video_edges_with_shortcode:
+                logger.info(
+                    "Fetching transcriptions for %d video posts",
+                    len(video_edges_with_shortcode),
+                )
+                semaphore = asyncio.Semaphore(5)
+                tasks = [
+                    self._fetch_transcription_api(shortcode, semaphore)
+                    for _, shortcode in video_edges_with_shortcode
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for (edge, shortcode), result in zip(video_edges_with_shortcode, results):
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "Transcription task failed for shortcode %s: %s",
+                            shortcode,
+                            result,
+                            exc_info=result,
+                        )
+                        continue
+                    if isinstance(result, str) and result:
+                        node = edge.get("node", {})
+                        if isinstance(node, dict):
+                            node["api_transcription"] = result
 
             # Build author profile metadata once (reused for all content items)
             author_metadata = self._build_author_profile_metadata(user)
@@ -285,25 +371,141 @@ class InstagramPlatformParser(BasePlatformParser):
             )
             raise
 
+    async def _fetch_profile_data(self, handle: str) -> dict[str, Any] | None:
+        """Fetch profile data from Scrape Creators API and cache it.
+
+        Args:
+            handle: Instagram username (without @ prefix).
+
+        Returns:
+            API response dictionary, or None if the request failed.
+        """
+        try:
+            response: dict[str, Any] = await self.client.get(
+                endpoint="/v1/instagram/profile",
+                params={"handle": handle},
+            )
+            logger.info(
+                "API response status for profile %s: success, credits consumed: %s",
+                handle,
+                response.get("credits", "N/A"),
+            )
+
+            # Cache the response
+            self._cached_profile_data = response
+            self._cached_handle = handle
+
+            return response
+
+        except Exception as e:
+            logger.error(
+                "API request failed for Instagram profile %s: %s",
+                handle,
+                e,
+                exc_info=True,
+            )
+            return None
+
+    async def _get_cached_or_fetch_profile(self, handle: str) -> dict[str, Any] | None:
+        """Get profile data from cache or fetch from API if cache is missing/stale.
+
+        Args:
+            handle: Instagram username (without @ prefix).
+
+        Returns:
+            API response dictionary, or None if the request failed.
+        """
+        # Check if cache is valid
+        if self._cached_profile_data is not None and self._cached_handle == handle:
+            logger.debug("Using cached profile data for handle: %s", handle)
+            return self._cached_profile_data
+
+        # Cache miss or stale, fetch new data
+        logger.info("Cache miss for handle: %s, fetching from API", handle)
+        return await self._fetch_profile_data(handle)
+
+    async def _fetch_transcription_api(self, shortcode: str, semaphore: asyncio.Semaphore) -> str | None:
+        """Fetch transcription for a video post via Scrape Creators transcript endpoint.
+
+        Args:
+            shortcode: Instagram post shortcode.
+            semaphore: Semaphore to limit concurrent requests.
+
+        Returns:
+            Transcription text if available, None otherwise.
+        """
+        try:
+            async with semaphore:
+                response: dict[str, Any] = await self.client.get(
+                    endpoint="/v2/instagram/media/transcript",
+                    params={"shortcode": shortcode},
+                )
+            # Extract transcription from possible response keys
+            transcription = None
+            data = response.get("data", {})
+            if isinstance(data, dict):
+                transcription = data.get("transcript")
+            if not transcription:
+                transcription = response.get("transcript")
+            if not transcription:
+                transcription = response.get("text")
+            if isinstance(transcription, str) and transcription.strip():
+                return transcription.strip()
+            return None
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch transcription for shortcode %s: %s",
+                shortcode,
+                e,
+                exc_info=True,
+            )
+            return None
+
     async def _upsert_account(self, user: dict[str, Any], status: str = "parsed") -> int:
-        """Upsert Instagram account record to database using PostgreSQL ON CONFLICT.
+        """Upsert Instagram account record using select-then-insert/update pattern.
+
+        Uses a select-then-upsert transaction pattern to avoid InvalidColumnReferenceError
+        caused by missing unique constraint on (platform, platform_id) in the accounts table.
 
         Args:
             user: User object from Scrape Creators API response.
             status: Account status ('parsed', 'rejected', etc.).
 
         Returns:
-            ID of the upserted Account record (auto-generated by PostgreSQL).
+            ID of the account record (auto-generated by PostgreSQL for new records).
         """
-        platform_id: str = str(user.get("id") or user.get("pk", ""))
-        username: str | None = user.get("username") or user.get("handle")
-        full_name: str | None = user.get("full_name") or user.get("name")
-        biography: str | None = user.get("biography") or user.get("bio")
+        platform_id: str = str(user.get("id", ""))
+        username: str | None = user.get("username")
+        full_name: str | None = user.get("full_name")
+        biography: str | None = user.get("biography")
         subscribers_count: int = self._extract_subscribers_count(user)
 
         async with self.session_maker() as session:
-            async with session.begin():
-                stmt = pg_insert(Account).values(
+            # Select existing account by platform and platform_id
+            stmt = select(Account).where(
+                Account.platform == "INSTAGRAM",
+                Account.platform_id == platform_id,
+            )
+            result = await session.execute(stmt)
+            db_account: Account | None = result.scalar_one_or_none()
+
+            if db_account:
+                # Update existing record
+                db_account.username = username
+                db_account.title = full_name or username or "Unknown"
+                db_account.description = biography
+                db_account.subscribers_count = subscribers_count
+                db_account.status = status
+                db_account.updated_at = datetime.now(timezone.utc)
+                logger.debug(
+                    "Updated existing Instagram account %s (ID: %d, status: %s)",
+                    username,
+                    db_account.id,
+                    status,
+                )
+            else:
+                # Create new record (let PostgreSQL generate ID)
+                db_account = Account(
                     platform="INSTAGRAM",
                     platform_id=platform_id,
                     username=username,
@@ -312,27 +514,16 @@ class InstagramPlatformParser(BasePlatformParser):
                     subscribers_count=subscribers_count,
                     status=status,
                 )
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["platform", "platform_id"],
-                    set_=dict(
-                        username=username,
-                        title=full_name or username or "Unknown",
-                        description=biography,
-                        subscribers_count=subscribers_count,
-                        status=status,
-                        updated_at=datetime.now(timezone.utc),
-                    ),
-                ).returning(Account.id)
-
-                result = await session.execute(stmt)
-                account_id: int = result.scalar_one()
+                session.add(db_account)
                 logger.debug(
-                    "Upserted Instagram account %s (ID: %d, status: %s)",
+                    "Created new Instagram account %s (status: %s)",
                     username,
-                    account_id,
                     status,
                 )
-                return account_id
+
+            await session.commit()
+            await session.refresh(db_account)
+            return db_account.id
 
     async def _upsert_virtual_profile_post(
         self, account_id: int, user: dict[str, Any]
@@ -353,16 +544,16 @@ class InstagramPlatformParser(BasePlatformParser):
             account_id: Database ID of the parent account record.
             user: User object from Scrape Creators API response.
         """
-        platform_id: str = str(user.get("id") or user.get("pk", ""))
-        username: str | None = user.get("username") or user.get("handle")
-        full_name: str | None = user.get("full_name") or user.get("name")
-        biography: str | None = user.get("biography") or user.get("bio")
+        platform_id: str = str(user.get("id", ""))
+        username: str | None = user.get("username")
+        full_name: str | None = user.get("full_name")
+        biography: str | None = user.get("biography")
         subscribers_count: int = self._extract_subscribers_count(user)
 
         virtual_content_id: str = f"profile_bio_{platform_id}"
         compiled_text: str = (
             f"[PROFILE METADATA]\n"
-            f"Platform: Instagram\n"
+            f"Platform: INSTAGRAM\n"
             f"Username: @{username or 'unknown'}\n"
             f"Title: {full_name or 'Unknown'}\n"
             f"Subscribers: {subscribers_count}\n"
@@ -386,7 +577,7 @@ class InstagramPlatformParser(BasePlatformParser):
                     has_media=False,
                     is_embedded=False,
                     is_graph_extracted=False,
-                    raw_metadata=None,
+                    raw_metadata={},
                     updated_at=now,
                 )
                 stmt = stmt.on_conflict_do_update(
@@ -439,16 +630,16 @@ class InstagramPlatformParser(BasePlatformParser):
                 published_at: datetime | None = self._extract_published_at(node)
 
                 # Extract engagement metrics
-                views: int | None = node.get("video_view_count") or node.get("view_count")
+                views: int | None = node.get("video_view_count")
                 reactions_count: int | None = self._extract_reactions_count(node)
                 comments_count: int | None = self._extract_comments_count(node)
-                shares_count: int | None = node.get("share_count")
+                shares_count: int | None = None
 
                 # Check if video post and extract video URL
                 is_video: bool = node.get("is_video", False)
                 has_media: bool = is_video
 
-                # Extract high-quality direct MP4 URL for GPU worker
+                # Extract direct MP4 URL for GPU worker
                 video_download_url: str | None = None
                 if is_video:
                     video_download_url = self._extract_video_download_url(node)
@@ -465,10 +656,11 @@ class InstagramPlatformParser(BasePlatformParser):
                     "is_video": is_video,
                 }
 
-                # Build raw_metadata with author_profile_metadata and platform_metrics
+                # Build raw_metadata with all required fields
                 raw_metadata: dict[str, Any] = {
                     "author_profile_metadata": author_metadata,
                     "platform_metrics": platform_metrics,
+                    "raw_post_node": node,
                 }
                 if video_download_url:
                     raw_metadata["video_download_url"] = video_download_url
@@ -505,7 +697,7 @@ class InstagramPlatformParser(BasePlatformParser):
                     constraint="uq_content_account_platform_id",
                     set_=dict(
                         content=stmt.excluded.content,
-                        transcription=stmt.excluded.transcription,
+                        transcription=func.coalesce(stmt.excluded.transcription, Content.transcription),
                         views=stmt.excluded.views,
                         reactions_count=stmt.excluded.reactions_count,
                         shares_count=stmt.excluded.shares_count,
@@ -538,9 +730,9 @@ class InstagramPlatformParser(BasePlatformParser):
         Returns:
             Dictionary containing author profile metadata.
         """
-        biography: str | None = user.get("biography") or user.get("bio")
-        username: str | None = user.get("username") or user.get("handle")
-        full_name: str | None = user.get("full_name") or user.get("name")
+        biography: str | None = user.get("biography")
+        username: str | None = user.get("username")
+        full_name: str | None = user.get("full_name")
 
         # Use shared utility to parse contacts from biography and external_url
         external_url: str | None = user.get("external_url")
@@ -588,6 +780,116 @@ class InstagramPlatformParser(BasePlatformParser):
 
         # Remove None values for cleaner JSON
         return {k: v for k, v in author_metadata.items() if v is not None}
+
+    async def _queue_discovered_accounts(
+        self, session: AsyncSession, contacts_dict: dict[str, Any]
+    ) -> None:
+        """Queue discovered accounts from contacts for cross-platform expansion.
+
+        Processes emails, telegram handles, and external links from the contacts
+        dictionary and inserts new account records into the accounts table with
+        status "pending" for platforms YOUTUBE, TIKTOK, THREADS, and TELEGRAM.
+
+        Uses on_conflict_do_nothing to avoid duplicate entries.
+
+        Args:
+            session: SQLAlchemy async session for database operations.
+            contacts_dict: Dictionary containing emails, telegram_handles, and external_links.
+        """
+        # Process external links for YouTube, TikTok, and Threads
+        external_links: list[str] = contacts_dict.get("external_links", [])
+        for link in external_links:
+            if not isinstance(link, str):
+                continue
+
+            link_lower = link.lower()
+
+            # YouTube: youtube.com/ or youtu.be/
+            if "youtube.com/" in link_lower or "youtu.be/" in link_lower:
+                # Extract handle or channel ID
+                platform_id: str | None = None
+                if "/@" in link:
+                    # Format: youtube.com/@handle
+                    platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
+                elif "youtube.com/channel/" in link_lower:
+                    # Format: youtube.com/channel/UC...
+                    platform_id = link.split("/channel/")[-1].split("?")[0].split("/")[0]
+                elif "youtu.be/" in link_lower:
+                    # Format: youtu.be/VIDEO_ID (not a channel, skip)
+                    continue
+
+                if platform_id:
+                    await self._insert_pending_account(session, "YOUTUBE", platform_id)
+
+            # TikTok: tiktok.com/@
+            elif "tiktok.com/@" in link_lower:
+                # Extract username
+                platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
+                if platform_id:
+                    await self._insert_pending_account(session, "TIKTOK", platform_id)
+
+            # Threads: threads.net/@
+            elif "threads.net/@" in link_lower or "threads.net/" in link_lower:
+                # Extract username
+                if "/@" in link:
+                    platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
+                else:
+                    platform_id = link.split("/")[-1].split("?")[0].split("/")[0]
+                if platform_id:
+                    await self._insert_pending_account(session, "THREADS", platform_id)
+
+        # Process Telegram handles
+        telegram_handles: list[str] = contacts_dict.get("telegram_handles", [])
+        for handle in telegram_handles:
+            if not isinstance(handle, str) or not handle:
+                continue
+            # Remove @ if present
+            platform_id = handle.lstrip("@")
+            if platform_id:
+                await self._insert_pending_account(session, "TELEGRAM", platform_id)
+
+    async def _insert_pending_account(
+        self, session: AsyncSession, platform: str, platform_id: str
+    ) -> None:
+        """Insert a pending account record if it doesn't already exist.
+
+        Args:
+            session: SQLAlchemy async session for database operations.
+            platform: Platform name (YOUTUBE, TIKTOK, THREADS, TELEGRAM).
+            platform_id: Platform-specific account ID or handle.
+        """
+        # Check if account already exists
+        stmt = select(Account).where(
+            Account.platform == platform,
+            Account.platform_id == platform_id,
+        )
+        result = await session.execute(stmt)
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            logger.debug(
+                "Account already exists: platform=%s, platform_id=%s",
+                platform,
+                platform_id,
+            )
+            return
+
+        # Insert new pending account
+        new_account = Account(
+            platform=platform,
+            platform_id=platform_id,
+            username=None,
+            title=platform_id,
+            description=None,
+            subscribers_count=None,
+            status="pending",
+        )
+        session.add(new_account)
+        logger.debug(
+            "Queued new account: platform=%s, platform_id=%s",
+            platform,
+            platform_id,
+        )
 
     def _extract_video_download_url(self, node: dict[str, Any]) -> str | None:
         """Extract high-quality direct MP4 URL from video node.
@@ -639,7 +941,8 @@ class InstagramPlatformParser(BasePlatformParser):
             Transcription text, or None if not available.
         """
         transcription: str | None = (
-            node.get("transcription")
+            node.get("api_transcription")
+            or node.get("transcription")
             or node.get("transcript")
             or node.get("video_transcription")
         )
@@ -695,6 +998,12 @@ class InstagramPlatformParser(BasePlatformParser):
                     text_node = first_edge.get("node", {})
                     if isinstance(text_node, dict) and text_node.get("text"):
                         return str(text_node["text"])
+
+        # Fallback to accessibility_caption
+        accessibility_caption = node.get("accessibility_caption")
+        if accessibility_caption and isinstance(accessibility_caption, str):
+            return accessibility_caption
+
         return None
 
     def _extract_published_at(self, node: dict[str, Any]) -> datetime | None:
@@ -706,19 +1015,12 @@ class InstagramPlatformParser(BasePlatformParser):
         Returns:
             Timezone-aware datetime, or None if timestamp is invalid.
         """
-        timestamp = (
-            node.get("taken_at_timestamp")
-            or node.get("timestamp")
-            or node.get("created_at")
-            or node.get("published_at")
-        )
+        timestamp = node.get("taken_at_timestamp")
 
         if timestamp:
             try:
                 if isinstance(timestamp, (int, float)):
                     return datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
-                elif isinstance(timestamp, str):
-                    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             except (ValueError, TypeError, OSError) as e:
                 logger.warning("Failed to parse timestamp %s: %s", timestamp, e)
         return None
@@ -740,7 +1042,7 @@ class InstagramPlatformParser(BasePlatformParser):
                     return int(count)
                 except (ValueError, TypeError):
                     pass
-        return node.get("like_count") or node.get("reactions_count")
+        return None
 
     def _extract_comments_count(self, node: dict[str, Any]) -> int | None:
         """Extract comments count from content node.
@@ -759,4 +1061,4 @@ class InstagramPlatformParser(BasePlatformParser):
                     return int(count)
                 except (ValueError, TypeError):
                     pass
-        return node.get("comment_count") or node.get("comments_count")
+        return None
