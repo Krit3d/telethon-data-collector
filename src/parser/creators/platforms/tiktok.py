@@ -8,7 +8,8 @@ and stores it inside Content.raw_metadata under the "author_profile_metadata" ke
 Features:
     - One-request cache optimization for profile data
     - Profile parsing with account upsert to accounts table
-    - Minimum follower threshold enforcement (3000 followers)
+    - Minimum and maximum follower threshold enforcement (3k-150k, micro-influencers)
+    - Russian language (Cyrillic) biography check
     - Virtual profile post creation for semantic search over biographies
     - Content fetching from itemList with deduplication
     - PostgreSQL ON CONFLICT DO UPDATE for high-throughput concurrency
@@ -16,13 +17,17 @@ Features:
     - Extraction of external links, contact info from biography via shared utils
     - Video download URL extraction for GPU worker processing
     - Transcription support for video content
+    - Cross-platform spidering queue for discovered accounts
 """
 
+import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -34,15 +39,30 @@ from src.parser.creators.sc_client import ScrapeCreatorsClient
 
 logger = logging.getLogger(__name__)
 
-# Minimum follower threshold for TikTok accounts
+# Minimum and maximum follower thresholds for TikTok accounts (micro-influencers: 3k-150k)
 MIN_FOLLOWERS: int = 3000
+MAX_FOLLOWERS: int = 150000
+
+
+def is_russian_text(text: str | None) -> bool:
+    """Check if text contains Russian Cyrillic characters.
+
+    Args:
+        text: Text to check, or None.
+
+    Returns:
+        True if text contains at least one Russian Cyrillic character, False otherwise.
+    """
+    if not text:
+        return False
+    return bool(re.search(r'[а-яА-ЯёЁ]', text))
 
 
 class TikTokPlatformParser(BasePlatformParser):
     """TikTok platform parser for profile and content ingestion.
 
     Inherits from BasePlatformParser and implements TikTok-specific
-    profile parsing and content upsert logic using the Scrape Creators API.
+    profile parsing and content upsert logic using the Scrape Creators API v2.
 
     Features instance-level caching for the profile endpoint to avoid
     duplicate API calls when fetching profile and content data.
@@ -83,10 +103,11 @@ class TikTokPlatformParser(BasePlatformParser):
         """Fetch TikTok profile, upsert account to database, return account ID.
 
         Parses the TikTok profile for the given handle, checks if the account
-        meets the minimum follower threshold (3000), extracts author profile
-        metadata (external links, contacts, location, language), upserts the
-        account information to the accounts table, creates a virtual profile post
-        for semantic search, and returns the database ID.
+        meets the follower threshold (3k-150k), verifies Russian Cyrillic
+        in biography, extracts author profile metadata, upserts the account
+        information to the accounts table, creates a virtual profile post
+        for semantic search, queues discovered cross-platform accounts,
+        and returns the database ID.
 
         Uses instance-level caching to avoid duplicate API calls when subsequently
         calling parse_content() for the same handle.
@@ -96,7 +117,7 @@ class TikTokPlatformParser(BasePlatformParser):
 
         Returns:
             Database ID of the upserted account record, or None if the profile
-            could not be parsed or doesn't meet the minimum follower threshold.
+            could not be parsed, doesn't meet follower thresholds, or is non-Russian.
         """
         logger.info("Starting TikTok profile parse for handle: %s", handle)
 
@@ -106,10 +127,10 @@ class TikTokPlatformParser(BasePlatformParser):
                 logger.debug("Using cached profile data for handle: %s", handle)
                 response = self._cached_profile
             else:
-                # Fetch profile data from Scrape Creators API
+                # Fetch profile data from Scrape Creators API v2
                 try:
                     response = await self.client.get(
-                        endpoint="/v1/tiktok/profile",
+                        endpoint="/v2/tiktok/profile",
                         params={"handle": handle, "count": 100},
                     )
                     logger.info(
@@ -140,21 +161,32 @@ class TikTokPlatformParser(BasePlatformParser):
                 logger.error("Missing 'user' in data for TikTok handle %s", handle)
                 return None
 
-            # Extract user ID and follower count
+            # Extract user ID, follower count, and biography
             user_id: str = str(user.get("id") or user.get("userId", ""))
             if not user_id:
                 logger.error("Could not extract user ID for TikTok handle %s", handle)
                 return None
 
             follower_count: int = self._extract_follower_count(user)
+            biography: str | None = user.get("signature") or user.get("bio")
 
-            # Check if account meets minimum threshold
-            if follower_count < MIN_FOLLOWERS:
+            # Check if account meets follower range (micro-influencer: 3k-150k)
+            if follower_count < MIN_FOLLOWERS or follower_count > MAX_FOLLOWERS:
                 logger.info(
-                    "TikTok handle %s has %d followers, below minimum %d. Rejecting.",
+                    "TikTok handle %s has %d followers, outside range [%d, %d]. Rejecting.",
                     handle,
                     follower_count,
                     MIN_FOLLOWERS,
+                    MAX_FOLLOWERS,
+                )
+                await self._upsert_account(user, status="rejected")
+                return None
+
+            # Check if biography contains Russian Cyrillic characters
+            if not is_russian_text(biography):
+                logger.info(
+                    "TikTok handle %s has non-Russian biography. Rejecting.",
+                    handle,
                 )
                 await self._upsert_account(user, status="rejected")
                 return None
@@ -167,6 +199,13 @@ class TikTokPlatformParser(BasePlatformParser):
                 account_id,
                 follower_count,
             )
+
+            # Parse contacts from biography for cross-platform spidering
+            contacts_dict: dict[str, Any] = parse_profile_contacts(biography, None)
+
+            # Queue discovered accounts from contacts
+            async with self.session_maker() as session:
+                await self._queue_discovered_accounts(session, contacts_dict)
 
             # Upsert virtual profile post for semantic search over biography
             await self._upsert_virtual_profile_post(account_id, user)
@@ -191,7 +230,7 @@ class TikTokPlatformParser(BasePlatformParser):
         """Fetch TikTok content and bulk upsert to content table.
 
         Retrieves content items from the cached profile response itemList
-        for the given account using the Scrape Creators API, parses the data,
+        for the given account using the Scrape Creators API v2, parses the data,
         and performs a bulk upsert into the content table using PostgreSQL
         ON CONFLICT DO UPDATE.
 
@@ -219,7 +258,7 @@ class TikTokPlatformParser(BasePlatformParser):
             else:
                 try:
                     response = await self.client.get(
-                        endpoint="/v1/tiktok/profile",
+                        endpoint="/v2/tiktok/profile",
                         params={"handle": platform_id, "count": 100},
                     )
                     self._cached_profile = response
@@ -342,6 +381,142 @@ class TikTokPlatformParser(BasePlatformParser):
             await session.commit()
             await session.refresh(db_account)
             return db_account.id
+
+    async def _queue_discovered_accounts(self, session: AsyncSession, contacts_dict: dict[str, Any]) -> None:
+        """Queue discovered accounts from contacts for cross-platform spidering.
+
+        Processes Telegram handles and external links from parsed contacts,
+        inserting new accounts into the accounts table with status 'pending'
+        if they do not already exist.
+
+        Args:
+            session: Active SQLAlchemy async session for database operations.
+            contacts_dict: Dictionary of parsed contacts from parse_profile_contacts.
+        """
+        # Process Telegram handles
+        telegram_handles: list[str] = contacts_dict.get("telegram_handles", [])
+        for handle in telegram_handles:
+            if not handle:
+                continue
+            # Check if account already exists
+            stmt = select(Account).where(
+                Account.platform == "TELEGRAM",
+                Account.platform_id == handle,
+            )
+            result = await session.execute(stmt)
+            if result.scalar_one_or_none():
+                logger.debug("Telegram account @%s already exists, skipping", handle)
+                continue
+            # Insert new Telegram account
+            new_account = Account(
+                platform="TELEGRAM",
+                platform_id=handle,
+                username=handle,
+                title=handle,
+                status="pending",
+            )
+            session.add(new_account)
+            logger.info("Queued Telegram account @%s for spidering", handle)
+
+        # Process external links
+        external_links: list[str] = contacts_dict.get("external_links", [])
+        for link in external_links:
+            if not link:
+                continue
+            link_lower = link.lower()
+
+            # Instagram
+            if "instagram.com/" in link_lower:
+                parsed = urlparse(link)
+                path_parts = [p for p in parsed.path.split("/") if p]
+                if not path_parts:
+                    continue
+                handle = path_parts[0].split("?")[0]
+                if not handle:
+                    continue
+                # Check if exists
+                stmt = select(Account).where(
+                    Account.platform == "INSTAGRAM",
+                    Account.platform_id == handle,
+                )
+                result = await session.execute(stmt)
+                if result.scalar_one_or_none():
+                    logger.debug("Instagram account %s already exists, skipping", handle)
+                    continue
+                # Insert
+                new_account = Account(
+                    platform="INSTAGRAM",
+                    platform_id=handle,
+                    username=handle,
+                    title=handle,
+                    status="pending",
+                )
+                session.add(new_account)
+                logger.info("Queued Instagram account %s for spidering", handle)
+                continue
+
+            # YouTube
+            if "youtube.com/" in link_lower or "youtu.be/" in link_lower:
+                parsed = urlparse(link)
+                path_parts = [p for p in parsed.path.split("/") if p]
+                if not path_parts:
+                    continue
+                channel_id = path_parts[-1].split("?")[0]
+                if not channel_id:
+                    continue
+                # Check if exists
+                stmt = select(Account).where(
+                    Account.platform == "YOUTUBE",
+                    Account.platform_id == channel_id,
+                )
+                result = await session.execute(stmt)
+                if result.scalar_one_or_none():
+                    logger.debug("YouTube account %s already exists, skipping", channel_id)
+                    continue
+                # Insert
+                new_account = Account(
+                    platform="YOUTUBE",
+                    platform_id=channel_id,
+                    username=channel_id,
+                    title=channel_id,
+                    status="pending",
+                )
+                session.add(new_account)
+                logger.info("Queued YouTube account %s for spidering", channel_id)
+                continue
+
+            # Threads
+            if "threads.net/" in link_lower:
+                parsed = urlparse(link)
+                path_parts = [p for p in parsed.path.split("/") if p]
+                if not path_parts:
+                    continue
+                handle = path_parts[0].split("?")[0]
+                if not handle:
+                    continue
+                # Check if exists
+                stmt = select(Account).where(
+                    Account.platform == "THREADS",
+                    Account.platform_id == handle,
+                )
+                result = await session.execute(stmt)
+                if result.scalar_one_or_none():
+                    logger.debug("Threads account %s already exists, skipping", handle)
+                    continue
+                # Insert
+                new_account = Account(
+                    platform="THREADS",
+                    platform_id=handle,
+                    username=handle,
+                    title=handle,
+                    status="pending",
+                )
+                session.add(new_account)
+                logger.info("Queued Threads account %s for spidering", handle)
+                continue
+
+        # Commit all queued accounts
+        await session.commit()
 
     async def _upsert_virtual_profile_post(
         self, account_id: int, user: dict[str, Any]
@@ -547,7 +722,7 @@ class TikTokPlatformParser(BasePlatformParser):
                     index_elements=["account_id", "platform_content_id"],
                     set_=dict(
                         content=stmt.excluded.content,
-                        transcription=stmt.excluded.transcription,
+                        transcription=func.coalesce(stmt.excluded.transcription, Content.transcription),
                         views=stmt.excluded.views,
                         reactions_count=stmt.excluded.reactions_count,
                         comments_count=stmt.excluded.comments_count,

@@ -8,7 +8,8 @@ under the "author_profile_metadata" key.
 
 Features:
     - Profile parsing with account upsert to accounts table
-    - Minimum subscriber threshold enforcement (3000 subscribers)
+    - Minimum and maximum subscriber threshold enforcement (3k-150k)
+    - Russian language content filtering
     - Virtual profile post creation for semantic search over biographies
     - YouTube Shorts content fetching and bulk upsert to content table
     - PostgreSQL ON CONFLICT DO UPDATE for high-throughput concurrency
@@ -16,13 +17,16 @@ Features:
     - Extraction of external links, contact info from channel description via shared utils
     - Video download URL extraction for GPU worker processing
     - Transcription support for video content
+    - Cross-platform spidering queue for discovered accounts
 """
 
+import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -34,8 +38,25 @@ from src.parser.creators.sc_client import ScrapeCreatorsClient
 
 logger = logging.getLogger(__name__)
 
-# Minimum subscriber threshold for YouTube channels
+# Minimum subscriber threshold for YouTube channels (micro-influencers)
 MIN_SUBSCRIBERS: int = 3000
+
+# Maximum subscriber threshold for YouTube channels (micro-influencers)
+MAX_SUBSCRIBERS: int = 150000
+
+
+def is_russian_text(text: str | None) -> bool:
+    """Check if text contains Russian Cyrillic characters.
+
+    Args:
+        text: Text to check for Russian characters.
+
+    Returns:
+        True if text contains Russian Cyrillic characters, False otherwise.
+    """
+    if not text:
+        return False
+    return bool(re.search(r'[а-яА-ЯёЁ]', text))
 
 
 class YouTubePlatformParser(BasePlatformParser):
@@ -77,25 +98,26 @@ class YouTubePlatformParser(BasePlatformParser):
         """Fetch YouTube profile, upsert account to database, return account ID.
 
         Parses the YouTube channel profile for the given handle, checks if the channel
-        meets the minimum subscriber threshold (3000), extracts author profile
-        metadata (external links, contacts, location, language), upserts the
-        account information to the accounts table, creates a virtual profile post
-        for semantic search, and returns the database ID.
+        meets the subscriber threshold (3k-150k), verifies Russian language content,
+        extracts author profile metadata (external links, contacts, location, language),
+        upserts the account information to the accounts table, creates a virtual
+        profile post for semantic search, queues discovered accounts for cross-platform
+        spidering, and returns the database ID.
 
         Args:
             handle: YouTube channel handle (without @ prefix) or custom URL.
 
         Returns:
             Database ID of the upserted account record, or None if the profile
-            could not be parsed or doesn't meet the minimum subscriber threshold.
+            could not be parsed or doesn't meet the filtering criteria.
         """
         logger.info("Starting YouTube profile parse for handle: %s", handle)
 
         try:
-            # Fetch profile data from Scrape Creators API
+            # Fetch profile data from Scrape Creators API (v2)
             try:
                 response: dict[str, Any] = await self.client.get(
-                    endpoint="/v1/youtube/profile",
+                    endpoint="/v2/youtube/profile",
                     params={"handle": handle},
                 )
                 logger.info(
@@ -148,6 +170,31 @@ class YouTubePlatformParser(BasePlatformParser):
                 await self._upsert_account(channel, status="rejected")
                 return None
 
+            # Check if account exceeds maximum threshold
+            if subscriber_count > MAX_SUBSCRIBERS:
+                logger.info(
+                    "YouTube handle %s has %d subscribers, above maximum %d. Rejecting.",
+                    handle,
+                    subscriber_count,
+                    MAX_SUBSCRIBERS,
+                )
+                await self._upsert_account(channel, status="rejected")
+                return None
+
+            # Check for Russian language content in description/bio
+            description: str | None = (
+                channel.get("description")
+                or channel.get("bio")
+                or channel.get("channelDescription")
+            )
+            if not is_russian_text(description):
+                logger.info(
+                    "YouTube handle %s does not contain Russian text in description. Rejecting.",
+                    handle,
+                )
+                await self._upsert_account(channel, status="rejected")
+                return None
+
             # Upsert account with 'parsed' status
             account_id: int = await self._upsert_account(channel, status="parsed")
             logger.info(
@@ -159,6 +206,12 @@ class YouTubePlatformParser(BasePlatformParser):
 
             # Upsert virtual profile post for semantic search over biography
             await self._upsert_virtual_profile_post(account_id, channel)
+
+            # Queue discovered accounts from contacts for cross-platform spidering
+            contacts_dict: dict[str, Any] = parse_profile_contacts(description, None)
+            async with self.session_maker() as session:
+                await self._queue_discovered_accounts(session, contacts_dict)
+                await session.commit()
 
             return account_id
 
@@ -180,7 +233,7 @@ class YouTubePlatformParser(BasePlatformParser):
         """Fetch YouTube Shorts content and bulk upsert to content table.
 
         Retrieves YouTube Shorts for the given channel using the Scrape Creators
-        API, parses the data, and performs a bulk upsert into the content table
+        API (v2), parses the data, and performs a bulk upsert into the content table
         using PostgreSQL ON CONFLICT DO UPDATE.
 
         The raw_metadata field contains:
@@ -201,10 +254,10 @@ class YouTubePlatformParser(BasePlatformParser):
         )
 
         try:
-            # Fetch YouTube Shorts data from Scrape Creators API
+            # Fetch YouTube Shorts data from Scrape Creators API (v2)
             try:
                 response: dict[str, Any] = await self.client.get(
-                    endpoint="/v1/youtube/shorts",
+                    endpoint="/v2/youtube/shorts",
                     params={"handle": platform_id, "limit": max_items},
                 )
                 logger.info(
@@ -427,6 +480,104 @@ class YouTubePlatformParser(BasePlatformParser):
                     virtual_content_id,
                 )
 
+    async def _queue_discovered_accounts(self, session: AsyncSession, contacts_dict: dict[str, Any]) -> None:
+        """Queue discovered accounts from profile contacts for cross-platform spidering.
+
+        Processes telegram handles and external links from the contacts dictionary,
+        extracts platform-specific identifiers, and inserts new accounts with
+        'pending' status for later processing. Checks for existing accounts to
+        prevent unique constraint violations.
+
+        Args:
+            session: SQLAlchemy async session for database operations.
+            contacts_dict: Dictionary containing parsed contacts with keys:
+                - telegram_handles: List of Telegram handles
+                - external_links: List of external URLs
+        """
+        # Process Telegram handles
+        telegram_handles: list[str] = contacts_dict.get("telegram_handles", [])
+        for handle in telegram_handles:
+            if not handle:
+                continue
+            # Clean handle (remove @ if present)
+            clean_handle = handle.lstrip("@")
+            # Check if account already exists
+            stmt = select(Account).where(
+                Account.platform == "TELEGRAM",
+                Account.platform_id == clean_handle,
+            )
+            result = await session.execute(stmt)
+            existing = result.scalar_one_or_none()
+            if not existing:
+                new_account = Account(
+                    platform="TELEGRAM",
+                    platform_id=clean_handle,
+                    username=clean_handle,
+                    title=clean_handle,
+                    status="pending",
+                )
+                session.add(new_account)
+                logger.debug("Queued Telegram account for spidering: %s", clean_handle)
+
+        # Process external links
+        external_links: list[str] = contacts_dict.get("external_links", [])
+        for link in external_links:
+            if not link or not isinstance(link, str):
+                continue
+
+            # Instagram: extract handle from instagram.com/ URL
+            if "instagram.com/" in link:
+                # Extract handle: https://www.instagram.com/username/ -> username
+                match = re.search(r'instagram\.com/([^/?#]+)', link)
+                if match:
+                    instagram_handle = match.group(1)
+                    if instagram_handle and instagram_handle != "p":  # Skip post URLs
+                        await self._queue_single_account(session, "INSTAGRAM", instagram_handle)
+
+            # TikTok: extract username from tiktok.com/@ URL
+            elif "tiktok.com/" in link:
+                # Extract username: https://www.tiktok.com/@username -> @username or username
+                match = re.search(r'tiktok\.com/@([^/?#]+)', link)
+                if match:
+                    tiktok_username = match.group(1)
+                    if tiktok_username:
+                        await self._queue_single_account(session, "TIKTOK", tiktok_username)
+
+            # Threads: extract handle from threads.net/ URL
+            elif "threads.net/" in link:
+                # Extract handle: https://www.threads.net/@username -> @username or username
+                match = re.search(r'threads\.net/@?([^/?#]+)', link)
+                if match:
+                    threads_handle = match.group(1)
+                    if threads_handle:
+                        await self._queue_single_account(session, "THREADS", threads_handle)
+
+    async def _queue_single_account(self, session: AsyncSession, platform: str, platform_id: str) -> None:
+        """Queue a single account for cross-platform spidering if it doesn't exist.
+
+        Args:
+            session: SQLAlchemy async session for database operations.
+            platform: Platform name (TELEGRAM, INSTAGRAM, TIKTOK, THREADS).
+            platform_id: Platform-specific identifier (handle, username, etc.).
+        """
+        # Check if account already exists
+        stmt = select(Account).where(
+            Account.platform == platform,
+            Account.platform_id == platform_id,
+        )
+        result = await session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        if not existing:
+            new_account = Account(
+                platform=platform,
+                platform_id=platform_id,
+                username=platform_id,
+                title=platform_id,
+                status="pending",
+            )
+            session.add(new_account)
+            logger.debug("Queued %s account for spidering: %s", platform, platform_id)
+
     async def _upsert_content(
         self,
         shorts: list[dict[str, Any]],
@@ -576,7 +727,7 @@ class YouTubePlatformParser(BasePlatformParser):
                     index_elements=["account_id", "platform_content_id"],
                     set_=dict(
                         content=stmt.excluded.content,
-                        transcription=stmt.excluded.transcription,
+                        transcription=func.coalesce(stmt.excluded.transcription, Content.transcription),
                         views=stmt.excluded.views,
                         reactions_count=stmt.excluded.reactions_count,
                         comments_count=stmt.excluded.comments_count,

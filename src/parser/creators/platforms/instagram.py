@@ -24,6 +24,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+import aiohttp
+
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -45,6 +47,22 @@ MAX_SUBSCRIBERS: int = 150000
 # Email extraction pattern
 EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
+# Stop-words to identify AI slop, meme pages, and compilation accounts
+SLOP_STOP_WORDS: frozenset[str] = frozenset({
+    # AI Slop / Generation terms
+    "ai art", "midjourney", "stable diffusion", "нейросеть", "нейросети",
+    "генерация", "chatgpt", "dall-e",
+    # Compilations / Meme pages / Theme channels
+    "нарезки", "нарезка", "мемы", "мем", "юмор", "приколы", "прикол",
+    "смешно", "смешное", "гороскоп", "гороскопы",
+    "анекдоты", "анекдот", "фильмы на вечер", "лучшие фильмы",
+    "кино на вечер", "треки", "музыка", "сохрани",
+    # Aggregators & Spam terms
+    "подпишись", "взаимно", "паблик", "админ", "по вопросам рекламы",
+    "сливы", "слив", "shina", "compilation",
+    "gaming clips", "funny moments", "pubg", "fortnite", "dota", "csgo",
+})
+
 
 def is_russian_text(text: str | None) -> bool:
     """Check if text contains any Cyrillic (Russian) characters.
@@ -57,7 +75,7 @@ def is_russian_text(text: str | None) -> bool:
     """
     if not text:
         return False
-    return bool(re.search(r'[а-яА-ЯёЁ]', text))
+    return bool(re.search(r"[а-яА-ЯёЁ]", text))
 
 
 class InstagramPlatformParser(BasePlatformParser):
@@ -102,6 +120,31 @@ class InstagramPlatformParser(BasePlatformParser):
         self._cached_profile_data: dict[str, Any] | None = None
         self._cached_handle: str | None = None
 
+    def _is_slop_or_theme_page(self, username: str | None, biography: str | None) -> bool:
+        """Check if account is an AI slop, meme page, or compilation channel.
+
+        Scans the username and biography for stop-words that indicate
+        non-author accounts such as AI generation pages, meme aggregators,
+        video compilation channels, and spam accounts.
+
+        Args:
+            username: Instagram username (without @ prefix), or None.
+            biography: User biography text, or None.
+
+        Returns:
+            True if any stop-word from SLOP_STOP_WORDS is found in either
+            the username or biography (case-insensitive), False otherwise.
+        """
+        search_text: str = ""
+
+        if username:
+            search_text += username.lower() + " "
+
+        if biography:
+            search_text += biography.lower()
+
+        return any(stop_word in search_text for stop_word in SLOP_STOP_WORDS)
+
     async def parse_profile(self, handle: str) -> int | None:
         """Fetch Instagram profile, upsert account to database, return account ID.
 
@@ -125,27 +168,41 @@ class InstagramPlatformParser(BasePlatformParser):
 
         try:
             # Fetch profile data from Scrape Creators API (single call for profile + posts)
-            response: dict[str, Any] | None = await self._fetch_profile_data(handle)
+            response: dict[str, Any] | None = await self._fetch_profile_data(
+                handle
+            )
 
             if response is None:
-                logger.error("Failed to fetch profile data for handle: %s", handle)
+                logger.error(
+                    "Failed to fetch profile data for handle: %s", handle
+                )
                 return None
 
             # Validate response structure
             data = response.get("data")
             if not data:
-                logger.error("Missing 'data' in API response for Instagram handle %s", handle)
+                logger.info(
+                    "Raw failed API response for %s: %s", handle, response
+                )
+                logger.error(
+                    "Missing 'data' in API response for Instagram handle %s",
+                    handle,
+                )
                 return None
 
             user = data.get("user")
             if not user:
-                logger.error("Missing 'user' in data for Instagram handle %s", handle)
+                logger.error(
+                    "Missing 'user' in data for Instagram handle %s", handle
+                )
                 return None
 
             # Extract user ID and subscriber count
             user_id: str = str(user.get("id", ""))
             if not user_id:
-                logger.error("Could not extract user ID for Instagram handle %s", handle)
+                logger.error(
+                    "Could not extract user ID for Instagram handle %s", handle
+                )
                 return None
 
             subscribers_count: int = self._extract_subscribers_count(user)
@@ -183,6 +240,16 @@ class InstagramPlatformParser(BasePlatformParser):
                 await self._upsert_account(user, status="rejected")
                 return None
 
+            # Check if account is AI slop, meme page, or compilation channel
+            username: str | None = user.get("username")
+            if self._is_slop_or_theme_page(username, biography):
+                logger.info(
+                    "Instagram handle %s rejected: identified as AI slop or theme/meme page.",
+                    handle,
+                )
+                await self._upsert_account(user, status="rejected")
+                return None
+
             # Upsert account with 'parsed' status
             account_id: int = await self._upsert_account(user, status="parsed")
             logger.info(
@@ -197,7 +264,9 @@ class InstagramPlatformParser(BasePlatformParser):
 
             # Build contacts dictionary for queue expansion
             external_url: str | None = user.get("external_url")
-            contacts_dict: dict[str, Any] = parse_profile_contacts(biography, external_url)
+            contacts_dict: dict[str, Any] = parse_profile_contacts(
+                biography, external_url
+            )
 
             # Queue discovered accounts from contacts (cross-platform expansion)
             async with self.session_maker() as session:
@@ -247,15 +316,23 @@ class InstagramPlatformParser(BasePlatformParser):
 
         try:
             # Get profile data (use cache if available, otherwise fetch)
-            response: dict[str, Any] | None = await self._get_cached_or_fetch_profile(platform_id)
+            response: dict[str, Any] | None = (
+                await self._get_cached_or_fetch_profile(platform_id)
+            )
 
             if response is None:
-                logger.error("Failed to get profile data for content parsing, platform_id: %s", platform_id)
+                logger.error(
+                    "Failed to get profile data for content parsing, platform_id: %s",
+                    platform_id,
+                )
                 return
 
             # Validate response structure
             data = response.get("data")
             if not data:
+                logger.info(
+                    "Raw failed API response for %s: %s", platform_id, response
+                )
                 logger.error(
                     "Missing 'data' in API response for Instagram content, platform_id %s",
                     platform_id,
@@ -311,7 +388,9 @@ class InstagramPlatformParser(BasePlatformParser):
             unique_edges = unique_edges[:max_items]
 
             if not unique_edges:
-                logger.info("No Instagram content found for account_id: %d", account_id)
+                logger.info(
+                    "No Instagram content found for account_id: %d", account_id
+                )
                 return
 
             # Fetch transcriptions for video posts concurrently
@@ -322,7 +401,11 @@ class InstagramPlatformParser(BasePlatformParser):
                     continue
                 is_video = node.get("is_video")
                 shortcode = node.get("shortcode")
-                if is_video is True and isinstance(shortcode, str) and shortcode:
+                if (
+                    is_video is True
+                    and isinstance(shortcode, str)
+                    and shortcode
+                ):
                     video_edges_with_shortcode.append((edge, shortcode))
 
             if video_edges_with_shortcode:
@@ -337,7 +420,9 @@ class InstagramPlatformParser(BasePlatformParser):
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                for (edge, shortcode), result in zip(video_edges_with_shortcode, results):
+                for (edge, shortcode), result in zip(
+                    video_edges_with_shortcode, results
+                ):
                     if isinstance(result, Exception):
                         logger.warning(
                             "Transcription task failed for shortcode %s: %s",
@@ -355,7 +440,9 @@ class InstagramPlatformParser(BasePlatformParser):
             author_metadata = self._build_author_profile_metadata(user)
 
             # Process and upsert content items
-            await self._upsert_content(unique_edges, account_id, author_metadata)
+            await self._upsert_content(
+                unique_edges, account_id, author_metadata
+            )
             logger.info(
                 "Successfully upserted %d Instagram content items for account_id: %d",
                 len(unique_edges),
@@ -385,10 +472,10 @@ class InstagramPlatformParser(BasePlatformParser):
                 endpoint="/v1/instagram/profile",
                 params={"handle": handle},
             )
+            credits_remaining = response.get("credits_remaining", "N/A")
             logger.info(
-                "API response status for profile %s: success, credits consumed: %s",
-                handle,
-                response.get("credits", "N/A"),
+                "API response success. Remaining credits: %s",
+                credits_remaining,
             )
 
             # Cache the response
@@ -406,7 +493,9 @@ class InstagramPlatformParser(BasePlatformParser):
             )
             return None
 
-    async def _get_cached_or_fetch_profile(self, handle: str) -> dict[str, Any] | None:
+    async def _get_cached_or_fetch_profile(
+        self, handle: str
+    ) -> dict[str, Any] | None:
         """Get profile data from cache or fetch from API if cache is missing/stale.
 
         Args:
@@ -416,7 +505,10 @@ class InstagramPlatformParser(BasePlatformParser):
             API response dictionary, or None if the request failed.
         """
         # Check if cache is valid
-        if self._cached_profile_data is not None and self._cached_handle == handle:
+        if (
+            self._cached_profile_data is not None
+            and self._cached_handle == handle
+        ):
             logger.debug("Using cached profile data for handle: %s", handle)
             return self._cached_profile_data
 
@@ -424,44 +516,99 @@ class InstagramPlatformParser(BasePlatformParser):
         logger.info("Cache miss for handle: %s, fetching from API", handle)
         return await self._fetch_profile_data(handle)
 
-    async def _fetch_transcription_api(self, shortcode: str, semaphore: asyncio.Semaphore) -> str | None:
+    async def _fetch_transcription_api(
+        self, shortcode: str, semaphore: asyncio.Semaphore
+    ) -> str | None:
         """Fetch transcription for a video post via Scrape Creators transcript endpoint.
+
+        Probes different URL formats and API endpoints to find a working combination.
+        Implements a nested loop strategy to try multiple combinations of:
+        - Instagram URL formats (with/without www, /p/ or /reel/)
+        - API endpoints (/v2/instagram/media/transcript, /v2/instagram/transcript)
 
         Args:
             shortcode: Instagram post shortcode.
             semaphore: Semaphore to limit concurrent requests.
 
         Returns:
-            Transcription text if available, None otherwise.
+            Transcription text if available and valid, None otherwise.
         """
-        try:
-            async with semaphore:
-                response: dict[str, Any] = await self.client.get(
-                    endpoint="/v2/instagram/media/transcript",
-                    params={"shortcode": shortcode},
-                )
-            # Extract transcription from possible response keys
-            transcription = None
-            data = response.get("data", {})
-            if isinstance(data, dict):
-                transcription = data.get("transcript")
-            if not transcription:
-                transcription = response.get("transcript")
-            if not transcription:
-                transcription = response.get("text")
-            if isinstance(transcription, str) and transcription.strip():
-                return transcription.strip()
-            return None
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch transcription for shortcode %s: %s",
-                shortcode,
-                e,
-                exc_info=True,
-            )
-            return None
+        # Define potential Instagram URL formats for the given shortcode
+        url_formats = [
+            f"https://www.instagram.com/p/{shortcode}/",   # Format A
+            f"https://www.instagram.com/reel/{shortcode}/",  # Format B
+            f"https://instagram.com/p/{shortcode}",           # Format C
+            f"https://instagram.com/reel/{shortcode}",        # Format D
+        ]
 
-    async def _upsert_account(self, user: dict[str, Any], status: str = "parsed") -> int:
+        # Define candidate Scrape Creators API endpoints
+        endpoints = [
+            "/v2/instagram/media/transcript",  # Endpoint 1
+            "/v2/instagram/transcript",        # Endpoint 2
+        ]
+
+        async with semaphore:
+            # Nested loop: try each endpoint with each URL format
+            for endpoint in endpoints:
+                for url_format in url_formats:
+                    try:
+                        logger.debug(
+                            "Probing endpoint: %s with URL: %s",
+                            endpoint,
+                            url_format,
+                        )
+                        # Call transcript API with 'url' parameter
+                        response: dict[str, Any] = await self.client.get(
+                            endpoint=endpoint,
+                            params={"url": url_format},
+                        )
+
+                        # Check if response contains valid transcription
+                        transcripts = response.get("transcripts")
+                        if isinstance(transcripts, list) and transcripts:
+                            first_transcript = transcripts[0]
+                            if (
+                                isinstance(first_transcript, str)
+                                and first_transcript.strip()
+                            ):
+                                # Success! Log and return immediately
+                                logger.info(
+                                    "[API PROBE SUCCESS] Working combination found! Endpoint: %s, URL: %s",
+                                    endpoint,
+                                    url_format,
+                                )
+                                return first_transcript.strip()
+
+                    except aiohttp.ClientResponseError as e:
+                        # Handle HTTP errors (400, 404, 500, etc.)
+                        logger.debug(
+                            "HTTP %d error for endpoint: %s, URL: %s - %s",
+                            e.status,
+                            endpoint,
+                            url_format,
+                            e.message,
+                        )
+                        continue
+                    except Exception as e:
+                        # Handle other exceptions
+                        logger.debug(
+                            "Exception for endpoint: %s, URL: %s - %s",
+                            endpoint,
+                            url_format,
+                            e,
+                        )
+                        continue
+
+        # All combinations failed
+        logger.warning(
+            "Failed to fetch transcription for shortcode %s after probing all endpoints and URL formats.",
+            shortcode,
+        )
+        return None
+
+    async def _upsert_account(
+        self, user: dict[str, Any], status: str = "parsed"
+    ) -> int:
         """Upsert Instagram account record using select-then-insert/update pattern.
 
         Uses a select-then-upsert transaction pattern to avoid InvalidColumnReferenceError
@@ -631,7 +778,9 @@ class InstagramPlatformParser(BasePlatformParser):
 
                 # Extract engagement metrics
                 views: int | None = node.get("video_view_count")
-                reactions_count: int | None = self._extract_reactions_count(node)
+                reactions_count: int | None = self._extract_reactions_count(
+                    node
+                )
                 comments_count: int | None = self._extract_comments_count(node)
                 shares_count: int | None = None
 
@@ -665,29 +814,39 @@ class InstagramPlatformParser(BasePlatformParser):
                 if video_download_url:
                     raw_metadata["video_download_url"] = video_download_url
 
-                content_values.append({
-                    "account_id": account_id,
-                    "platform_content_id": platform_content_id,
-                    "content": content_text,
-                    "transcription": transcription,
-                    "published_at": published_at or datetime.now(timezone.utc),
-                    "views": views,
-                    "comments_count": comments_count,
-                    "shares_count": shares_count,
-                    "reactions_count": reactions_count,
-                    "has_media": has_media,
-                    "raw_metadata": raw_metadata,
-                    "is_embedded": False,
-                    "is_graph_extracted": False,
-                    "updated_at": datetime.now(timezone.utc),
-                })
+                content_values.append(
+                    {
+                        "account_id": account_id,
+                        "platform_content_id": platform_content_id,
+                        "content": content_text,
+                        "transcription": transcription,
+                        "published_at": published_at
+                        or datetime.now(timezone.utc),
+                        "views": views,
+                        "comments_count": comments_count,
+                        "shares_count": shares_count,
+                        "reactions_count": reactions_count,
+                        "has_media": has_media,
+                        "raw_metadata": raw_metadata,
+                        "is_embedded": False,
+                        "is_graph_extracted": False,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                )
 
             except Exception as e:
-                logger.error("Failed to parse Instagram content item: %s", e, exc_info=True)
+                logger.error(
+                    "Failed to parse Instagram content item: %s",
+                    e,
+                    exc_info=True,
+                )
                 continue
 
         if not content_values:
-            logger.warning("No valid content items to upsert for account_id: %d", account_id)
+            logger.warning(
+                "No valid content items to upsert for account_id: %d",
+                account_id,
+            )
             return
 
         async with self.session_maker() as session:
@@ -697,7 +856,9 @@ class InstagramPlatformParser(BasePlatformParser):
                     constraint="uq_content_account_platform_id",
                     set_=dict(
                         content=stmt.excluded.content,
-                        transcription=func.coalesce(stmt.excluded.transcription, Content.transcription),
+                        transcription=func.coalesce(
+                            stmt.excluded.transcription, Content.transcription
+                        ),
                         views=stmt.excluded.views,
                         reactions_count=stmt.excluded.reactions_count,
                         shares_count=stmt.excluded.shares_count,
@@ -714,7 +875,9 @@ class InstagramPlatformParser(BasePlatformParser):
                     account_id,
                 )
 
-    def _build_author_profile_metadata(self, user: dict[str, Any]) -> dict[str, Any]:
+    def _build_author_profile_metadata(
+        self, user: dict[str, Any]
+    ) -> dict[str, Any]:
         """Build author profile metadata dictionary from user data.
 
         Extracts external links, contact information, location, language,
@@ -736,7 +899,9 @@ class InstagramPlatformParser(BasePlatformParser):
 
         # Use shared utility to parse contacts from biography and external_url
         external_url: str | None = user.get("external_url")
-        contacts_dict: dict[str, Any] = parse_profile_contacts(biography, external_url)
+        contacts_dict: dict[str, Any] = parse_profile_contacts(
+            biography, external_url
+        )
         # parse_profile_contacts returns: {emails, telegram_handles, external_links, raw_bio}
 
         # Build profile link
@@ -757,7 +922,9 @@ class InstagramPlatformParser(BasePlatformParser):
         location: str | None = None
         business_address = user.get("business_address_json")
         if business_address and isinstance(business_address, dict):
-            location = business_address.get("street_address") or business_address.get("city")
+            location = business_address.get(
+                "street_address"
+            ) or business_address.get("city")
         elif user.get("location"):
             location = user.get("location")
 
@@ -810,33 +977,47 @@ class InstagramPlatformParser(BasePlatformParser):
                 platform_id: str | None = None
                 if "/@" in link:
                     # Format: youtube.com/@handle
-                    platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
+                    platform_id = (
+                        link.split("/@")[-1].split("?")[0].split("/")[0]
+                    )
                 elif "youtube.com/channel/" in link_lower:
                     # Format: youtube.com/channel/UC...
-                    platform_id = link.split("/channel/")[-1].split("?")[0].split("/")[0]
+                    platform_id = (
+                        link.split("/channel/")[-1].split("?")[0].split("/")[0]
+                    )
                 elif "youtu.be/" in link_lower:
                     # Format: youtu.be/VIDEO_ID (not a channel, skip)
                     continue
 
                 if platform_id:
-                    await self._insert_pending_account(session, "YOUTUBE", platform_id)
+                    await self._insert_pending_account(
+                        session, "YOUTUBE", platform_id
+                    )
 
             # TikTok: tiktok.com/@
             elif "tiktok.com/@" in link_lower:
                 # Extract username
                 platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
                 if platform_id:
-                    await self._insert_pending_account(session, "TIKTOK", platform_id)
+                    await self._insert_pending_account(
+                        session, "TIKTOK", platform_id
+                    )
 
             # Threads: threads.net/@
             elif "threads.net/@" in link_lower or "threads.net/" in link_lower:
                 # Extract username
                 if "/@" in link:
-                    platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
+                    platform_id = (
+                        link.split("/@")[-1].split("?")[0].split("/")[0]
+                    )
                 else:
-                    platform_id = link.split("/")[-1].split("?")[0].split("/")[0]
+                    platform_id = (
+                        link.split("/")[-1].split("?")[0].split("/")[0]
+                    )
                 if platform_id:
-                    await self._insert_pending_account(session, "THREADS", platform_id)
+                    await self._insert_pending_account(
+                        session, "THREADS", platform_id
+                    )
 
         # Process Telegram handles
         telegram_handles: list[str] = contacts_dict.get("telegram_handles", [])
@@ -846,7 +1027,9 @@ class InstagramPlatformParser(BasePlatformParser):
             # Remove @ if present
             platform_id = handle.lstrip("@")
             if platform_id:
-                await self._insert_pending_account(session, "TELEGRAM", platform_id)
+                await self._insert_pending_account(
+                    session, "TELEGRAM", platform_id
+                )
 
     async def _insert_pending_account(
         self, session: AsyncSession, platform: str, platform_id: str
@@ -910,7 +1093,11 @@ class InstagramPlatformParser(BasePlatformParser):
 
         # Try display_url as fallback (may be image, check)
         display_url: str | None = node.get("display_url")
-        if display_url and isinstance(display_url, str) and "cdninstagram" in display_url:
+        if (
+            display_url
+            and isinstance(display_url, str)
+            and "cdninstagram" in display_url
+        ):
             return display_url
 
         # Try video_resources for highest quality
@@ -1020,7 +1207,9 @@ class InstagramPlatformParser(BasePlatformParser):
         if timestamp:
             try:
                 if isinstance(timestamp, (int, float)):
-                    return datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
+                    return datetime.fromtimestamp(
+                        int(timestamp), tz=timezone.utc
+                    )
             except (ValueError, TypeError, OSError) as e:
                 logger.warning("Failed to parse timestamp %s: %s", timestamp, e)
         return None

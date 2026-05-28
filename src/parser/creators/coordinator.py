@@ -2,7 +2,7 @@
 Multi-platform Ingestion Coordinator for creators scraping.
 
 Queries the database for pending accounts, processes them concurrently across
-different platforms (Instagram, TikTok), and updates their scraping status.
+different platforms (Instagram, Threads, TikTok, YouTube), and updates their scraping status.
 
 This module is designed to run as a production-grade background daemon with
 graceful shutdown handling for OS signals (SIGTERM, SIGINT).
@@ -16,7 +16,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from src.config.config import Settings, load_settings
 from src.db.models import Account
@@ -33,7 +37,7 @@ STATUS_REJECTED = "rejected"
 STATUS_FAILED = "failed"
 
 # Platforms that are handled by the creators coordinator (not Telegram)
-CREATOR_PLATFORMS = ["INSTAGRAM", "TIKTOK"]
+CREATOR_PLATFORMS = ["INSTAGRAM", "THREADS", "TIKTOK", "YOUTUBE"]
 
 # Default threshold for re-processing accounts (24 hours ago)
 DEFAULT_STATUS_UPDATE_THRESHOLD_HOURS = 24
@@ -72,7 +76,9 @@ class CreatorsCoordinator:
         self.settings = settings
         self._shutdown_event = shutdown_event
         self.min_subscribers: int = settings.creators_min_subscribers
-        self.status_threshold_hours: int = settings.creators_status_threshold_hours
+        self.status_threshold_hours: int = (
+            settings.creators_status_threshold_hours
+        )
         self.poll_interval_s: int = settings.creators_poll_interval_s
         logger.info(
             f"CreatorsCoordinator initialized with min_subscribers={self.min_subscribers}, "
@@ -176,7 +182,9 @@ class CreatorsCoordinator:
                     f"Unexpected error in task {i}: {result!r}", exc_info=result
                 )
 
-        logger.info(f"Ingestion cycle completed. Processed {len(tasks)} accounts.")
+        logger.info(
+            f"Ingestion cycle completed. Processed {len(tasks)} accounts."
+        )
 
     async def _process_single_account(
         self,
@@ -195,14 +203,12 @@ class CreatorsCoordinator:
 
         Args:
             account_id: Database ID of the account to process.
-            platform: Platform name (e.g., "INSTAGRAM", "TIKTOK").
+            platform: Platform name (e.g., "INSTAGRAM", "THREADS", "TIKTOK", "YOUTUBE").
             username: Platform username/handle (without @ prefix).
             semaphore: asyncio.Semaphore for concurrency control.
         """
         if not username:
-            logger.warning(
-                f"Account {account_id} has no username, skipping"
-            )
+            logger.warning(f"Account {account_id} has no username, skipping")
             return
 
         async with semaphore:
@@ -245,9 +251,7 @@ class CreatorsCoordinator:
 
                     # Get the updated account to check subscriber count
                     async with self.session_maker() as session:
-                        stmt = select(Account).where(
-                            Account.id == account_id
-                        )
+                        stmt = select(Account).where(Account.id == account_id)
                         result = await session.execute(stmt)
                         account = result.scalar_one_or_none()
 
@@ -274,9 +278,7 @@ class CreatorsCoordinator:
                     )
 
                     # On successful completion, update status to "parsed"
-                    await self._update_account_status(
-                        account_id, STATUS_PARSED
-                    )
+                    await self._update_account_status(account_id, STATUS_PARSED)
                     logger.info(
                         f"Successfully processed account {account_id} "
                         f"({username} on {platform})"
@@ -352,7 +354,9 @@ async def _sleep_with_shutdown_check(
     elapsed: float = 0.0
     while elapsed < interval_s:
         if shutdown_event.is_set():
-            logger.info("Shutdown requested during sleep cycle, waking up early.")
+            logger.info(
+                "Shutdown requested during sleep cycle, waking up early."
+            )
             return True
         sleep_chunk: float = min(check_interval_s, interval_s - elapsed)
         await asyncio.sleep(sleep_chunk)
@@ -405,8 +409,12 @@ async def main() -> None:
         will finish the current batch and exit cleanly.
         """
         sig_name: str = signal.Signals(sig).name
-        logger.info(f"Received signal {sig_name}, initiating graceful shutdown...")
-        logger.info("Waiting for current batch to complete before shutting down...")
+        logger.info(
+            f"Received signal {sig_name}, initiating graceful shutdown..."
+        )
+        logger.info(
+            "Waiting for current batch to complete before shutting down..."
+        )
         shutdown_event.set()
 
     # Register signal handlers for graceful shutdown
@@ -442,11 +450,15 @@ async def main() -> None:
 
             # Check shutdown before sleeping
             if shutdown_event.is_set():
-                logger.info("Shutdown requested after batch completion, exiting.")
+                logger.info(
+                    "Shutdown requested after batch completion, exiting."
+                )
                 break
 
             # Sleep with periodic shutdown checks
-            logger.info(f"Sleeping for {coordinator.poll_interval_s}s until next batch...")
+            logger.info(
+                f"Sleeping for {coordinator.poll_interval_s}s until next batch..."
+            )
             shutdown_during_sleep: bool = await _sleep_with_shutdown_check(
                 shutdown_event=shutdown_event,
                 interval_s=coordinator.poll_interval_s,
