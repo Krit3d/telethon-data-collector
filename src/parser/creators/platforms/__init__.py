@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.config.config import Settings
 from src.parser.creators.sc_client import ScrapeCreatorsClient
 from .base import BasePlatformParser
-from .instagram import InstagramPlatformParser
-from .threads import ThreadsPlatformParser
-from .tiktok import TikTokPlatformParser
-from .youtube import YouTubePlatformParser
+from .instagram import InstagramParser
+from .threads import ThreadsParser
+from .tiktok import TikTokParser
+from .youtube import YouTubeParser
 
 
 def get_platform_parser(
@@ -38,10 +38,10 @@ def get_platform_parser(
         ValueError: If the provided platform string is not supported.
     """
     platform_registry = {
-        "INSTAGRAM": InstagramPlatformParser,
-        "THREADS": ThreadsPlatformParser,
-        "TIKTOK": TikTokPlatformParser,
-        "YOUTUBE": YouTubePlatformParser,
+        "INSTAGRAM": InstagramParser,
+        "THREADS": ThreadsParser,
+        "TIKTOK": TikTokParser,
+        "YOUTUBE": YouTubeParser,
     }
 
     normalized_platform = platform.upper()

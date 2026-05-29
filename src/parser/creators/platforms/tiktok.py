@@ -1,30 +1,31 @@
 """
-TikTok platform parser using Scrape Creators API.
+TikTok platform parser using Scrape Creators API v1 (profile) and v3 (videos).
 
 Implements TikTok-specific profile parsing and content ingestion into PostgreSQL.
 Extracts author profile metadata (external links, contacts, location, language)
 and stores it inside Content.raw_metadata under the "author_profile_metadata" key.
 
 Features:
-    - Profile parsing with account upsert to accounts table
+    - Profile parsing via /v1/tiktok/profile endpoint with account upsert to accounts table
     - Follower threshold enforcement (3,000 to 150,000 for micro-influencers)
-    - Russian language (Cyrillic) biography check
+    - Russian language (Cyrillic) biography check (biography OR display name)
     - AI-slop / theme-page detection
     - Female creator detection with virtual profile post creation
-    - Content fetching and bulk upsert to content table
-    - PostgreSQL ON CONFLICT DO UPDATE for high-throughput concurrency
+    - Content fetching via /v3/tiktok/profile/videos endpoint with pagination
+    - Bulk upsert to content table with PostgreSQL ON CONFLICT DO UPDATE
     - Raw metadata preservation for OpenSPG processing
     - Extraction of external links, contact info from biography via shared utils
     - Video download URL extraction for GPU worker processing
-    - Transcription support via Scrape Creators API transcript endpoint
     - Cross-platform spidering queue for discovered accounts
+    - Duration filtering (<= 120 seconds) for short-form content
+    - No secondary transcript API calls; descriptions extracted inline
 """
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from aiohttp import ClientResponseError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -50,15 +51,13 @@ logger = logging.getLogger(__name__)
 MIN_FOLLOWERS: int = 3000
 MAX_FOLLOWERS: int = 150000
 
-# Semaphore limit for concurrent transcript API calls
-TRANSCRIPT_SEMAPHORE_LIMIT: int = 5
 
-
-class TikTokPlatformParser(BasePlatformParser):
+class TikTokParser(BasePlatformParser):
     """TikTok platform parser for profile and content ingestion.
 
     Inherits from BasePlatformParser and implements TikTok-specific
-    profile parsing and content upsert logic using the Scrape Creators API.
+    profile parsing and content upsert logic using the Scrape Creators API
+    v1 (profile) and v3 (videos).
 
     Features instance-level caching for the profile endpoint to avoid
     duplicate API calls when fetching profile and content data.
@@ -76,7 +75,6 @@ class TikTokPlatformParser(BasePlatformParser):
         settings: Application settings containing configuration values.
         _cached_profile: Instance-level cache for profile response data.
         _cached_handle: The handle for which profile data is cached.
-        _transcript_semaphore: Semaphore to limit concurrent transcript API calls.
     """
 
     def __init__(
@@ -95,15 +93,15 @@ class TikTokPlatformParser(BasePlatformParser):
         super().__init__(session_maker, client, settings)
         self._cached_profile: dict[str, Any] | None = None
         self._cached_handle: str | None = None
-        self._transcript_semaphore = asyncio.Semaphore(TRANSCRIPT_SEMAPHORE_LIMIT)
 
     async def parse_profile(self, handle: str) -> int | None:
         """Fetch TikTok profile, apply filters, upsert account.
 
         Parses the TikTok profile for the given handle, checks follower
-        thresholds (3k-150k), verifies Russian Cyrillic in biography,
-        checks for AI-slop/theme-page content, detects female creators,
-        and upserts the account information to the accounts table.
+        thresholds (3k-150k), verifies Russian Cyrillic in biography or
+        display name, checks for AI-slop/theme-page content, detects
+        female creators, and upserts the account information to the
+        accounts table.
 
         Args:
             handle: TikTok username (without @ prefix).
@@ -131,7 +129,10 @@ class TikTokPlatformParser(BasePlatformParser):
         # Content quality filters
         username = profile.get("uniqueId") or profile.get("handle", "")
         biography = profile.get("signature") or profile.get("bio", "")
-        if not is_russian_text(biography) or is_slop_or_theme_page(username, biography):
+        full_name = profile.get("nickname") or profile.get("displayName")
+        # Check if EITHER biography OR full_name contains Russian Cyrillic characters
+        has_russian = is_russian_text(biography) or is_russian_text(full_name)
+        if not has_russian or is_slop_or_theme_page(username, biography):
             logger.info("TikTok handle %s failed content filters. Rejecting.", handle)
             await self._upsert_account(profile, "rejected")
             return None
@@ -157,11 +158,12 @@ class TikTokPlatformParser(BasePlatformParser):
                     platform="TIKTOK",
                     platform_id=str(profile.get("id") or profile.get("userId", "")),
                     username=username,
-                    full_name=profile.get("nickname") or profile.get("displayName"),
+                    full_name=full_name,
                     biography=biography,
                     subscribers_count=followers,
                     raw_metadata={"female_heuristic": True},
                 )
+                await session.commit()
 
         # Queue discovered accounts from contacts (spidering)
         contacts_dict = parse_profile_contacts(biography, None)
@@ -171,6 +173,7 @@ class TikTokPlatformParser(BasePlatformParser):
                 contacts_dict=contacts_dict,
                 parent_handle=handle,
             )
+            await session.commit()
 
         return account_id
 
@@ -180,43 +183,33 @@ class TikTokPlatformParser(BasePlatformParser):
         platform_id: str,
         max_items: int = 50,
     ) -> None:
-        """Fetch TikTok content and bulk upsert to content table.
+        """Fetch TikTok videos and bulk upsert to content table.
 
-        Retrieves content items (videos) for the given account using the
-        Scrape Creators API, parses the data, and performs a bulk upsert
-        into the content table using PostgreSQL ON CONFLICT DO UPDATE.
+        Retrieves videos for the given account using the Scrape Creators API v3
+        /v3/tiktok/profile/videos endpoint, paginates using cursor until up to max_items
+        are collected, filters videos with duration <= 120 seconds, and bulk upserts
+        into the content table.
 
-        The database stores numerical platform_id (e.g., '7123456789') for
-        TikTok accounts, but the Scrape Creators API requires the textual
-        handle (username, e.g., 'khaby.lame'). This method resolves the
-        handle by querying the database for the account's username.
-
-        If the API response does not contain transcripts, this method will
-        attempt to fetch them via the /v2/tiktok/media/transcript endpoint
-        with a semaphore limit of 5 concurrent requests.
-
-        The raw_metadata field contains:
-            - "author_profile_metadata": Profile-level data (contacts, links, etc.)
-            - "platform_metrics": Platform-specific engagement metrics including video_url
+        The database stores numerical platform_id, but the API requires the textual
+        handle (username) which is resolved from the database. Video descriptions
+        are extracted directly from the inline payload (desc/title) and mapped to
+        the Content text column. No transcript requests are made.
 
         Args:
             account_id: Database ID of the parent account record.
             platform_id: TikTok numerical platform ID (e.g., '7123456789').
-            max_items: Maximum number of content items to fetch (default: 50).
+            max_items: Maximum number of videos to fetch (default: 50).
         """
         # Resolve the textual username (handle) from the database
-        # The database stores numerical platform_id, but API needs the username
         handle: str | None = None
         async with self.session_maker() as session:
             stmt = select(Account.username).where(Account.id == account_id)
             result = await session.execute(stmt)
             handle = result.scalar_one_or_none()
 
-        # Fallback to platform_id if username not found in database
         if not handle:
             logger.warning(
-                "Username not found in database for account_id: %d, "
-                "falling back to platform_id: %s",
+                "Username not found in database for account_id: %d, falling back to platform_id: %s",
                 account_id,
                 platform_id,
             )
@@ -228,83 +221,105 @@ class TikTokPlatformParser(BasePlatformParser):
             handle,
         )
 
+        # Fetch profile for author metadata (uses instance cache)
         profile = await self._get_cached_or_fetch_profile(handle)
-        if not profile:
-            return
+        author_metadata: dict[str, Any] = {}
+        if profile:
+            # Build author profile metadata from profile data
+            username: str | None = profile.get("uniqueId") or profile.get("handle")
+            biography: str | None = profile.get("signature") or profile.get("bio")
+            contacts_dict: dict[str, Any] = parse_profile_contacts(biography, None)
 
-        # Validate response structure
-        data = profile.get("data") if isinstance(profile, dict) else None
-        if not data:
-            logger.error(
-                "Missing 'data' in API response for TikTok content, handle %s",
-                handle,
+            # Extract geo data (region/city/country) from profile
+            geo_data: dict[str, Any] | None = None
+            region = profile.get("region")
+            city = profile.get("city")
+            country = profile.get("country")
+            if region or city or country:
+                geo_data = {}
+                if region:
+                    geo_data["region"] = str(region)
+                if city:
+                    geo_data["city"] = str(city)
+                if country:
+                    geo_data["country"] = str(country)
+
+            # Extract official website link
+            extra_links: list[str] = []
+            website = profile.get("websiteUrl") or profile.get("website")
+            if website:
+                extra_links.append(str(website))
+
+            author_metadata = compile_author_metadata(
+                platform="TIKTOK",
+                username=username,
+                biography=biography,
+                contacts_dict=contacts_dict,
+                extra_links=extra_links if extra_links else None,
+                language=profile.get("language"),
+                location=profile.get("location"),
+                geo_data=geo_data,
             )
+        else:
+            logger.warning("Failed to fetch profile for handle %s, author metadata will be empty", handle)
+
+        # Fetch videos with pagination from /v3/tiktok/profile/videos endpoint
+        videos_collected: list[dict[str, Any]] = []
+        cursor: str | None = None
+
+        while len(videos_collected) < max_items:
+            # Scrape Creators v3 videos endpoint parameters
+            params: dict[str, Any] = {"handle": platform_id}
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                response = await self.client.get(
+                    endpoint="/v3/tiktok/profile/videos",
+                    params=params,
+                )
+            except Exception as e:
+                logger.error("Failed to fetch videos for handle %s: %s", handle, e)
+                break
+
+            # Extract videos from root-level "aweme_list" (v3 API returns list directly)
+            items: list[dict[str, Any]] = response.get("aweme_list", [])
+            if not items:
+                logger.info("No more videos available for handle %s", handle)
+                break
+
+            # Filter items by duration <= 120 seconds and collect up to max_items
+            for item in items:
+                duration = item.get("duration") or item.get("durationSec")
+                if duration is None:
+                    continue
+
+                try:
+                    duration_sec = float(duration)
+                except (ValueError, TypeError):
+                    continue
+
+                if duration_sec > 120.0:
+                    continue
+
+                videos_collected.append(item)
+                if len(videos_collected) >= max_items:
+                    break
+
+            # Get next cursor for pagination from response root
+            cursor = response.get("cursor") or response.get("nextCursor") or response.get("pageCursor")
+            if not cursor:
+                break
+
+        if not videos_collected:
+            logger.info("No valid TikTok videos found for account_id: %d", account_id)
             return
 
-        # Extract itemList from profile response
-        item_list: list[dict[str, Any]] = data.get("itemList", [])
-        if not isinstance(item_list, list):
-            logger.error(
-                "Invalid itemList in API response for TikTok content, handle %s",
-                handle,
-            )
-            return
-
-        if not item_list:
-            logger.info("No TikTok content found for account_id: %d", account_id)
-            return
-
-        # Limit to max_items
-        item_list = item_list[:max_items]
-
-        # Build author profile metadata using core helper
-        user = data.get("user") or data
-        username: str | None = user.get("uniqueId") or user.get("handle")
-        biography: str | None = user.get("signature") or user.get("bio")
-
-        # Parse contacts from biography
-        contacts_dict: dict[str, Any] = parse_profile_contacts(biography, None)
-
-        # Extract geo data (region/city/country) from user object
-        geo_data: dict[str, Any] | None = None
-        region = user.get("region")
-        city = user.get("city")
-        country = user.get("country")
-        if region or city or country:
-            geo_data = {}
-            if region:
-                geo_data["region"] = str(region)
-            if city:
-                geo_data["city"] = str(city)
-            if country:
-                geo_data["country"] = str(country)
-
-        # Also check for official website link in user object
-        extra_links: list[str] = []
-        website = user.get("websiteUrl") or user.get("website")
-        if website:
-            extra_links.append(str(website))
-
-        # Use core helper to compile author metadata
-        author_metadata = compile_author_metadata(
-            platform="TIKTOK",
-            username=username,
-            biography=biography,
-            contacts_dict=contacts_dict,
-            extra_links=extra_links if extra_links else None,
-            language=user.get("language"),
-            location=user.get("location"),
-            geo_data=geo_data,
-        )
-
-        # Fetch transcripts concurrently with semaphore limit
-        await self._fetch_transcripts_for_videos(item_list)
-
-        # Process and upsert content items
-        await self._upsert_content(item_list, account_id, author_metadata)
+        # Process and upsert collected video items
+        await self._upsert_content(videos_collected, account_id, author_metadata)
         logger.info(
             "Successfully upserted %d TikTok content items for account_id: %d (handle: %s)",
-            len(item_list),
+            len(videos_collected),
             account_id,
             handle,
         )
@@ -314,6 +329,7 @@ class TikTokPlatformParser(BasePlatformParser):
 
         Uses instance-level caching to avoid duplicate API calls when
         subsequently calling parse_content() for the same handle.
+        Uses Scrape Creators API v1 /v1/tiktok/profile endpoint.
 
         Args:
             handle: TikTok username to fetch.
@@ -327,26 +343,29 @@ class TikTokPlatformParser(BasePlatformParser):
 
         try:
             response = await self.client.get(
-                endpoint="/v2/tiktok/profile",
-                params={"handle": handle, "count": 100},
+                endpoint="/v1/tiktok/profile",
+                params={"handle": handle},
             )
-            data = response.get("data")
-            if not data:
-                logger.error("Missing 'data' in API response for TikTok handle %s", handle)
-                return None
-
-            user = data.get("user") or data
-            if not user:
-                logger.error("Missing user data for TikTok handle %s", handle)
-                return None
-
-            # Cache the response
+            # TikTok v1 API returns profile fields directly at root level
+            # Treat entire response as profile data
             self._cached_profile = response
             self._cached_handle = handle
             return response
 
+        except ClientResponseError as e:
+            if e.status == 404:
+                logger.warning("TikTok profile %s not found (404). Marking as rejected.", handle)
+            else:
+                logger.error(
+                    "TikTok API request failed for %s with HTTP %d: %s",
+                    handle, e.status, e,
+                )
+            return None
         except Exception as e:
-            logger.error("API request failed for TikTok profile %s: %s", handle, e, exc_info=True)
+            logger.error(
+                "Unexpected error fetching TikTok profile %s: %s",
+                handle, e, exc_info=True,
+            )
             return None
 
     async def _upsert_account(
@@ -398,76 +417,6 @@ class TikTokPlatformParser(BasePlatformParser):
             await session.refresh(db_account)
             return db_account.id
 
-    async def _fetch_transcripts_for_videos(
-        self, items: list[dict[str, Any]],
-    ) -> None:
-        """Fetch transcripts for videos that don't already have them.
-
-        Uses the Scrape Creators API endpoint /v2/tiktok/media/transcript
-        to fetch transcripts for videos that don't already have transcription
-        in the response. Limits concurrent requests to 5 using a semaphore.
-
-        After fetching, stores the transcript in the item's "transcription" field.
-        Checks for the plural "transcripts" key in the JSON response.
-
-        Args:
-            items: List of video item dictionaries to fetch transcripts for.
-        """
-        tasks = []
-        for item in items:
-            # Skip if already has transcription
-            if item.get("transcription") or item.get("transcript"):
-                continue
-
-            video_id = item.get("id")
-            if not video_id:
-                continue
-
-            tasks.append(self._fetch_single_transcript(item, str(video_id)))
-
-        if tasks:
-            logger.info("Fetching transcripts for %d TikTok videos", len(tasks))
-            await asyncio.gather(*tasks)
-
-    async def _fetch_single_transcript(
-        self, item: dict[str, Any], video_id: str,
-    ) -> None:
-        """Fetch transcript for a single video with semaphore limiting.
-
-        Args:
-            item: Video item dictionary to store the transcript in.
-            video_id: TikTok video ID for the API call.
-        """
-        async with self._transcript_semaphore:
-            try:
-                response = await self.client.get(
-                    endpoint="/v2/tiktok/media/transcript",
-                    params={"video_id": video_id},
-                )
-                data = response.get("data")
-                if not data:
-                    return
-
-                # Check for "transcripts" (plural) key in response
-                transcripts = data.get("transcripts") or data.get("transcript")
-                if isinstance(transcripts, list) and transcripts:
-                    # Combine all transcript entries
-                    text_parts = []
-                    for entry in transcripts:
-                        if isinstance(entry, dict):
-                            text_parts.append(entry.get("text", ""))
-                        elif isinstance(entry, str):
-                            text_parts.append(entry)
-                    item["transcription"] = " ".join(text_parts).strip()
-                elif isinstance(transcripts, str):
-                    item["transcription"] = transcripts.strip()
-
-            except Exception as e:
-                logger.warning(
-                    "Failed to fetch transcript for TikTok video %s: %s",
-                    video_id, e,
-                )
-
     async def _upsert_content(
         self,
         items: list[dict[str, Any]],
@@ -491,8 +440,8 @@ class TikTokPlatformParser(BasePlatformParser):
                     logger.warning("Skipping content item with no ID")
                     continue
 
-                # Extract content text (video description)
-                content_text: str | None = item.get("desc") or item.get("description")
+                # Extract content text (video description from inline payload)
+                content_text: str | None = item.get("desc") or item.get("title") or item.get("description")
 
                 # Extract published timestamp using core helper
                 create_time = item.get("createTime") or item.get("createdAt")
@@ -506,9 +455,6 @@ class TikTokPlatformParser(BasePlatformParser):
 
                 # Extract video download URL for GPU worker
                 video_url: str | None = self._extract_video_download_url(item)
-
-                # Extract transcription
-                transcription: str | None = self._extract_transcription(item)
 
                 # Build platform metrics with video_url for GPU worker
                 platform_metrics: dict[str, Any] = {
@@ -529,7 +475,6 @@ class TikTokPlatformParser(BasePlatformParser):
                     "account_id": account_id,
                     "platform_content_id": platform_content_id,
                     "content": content_text,
-                    "transcription": transcription,
                     "published_at": published_at,
                     "views": views,
                     "reactions_count": reactions_count,
@@ -557,7 +502,6 @@ class TikTokPlatformParser(BasePlatformParser):
                     constraint="uq_content_account_platform_id",
                     set_=dict(
                         content=stmt.excluded.content,
-                        transcription=stmt.excluded.transcription,
                         views=stmt.excluded.views,
                         reactions_count=stmt.excluded.reactions_count,
                         comments_count=stmt.excluded.comments_count,
@@ -653,28 +597,4 @@ class TikTokPlatformParser(BasePlatformParser):
         if direct_url and isinstance(direct_url, str):
             return direct_url
 
-        return None
-
-    def _extract_transcription(self, item: dict[str, Any]) -> str | None:
-        """Extract transcription from TikTok video item.
-
-        Checks for transcription in various possible fields in the item.
-        If the Scrape Creators API returns transcription in the video payload,
-        it will be extracted here. Otherwise, _fetch_transcripts_for_videos
-        will attempt to fetch it from the transcript endpoint.
-
-        Args:
-            item: Video item dictionary from API response.
-
-        Returns:
-            Transcription text if available, else None.
-        """
-        transcription = (
-            item.get("transcription")
-            or item.get("transcript")
-            or item.get("subtitle")
-            or item.get("captions")
-        )
-        if transcription and isinstance(transcription, str):
-            return transcription.strip()
         return None

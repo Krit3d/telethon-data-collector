@@ -1,5 +1,5 @@
 """
-Threads platform parser using Scrape Creators API.
+Threads platform parser using Scrape Creators API v1.
 
 Implements Threads-specific profile parsing and content ingestion into PostgreSQL.
 Extracts author profile metadata and stores it inside Content.raw_metadata.
@@ -10,17 +10,18 @@ Features:
     - Russian language (Cyrillic) biography check
     - AI-slop / theme-page detection
     - Female creator detection with virtual profile post creation
-    - Content fetching and bulk upsert to content table
+    - Content fetching with pagination and bulk upsert to content table
     - PostgreSQL ON CONFLICT DO UPDATE for high-throughput concurrency
     - Cross-platform spidering queue for discovered accounts
-    - Transcription set to None (Threads is primarily text-based)
+    - No transcript requests (Threads is text-based, content text is inline)
 """
 
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, func
+from aiohttp import ClientResponseError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -50,7 +51,7 @@ class ThreadsParser(BasePlatformParser):
     """Threads platform parser for profile and content ingestion.
 
     Inherits from BasePlatformParser and implements Threads-specific
-    profile parsing and content upsert logic using the Scrape Creators API.
+    profile parsing and content upsert logic using the Scrape Creators API v1.
 
     Attributes:
         session_maker: SQLAlchemy async session maker for database operations.
@@ -136,6 +137,7 @@ class ThreadsParser(BasePlatformParser):
                     subscribers_count=subscribers,
                     raw_metadata={"female_heuristic": True},
                 )
+                await session.commit()  # Explicit commit after virtual bio post upsert
 
         # Queue discovered accounts from contacts (spidering)
         contacts_dict = parse_profile_contacts(biography, profile.get("external_url"))
@@ -145,6 +147,7 @@ class ThreadsParser(BasePlatformParser):
                 contacts_dict=contacts_dict,
                 parent_handle=handle,
             )
+            await session.commit()  # Explicit commit after discovered accounts queue
 
         return account_id
 
@@ -154,18 +157,19 @@ class ThreadsParser(BasePlatformParser):
         platform_id: str,
         max_items: int = 50,
     ) -> None:
-        """Fetch Threads content and bulk upsert to content table.
+        """Fetch Threads content with pagination and bulk upsert to content table.
 
         Retrieves content items (threads) for the given account using the
-        Scrape Creators API, parses the data, and performs a bulk upsert
+        Scrape Creators API v1 /v1/threads/user/posts endpoint, paginates using
+        cursor until max_items are collected, and performs a bulk upsert
         into the content table using PostgreSQL ON CONFLICT DO UPDATE.
 
-        Threads are primarily text posts. Transcription is set to None.
-        The has_media flag is set based on presence of image/video URLs.
+        Threads are text-based: content text is extracted directly from the
+        post payload (text or caption.text) with no transcript requests.
 
         Args:
             account_id: Database ID of the parent account record.
-            platform_id: Numerical platform ID (Threads user ID) stored in the database.
+            platform_id: Threads user ID (numerical platform ID) stored in the database.
             max_items: Maximum number of content items to fetch (default: 50).
         """
         logger.info(
@@ -174,69 +178,74 @@ class ThreadsParser(BasePlatformParser):
             platform_id,
         )
 
-        # Resolve handle (username) from database using account_id
-        async with self.session_maker() as session:
-            result = await session.execute(
-                select(Account.username).where(Account.id == account_id)
-            )
-            db_username = result.scalar_one_or_none()
+        collected_posts: list[dict[str, Any]] = []
+        cursor: str | None = None
+        last_response: dict[str, Any] = {}
 
-        if db_username:
-            handle = db_username
-            logger.debug("Resolved handle %s for account_id %d", handle, account_id)
-        else:
-            logger.warning(
-                "Username not found for account_id %d, falling back to platform_id %s as handle",
+        # Paginate through API responses until max_items collected
+        while len(collected_posts) < max_items:
+            params: dict[str, Any] = {"handle": platform_id}
+            if cursor:
+                params["cursor"] = cursor
+            # Request remaining items needed, capped at reasonable page size
+            remaining = max_items - len(collected_posts)
+            params["limit"] = min(remaining, 100)  # API page size limit if any
+
+            try:
+                response = await self.client.get(
+                    endpoint="/v1/threads/user/posts",
+                    params=params,
+                )
+                logger.info(
+                    "API response for content, platform_id %s: success, remaining credits: %s",
+                    platform_id,
+                    response.get("credits_remaining", "N/A"),
+                )
+            except Exception as e:
+                logger.error(
+                    "API request failed for Threads content, platform_id %s: %s",
+                    platform_id,
+                    e,
+                    exc_info=True,
+                )
+                break
+
+            # Store last successful response for author metadata extraction
+            last_response = response
+
+            # Extract posts directly from root response (no "data" wrapper per v1 API spec)
+            posts = self._extract_posts_from_response(response)
+            if not posts:
+                logger.info("No more posts in current page for platform_id %s", platform_id)
+                break
+
+            collected_posts.extend(posts)
+            logger.debug(
+                "Collected %d posts so far for account_id %d",
+                len(collected_posts),
                 account_id,
-                platform_id,
             )
-            handle = platform_id
 
-        # Fetch profile using resolved handle
-        profile = await self._get_cached_or_fetch_profile(handle)
-        if not profile:
-            return
+            # Check if we have enough posts
+            if len(collected_posts) >= max_items:
+                collected_posts = collected_posts[:max_items]
+                break
 
-        # Fetch content data from Scrape Creators API
-        try:
-            response = await self.client.get(
-                endpoint="/v2/threads/posts",
-                params={"handle": handle, "limit": max_items},
-            )
-            logger.info(
-                "API response status for content, handle %s: success, credits consumed: %s",
-                handle,
-                response.get("credits", "N/A"),
-            )
-        except Exception as e:
-            logger.error(
-                "API request failed for Threads content, handle %s: %s",
-                handle,
-                e,
-                exc_info=True,
-            )
-            return
+            # Get next cursor for pagination directly from root response
+            cursor = response.get("next_cursor") or response.get("cursor")
+            if not cursor:
+                logger.debug("No more pages for platform_id %s", platform_id)
+                break
 
-        # Validate response structure
-        data = response.get("data")
-        if not data:
-            logger.error(
-                "Missing 'data' in API response for Threads content, handle %s",
-                handle,
-            )
-            return
-
-        # Extract posts/threads from response
-        posts = self._extract_posts_from_response(data)
-        if not posts:
+        if not collected_posts:
             logger.info("No Threads content found for account_id: %d", account_id)
             return
 
-        # Limit to max_items
-        posts = posts[:max_items]
+        # Limit to max_items (redundant but safe)
+        collected_posts = collected_posts[:max_items]
 
-        # Build author profile metadata using core helper
-        user_data = data.get("user") or data.get("author") or profile
+        # Build author profile metadata from last response's user/author data
+        user_data: dict[str, Any] = last_response.get("user") or last_response.get("author", {})
         username: str | None = user_data.get("username") or user_data.get("handle")
         biography: str | None = user_data.get("biography") or user_data.get("bio")
 
@@ -244,7 +253,7 @@ class ThreadsParser(BasePlatformParser):
         external_url: str | None = user_data.get("external_url")
         contacts_dict: dict[str, Any] = parse_profile_contacts(biography, external_url)
 
-        # Use core helper to compile author metadata
+        # Compile author metadata using core helper
         author_metadata = compile_author_metadata(
             platform="THREADS",
             username=username,
@@ -254,10 +263,10 @@ class ThreadsParser(BasePlatformParser):
         )
 
         # Process and upsert content items
-        await self._upsert_content(posts, account_id, author_metadata)
+        await self._upsert_content(collected_posts, account_id, author_metadata)
         logger.info(
             "Successfully upserted %d Threads content items for account_id: %d",
-            len(posts),
+            len(collected_posts),
             account_id,
         )
 
@@ -266,6 +275,9 @@ class ThreadsParser(BasePlatformParser):
 
         Uses instance-level caching to avoid duplicate API calls when
         subsequently calling parse_content() for the same handle.
+
+        Catches ClientResponseError and logs a quiet warning for 404s
+        without traceback (exc_info=True is not used for 404s).
 
         Args:
             handle: Threads username to fetch.
@@ -279,27 +291,29 @@ class ThreadsParser(BasePlatformParser):
 
         try:
             response = await self.client.get(
-                endpoint="/v2/threads/profile",
+                endpoint="/v1/threads/profile",
                 params={"handle": handle},
             )
-            data = response.get("data")
-            if not data:
-                logger.error("Missing 'data' in API response for Threads handle %s", handle)
-                return None
-
-            # Threads API may return user data at different levels
-            user = data.get("user") or data.get("author") or data
-            if not user:
-                logger.error("Missing user data for Threads handle %s", handle)
-                return None
-
-            # Cache the profile
-            self._cached_profile = user
+            # Threads v1 API returns profile fields directly at root level
+            # Treat entire response as profile data
+            self._cached_profile = response
             self._cached_handle = handle
-            return user
+            return response
 
+        except ClientResponseError as e:
+            if e.status == 404:
+                logger.warning("Threads profile %s not found (404). Marking as rejected.", handle)
+            else:
+                logger.error(
+                    "Threads API request failed for %s with HTTP %d: %s",
+                    handle, e.status, e,
+                )
+            return None
         except Exception as e:
-            logger.error("API request failed for Threads profile %s: %s", handle, e, exc_info=True)
+            logger.error(
+                "Unexpected error fetching Threads profile %s: %s",
+                handle, e, exc_info=True,
+            )
             return None
 
     async def _upsert_account(
@@ -369,12 +383,16 @@ class ThreadsParser(BasePlatformParser):
     ) -> None:
         """Bulk upsert Threads content records to database.
 
+        Uses PostgreSQL-specific ON CONFLICT DO UPDATE on constraint
+        uq_content_account_platform_id for high-throughput concurrency.
+
         Args:
             posts: List of post dictionaries from API responses.
             account_id: ID of the parent Account record.
             author_metadata: Author profile metadata to embed in each content record.
         """
         content_values: list[dict[str, Any]] = []
+        now = datetime.now(timezone.utc)
 
         for post in posts:
             try:
@@ -389,7 +407,7 @@ class ThreadsParser(BasePlatformParser):
                     logger.warning("Skipping content item with no ID")
                     continue
 
-                # Extract content text
+                # Extract content text (inline, no transcript)
                 content_text: str | None = self._extract_content_text(post)
 
                 # Extract published timestamp using core helper
@@ -435,6 +453,7 @@ class ThreadsParser(BasePlatformParser):
                     "content": content_text,
                     "transcription": None,  # Threads is primarily text-based
                     "published_at": published_at,
+                    "created_at": now,  # Set created_at for new records
                     "views": None,
                     "reactions_count": likes,
                     "comments_count": replies,
@@ -443,7 +462,7 @@ class ThreadsParser(BasePlatformParser):
                     "is_embedded": False,
                     "is_graph_extracted": False,
                     "raw_metadata": raw_metadata,
-                    "updated_at": datetime.now(timezone.utc),
+                    "updated_at": now,
                 })
 
             except Exception as e:
@@ -455,47 +474,52 @@ class ThreadsParser(BasePlatformParser):
             return
 
         async with self.session_maker() as session:
-            async with session.begin():
-                stmt = pg_insert(Content).values(content_values)
-                stmt = stmt.on_conflict_do_update(
-                    constraint="uq_content_account_platform_id",
-                    set_=dict(
-                        content=stmt.excluded.content,
-                        transcription=stmt.excluded.transcription,
-                        views=stmt.excluded.views,
-                        reactions_count=stmt.excluded.reactions_count,
-                        comments_count=stmt.excluded.comments_count,
-                        shares_count=stmt.excluded.shares_count,
-                        has_media=stmt.excluded.has_media,
-                        raw_metadata=stmt.excluded.raw_metadata,
-                        updated_at=stmt.excluded.updated_at,
-                    ),
-                )
-                await session.execute(stmt)
-                logger.debug(
-                    "Upserted %d Threads content records for account ID %d",
-                    len(content_values),
-                    account_id,
-                )
+            stmt = pg_insert(Content).values(content_values)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_content_account_platform_id",
+                set_=dict(
+                    content=stmt.excluded.content,
+                    transcription=stmt.excluded.transcription,
+                    views=stmt.excluded.views,
+                    reactions_count=stmt.excluded.reactions_count,
+                    comments_count=stmt.excluded.comments_count,
+                    shares_count=stmt.excluded.shares_count,
+                    has_media=stmt.excluded.has_media,
+                    is_embedded=stmt.excluded.is_embedded,
+                    is_graph_extracted=stmt.excluded.is_graph_extracted,
+                    raw_metadata=stmt.excluded.raw_metadata,
+                    updated_at=stmt.excluded.updated_at,
+                ),
+            )
+            await session.execute(stmt)
+            await session.commit()
+            logger.debug(
+                "Upserted %d Threads content records for account ID %d",
+                len(content_values),
+                account_id,
+            )
 
-    def _extract_posts_from_response(self, data: dict[str, Any]) -> list[dict[str, Any]]:
-        """Extract posts list from API response data.
+    def _extract_posts_from_response(self, response: dict[str, Any]) -> list[dict[str, Any]]:
+        """Extract posts list from root API response.
+
+        Searches for posts in top-level keys: "posts", "threads", "items"
+        to handle potential API response variations.
 
         Args:
-            data: Response data dictionary.
+            response: Root response dictionary from Scrape Creators API.
 
         Returns:
-            List of post dictionaries.
+            List of post dictionaries, empty if no valid posts found.
         """
         posts: list[dict[str, Any]] = []
 
-        # Try different possible response structures
-        if "posts" in data and isinstance(data["posts"], list):
-            posts = data["posts"]
-        elif "threads" in data and isinstance(data["threads"], list):
-            posts = data["threads"]
-        elif "items" in data and isinstance(data["items"], list):
-            posts = data["items"]
+        # Try different possible top-level response structures
+        if "posts" in response and isinstance(response["posts"], list):
+            posts = response["posts"]
+        elif "threads" in response and isinstance(response["threads"], list):
+            posts = response["threads"]
+        elif "items" in response and isinstance(response["items"], list):
+            posts = response["items"]
 
         return posts
 
@@ -508,11 +532,12 @@ class ThreadsParser(BasePlatformParser):
         Returns:
             Follower count as integer, or 0 if not found.
         """
-        # Try standard follower fields
+        # Try standard follower fields at root level
         followers = (
-            user.get("followers")
+            user.get("follower_count")
+            or user.get("followerCount")
+            or user.get("followers")
             or user.get("followers_count")
-            or user.get("follower_count")
         )
         if followers is not None:
             try:
@@ -535,20 +560,32 @@ class ThreadsParser(BasePlatformParser):
     def _extract_content_text(self, post: dict[str, Any]) -> str | None:
         """Extract text content from Threads post.
 
+        Prioritizes top-level "text" field, then nested "caption.text"
+        (where caption is a dictionary), then falls back to other text fields.
+
         Args:
             post: Post dictionary from API response.
 
         Returns:
             Extracted text content, or None if not found.
         """
-        text: str | None = (
-            post.get("text")
-            or post.get("content")
-            or post.get("caption")
-            or post.get("post_text")
-        )
+        # Check top-level "text" field first
+        text = post.get("text")
         if text and isinstance(text, str):
             return text.strip()
+
+        # Check nested caption.text (caption is a dict with "text" key)
+        caption = post.get("caption")
+        if isinstance(caption, dict):
+            caption_text = caption.get("text")
+            if caption_text and isinstance(caption_text, str):
+                return caption_text.strip()
+
+        # Fallback to other common text fields
+        text = post.get("content") or post.get("post_text")
+        if text and isinstance(text, str):
+            return text.strip()
+
         return None
 
     def _has_media(self, post: dict[str, Any]) -> bool:

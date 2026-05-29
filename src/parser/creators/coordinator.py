@@ -70,7 +70,7 @@ class CreatorsCoordinator:
         Args:
             session_maker: SQLAlchemy async session maker for database operations.
             settings: Application settings containing configuration values.
-            shutdown_event: Optional asyncio.Event for graceful shutdown coordination.
+            shutdown_event: asyncio.Event | None for graceful shutdown coordination.
         """
         self.session_maker = session_maker
         self.settings = settings
@@ -332,6 +332,44 @@ class CreatorsCoordinator:
             )
 
 
+    async def reset_orphaned_processing_accounts(self) -> None:
+        """
+        Reset orphaned creator accounts stuck in 'processing' status back to 'pending'.
+
+        This method is called during startup to handle accounts that were left in
+        'processing' status due to container restarts or crashes. It only affects
+        creator platforms (INSTAGRAM, THREADS, TIKTOK, YOUTUBE) and explicitly
+        excludes TELEGRAM to prevent state collisions with the Telegram crawler.
+        """
+        async with self.session_maker() as session:
+            # Create update statement for orphaned processing accounts
+            # Explicitly filter by CREATOR_PLATFORMS to exclude TELEGRAM
+            stmt = (
+                update(Account)
+                .where(
+                    Account.platform.in_(CREATOR_PLATFORMS),
+                    Account.status == STATUS_PROCESSING,
+                )
+                .values(
+                    status=STATUS_PENDING,
+                    updated_at=datetime.now(timezone.utc),
+                )
+                .returning(Account.id)
+            )
+            result = await session.execute(stmt)
+            updated_rows = result.fetchall()
+            await session.commit()
+
+            # Log the number of reset rows
+            count = len(updated_rows)
+            if count > 0:
+                logger.info(
+                    f"Successfully restored {count} orphaned creator accounts to 'pending'"
+                )
+            else:
+                logger.info("No orphaned creator accounts found to restore")
+
+
 async def _sleep_with_shutdown_check(
     shutdown_event: asyncio.Event,
     interval_s: int,
@@ -400,6 +438,17 @@ async def main() -> None:
         settings=settings,
         shutdown_event=shutdown_event,
     )
+
+    # Run auto-heal to reset orphaned processing accounts
+    try:
+        logger.info("Running auto-heal to reset orphaned processing accounts...")
+        await coordinator.reset_orphaned_processing_accounts()
+    except Exception as e:
+        logger.error(
+            f"Failed to reset orphaned processing accounts: {e!r}",
+            exc_info=e,
+        )
+        logger.warning("Continuing startup despite auto-heal failure...")
 
     def _signal_handler(sig: int, frame: Any | None = None) -> None:
         """

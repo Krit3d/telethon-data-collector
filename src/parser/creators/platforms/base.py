@@ -7,7 +7,6 @@ profile parsing and content ingestion into the PostgreSQL database.
 
 import abc
 import logging
-from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 

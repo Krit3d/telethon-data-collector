@@ -240,7 +240,7 @@ class ScrapeCreatorsClient:
 
                     # Parse JSON body
                     try:
-                        return await response.json()
+                        response_dict = await response.json()
                     except aiohttp.ContentTypeError as e:
                         logger.error(
                             "Failed to parse JSON response from %s %s: %s",
@@ -251,6 +251,16 @@ class ScrapeCreatorsClient:
                         raise ValueError(
                             f"Invalid JSON response from {method} {full_url}"
                         ) from e
+
+                    # Extract remaining credits from the root of the JSON response
+                    credits_remaining: int | None = None
+                    if isinstance(response_dict, dict):
+                        credits_remaining = response_dict.get("credits_remaining")
+
+                    # Log successful request with remaining credits
+                    logger.info("API request success. Remaining credits: %s", credits_remaining)
+
+                    return response_dict
 
             except aiohttp.ClientResponseError as cre:
                 # ClientResponseError (4xx, 5xx) - handle 4xx immediately without retry
