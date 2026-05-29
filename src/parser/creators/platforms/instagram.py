@@ -44,6 +44,9 @@ MIN_SUBSCRIBERS: int = 3000
 # Maximum subscriber threshold for Instagram accounts (micro-influencers)
 MAX_SUBSCRIBERS: int = 150000
 
+# Maximum video duration for transcription API (in seconds)
+MAX_TRANSCRIPTION_DURATION: float = 120.0
+
 # Email extraction pattern
 EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
@@ -270,7 +273,7 @@ class InstagramPlatformParser(BasePlatformParser):
 
             # Queue discovered accounts from contacts (cross-platform expansion)
             async with self.session_maker() as session:
-                await self._queue_discovered_accounts(session, contacts_dict)
+                await self._queue_discovered_accounts(session, contacts_dict, handle)
 
             return account_id
 
@@ -406,6 +409,16 @@ class InstagramPlatformParser(BasePlatformParser):
                     and isinstance(shortcode, str)
                     and shortcode
                 ):
+                    # Check video duration limit (120 seconds max for transcription API)
+                    duration: float | None = node.get("video_duration")
+                    if duration is not None and float(duration) > MAX_TRANSCRIPTION_DURATION:
+                        logger.info(
+                            "Skipping transcription for shortcode %s: duration %ss exceeds the %ss API limit.",
+                            shortcode,
+                            duration,
+                            MAX_TRANSCRIPTION_DURATION,
+                        )
+                        continue
                     video_edges_with_shortcode.append((edge, shortcode))
 
             if video_edges_with_shortcode:
@@ -521,90 +534,69 @@ class InstagramPlatformParser(BasePlatformParser):
     ) -> str | None:
         """Fetch transcription for a video post via Scrape Creators transcript endpoint.
 
-        Probes different URL formats and API endpoints to find a working combination.
-        Implements a nested loop strategy to try multiple combinations of:
-        - Instagram URL formats (with/without www, /p/ or /reel/)
-        - API endpoints (/v2/instagram/media/transcript, /v2/instagram/transcript)
+        Uses the verified winning format (https://instagram.com/p/{shortcode})
+        to fetch transcription. Logs 4xx/5xx errors with logger.warning
+        but returns None gracefully on failure.
 
         Args:
             shortcode: Instagram post shortcode.
             semaphore: Semaphore to limit concurrent requests.
 
         Returns:
-            Transcription text if available and valid, None otherwise.
+            Transcription text if available, None otherwise.
         """
-        # Define potential Instagram URL formats for the given shortcode
-        url_formats = [
-            f"https://www.instagram.com/p/{shortcode}/",   # Format A
-            f"https://www.instagram.com/reel/{shortcode}/",  # Format B
-            f"https://instagram.com/p/{shortcode}",           # Format C
-            f"https://instagram.com/reel/{shortcode}",        # Format D
-        ]
-
-        # Define candidate Scrape Creators API endpoints
-        endpoints = [
-            "/v2/instagram/media/transcript",  # Endpoint 1
-            "/v2/instagram/transcript",        # Endpoint 2
-        ]
+        endpoint = "/v2/instagram/media/transcript"
+        # Use the verified winning format
+        url_param: str = f"https://instagram.com/p/{shortcode}"
 
         async with semaphore:
-            # Nested loop: try each endpoint with each URL format
-            for endpoint in endpoints:
-                for url_format in url_formats:
-                    try:
-                        logger.debug(
-                            "Probing endpoint: %s with URL: %s",
-                            endpoint,
-                            url_format,
-                        )
-                        # Call transcript API with 'url' parameter
-                        response: dict[str, Any] = await self.client.get(
-                            endpoint=endpoint,
-                            params={"url": url_format},
-                        )
+            try:
+                response: dict[str, Any] = await self.client.get(
+                    endpoint=endpoint,
+                    params={"url": url_param},
+                )
 
-                        # Check if response contains valid transcription
-                        transcripts = response.get("transcripts")
-                        if isinstance(transcripts, list) and transcripts:
-                            first_transcript = transcripts[0]
-                            if (
-                                isinstance(first_transcript, str)
-                                and first_transcript.strip()
-                            ):
-                                # Success! Log and return immediately
-                                logger.info(
-                                    "[API PROBE SUCCESS] Working combination found! Endpoint: %s, URL: %s",
-                                    endpoint,
-                                    url_format,
-                                )
-                                return first_transcript.strip()
+                # Parse response JSON safely matching the verified structure
+                if "transcripts" in response:
+                    transcripts = response["transcripts"]
+                    if isinstance(transcripts, list) and transcripts:
+                        first_item = transcripts[0]
+                        if isinstance(first_item, dict):
+                            text: str | None = first_item.get("text")
+                            if text and isinstance(text, str):
+                                return text.strip()
 
-                    except aiohttp.ClientResponseError as e:
-                        # Handle HTTP errors (400, 404, 500, etc.)
-                        logger.debug(
-                            "HTTP %d error for endpoint: %s, URL: %s - %s",
-                            e.status,
-                            endpoint,
-                            url_format,
-                            e.message,
+                # No valid transcription found in response
+                logger.debug(
+                    "No transcription data found in response for shortcode %s",
+                    shortcode,
+                )
+                return None
+
+            except Exception as e:
+                # Suppress tracebacks for aiohttp.ClientError (e.g., server errors, connection issues)
+                if isinstance(e, aiohttp.ClientError):
+                    if isinstance(e, aiohttp.ClientResponseError) and e.status == 500:
+                        logger.warning(
+                            "Transcription API failed for shortcode %s due to Scrape Creators server error (500).",
+                            shortcode,
                         )
-                        continue
-                    except Exception as e:
-                        # Handle other exceptions
-                        logger.debug(
-                            "Exception for endpoint: %s, URL: %s - %s",
-                            endpoint,
-                            url_format,
+                    else:
+                        # Other aiohttp errors (connection errors, timeouts, non-500 responses)
+                        logger.warning(
+                            "Transcription API failed for shortcode %s: %s",
+                            shortcode,
                             e,
                         )
-                        continue
-
-        # All combinations failed
-        logger.warning(
-            "Failed to fetch transcription for shortcode %s after probing all endpoints and URL formats.",
-            shortcode,
-        )
-        return None
+                else:
+                    # Unexpected non-aiohttp exceptions: log full traceback
+                    logger.error(
+                        "Unexpected error fetching transcription for shortcode %s: %s",
+                        shortcode,
+                        e,
+                        exc_info=True,
+                    )
+                return None
 
     async def _upsert_account(
         self, user: dict[str, Any], status: str = "parsed"
@@ -949,22 +941,34 @@ class InstagramPlatformParser(BasePlatformParser):
         return {k: v for k, v in author_metadata.items() if v is not None}
 
     async def _queue_discovered_accounts(
-        self, session: AsyncSession, contacts_dict: dict[str, Any]
+        self, session: AsyncSession, contacts_dict: dict[str, Any], parent_handle: str
     ) -> None:
         """Queue discovered accounts from contacts for cross-platform expansion.
-
+    
         Processes emails, telegram handles, and external links from the contacts
         dictionary and inserts new account records into the accounts table with
         status "pending" for platforms YOUTUBE, TIKTOK, THREADS, and TELEGRAM.
-
+    
         Uses on_conflict_do_nothing to avoid duplicate entries.
-
+    
         Args:
             session: SQLAlchemy async session for database operations.
             contacts_dict: Dictionary containing emails, telegram_handles, and external_links.
+            parent_handle: Instagram handle of the parent account whose bio was scanned.
         """
-        # Process external links for YouTube, TikTok, and Threads
+        # Extract contacts from contacts_dict
+        telegram_handles: list[str] = contacts_dict.get("telegram_handles", [])
         external_links: list[str] = contacts_dict.get("external_links", [])
+
+        # Check if there are any contacts to process
+        if not telegram_handles and not external_links:
+            logger.debug(
+                "[SPIDER] No external social accounts discovered in bio of parent account %s.",
+                parent_handle,
+            )
+            return
+
+        # Process external links for YouTube, TikTok, and Threads
         for link in external_links:
             if not isinstance(link, str):
                 continue
@@ -990,18 +994,30 @@ class InstagramPlatformParser(BasePlatformParser):
                     continue
 
                 if platform_id:
-                    await self._insert_pending_account(
+                    inserted: bool = await self._insert_pending_account(
                         session, "YOUTUBE", platform_id
                     )
+                    if inserted:
+                        logger.info(
+                            "[SPIDER] Queued discovered YOUTUBE account: %s from bio of parent account %s.",
+                            platform_id,
+                            parent_handle,
+                        )
 
             # TikTok: tiktok.com/@
             elif "tiktok.com/@" in link_lower:
                 # Extract username
                 platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
                 if platform_id:
-                    await self._insert_pending_account(
+                    inserted: bool = await self._insert_pending_account(
                         session, "TIKTOK", platform_id
                     )
+                    if inserted:
+                        logger.info(
+                            "[SPIDER] Queued discovered TIKTOK account: %s from bio of parent account %s.",
+                            platform_id,
+                            parent_handle,
+                        )
 
             # Threads: threads.net/@
             elif "threads.net/@" in link_lower or "threads.net/" in link_lower:
@@ -1015,31 +1031,45 @@ class InstagramPlatformParser(BasePlatformParser):
                         link.split("/")[-1].split("?")[0].split("/")[0]
                     )
                 if platform_id:
-                    await self._insert_pending_account(
+                    inserted: bool = await self._insert_pending_account(
                         session, "THREADS", platform_id
                     )
+                    if inserted:
+                        logger.info(
+                            "[SPIDER] Queued discovered THREADS account: %s from bio of parent account %s.",
+                            platform_id,
+                            parent_handle,
+                        )
 
         # Process Telegram handles
-        telegram_handles: list[str] = contacts_dict.get("telegram_handles", [])
         for handle in telegram_handles:
             if not isinstance(handle, str) or not handle:
                 continue
             # Remove @ if present
             platform_id = handle.lstrip("@")
             if platform_id:
-                await self._insert_pending_account(
+                inserted: bool = await self._insert_pending_account(
                     session, "TELEGRAM", platform_id
                 )
+                if inserted:
+                    logger.info(
+                        "[SPIDER] Queued discovered TELEGRAM account: @%s from bio of parent account %s.",
+                        platform_id,
+                        parent_handle,
+                    )
 
     async def _insert_pending_account(
         self, session: AsyncSession, platform: str, platform_id: str
-    ) -> None:
+    ) -> bool:
         """Insert a pending account record if it doesn't already exist.
-
+    
         Args:
             session: SQLAlchemy async session for database operations.
             platform: Platform name (YOUTUBE, TIKTOK, THREADS, TELEGRAM).
             platform_id: Platform-specific account ID or handle.
+    
+        Returns:
+            True if a new account was inserted, False if it already existed.
         """
         # Check if account already exists
         stmt = select(Account).where(
@@ -1048,15 +1078,15 @@ class InstagramPlatformParser(BasePlatformParser):
         )
         result = await session.execute(stmt)
         existing = result.scalar_one_or_none()
-
+    
         if existing:
             logger.debug(
                 "Account already exists: platform=%s, platform_id=%s",
                 platform,
                 platform_id,
             )
-            return
-
+            return False
+    
         # Insert new pending account
         new_account = Account(
             platform=platform,
@@ -1073,6 +1103,7 @@ class InstagramPlatformParser(BasePlatformParser):
             platform,
             platform_id,
         )
+        return True
 
     def _extract_video_download_url(self, node: dict[str, Any]) -> str | None:
         """Extract high-quality direct MP4 URL from video node.

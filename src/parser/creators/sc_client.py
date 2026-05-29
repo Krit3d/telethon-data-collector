@@ -7,6 +7,7 @@ in higher-level services or parsers.
 
 import asyncio
 import logging
+import json
 from typing import Any
 
 import aiohttp
@@ -112,7 +113,13 @@ class ScrapeCreatorsClient:
 
         Retries up to 3 times on:
         * Network errors (`aiohttp.ClientError`, `asyncio.TimeoutError`)
-        * HTTP 429 Too Many Requests
+        * HTTP 429 Too Many Requests (with Retry-After header support)
+        * Server errors (HTTP 5xx)
+
+        Client errors (HTTP 4xx, except 429) are caught by the specific
+        `aiohttp.ClientResponseError` handler and raised immediately without
+        retrying, as they indicate invalid requests that will not succeed
+        on subsequent attempts.
 
         For 429 responses the client honours the ``Retry-After`` header when
         present, falling back to exponential backoff.
@@ -127,7 +134,10 @@ class ScrapeCreatorsClient:
             Parsed JSON response as a dictionary.
 
         Raises:
-            aiohttp.ClientError: When the request fails after all retries.
+            aiohttp.ClientResponseError: When a client error (4xx) occurs.
+                This is raised immediately without retry.
+            aiohttp.ClientError: When a server error (5xx) or network error
+                fails after all retries.
             asyncio.TimeoutError: When the request times out after all retries.
             ValueError: When the response body cannot be parsed as JSON.
         """
@@ -185,8 +195,48 @@ class ScrapeCreatorsClient:
                         await asyncio.sleep(wait_time)
                         continue
 
-                    # Any other non-2xx raises
-                    response.raise_for_status()
+                    # --- Client error handling (4xx except 429) ---
+                    # Client errors (4xx) indicate invalid requests that won't succeed on retry
+                    if 400 <= response.status < 500:
+                        # Read and log the response body before raising the error
+                        error_detail = None
+                        # Try to parse as JSON first
+                        try:
+                            error_data = await response.json()
+                            # Extract meaningful error message from common keys
+                            if isinstance(error_data, dict):
+                                for key in ("message", "error", "messageStatus", "errorStatus", "details"):
+                                    if key in error_data:
+                                        error_detail = str(error_data[key])
+                                        break
+                                if error_detail is None:
+                                    error_detail = str(error_data)
+                            else:
+                                error_detail = str(error_data)
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                            # JSON parsing failed, try raw text
+                            try:
+                                error_detail = await response.text()
+                            except Exception:
+                                error_detail = "(unable to read response body)"
+                        # Log the detailed error
+                        logger.error(
+                            "API Error %d detail: %s. Request: %s %s. Raising immediately without retry.",
+                            response.status,
+                            error_detail,
+                            method,
+                            full_url,
+                        )
+                        # Raise ClientResponseError - will be caught by the specific
+                        # except block below and raised immediately without retry
+                        response.raise_for_status()
+
+                    # --- Server error handling (5xx) ---
+                    # Server errors (5xx) may be transient, so we raise ClientError
+                    # (not ClientResponseError) to allow the general except block
+                    # to catch it and retry with backoff
+                    if 500 <= response.status < 600:
+                        raise aiohttp.ClientError(f"Server error: {response.status}")
 
                     # Parse JSON body
                     try:
@@ -202,7 +252,22 @@ class ScrapeCreatorsClient:
                             f"Invalid JSON response from {method} {full_url}"
                         ) from e
 
+            except aiohttp.ClientResponseError as cre:
+                # ClientResponseError (4xx, 5xx) - handle 4xx immediately without retry
+                # 5xx errors should have been raised as ClientError (not ClientResponseError)
+                # in the try block, so this block mainly handles 4xx errors.
+                if cre.status == 429:
+                    # 429 should have been handled in the try block with retries
+                    # If we get here, max retries for 429 were exceeded
+                    raise
+                else:
+                    # For other 4xx errors (400, 401, 403, 404, etc.), raise immediately
+                    # without retrying, as these indicate invalid requests
+                    raise cre
+            
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # Only retry for network errors, timeouts, and server errors (5xx)
+                # Client errors (4xx) should have been caught above and raised immediately
                 logger.warning(
                     "Request failed on attempt %d/%d for %s %s: %s",
                     attempt + 1,
