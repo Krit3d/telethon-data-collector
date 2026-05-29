@@ -10,6 +10,8 @@ Features:
     - Profile parsing with account upsert to accounts table
     - Minimum and maximum subscriber threshold enforcement (3k-150k)
     - Russian language content filtering
+    - AI-slop and theme-page filtering
+    - Female creator detection
     - Virtual profile post creation for semantic search over biographies
     - YouTube Shorts content fetching and bulk upsert to content table
     - PostgreSQL ON CONFLICT DO UPDATE for high-throughput concurrency
@@ -20,7 +22,6 @@ Features:
     - Cross-platform spidering queue for discovered accounts
 """
 
-import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -32,7 +33,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.config.config import Settings
 from src.db.models import Account, Content
-from src.parser.creators.core.utils import parse_profile_contacts
+from src.parser.creators.core.utils import (
+    is_russian_text,
+    is_slop_or_theme_page,
+    detect_female_creator,
+    upsert_virtual_bio_post,
+    queue_discovered_accounts,
+    parse_profile_contacts,
+    parse_published_at,
+)
 from src.parser.creators.platforms.base import BasePlatformParser
 from src.parser.creators.sc_client import ScrapeCreatorsClient
 
@@ -43,20 +52,6 @@ MIN_SUBSCRIBERS: int = 3000
 
 # Maximum subscriber threshold for YouTube channels (micro-influencers)
 MAX_SUBSCRIBERS: int = 150000
-
-
-def is_russian_text(text: str | None) -> bool:
-    """Check if text contains Russian Cyrillic characters.
-
-    Args:
-        text: Text to check for Russian characters.
-
-    Returns:
-        True if text contains Russian Cyrillic characters, False otherwise.
-    """
-    if not text:
-        return False
-    return bool(re.search(r'[а-яА-ЯёЁ]', text))
 
 
 class YouTubePlatformParser(BasePlatformParser):
@@ -99,7 +94,8 @@ class YouTubePlatformParser(BasePlatformParser):
 
         Parses the YouTube channel profile for the given handle, checks if the channel
         meets the subscriber threshold (3k-150k), verifies Russian language content,
-        extracts author profile metadata (external links, contacts, location, language),
+        filters out AI-slop and theme pages, detects female creators, extracts
+        author profile metadata (external links, contacts, location, language),
         upserts the account information to the accounts table, creates a virtual
         profile post for semantic search, queues discovered accounts for cross-platform
         spidering, and returns the database ID.
@@ -159,34 +155,26 @@ class YouTubePlatformParser(BasePlatformParser):
 
             subscriber_count: int = self._extract_subscriber_count(channel)
 
-            # Check if account meets minimum threshold
-            if subscriber_count < MIN_SUBSCRIBERS:
+            # Check if account meets subscriber thresholds [3000, 150000]
+            if subscriber_count < MIN_SUBSCRIBERS or subscriber_count > MAX_SUBSCRIBERS:
                 logger.info(
-                    "YouTube handle %s has %d subscribers, below minimum %d. Rejecting.",
+                    "YouTube handle %s has %d subscribers, outside threshold [%d, %d]. Rejecting.",
                     handle,
                     subscriber_count,
                     MIN_SUBSCRIBERS,
-                )
-                await self._upsert_account(channel, status="rejected")
-                return None
-
-            # Check if account exceeds maximum threshold
-            if subscriber_count > MAX_SUBSCRIBERS:
-                logger.info(
-                    "YouTube handle %s has %d subscribers, above maximum %d. Rejecting.",
-                    handle,
-                    subscriber_count,
                     MAX_SUBSCRIBERS,
                 )
                 await self._upsert_account(channel, status="rejected")
                 return None
 
-            # Check for Russian language content in description/bio
+            # Extract description for filtering
             description: str | None = (
                 channel.get("description")
                 or channel.get("bio")
                 or channel.get("channelDescription")
             )
+
+            # Check for Russian language content in description/bio
             if not is_russian_text(description):
                 logger.info(
                     "YouTube handle %s does not contain Russian text in description. Rejecting.",
@@ -194,6 +182,25 @@ class YouTubePlatformParser(BasePlatformParser):
                 )
                 await self._upsert_account(channel, status="rejected")
                 return None
+
+            # Check for AI-slop / theme-page / meme-page
+            username: str | None = (
+                channel.get("handle")
+                or channel.get("customUrl")
+                or channel.get("username")
+            )
+            if is_slop_or_theme_page(username, description):
+                logger.info(
+                    "YouTube handle %s detected as AI-slop or theme page. Rejecting.",
+                    handle,
+                )
+                await self._upsert_account(channel, status="rejected")
+                return None
+
+            # Detect female creator
+            female_heuristic = detect_female_creator(description)
+            if female_heuristic:
+                logger.info("YouTube handle %s detected as female creator.", handle)
 
             # Upsert account with 'parsed' status
             account_id: int = await self._upsert_account(channel, status="parsed")
@@ -205,12 +212,34 @@ class YouTubePlatformParser(BasePlatformParser):
             )
 
             # Upsert virtual profile post for semantic search over biography
-            await self._upsert_virtual_profile_post(account_id, channel)
+            full_name: str | None = (
+                channel.get("title")
+                or channel.get("channelTitle")
+                or channel.get("name")
+            )
+            # Build raw_metadata with female_heuristic if detected
+            raw_metadata: dict[str, Any] = {}
+            if female_heuristic:
+                raw_metadata["female_heuristic"] = True
+
+            async with self.session_maker() as session:
+                await upsert_virtual_bio_post(
+                    session=session,
+                    account_id=account_id,
+                    platform="YOUTUBE",
+                    platform_id=channel_id,
+                    username=username,
+                    full_name=full_name,
+                    biography=description,
+                    subscribers_count=subscriber_count,
+                    raw_metadata=raw_metadata if raw_metadata else None,
+                )
+                await session.commit()
 
             # Queue discovered accounts from contacts for cross-platform spidering
             contacts_dict: dict[str, Any] = parse_profile_contacts(description, None)
             async with self.session_maker() as session:
-                await self._queue_discovered_accounts(session, contacts_dict)
+                await queue_discovered_accounts(session, contacts_dict, handle)
                 await session.commit()
 
             return account_id
@@ -243,7 +272,7 @@ class YouTubePlatformParser(BasePlatformParser):
 
         Args:
             account_id: Database ID of the parent account record.
-            platform_id: YouTube channel handle/ID used in API calls.
+            platform_id: YouTube channel ID (UC...). Used as fallback handle.
             max_items: Maximum number of content items to fetch (default: 50).
         """
         logger.info(
@@ -253,22 +282,49 @@ class YouTubePlatformParser(BasePlatformParser):
             max_items,
         )
 
+        # Fetch the account's username (handle) from the database
+        handle: str = platform_id  # fallback to platform_id (channel ID)
+        try:
+            async with self.session_maker() as session:
+                stmt = select(Account.username).where(Account.id == account_id)
+                result = await session.execute(stmt)
+                db_username: str | None = result.scalar_one_or_none()
+                if db_username:
+                    handle = db_username
+                    logger.debug(
+                        "Using username '%s' as handle for account_id: %d",
+                        handle,
+                        account_id,
+                    )
+                else:
+                    logger.warning(
+                        "Username not found for account_id: %d, falling back to platform_id: %s",
+                        account_id,
+                        platform_id,
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch username for account_id: %d: %s. Using platform_id as fallback.",
+                account_id,
+                e,
+            )
+
         try:
             # Fetch YouTube Shorts data from Scrape Creators API (v2)
             try:
                 response: dict[str, Any] = await self.client.get(
                     endpoint="/v2/youtube/shorts",
-                    params={"handle": platform_id, "limit": max_items},
+                    params={"handle": handle, "limit": max_items},
                 )
                 logger.info(
-                    "API response status for YouTube Shorts, platform_id %s: success, credits consumed: %s",
-                    platform_id,
+                    "API response status for YouTube Shorts, handle %s: success, credits consumed: %s",
+                    handle,
                     response.get("credits", "N/A"),
                 )
             except Exception as e:
                 logger.error(
-                    "API request failed for YouTube Shorts, platform_id %s: %s",
-                    platform_id,
+                    "API request failed for YouTube Shorts, handle %s: %s",
+                    handle,
                     e,
                     exc_info=True,
                 )
@@ -278,8 +334,8 @@ class YouTubePlatformParser(BasePlatformParser):
             data = response.get("data")
             if not data:
                 logger.error(
-                    "Missing 'data' in API response for YouTube Shorts, platform_id %s",
-                    platform_id,
+                    "Missing 'data' in API response for YouTube Shorts, handle %s",
+                    handle,
                 )
                 return
 
@@ -394,190 +450,6 @@ class YouTubePlatformParser(BasePlatformParser):
             await session.refresh(db_account)
             return db_account.id
 
-    async def _upsert_virtual_profile_post(
-        self, account_id: int, channel: dict[str, Any]
-    ) -> None:
-        """Upsert a virtual profile post into the content table for semantic search.
-
-        Creates a synthetic content record containing the creator's biography and
-        profile metadata so the embedding worker can index it into Qdrant for
-        semantic search over creator biographies.
-
-        The virtual post has:
-            - platform_content_id = "profile_bio_{platform_id}"
-            - content = compiled profile metadata string
-            - is_embedded = False (picked up by embedding worker)
-            - has_media = False
-
-        Args:
-            account_id: Database ID of the parent account record.
-            channel: Channel object from Scrape Creators API response.
-        """
-        platform_id: str = str(
-            channel.get("id")
-            or channel.get("channelId")
-            or channel.get("channel_id")
-            or ""
-        )
-        username: str | None = (
-            channel.get("handle")
-            or channel.get("customUrl")
-            or channel.get("username")
-        )
-        full_name: str | None = (
-            channel.get("title")
-            or channel.get("channelTitle")
-            or channel.get("name")
-        )
-        description: str | None = (
-            channel.get("description")
-            or channel.get("bio")
-            or channel.get("channelDescription")
-        )
-        subscriber_count: int = self._extract_subscriber_count(channel)
-
-        virtual_content_id: str = f"profile_bio_{platform_id}"
-        compiled_text: str = (
-            f"[PROFILE METADATA]\n"
-            f"Platform: YouTube\n"
-            f"Username: @{username or 'unknown'}\n"
-            f"Title: {full_name or 'Unknown'}\n"
-            f"Subscribers: {subscriber_count}\n"
-            f"Bio: {description or 'N/A'}"
-        )
-
-        now = datetime.now(timezone.utc)
-
-        async with self.session_maker() as session:
-            async with session.begin():
-                stmt = pg_insert(Content).values(
-                    account_id=account_id,
-                    platform_content_id=virtual_content_id,
-                    content=compiled_text,
-                    transcription=None,
-                    published_at=now,
-                    views=None,
-                    reactions_count=None,
-                    comments_count=None,
-                    shares_count=None,
-                    has_media=False,
-                    is_embedded=False,
-                    is_graph_extracted=False,
-                    raw_metadata=None,
-                    updated_at=now,
-                )
-                stmt = stmt.on_conflict_do_update(
-                    constraint="uq_content_account_platform_id",
-                    set_=dict(
-                        content=stmt.excluded.content,
-                        updated_at=stmt.excluded.updated_at,
-                    ),
-                )
-                await session.execute(stmt)
-                logger.debug(
-                    "Upserted virtual profile post for YouTube account_id: %d (platform_content_id: %s)",
-                    account_id,
-                    virtual_content_id,
-                )
-
-    async def _queue_discovered_accounts(self, session: AsyncSession, contacts_dict: dict[str, Any]) -> None:
-        """Queue discovered accounts from profile contacts for cross-platform spidering.
-
-        Processes telegram handles and external links from the contacts dictionary,
-        extracts platform-specific identifiers, and inserts new accounts with
-        'pending' status for later processing. Checks for existing accounts to
-        prevent unique constraint violations.
-
-        Args:
-            session: SQLAlchemy async session for database operations.
-            contacts_dict: Dictionary containing parsed contacts with keys:
-                - telegram_handles: List of Telegram handles
-                - external_links: List of external URLs
-        """
-        # Process Telegram handles
-        telegram_handles: list[str] = contacts_dict.get("telegram_handles", [])
-        for handle in telegram_handles:
-            if not handle:
-                continue
-            # Clean handle (remove @ if present)
-            clean_handle = handle.lstrip("@")
-            # Check if account already exists
-            stmt = select(Account).where(
-                Account.platform == "TELEGRAM",
-                Account.platform_id == clean_handle,
-            )
-            result = await session.execute(stmt)
-            existing = result.scalar_one_or_none()
-            if not existing:
-                new_account = Account(
-                    platform="TELEGRAM",
-                    platform_id=clean_handle,
-                    username=clean_handle,
-                    title=clean_handle,
-                    status="pending",
-                )
-                session.add(new_account)
-                logger.debug("Queued Telegram account for spidering: %s", clean_handle)
-
-        # Process external links
-        external_links: list[str] = contacts_dict.get("external_links", [])
-        for link in external_links:
-            if not link or not isinstance(link, str):
-                continue
-
-            # Instagram: extract handle from instagram.com/ URL
-            if "instagram.com/" in link:
-                # Extract handle: https://www.instagram.com/username/ -> username
-                match = re.search(r'instagram\.com/([^/?#]+)', link)
-                if match:
-                    instagram_handle = match.group(1)
-                    if instagram_handle and instagram_handle != "p":  # Skip post URLs
-                        await self._queue_single_account(session, "INSTAGRAM", instagram_handle)
-
-            # TikTok: extract username from tiktok.com/@ URL
-            elif "tiktok.com/" in link:
-                # Extract username: https://www.tiktok.com/@username -> @username or username
-                match = re.search(r'tiktok\.com/@([^/?#]+)', link)
-                if match:
-                    tiktok_username = match.group(1)
-                    if tiktok_username:
-                        await self._queue_single_account(session, "TIKTOK", tiktok_username)
-
-            # Threads: extract handle from threads.net/ URL
-            elif "threads.net/" in link:
-                # Extract handle: https://www.threads.net/@username -> @username or username
-                match = re.search(r'threads\.net/@?([^/?#]+)', link)
-                if match:
-                    threads_handle = match.group(1)
-                    if threads_handle:
-                        await self._queue_single_account(session, "THREADS", threads_handle)
-
-    async def _queue_single_account(self, session: AsyncSession, platform: str, platform_id: str) -> None:
-        """Queue a single account for cross-platform spidering if it doesn't exist.
-
-        Args:
-            session: SQLAlchemy async session for database operations.
-            platform: Platform name (TELEGRAM, INSTAGRAM, TIKTOK, THREADS).
-            platform_id: Platform-specific identifier (handle, username, etc.).
-        """
-        # Check if account already exists
-        stmt = select(Account).where(
-            Account.platform == platform,
-            Account.platform_id == platform_id,
-        )
-        result = await session.execute(stmt)
-        existing = result.scalar_one_or_none()
-        if not existing:
-            new_account = Account(
-                platform=platform,
-                platform_id=platform_id,
-                username=platform_id,
-                title=platform_id,
-                status="pending",
-            )
-            session.add(new_account)
-            logger.debug("Queued %s account for spidering: %s", platform, platform_id)
-
     async def _upsert_content(
         self,
         shorts: list[dict[str, Any]],
@@ -613,32 +485,14 @@ class YouTubePlatformParser(BasePlatformParser):
                     or (video.get("snippet") or {}).get("title")
                 )
 
-                # Extract published timestamp
-                published_at: datetime
+                # Extract published timestamp using shared utility
                 publish_time = (
                     video.get("publishedAt")
                     or video.get("publishDate")
                     or video.get("published")
                     or (video.get("snippet") or {}).get("publishedAt")
                 )
-                if publish_time:
-                    try:
-                        # Handle ISO string format
-                        if isinstance(publish_time, str):
-                            published_at = datetime.fromisoformat(
-                                publish_time.replace("Z", "+00:00")
-                            )
-                        else:
-                            published_at = datetime.now(timezone.utc)
-                    except (ValueError, TypeError) as e:
-                        logger.warning(
-                            "Failed to parse publishedAt for video %s: %s",
-                            platform_content_id,
-                            e,
-                        )
-                        published_at = datetime.now(timezone.utc)
-                else:
-                    published_at = datetime.now(timezone.utc)
+                published_at = parse_published_at(publish_time)
 
                 # Extract engagement metrics
                 statistics = video.get("statistics") or video.get("stats") or {}
@@ -917,8 +771,8 @@ class YouTubePlatformParser(BasePlatformParser):
         contacts: list[str] = []
         for email in contacts_dict.get("emails", []):
             contacts.append(f"email:{email}")
-        for handle in contacts_dict.get("telegram_handles", []):
-            contacts.append(f"telegram:@{handle}")
+        for telegram_handle in contacts_dict.get("telegram_handles", []):
+            contacts.append(f"telegram:@{telegram_handle}")
         # Add external links as contact entries
         external_links: list[str] = contacts_dict.get("external_links", [])
 
