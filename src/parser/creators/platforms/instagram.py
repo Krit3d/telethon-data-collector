@@ -1,7 +1,8 @@
 """
-Instagram platform parser using Scrape Creators API v2.
+Instagram platform parser using Scrape Creators API.
 
 Implements Instagram-specific profile parsing and content ingestion into PostgreSQL.
+Uses v1 API for profile endpoint and v2 API for posts and transcripts.
 Extracts author profile metadata and stores it inside Content.raw_metadata.
 """
 
@@ -149,6 +150,58 @@ class InstagramParser(BasePlatformParser):
             )
             await session.commit()
 
+        # Profile Chaining Discovery (Infinite Spidering)
+        # Extract related accounts to prevent running out of seed accounts
+        try:
+            related_edges = (
+                profile.get("edge_related_profiles", {}).get("edges", [])
+            )
+            if related_edges:
+                logger.info(
+                    "Found %d related profiles for %s, processing chaining discovery",
+                    len(related_edges), handle
+                )
+                async with self.session_maker() as session:
+                    for edge in related_edges:
+                        node = edge.get("node", {})
+                        related_username = node.get("username")
+                        if not related_username or not isinstance(related_username, str):
+                            continue
+
+                        # Select-then-insert: check if account already exists
+                        stmt = select(Account).where(
+                            Account.platform == "INSTAGRAM",
+                            Account.username == related_username,
+                        )
+                        result = await session.execute(stmt)
+                        existing = result.scalar_one_or_none()
+
+                        if not existing:
+                            # Insert new Account for chaining
+                            new_account = Account(
+                                platform="INSTAGRAM",
+                                platform_id=related_username,
+                                username=related_username,
+                                title=related_username,
+                                status="ready_for_parsing",
+                            )
+                            session.add(new_account)
+                            logger.debug(
+                                "Chained new INSTAGRAM account: %s from seed: %s",
+                                related_username, handle
+                            )
+
+                    await session.commit()
+                    logger.info(
+                        "Profile chaining discovery completed for %s",
+                        handle
+                    )
+        except Exception as e:
+            logger.error(
+                "Profile chaining discovery failed for %s: %s",
+                handle, e, exc_info=True
+            )
+
         return account_id
 
     async def _get_cached_or_fetch_profile(self, handle: str) -> dict[str, Any] | None:
@@ -166,7 +219,7 @@ class InstagramParser(BasePlatformParser):
 
         try:
             response = await self.client.get(
-                endpoint="/v2/instagram/profile",
+                endpoint="/v1/instagram/profile",
                 params={"handle": handle},
             )
             data = response.get("data")
@@ -254,11 +307,19 @@ class InstagramParser(BasePlatformParser):
     ) -> None:
         """Parse timeline content via paginated posts endpoint, fetch transcripts, and bulk upsert.
 
+        Implements Smart Adaptive Pagination:
+        - Early exit on page 1 if no valid videos found (photo-only accounts)
+        - 5-page ceiling to limit credit usage
+        - Collects up to max_items (50) valid videos
+
         Args:
             account_id: Database ID of the associated account.
             platform_id: Instagram platform ID (username or ID).
             max_items: Maximum number of valid items to collect (default: 50).
         """
+        # Smart Adaptive Pagination: 5-page ceiling to limit credit usage
+        MAX_PAGES_TO_CHECK: int = 5
+
         logger.info(
             "Starting Instagram content parse for account_id: %d, platform_id: %s",
             account_id, platform_id
@@ -271,44 +332,43 @@ class InstagramParser(BasePlatformParser):
 
         author_metadata = build_instagram_author_metadata(profile)
 
-        # Paginated fetch from /v2/instagram/posts
+        # Paginated fetch from /v2/instagram/user/posts
         valid_items: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        cursor: str | None = None
+        next_max_id: str | None = None
         page_count = 0
 
         while len(valid_items) < max_items:
             page_count += 1
+
+            # Ceiling Check: stop pagination after MAX_PAGES_TO_CHECK pages
+            if page_count >= MAX_PAGES_TO_CHECK:
+                logger.info(
+                    "Reached page limit (%d) for account %s, stopping pagination with %d videos collected",
+                    MAX_PAGES_TO_CHECK, platform_id, len(valid_items)
+                )
+                break
+
+            # Page fetch log with required format
+            logger.info("Fetching page %d of posts for %s...", page_count, platform_id)
+
             params: dict[str, Any] = {"handle": platform_id}
-            if cursor:
-                params["cursor"] = cursor
+            if next_max_id:
+                params["next_max_id"] = next_max_id
 
             try:
                 response = await self.client.get(
-                    endpoint="/v2/instagram/posts",
+                    endpoint="/v2/instagram/user/posts",
                     params=params,
                 )
             except Exception as e:
                 logger.error("Failed to fetch posts page %d for %s: %s", page_count, platform_id, e)
                 break
 
-            # Extract items from response
-            data = response.get("data") or response
-            items: list[dict[str, Any]] = []
-            has_next = False
-
-            # Handle different response structures
-            if isinstance(data, dict):
-                items = data.get("items") or data.get("posts") or []
-                page_info = data.get("page_info") or {}
-                cursor = page_info.get("end_cursor") or response.get("next_cursor")
-                has_next = page_info.get("has_next_page", False)
-            elif isinstance(data, list):
-                items = data
-                cursor = response.get("next_cursor") or response.get("end_cursor")
-                has_next = bool(cursor)
-            else:
-                items = []
+            # Extract top-level fields from Scrape Creators response
+            items: list[dict[str, Any]] = response.get("items", [])
+            next_max_id = response.get("next_max_id")
+            more_available: bool = response.get("more_available", False)
 
             if not items:
                 logger.info("No more items found for %s after %d pages", platform_id, page_count)
@@ -326,7 +386,12 @@ class InstagramParser(BasePlatformParser):
                 seen_ids.add(item_id)
 
                 # Check if it's a valid video under 120 seconds
-                is_video = item.get("is_video", False)
+                # Robust video detection: check multiple API payload variations
+                is_video = (
+                    item.get("is_video", False) is True
+                    or item.get("media_type") == 2
+                    or "video_versions" in item
+                )
                 if not is_video:
                     continue
 
@@ -339,8 +404,17 @@ class InstagramParser(BasePlatformParser):
                 if len(valid_items) >= max_items:
                     break
 
+            # Early Exit Check: After processing page 1, if no valid videos found,
+            # immediately break to avoid wasting credits on photo-only or dead accounts
+            if page_count == 1 and len(valid_items) == 0:
+                logger.info(
+                    "Early exit: No valid videos found on page 1 for Instagram handle '%s'. Stopping to avoid credit waste.",
+                    platform_id
+                )
+                break
+
             # Check if we should continue pagination
-            if not has_next or not cursor:
+            if not more_available or next_max_id is None:
                 break
 
         if not valid_items:
@@ -451,6 +525,9 @@ class InstagramParser(BasePlatformParser):
         Returns:
             Transcript text if available, otherwise None.
         """
+        # Transcript request log with required format
+        logger.info("Requesting transcript for video: %s", video_url)
+
         async with semaphore:
             try:
                 response = await self.client.get(
@@ -458,14 +535,28 @@ class InstagramParser(BasePlatformParser):
                     params={"url": video_url},
                 )
                 # Parse the transcripts list from the API response
+                # Scrape Creators API returns: [{"id": "...", "shortcode": "...", "text": "..."}]
+                # or [null] / [] if empty
                 transcripts = response.get("transcripts")
-                if (
-                    isinstance(transcripts, list)
-                    and len(transcripts) > 0
-                    and isinstance(transcripts[0], str)
-                    and transcripts[0]
-                ):
-                    return transcripts[0]
+                if isinstance(transcripts, list) and len(transcripts) > 0:
+                    first_item = transcripts[0]
+                    transcript_text: str | None = None
+
+                    if isinstance(first_item, str) and first_item:
+                        # Handle case where API returns list of strings
+                        transcript_text = first_item
+                    elif isinstance(first_item, dict):
+                        # Handle case where API returns list of dictionaries
+                        text_value = first_item.get("text")
+                        if isinstance(text_value, str) and text_value:
+                            transcript_text = text_value
+
+                    if transcript_text:
+                        # Transcript success log with required format, handling None safely
+                        logger.info("Successfully retrieved transcript for video %s", video_url[:50])
+                        return transcript_text
+
+                logger.info("No transcript available for video: %s", video_url[:50])
                 return None
             except Exception as e:
                 logger.error("Transcript fetch failed for %s: %s", video_url, e)

@@ -35,6 +35,7 @@ STATUS_PROCESSING = "processing"
 STATUS_PARSED = "parsed"
 STATUS_REJECTED = "rejected"
 STATUS_FAILED = "failed"
+STATUS_READY_FOR_PARSING = "ready_for_parsing"
 
 # Platforms that are handled by the creators coordinator (not Telegram)
 CREATOR_PLATFORMS = ["INSTAGRAM", "THREADS", "TIKTOK", "YOUTUBE"]
@@ -106,9 +107,9 @@ class CreatorsCoordinator:
         Run a single ingestion cycle: query pending accounts and process them concurrently.
 
         Queries the accounts table for accounts where platform is in CREATOR_PLATFORMS
-        AND status is "pending" or "failed" with updated_at older than the configured
-        threshold, ordered by updated_at ascending. Processes these accounts concurrently
-        using an asyncio.Semaphore.
+        AND status is "pending", "ready_for_parsing", or "failed" with updated_at older
+        than the configured threshold, ordered by updated_at ascending. Processes these
+        accounts concurrently using an asyncio.Semaphore.
 
         Args:
             batch_size: Maximum number of accounts to process in this cycle.
@@ -132,6 +133,7 @@ class CreatorsCoordinator:
                     Account.platform.in_(CREATOR_PLATFORMS),
                     (
                         (Account.status == STATUS_PENDING)
+                        | (Account.status == STATUS_READY_FOR_PARSING)
                         | (
                             (Account.status == STATUS_FAILED)
                             & (Account.updated_at < threshold_time)

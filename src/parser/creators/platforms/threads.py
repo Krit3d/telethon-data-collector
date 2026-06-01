@@ -7,12 +7,13 @@ Extracts author profile metadata and stores it inside Content.raw_metadata.
 Features:
     - Profile parsing with account upsert to accounts table
     - Subscriber threshold enforcement (3,000 to 150,000 for micro-influencers)
-    - Russian language (Cyrillic) biography check
+    - Russian language (Cyrillic) biography check (only if biography is non-empty)
     - AI-slop / theme-page detection
     - Female creator detection with virtual profile post creation
     - Content fetching with pagination and bulk upsert to content table
     - PostgreSQL ON CONFLICT DO UPDATE for high-throughput concurrency
     - Cross-platform spidering queue for discovered accounts
+    - Cross-platform seeding: Threads -> Instagram (identical usernames)
     - No transcript requests (Threads is text-based, content text is inline)
 """
 
@@ -76,9 +77,11 @@ class ThreadsParser(BasePlatformParser):
         """Fetch Threads profile, apply filters, upsert account.
 
         Parses the Threads profile for the given handle, checks subscriber
-        thresholds (3k-150k), verifies Russian Cyrillic in biography,
-        checks for AI-slop/theme-page content, detects female creators,
-        and upserts the account information to the accounts table.
+        thresholds (3k-150k), verifies Russian Cyrillic in biography (only if
+        biography is non-empty), checks for AI-slop/theme-page content,
+        detects female creators, and upserts the account information to the
+        accounts table. After successful parse, seeds an Instagram account
+        with the same username for cross-platform parsing.
 
         Args:
             handle: Threads username (without @ prefix).
@@ -106,8 +109,24 @@ class ThreadsParser(BasePlatformParser):
         # Content quality filters
         username = profile.get("username", "")
         biography = profile.get("biography", "") or profile.get("bio", "")
-        if not is_russian_text(biography) or is_slop_or_theme_page(username, biography):
-            logger.info("Threads handle %s failed content filters. Rejecting.", handle)
+
+        # Only reject on language if biography is non-empty
+        # Empty biographies are allowed to pass - language will be evaluated
+        # during parse_content when actual posts are analyzed
+        if biography and not is_russian_text(biography):
+            logger.info(
+                "Threads handle %s has non-Russian biography. Rejecting.",
+                handle,
+            )
+            await self._upsert_account(profile, "rejected")
+            return None
+
+        # Check for AI-slop/theme-page (always apply, even with empty biography)
+        if is_slop_or_theme_page(username, biography):
+            logger.info(
+                "Threads handle %s appears to be AI-slop/theme-page. Rejecting.",
+                handle,
+            )
             await self._upsert_account(profile, "rejected")
             return None
 
@@ -122,6 +141,12 @@ class ThreadsParser(BasePlatformParser):
             "Successfully parsed Threads profile %s, account ID: %d, subscribers: %d",
             handle, account_id, subscribers,
         )
+
+        # Cross-platform seeding: Threads -> Instagram
+        # Since usernames are often identical across Threads and Instagram,
+        # seed an Instagram account for the same username
+        if username:
+            await self._seed_instagram_from_threads(username)
 
         # Post-parse actions: upsert virtual profile post for female creators
         if is_female:
@@ -315,6 +340,64 @@ class ThreadsParser(BasePlatformParser):
                 handle, e, exc_info=True,
             )
             return None
+
+    async def _seed_instagram_from_threads(self, username: str) -> None:
+        """Seed an Instagram account from a successfully parsed Threads profile.
+
+        Performs a select-then-insert database transaction to check if an Account
+        on platform "INSTAGRAM" with the given username already exists. If it does
+        not exist, inserts a new Account row with status "ready_for_parsing".
+
+        This is wrapped in a try-except block to ensure that database lockups or
+        unique constraint violations never interrupt the primary Threads parsing.
+
+        Args:
+            username: The username to seed on Instagram platform.
+        """
+        try:
+            async with self.session_maker() as session:
+                # Select: check if Instagram account already exists
+                stmt = select(Account).where(
+                    Account.platform == "INSTAGRAM",
+                    Account.username == username,
+                )
+                result = await session.execute(stmt)
+                existing_account = result.scalar_one_or_none()
+
+                if existing_account:
+                    logger.debug(
+                        "Instagram account already exists for username: %s. Skipping seed.",
+                        username,
+                    )
+                    return
+
+                # Insert: create new Instagram account seeded from Threads
+                instagram_account = Account(
+                    platform="INSTAGRAM",
+                    platform_id=username,  # Use username as platform_id for Instagram
+                    username=username,
+                    title=username,
+                    description=None,
+                    subscribers_count=0,
+                    status="ready_for_parsing",
+                )
+                session.add(instagram_account)
+                await session.commit()
+                logger.info(
+                    "Seeded Instagram account for username: %s with status 'ready_for_parsing'",
+                    username,
+                )
+
+        except Exception as e:
+            # Catch all exceptions to prevent interrupting primary Threads parsing
+            # This includes database lockups, unique constraint violations, etc.
+            logger.warning(
+                "Failed to seed Instagram account for username %s: %s. "
+                "Continuing with Threads parsing.",
+                username,
+                e,
+                exc_info=True,
+            )
 
     async def _upsert_account(
         self, user: dict[str, Any], status: str = "parsed"
@@ -570,14 +653,14 @@ class ThreadsParser(BasePlatformParser):
             Extracted text content, or None if not found.
         """
         # Check top-level "text" field first
-        text = post.get("text")
+        text: str | None = post.get("text")
         if text and isinstance(text, str):
             return text.strip()
 
         # Check nested caption.text (caption is a dict with "text" key)
-        caption = post.get("caption")
+        caption: dict[str, Any] | None = post.get("caption")
         if isinstance(caption, dict):
-            caption_text = caption.get("text")
+            caption_text: str | None = caption.get("text")
             if caption_text and isinstance(caption_text, str):
                 return caption_text.strip()
 

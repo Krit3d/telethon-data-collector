@@ -2,7 +2,7 @@
 YouTube platform parser using Scrape Creators API v1.
 
 Implements YouTube-specific profile parsing and content ingestion into PostgreSQL.
-Focuses on YouTube Shorts content extraction and stores author profile metadata
+Focuses on YouTube content extraction and stores author profile metadata
 (external links, contacts, location, language) inside Content.raw_metadata
 under the "author_profile_metadata" key.
 
@@ -13,14 +13,15 @@ Features:
     - AI-slop and theme-page filtering
     - Female creator detection
     - Virtual profile post creation for semantic search over biographies
-    - YouTube Shorts content fetching via v1 API with pagination
+    - YouTube content fetching via v1 API with pagination using continuationToken
+    - Concurrent transcript fetching using asyncio.Semaphore (limit 5)
     - PostgreSQL ON CONFLICT DO UPDATE for high-throughput concurrency
     - Raw metadata preservation for OpenSPG processing
     - Extraction of external links, contact info from channel description via shared utils
-    - Video download URL extraction for GPU worker processing
     - Cross-platform spidering queue for discovered accounts
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -53,8 +54,8 @@ MIN_SUBSCRIBERS: int = 3000
 # Maximum subscriber threshold for YouTube channels (micro-influencers)
 MAX_SUBSCRIBERS: int = 150000
 
-# Maximum duration for YouTube Shorts in seconds
-MAX_SHORTS_DURATION: float = 120.0
+# Semaphore limit for concurrent transcript fetching
+TRANSCRIPT_SEMAPHORE_LIMIT: int = 5
 
 
 class YouTubeParser(BasePlatformParser):
@@ -62,7 +63,6 @@ class YouTubeParser(BasePlatformParser):
 
     Inherits from BasePlatformParser and implements YouTube-specific
     profile parsing and content upsert logic using the Scrape Creators API v1.
-    Focuses on YouTube Shorts content extraction.
 
     All author-level metadata (external links, contacts, location, language)
     is stored inside each Content.raw_metadata JSONB column under the key
@@ -97,7 +97,8 @@ class YouTubeParser(BasePlatformParser):
     def _format_handle(self, handle: str) -> str:
         """Format YouTube handle with proper prefix for API calls.
 
-        Handles that start with "UC" (channel IDs) or "@" are kept as-is.
+        Handles that start with "UC" (channel IDs) are kept as-is.
+        Handles that start with "@" are kept as-is.
         All other handles are prefixed with "@".
 
         Args:
@@ -109,6 +110,22 @@ class YouTubeParser(BasePlatformParser):
         if handle.startswith("UC") or handle.startswith("@"):
             return handle
         return f"@{handle}"
+
+    def _get_api_param_key(self, formatted_handle: str) -> str:
+        """Determine the correct API parameter key for the handle.
+
+        If the handle starts with "UC", it's a channel ID and should use
+        the "channelId" parameter. Otherwise, use the "handle" parameter.
+
+        Args:
+            formatted_handle: The formatted handle string.
+
+        Returns:
+            "channelId" if handle starts with "UC", otherwise "handle".
+        """
+        if formatted_handle.startswith("UC"):
+            return "channelId"
+        return "handle"
 
     async def _get_cached_or_fetch_profile(
         self, handle: str
@@ -131,9 +148,11 @@ class YouTubeParser(BasePlatformParser):
             return self._cached_profile
 
         try:
+            # Determine correct parameter key for profile endpoint
+            param_key = self._get_api_param_key(formatted_handle)
             response: dict[str, Any] = await self.client.get(
                 endpoint="/v1/youtube/channel",
-                params={"handle": formatted_handle},
+                params={param_key: formatted_handle},
             )
             logger.info(
                 "API response status for profile %s: success, remaining credits: %s",
@@ -308,27 +327,37 @@ class YouTubeParser(BasePlatformParser):
         platform_id: str,
         max_items: int = 50,
     ) -> None:
-        """Fetch YouTube Shorts content via v1 API and bulk upsert to content table.
+        """Fetch YouTube content via v1 API, fetch transcripts, and bulk upsert to content table.
 
-        Retrieves YouTube Shorts for the given channel using the Scrape Creators
-        API v1 with pagination support, parses the data, and performs a bulk upsert
-        into the content table using PostgreSQL ON CONFLICT DO UPDATE.
+        Implements Smart Adaptive Pagination:
+        - Early exit on page 1 if no videos found (dead channels)
+        - 5-page ceiling to limit credit usage
+        - Collects up to max_items (50) valid videos/Shorts
 
-        The content text is formed by concatenating title and description from the
-        inline video payload. Only videos with duration <= 120.0 seconds are kept.
+        Retrieves YouTube videos for the given channel using the Scrape Creators
+        API v1 with pagination support (using continuationToken), parses the data,
+        concurrently fetches transcripts for all videos using a semaphore limit of 5,
+        and performs a bulk upsert into the content table using PostgreSQL
+        ON CONFLICT DO UPDATE.
+
+        The content text is formed by concatenating title, description, and transcript
+        from the video payload. Unlike Instagram, YouTube videos have no duration
+        limit for transcript fetching.
 
         The raw_metadata field contains:
             - "author_profile_metadata": Profile-level data (contacts, links, location, etc.)
             - "platform_metrics": Platform-specific engagement metrics
-            - "video_download_url": Direct URL for GPU worker processing
 
         Args:
             account_id: Database ID of the parent account record.
             platform_id: YouTube channel ID (UC...) or handle.
             max_items: Maximum number of content items to fetch (default: 50).
         """
+        # Smart Adaptive Pagination: 5-page ceiling to limit credit usage
+        MAX_PAGES_TO_CHECK: int = 5
+
         logger.info(
-            "Starting YouTube Shorts content parse for account_id: %d, platform_id: %s, max_items: %d",
+            "Starting YouTube content parse for account_id: %d, platform_id: %s, max_items: %d",
             account_id,
             platform_id,
             max_items,
@@ -364,16 +393,43 @@ class YouTubeParser(BasePlatformParser):
         # Format handle for API call
         formatted_handle = self._format_handle(handle)
 
-        # Collect all videos using pagination
+        # Determine correct parameter key (channelId for UC..., handle otherwise)
+        param_key = self._get_api_param_key(formatted_handle)
+        if param_key == "channelId":
+            logger.debug(
+                "Using channelId parameter for handle: %s", formatted_handle
+            )
+        else:
+            logger.debug(
+                "Using handle parameter for handle: %s", formatted_handle
+            )
+
+        # Collect all videos using pagination with continuationToken
         all_videos: list[dict[str, Any]] = []
-        pagination_token: str | None = None
+        continuation_token: str | None = None
+
+        # Track page count for safety limit
+        page_count = 0
 
         try:
             while len(all_videos) < max_items:
-                # Build request parameters
-                params: dict[str, Any] = {"handle": formatted_handle}
-                if pagination_token:
-                    params["paginationToken"] = pagination_token
+                page_count += 1
+
+                # Ceiling Check: stop pagination after MAX_PAGES_TO_CHECK pages
+                if page_count >= MAX_PAGES_TO_CHECK:
+                    logger.info(
+                        "Reached page limit (%d) for account %s, stopping pagination with %d videos collected",
+                        MAX_PAGES_TO_CHECK, platform_id, len(all_videos)
+                    )
+                    break
+
+                # Page fetch log with required format
+                logger.info("Fetching page %d of posts for %s...", page_count, platform_id)
+
+                # Build request parameters with correct key
+                params: dict[str, Any] = {param_key: formatted_handle}
+                if continuation_token:
+                    params["continuationToken"] = continuation_token
 
                 # Fetch videos from v1 API
                 response: dict[str, Any] = await self.client.get(
@@ -401,13 +457,18 @@ class YouTubeParser(BasePlatformParser):
                     len(all_videos),
                 )
 
-                # Check for pagination token at root level (support multiple token names)
-                pagination_token = (
-                    response.get("paginationToken")
-                    or response.get("nextPageToken")
-                    or response.get("continuationToken")
-                )
-                if not pagination_token:
+                # Early Exit Check: After processing page 1, if no videos found,
+                # immediately break to avoid wasting credits on dead channels
+                if page_count == 1 and len(all_videos) == 0:
+                    logger.info(
+                        "Early exit: No videos found on page 1 for %s. Stopping to avoid credit waste.",
+                        platform_id
+                    )
+                    break
+
+                # Check for continuation token at root level
+                continuation_token = response.get("continuationToken")
+                if not continuation_token:
                     logger.debug(
                         "No more pages for handle %s", formatted_handle
                     )
@@ -428,10 +489,46 @@ class YouTubeParser(BasePlatformParser):
             )
             author_metadata = self._build_author_profile_metadata(channel_data)
 
+            # Fetch transcripts concurrently with semaphore limit of 5
+            transcript_map: dict[str, str | None] = {}
+            if all_videos:
+                logger.info(
+                    "Fetching transcripts for %d videos with semaphore limit %d",
+                    len(all_videos),
+                    TRANSCRIPT_SEMAPHORE_LIMIT,
+                )
+                semaphore = asyncio.Semaphore(TRANSCRIPT_SEMAPHORE_LIMIT)
+                tasks = [
+                    self._fetch_transcript(video, semaphore)
+                    for video in all_videos
+                ]
+                transcript_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Build map of video_id -> transcript text
+                for video, result in zip(all_videos, transcript_results):
+                    video_id = str(
+                        video.get("id")
+                        or video.get("videoId")
+                        or video.get("video_id")
+                        or ""
+                    )
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "Failed to fetch transcript for video %s: %s",
+                            video_id,
+                            result,
+                        )
+                        transcript_map[video_id] = None
+                    else:
+                        # result is str | None at this point (Exception already handled)
+                        transcript_map[video_id] = result if isinstance(result, (str, type(None))) else None
+
             # Process and upsert content items
-            await self._upsert_content(all_videos, account_id, author_metadata)
+            await self._upsert_content(
+                all_videos, account_id, author_metadata, transcript_map
+            )
             logger.info(
-                "Successfully upserted %d YouTube Shorts items for account_id: %d",
+                "Successfully upserted %d YouTube content items for account_id: %d",
                 len(all_videos),
                 account_id,
             )
@@ -457,101 +554,97 @@ class YouTubeParser(BasePlatformParser):
             )
             raise
 
-    async def _upsert_account(
-        self, channel: dict[str, Any], status: str = "parsed"
-    ) -> int:
-        """Upsert YouTube account record using select-then-insert/update pattern.
+    async def _fetch_transcript(
+        self, video: dict[str, Any], semaphore: asyncio.Semaphore
+    ) -> str | None:
+        """Fetch transcript for a single YouTube video.
 
-        Uses a select-then-upsert transaction pattern to avoid InvalidColumnReferenceError
-        caused by missing unique constraint on (platform, platform_id) in the accounts table.
+        Uses the Scrape Creators endpoint /v1/youtube/video/transcript
+        with the video URL parameter. Extracts the transcript segments
+        from the "transcript" key and joins them with a space.
 
         Args:
-            channel: Channel object from Scrape Creators API response.
-            status: Account status ('parsed', 'rejected', etc.).
+            video: Video dictionary containing the video ID.
+            semaphore: asyncio.Semaphore to limit concurrent requests.
 
         Returns:
-            ID of the account record (auto-generated by PostgreSQL for new records).
+            Joined transcript text, or None if fetching fails or no transcript available.
         """
-        platform_id: str = str(
-            channel.get("id")
-            or channel.get("channelId")
-            or channel.get("channel_id")
+        video_id = str(
+            video.get("id")
+            or video.get("videoId")
+            or video.get("video_id")
             or ""
         )
-        username: str | None = (
-            channel.get("handle")
-            or channel.get("customUrl")
-            or channel.get("username")
-        )
-        full_name: str | None = (
-            channel.get("title")
-            or channel.get("channelTitle")
-            or channel.get("name")
-        )
-        description: str | None = (
-            channel.get("description")
-            or channel.get("bio")
-            or channel.get("channelDescription")
-        )
-        subscriber_count: int = self._extract_subscriber_count(channel)
+        if not video_id:
+            return None
 
-        async with self.session_maker() as session:
-            # Select existing account by platform and platform_id
-            stmt = select(Account).where(
-                Account.platform == "YOUTUBE",
-                Account.platform_id == platform_id,
-            )
-            result = await session.execute(stmt)
-            db_account: Account | None = result.scalar_one_or_none()
+        url = f"https://www.youtube.com/watch?v={video_id}"
 
-            if db_account:
-                # Update existing record
-                db_account.username = username
-                db_account.title = full_name or username or "Unknown"
-                db_account.description = description
-                db_account.subscribers_count = subscriber_count
-                db_account.status = status
-                db_account.updated_at = datetime.now(timezone.utc)
-                logger.debug(
-                    "Updated existing YouTube account %s (ID: %d, status: %s)",
-                    username,
-                    db_account.id,
-                    status,
-                )
-            else:
-                # Create new record (let PostgreSQL generate ID)
-                db_account = Account(
-                    platform="YOUTUBE",
-                    platform_id=platform_id,
-                    username=username,
-                    title=full_name or username or "Unknown",
-                    description=description,
-                    subscribers_count=subscriber_count,
-                    status=status,
-                )
-                session.add(db_account)
-                logger.debug(
-                    "Created new YouTube account %s (status: %s)",
-                    username,
-                    status,
+        # Transcript request log with required format
+        logger.info("Requesting transcript for video: %s", url)
+
+        async with semaphore:
+            try:
+                response: dict[str, Any] = await self.client.get(
+                    endpoint="/v1/youtube/video/transcript",
+                    params={"url": url},
                 )
 
-            await session.commit()
-            await session.refresh(db_account)
-            return db_account.id
+                # Extract transcript segments from response
+                segments = response.get("transcript") or []
+                if not segments:
+                    logger.info("No transcript available for video: %s", url[:50])
+                    return None
+
+                # Join the "text" field of each segment with a space
+                transcript_text = " ".join(
+                    segment.get("text", "")
+                    for segment in segments
+                    if isinstance(segment, dict)
+                )
+
+                if transcript_text:
+                    # Transcript success log with required format, handling None safely
+                    logger.info("Successfully retrieved transcript for video %s", url[:50])
+                    return transcript_text
+                return None
+
+            except ClientResponseError as e:
+                if e.status == 404:
+                    logger.debug(
+                        "Transcript not found for video %s (404)", video_id
+                    )
+                else:
+                    logger.warning(
+                        "Failed to fetch transcript for video %s: HTTP %d: %s",
+                        video_id,
+                        e.status,
+                        e,
+                    )
+                return None
+            except Exception as e:
+                logger.warning(
+                    "Error fetching transcript for video %s: %s",
+                    video_id,
+                    e,
+                )
+                return None
 
     async def _upsert_content(
         self,
         videos: list[dict[str, Any]],
         account_id: int,
         author_metadata: dict[str, Any],
+        transcript_map: dict[str, str | None],
     ) -> None:
-        """Bulk upsert YouTube Shorts content records to database.
+        """Bulk upsert YouTube content records to database.
 
         Args:
             videos: List of YouTube video dictionaries from API responses.
             account_id: ID of the parent Account record.
             author_metadata: Author profile metadata to embed in each content record.
+            transcript_map: Dictionary mapping video_id to transcript text.
         """
         content_values: list[dict[str, Any]] = []
 
@@ -580,35 +673,17 @@ class YouTubeParser(BasePlatformParser):
                 else:
                     content_text: str = title.strip()
 
+                # Append transcript to content text if available
+                transcript = transcript_map.get(platform_content_id)
+                if transcript:
+                    if content_text:
+                        content_text = f"{content_text}\n\n[TRANSCRIPT]\n{transcript}"
+                    else:
+                        content_text = f"[TRANSCRIPT]\n{transcript}"
+
                 if not content_text:
                     logger.warning(
-                        "Skipping content item with no title or description"
-                    )
-                    continue
-
-                # Extract duration and filter for Shorts (<= 120 seconds)
-                duration = video.get("duration")
-                if duration is None:
-                    logger.debug(
-                        "Skipping video %s: no duration provided",
-                        platform_content_id,
-                    )
-                    continue
-                try:
-                    duration_float = float(duration)
-                    if duration_float > MAX_SHORTS_DURATION:
-                        logger.debug(
-                            "Skipping video %s: duration %s > %s seconds",
-                            platform_content_id,
-                            duration_float,
-                            MAX_SHORTS_DURATION,
-                        )
-                        continue
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Could not parse duration for video %s: %s",
-                        platform_content_id,
-                        duration,
+                        "Skipping content item with no title, description, or transcript"
                     )
                     continue
 
@@ -643,11 +718,6 @@ class YouTubeParser(BasePlatformParser):
                     or video.get("shares")
                 )
 
-                # Extract direct video download link - store in raw_metadata["video_download_url"]
-                video_download_url: str | None = (
-                    self._extract_video_download_url(video)
-                )
-
                 # Build platform metrics
                 platform_metrics: dict[str, Any] = {
                     "views": views,
@@ -663,20 +733,19 @@ class YouTubeParser(BasePlatformParser):
                     "author_profile_metadata": author_metadata,
                     "platform_metrics": platform_metrics,
                 }
-                if video_download_url:
-                    raw_metadata["video_download_url"] = video_download_url
 
                 content_values.append(
                     {
                         "account_id": account_id,
                         "platform_content_id": platform_content_id,
                         "content": content_text,
+                        "transcription": transcript,  # Store transcript in transcription column
                         "published_at": published_at,
                         "views": views,
                         "reactions_count": reactions_count,
                         "comments_count": comments_count,
                         "shares_count": shares_count,
-                        "has_media": True,  # YouTube Shorts are videos
+                        "has_media": True,  # YouTube videos are media
                         "raw_metadata": raw_metadata,
                         "is_embedded": False,
                         "is_graph_extracted": False,
@@ -693,7 +762,7 @@ class YouTubeParser(BasePlatformParser):
                 continue
 
         if not content_values:
-            logger.info("No valid YouTube Shorts items to upsert")
+            logger.info("No valid YouTube content items to upsert")
             return
 
         # Bulk upsert using PostgreSQL ON CONFLICT on uq_content_account_platform_id
@@ -703,6 +772,7 @@ class YouTubeParser(BasePlatformParser):
                 constraint="uq_content_account_platform_id",
                 set_=dict(
                     content=stmt.excluded.content,
+                    transcription=stmt.excluded.transcription,
                     views=stmt.excluded.views,
                     reactions_count=stmt.excluded.reactions_count,
                     comments_count=stmt.excluded.comments_count,
@@ -714,7 +784,7 @@ class YouTubeParser(BasePlatformParser):
             await session.execute(stmt)
             await session.commit()
             logger.debug(
-                "Bulk upserted %d YouTube Shorts items for account_id: %d",
+                "Bulk upserted %d YouTube content items for account_id: %d",
                 len(content_values),
                 account_id,
             )
@@ -741,54 +811,6 @@ class YouTubeParser(BasePlatformParser):
             return int(subscriber_count)
         except (ValueError, TypeError):
             return 0
-
-    def _extract_video_download_url(self, video: dict[str, Any]) -> str | None:
-        """Extract direct video download URL from YouTube video item.
-
-        Stores the direct video download link in raw_metadata["video_download_url"]
-        for GPU worker processing.
-
-        Args:
-            video: Video item dictionary from API response.
-
-        Returns:
-            Direct video download URL string, or None if not found.
-        """
-        # Check for direct download URL in various possible fields
-        download_url = (
-            video.get("downloadUrl")
-            or video.get("download_url")
-            or video.get("videoUrl")
-            or video.get("video_url")
-            or video.get("streamUrl")
-        )
-        if download_url and isinstance(download_url, str):
-            return download_url
-
-        # Check in nested objects (e.g., from YouTube API response)
-        player_response = video.get("playerResponse") or video.get(
-            "player_response"
-        )
-        if isinstance(player_response, dict):
-            streaming_data = player_response.get(
-                "streamingData"
-            ) or player_response.get("streaming_data")
-            if isinstance(streaming_data, dict):
-                # Try to get the highest quality format
-                formats = streaming_data.get("formats") or []
-                adaptive_formats = streaming_data.get("adaptiveFormats") or []
-                all_formats = (formats if isinstance(formats, list) else []) + (
-                    adaptive_formats
-                    if isinstance(adaptive_formats, list)
-                    else []
-                )
-                if all_formats:
-                    # Get the first format with a URL
-                    for fmt in all_formats:
-                        if isinstance(fmt, dict) and fmt.get("url"):
-                            return str(fmt["url"])
-
-        return None
 
     def _build_author_profile_metadata(
         self, channel: dict[str, Any]
@@ -892,3 +914,86 @@ class YouTubeParser(BasePlatformParser):
 
         # Remove None values for cleaner JSON
         return {k: v for k, v in author_metadata.items() if v is not None}
+
+    async def _upsert_account(
+        self, channel: dict[str, Any], status: str = "parsed"
+    ) -> int:
+        """Upsert YouTube account record using select-then-insert/update pattern.
+
+        Uses a select-then-upsert transaction pattern to avoid InvalidColumnReferenceError
+        caused by missing unique constraint on (platform, platform_id) in the accounts table.
+
+        Args:
+            channel: Channel object from Scrape Creators API response.
+            status: Account status ('parsed', 'rejected', etc.).
+
+        Returns:
+            ID of the account record (auto-generated by PostgreSQL for new records).
+        """
+        platform_id: str = str(
+            channel.get("id")
+            or channel.get("channelId")
+            or channel.get("channel_id")
+            or ""
+        )
+        username: str | None = (
+            channel.get("handle")
+            or channel.get("customUrl")
+            or channel.get("username")
+        )
+        full_name: str | None = (
+            channel.get("title")
+            or channel.get("channelTitle")
+            or channel.get("name")
+        )
+        description: str | None = (
+            channel.get("description")
+            or channel.get("bio")
+            or channel.get("channelDescription")
+        )
+        subscriber_count: int = self._extract_subscriber_count(channel)
+
+        async with self.session_maker() as session:
+            # Select existing account by platform and platform_id
+            stmt = select(Account).where(
+                Account.platform == "YOUTUBE",
+                Account.platform_id == platform_id,
+            )
+            result = await session.execute(stmt)
+            db_account: Account | None = result.scalar_one_or_none()
+
+            if db_account:
+                # Update existing record
+                db_account.username = username
+                db_account.title = full_name or username or "Unknown"
+                db_account.description = description
+                db_account.subscribers_count = subscriber_count
+                db_account.status = status
+                db_account.updated_at = datetime.now(timezone.utc)
+                logger.debug(
+                    "Updated existing YouTube account %s (ID: %d, status: %s)",
+                    username,
+                    db_account.id,
+                    status,
+                )
+            else:
+                # Create new record (let PostgreSQL generate ID)
+                db_account = Account(
+                    platform="YOUTUBE",
+                    platform_id=platform_id,
+                    username=username,
+                    title=full_name or username or "Unknown",
+                    description=description,
+                    subscribers_count=subscriber_count,
+                    status=status,
+                )
+                session.add(db_account)
+                logger.debug(
+                    "Created new YouTube account %s (status: %s)",
+                    username,
+                    status,
+                )
+
+            await session.commit()
+            await session.refresh(db_account)
+            return db_account.id

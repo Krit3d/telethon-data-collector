@@ -18,14 +18,15 @@ Features:
     - Video download URL extraction for GPU worker processing
     - Cross-platform spidering queue for discovered accounts
     - Duration filtering (<= 120 seconds) for short-form content
-    - No secondary transcript API calls; descriptions extracted inline
+    - Auto-generated caption (subtitle) extraction from TikTok CDN links (0 API credits)
 """
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
-from aiohttp import ClientResponseError
+from aiohttp import ClientResponseError, ClientTimeout
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -50,6 +51,16 @@ logger = logging.getLogger(__name__)
 # Follower thresholds for micro-influencers
 MIN_FOLLOWERS: int = 3000
 MAX_FOLLOWERS: int = 150000
+
+# Pre-compile VTT cleaning regex patterns for performance
+_VTT_HEADER_PATTERN = re.compile(r"^WEBVTT[\s\S]*?(?:\n\n|\Z)", re.MULTILINE)
+_VTT_TIMESTAMP_PATTERN = re.compile(
+    r"\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}[^\n]*\n?",
+    re.MULTILINE,
+)
+_VTT_METADATA_PATTERN = re.compile(r"{\\.*?}", re.MULTILINE)
+_VTT_EMPTY_LINES_PATTERN = re.compile(r"\n{3,}")
+_VTT_CONSECUTIVE_DUPLICATES_PATTERN = re.compile(r"^(.*)(\n\1)+$", re.MULTILINE)
 
 
 class TikTokParser(BasePlatformParser):
@@ -121,7 +132,10 @@ class TikTokParser(BasePlatformParser):
         if not (MIN_FOLLOWERS <= followers <= MAX_FOLLOWERS):
             logger.info(
                 "TikTok handle %s has %d followers, outside range [%d, %d]. Rejecting.",
-                handle, followers, MIN_FOLLOWERS, MAX_FOLLOWERS,
+                handle,
+                followers,
+                MIN_FOLLOWERS,
+                MAX_FOLLOWERS,
             )
             await self._upsert_account(profile, "rejected")
             return None
@@ -133,7 +147,9 @@ class TikTokParser(BasePlatformParser):
         # Check if EITHER biography OR full_name contains Russian Cyrillic characters
         has_russian = is_russian_text(biography) or is_russian_text(full_name)
         if not has_russian or is_slop_or_theme_page(username, biography):
-            logger.info("TikTok handle %s failed content filters. Rejecting.", handle)
+            logger.info(
+                "TikTok handle %s failed content filters. Rejecting.", handle
+            )
             await self._upsert_account(profile, "rejected")
             return None
 
@@ -146,7 +162,9 @@ class TikTokParser(BasePlatformParser):
         account_id = await self._upsert_account(profile, "parsed")
         logger.info(
             "Successfully parsed TikTok profile %s, account ID: %d, followers: %d",
-            handle, account_id, followers,
+            handle,
+            account_id,
+            followers,
         )
 
         # Post-parse actions: upsert virtual profile post for female creators
@@ -156,7 +174,9 @@ class TikTokParser(BasePlatformParser):
                     session=session,
                     account_id=account_id,
                     platform="TIKTOK",
-                    platform_id=str(profile.get("id") or profile.get("userId", "")),
+                    platform_id=str(
+                        profile.get("id") or profile.get("userId", "")
+                    ),
                     username=username,
                     full_name=full_name,
                     biography=biography,
@@ -193,7 +213,8 @@ class TikTokParser(BasePlatformParser):
         The database stores numerical platform_id, but the API requires the textual
         handle (username) which is resolved from the database. Video descriptions
         are extracted directly from the inline payload (desc/title) and mapped to
-        the Content text column. No transcript requests are made.
+        the Content text column. Auto-generated captions (subtitles) are fetched
+        from TikTok CDN links at zero API credit cost.
 
         Args:
             account_id: Database ID of the parent account record.
@@ -226,9 +247,15 @@ class TikTokParser(BasePlatformParser):
         author_metadata: dict[str, Any] = {}
         if profile:
             # Build author profile metadata from profile data
-            username: str | None = profile.get("uniqueId") or profile.get("handle")
-            biography: str | None = profile.get("signature") or profile.get("bio")
-            contacts_dict: dict[str, Any] = parse_profile_contacts(biography, None)
+            username: str | None = profile.get("uniqueId") or profile.get(
+                "handle"
+            )
+            biography: str | None = profile.get("signature") or profile.get(
+                "bio"
+            )
+            contacts_dict: dict[str, Any] = parse_profile_contacts(
+                biography, None
+            )
 
             # Extract geo data (region/city/country) from profile
             geo_data: dict[str, Any] | None = None
@@ -261,7 +288,10 @@ class TikTokParser(BasePlatformParser):
                 geo_data=geo_data,
             )
         else:
-            logger.warning("Failed to fetch profile for handle %s, author metadata will be empty", handle)
+            logger.warning(
+                "Failed to fetch profile for handle %s, author metadata will be empty",
+                handle,
+            )
 
         # Fetch videos with pagination from /v3/tiktok/profile/videos endpoint
         videos_collected: list[dict[str, Any]] = []
@@ -269,7 +299,8 @@ class TikTokParser(BasePlatformParser):
 
         while len(videos_collected) < max_items:
             # Scrape Creators v3 videos endpoint parameters
-            params: dict[str, Any] = {"handle": platform_id}
+            # NOTE: API requires textual handle, NOT numerical platform_id
+            params: dict[str, Any] = {"handle": handle}
             if cursor:
                 params["cursor"] = cursor
 
@@ -279,7 +310,9 @@ class TikTokParser(BasePlatformParser):
                     params=params,
                 )
             except Exception as e:
-                logger.error("Failed to fetch videos for handle %s: %s", handle, e)
+                logger.error(
+                    "Failed to fetch videos for handle %s: %s", handle, e
+                )
                 break
 
             # Extract videos from root-level "aweme_list" (v3 API returns list directly)
@@ -307,16 +340,24 @@ class TikTokParser(BasePlatformParser):
                     break
 
             # Get next cursor for pagination from response root
-            cursor = response.get("cursor") or response.get("nextCursor") or response.get("pageCursor")
+            cursor = (
+                response.get("cursor")
+                or response.get("nextCursor")
+                or response.get("pageCursor")
+            )
             if not cursor:
                 break
 
         if not videos_collected:
-            logger.info("No valid TikTok videos found for account_id: %d", account_id)
+            logger.info(
+                "No valid TikTok videos found for account_id: %d", account_id
+            )
             return
 
         # Process and upsert collected video items
-        await self._upsert_content(videos_collected, account_id, author_metadata)
+        await self._upsert_content(
+            videos_collected, account_id, author_metadata
+        )
         logger.info(
             "Successfully upserted %d TikTok content items for account_id: %d (handle: %s)",
             len(videos_collected),
@@ -324,7 +365,9 @@ class TikTokParser(BasePlatformParser):
             handle,
         )
 
-    async def _get_cached_or_fetch_profile(self, handle: str) -> dict[str, Any] | None:
+    async def _get_cached_or_fetch_profile(
+        self, handle: str
+    ) -> dict[str, Any] | None:
         """Get profile from cache or fetch from API.
 
         Uses instance-level caching to avoid duplicate API calls when
@@ -354,22 +397,31 @@ class TikTokParser(BasePlatformParser):
 
         except ClientResponseError as e:
             if e.status == 404:
-                logger.warning("TikTok profile %s not found (404). Marking as rejected.", handle)
+                logger.warning(
+                    "TikTok profile %s not found (404). Marking as rejected.",
+                    handle,
+                )
             else:
                 logger.error(
                     "TikTok API request failed for %s with HTTP %d: %s",
-                    handle, e.status, e,
+                    handle,
+                    e.status,
+                    e,
                 )
             return None
         except Exception as e:
             logger.error(
                 "Unexpected error fetching TikTok profile %s: %s",
-                handle, e, exc_info=True,
+                handle,
+                e,
+                exc_info=True,
             )
             return None
 
     async def _upsert_account(
-        self, user: dict[str, Any], status: str = "parsed",
+        self,
+        user: dict[str, Any],
+        status: str = "parsed",
     ) -> int:
         """Upsert TikTok account record using select-then-insert/update pattern.
 
@@ -441,7 +493,11 @@ class TikTokParser(BasePlatformParser):
                     continue
 
                 # Extract content text (video description from inline payload)
-                content_text: str | None = item.get("desc") or item.get("title") or item.get("description")
+                content_text: str | None = (
+                    item.get("desc")
+                    or item.get("title")
+                    or item.get("description")
+                )
 
                 # Extract published timestamp using core helper
                 create_time = item.get("createTime") or item.get("createdAt")
@@ -449,12 +505,19 @@ class TikTokParser(BasePlatformParser):
 
                 # Extract engagement metrics
                 views: int | None = self._extract_metric(item, "views")
-                reactions_count: int | None = self._extract_metric(item, "likes")
-                comments_count: int | None = self._extract_metric(item, "comments")
+                reactions_count: int | None = self._extract_metric(
+                    item, "likes"
+                )
+                comments_count: int | None = self._extract_metric(
+                    item, "comments"
+                )
                 shares_count: int | None = self._extract_metric(item, "shares")
 
                 # Extract video download URL for GPU worker
                 video_url: str | None = self._extract_video_download_url(item)
+
+                # Extract and download auto-generated captions (subtitles) from CDN
+                transcription: str | None = await self._extract_transcription(item)
 
                 # Build platform metrics with video_url for GPU worker
                 platform_metrics: dict[str, Any] = {
@@ -471,28 +534,36 @@ class TikTokParser(BasePlatformParser):
                     "platform_metrics": platform_metrics,
                 }
 
-                content_values.append({
-                    "account_id": account_id,
-                    "platform_content_id": platform_content_id,
-                    "content": content_text,
-                    "published_at": published_at,
-                    "views": views,
-                    "reactions_count": reactions_count,
-                    "comments_count": comments_count,
-                    "shares_count": shares_count,
-                    "has_media": True,  # TikTok items are videos
-                    "is_embedded": False,
-                    "is_graph_extracted": False,
-                    "raw_metadata": raw_metadata,
-                    "updated_at": datetime.now(timezone.utc),
-                })
+                content_values.append(
+                    {
+                        "account_id": account_id,
+                        "platform_content_id": platform_content_id,
+                        "content": content_text,
+                        "transcription": transcription,
+                        "published_at": published_at,
+                        "views": views,
+                        "reactions_count": reactions_count,
+                        "comments_count": comments_count,
+                        "shares_count": shares_count,
+                        "has_media": True,  # TikTok items are videos
+                        "is_embedded": False,
+                        "is_graph_extracted": False,
+                        "raw_metadata": raw_metadata,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                )
 
             except Exception as e:
-                logger.error("Failed to parse TikTok content item: %s", e, exc_info=True)
+                logger.error(
+                    "Failed to parse TikTok content item: %s", e, exc_info=True
+                )
                 continue
 
         if not content_values:
-            logger.warning("No valid content items to upsert for account_id: %d", account_id)
+            logger.warning(
+                "No valid content items to upsert for account_id: %d",
+                account_id,
+            )
             return
 
         async with self.session_maker() as session:
@@ -502,6 +573,7 @@ class TikTokParser(BasePlatformParser):
                     constraint="uq_content_account_platform_id",
                     set_=dict(
                         content=stmt.excluded.content,
+                        transcription=stmt.excluded.transcription,
                         views=stmt.excluded.views,
                         reactions_count=stmt.excluded.reactions_count,
                         comments_count=stmt.excluded.comments_count,
@@ -517,6 +589,130 @@ class TikTokParser(BasePlatformParser):
                     len(content_values),
                     account_id,
                 )
+
+    async def _extract_transcription(
+        self, item: dict[str, Any]
+    ) -> str | None:
+        """Extract auto-generated caption (subtitle) from TikTok CDN.
+
+        Searches the video object's subtitle_infos/subtitleInfos for a suitable
+        language track (preferring ru-RU/ru, falling back to en-US/en), downloads
+        the WebVTT content from the CDN URL, and cleans it into plain text.
+
+        Args:
+            item: Video item dictionary from API response.
+
+        Returns:
+            Cleaned transcription text, or None if not available or on error.
+        """
+        video = item.get("video")
+        if not isinstance(video, dict):
+            return None
+
+        # Check both snake_case and PascalCase variants
+        subtitle_infos: list[dict[str, Any]] = (
+            video.get("subtitle_infos")
+            or video.get("subtitleInfos")
+            or []
+        )
+
+        if not subtitle_infos:
+            return None
+
+        # Find suitable subtitle track: prefer ru-RU/ru, fallback to en-US/en
+        selected_track: dict[str, Any] | None = None
+
+        # First pass: look for Russian language tracks
+        for track in subtitle_infos:
+            lang = track.get("language_code_name") or track.get("LanguageCodeName", "")
+            if lang.startswith("ru"):
+                selected_track = track
+                break
+
+        # Second pass: fallback to English if no Russian found
+        if not selected_track:
+            for track in subtitle_infos:
+                lang = track.get("language_code_name") or track.get("LanguageCodeName", "")
+                if lang.startswith("en"):
+                    selected_track = track
+                    break
+
+        if not selected_track:
+            return None
+
+        # Extract CDN URL (check both snake_case and PascalCase)
+        subtitle_url: str | None = (
+            selected_track.get("url")
+            or selected_track.get("Url")
+        )
+
+        if not subtitle_url or not isinstance(subtitle_url, str):
+            return None
+
+        # Download and clean the VTT content
+        return await self._download_and_clean_vtt(subtitle_url)
+
+    async def _download_and_clean_vtt(self, url: str) -> str | None:
+        """Download WebVTT content from CDN URL and clean it into plain text.
+
+        Fetches the raw WebVTT file from the provided CDN URL using the internal
+        aiohttp.ClientSession, then cleans it by removing VTT headers, timestamps,
+        metadata blocks, and empty lines. Consecutive duplicate lines are merged.
+
+        Args:
+            url: CDN URL pointing to the WebVTT subtitle file.
+
+        Returns:
+            Cleaned plain text transcription, or None if download/parsing fails.
+        """
+        try:
+            # Use internal aiohttp.ClientSession from ScrapeCreatorsClient
+            session = self.client._session
+            if session is None or session.closed:
+                logger.warning("aiohttp session unavailable for VTT download")
+                return None
+
+            timeout = ClientTimeout(total=10)
+            async with session.get(url, timeout=timeout) as response:
+                response.raise_for_status()
+                raw_vtt: str = await response.text()
+
+        except Exception as e:
+            logger.warning("Failed to download VTT from %s: %s", url, e)
+            return None
+
+        if not raw_vtt:
+            return None
+
+        try:
+            # Clean the VTT content using pre-compiled regex patterns
+            cleaned: str = _VTT_HEADER_PATTERN.sub("", raw_vtt)
+            cleaned = _VTT_TIMESTAMP_PATTERN.sub("", cleaned)
+            cleaned = _VTT_METADATA_PATTERN.sub("", cleaned)
+
+            # Split into lines, strip whitespace, filter empty lines
+            lines: list[str] = [
+                line.strip() for line in cleaned.splitlines()
+            ]
+            filtered_lines: list[str] = [
+                line for line in lines if line and not line.startswith("NOTE")
+            ]
+
+            if not filtered_lines:
+                return None
+
+            # Remove consecutive duplicate lines
+            deduplicated: list[str] = [filtered_lines[0]]
+            for line in filtered_lines[1:]:
+                if line != deduplicated[-1]:
+                    deduplicated.append(line)
+
+            # Join into cohesive text
+            return " ".join(deduplicated)
+
+        except Exception as e:
+            logger.warning("Failed to clean VTT content from %s: %s", url, e)
+            return None
 
     def _extract_follower_count(self, user: dict[str, Any]) -> int:
         """Extract follower count from TikTok user object.
@@ -588,7 +784,9 @@ class TikTokParser(BasePlatformParser):
             if play_addr and isinstance(play_addr, str):
                 return play_addr
             # Fall back to downloadAddr
-            download_addr = video.get("downloadAddr") or video.get("downloadAddress")
+            download_addr = video.get("downloadAddr") or video.get(
+                "downloadAddress"
+            )
             if download_addr and isinstance(download_addr, str):
                 return download_addr
 
