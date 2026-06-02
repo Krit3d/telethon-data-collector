@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import ClientResponseError
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 
-from src.db.models import Account, Content
+from src.db.models import Account, Content, Comment
 from src.parser.creators.core.utils import (
     extract_instagram_subscribers,
     is_russian_text,
@@ -63,7 +64,9 @@ class InstagramParser(BasePlatformParser):
 
         Returns:
             Database ID of the upserted account record, or None if the profile
-            could not be parsed, doesn't meet criteria, or is rejected.
+            could not be fetched from the API.
+            Note: Returns the account_id even when the profile is rejected,
+            so the coordinator can use the correct merged account ID.
         """
         logger.info("Starting Instagram profile parse for handle: %s", handle)
 
@@ -89,8 +92,8 @@ class InstagramParser(BasePlatformParser):
                 MIN_SUBSCRIBERS,
                 MAX_SUBSCRIBERS,
             )
-            await self._upsert_account(profile, "rejected")
-            return None
+            # Return account_id even for rejected profiles so coordinator can use correct ID
+            return await self._upsert_account(profile, "rejected")
 
         # Content quality filters
         username = profile.get("username", "")
@@ -106,8 +109,8 @@ class InstagramParser(BasePlatformParser):
                 "Instagram handle %s REJECTED: No Cyrillic characters found in biography or full_name.",
                 handle,
             )
-            await self._upsert_account(profile, "rejected")
-            return None
+            # Return account_id even for rejected profiles so coordinator can use correct ID
+            return await self._upsert_account(profile, "rejected")
 
         # Check for slop/theme stop-words
         if is_slop_or_theme_page(username, biography):
@@ -115,16 +118,17 @@ class InstagramParser(BasePlatformParser):
                 "Instagram handle %s REJECTED: Matched slop/theme stop-words.",
                 handle,
             )
-            await self._upsert_account(profile, "rejected")
-            return None
+            # Return account_id even for rejected profiles so coordinator can use correct ID
+            return await self._upsert_account(profile, "rejected")
 
         # Female creator detection
         is_female = detect_female_creator(biography)
         if is_female:
             logger.info("Female creator detected: %s", handle)
 
-        # Upsert parsed account
-        account_id = await self._upsert_account(profile, "parsed")
+        # Upsert account with "processing" status
+        # Final "parsed" status will be set by coordinator after successful content fetching
+        account_id = await self._upsert_account(profile, "processing")
         logger.info(
             "Successfully parsed Instagram profile %s, account ID: %d, subscribers: %d",
             handle,
@@ -152,17 +156,36 @@ class InstagramParser(BasePlatformParser):
             try:
                 async with self.session_maker() as session:
                     # Import _queue_single_account dynamically
-                    from src.parser.creators.core.db import _queue_single_account
+                    from src.parser.creators.core.db import (
+                        _queue_single_account,
+                    )
 
                     # Queue identical handle for TikTok
-                    await _queue_single_account(session, "TIKTOK", username, f"instagram_sync_{username}")
+                    await _queue_single_account(
+                        session,
+                        "TIKTOK",
+                        username,
+                        f"instagram_sync_{username}",
+                    )
                     # Queue identical handle for Threads
-                    await _queue_single_account(session, "THREADS", username, f"instagram_sync_{username}")
+                    await _queue_single_account(
+                        session,
+                        "THREADS",
+                        username,
+                        f"instagram_sync_{username}",
+                    )
 
                     await session.commit()
-                    logger.info("Cross-platform seeds queued for TIKTOK and THREADS from Instagram: %s", username)
+                    logger.info(
+                        "Cross-platform seeds queued for TIKTOK and THREADS from Instagram: %s",
+                        username,
+                    )
             except Exception as e:
-                logger.warning("Failed to queue cross-platform seeds for %s: %s", username, e)
+                logger.warning(
+                    "Failed to queue cross-platform seeds for %s: %s",
+                    username,
+                    e,
+                )
 
         # Queue discovered accounts from contacts
         contacts_dict = parse_profile_contacts(
@@ -173,6 +196,7 @@ class InstagramParser(BasePlatformParser):
                 session=session,
                 contacts_dict=contacts_dict,
                 parent_handle=handle,
+                status="pending",
             )
             await session.commit()
 
@@ -211,19 +235,28 @@ class InstagramParser(BasePlatformParser):
 
                         if not existing:
                             # Insert new Account for chaining
-                            new_account = Account(
-                                platform="INSTAGRAM",
-                                platform_id=related_username,
-                                username=related_username,
-                                title=related_username,
-                                status="pending",
-                            )
-                            session.add(new_account)
-                            logger.debug(
-                                "Chained new INSTAGRAM account: %s from seed: %s",
-                                related_username,
-                                handle,
-                            )
+                            try:
+                                new_account = Account(
+                                    platform="INSTAGRAM",
+                                    platform_id=related_username,
+                                    username=related_username,
+                                    title=related_username,
+                                    status="pending",
+                                )
+                                session.add(new_account)
+                                await session.flush()
+                                logger.debug(
+                                    "Chained new INSTAGRAM account: %s from seed: %s",
+                                    related_username,
+                                    handle,
+                                )
+                            except IntegrityError as e:
+                                # Handle race condition where another process inserted the same account
+                                logger.debug(
+                                    "Integrity error while chaining INSTAGRAM account %s: %s",
+                                    related_username,
+                                    e,
+                                )
 
                     await session.commit()
                     logger.info(
@@ -307,6 +340,10 @@ class InstagramParser(BasePlatformParser):
     ) -> int:
         """Select-then-upsert account to avoid database conflicts.
 
+        Searches for existing account by BOTH numeric platform_id and username
+        to merge seeded/spider accounts with fully parsed ones.
+        Implements safe deduplication when multiple matching accounts are found.
+
         Args:
             profile: Instagram profile data dictionary.
             status: Account status (e.g., "parsed", "rejected").
@@ -321,21 +358,16 @@ class InstagramParser(BasePlatformParser):
         subscribers = extract_instagram_subscribers(profile)
 
         async with self.session_maker() as session:
+            # Query by BOTH platform_id and username to find all matching accounts
             stmt = select(Account).where(
                 Account.platform == "INSTAGRAM",
-                Account.platform_id == platform_id,
+                (Account.platform_id == platform_id) | (Account.username == username)
             )
             result = await session.execute(stmt)
-            db_account = result.scalar_one_or_none()
+            matching_accounts = result.scalars().all()
 
-            if db_account:
-                db_account.username = username
-                db_account.title = full_name or username or "Unknown"
-                db_account.description = biography
-                db_account.subscribers_count = subscribers
-                db_account.status = status
-                db_account.updated_at = datetime.now(timezone.utc)
-            else:
+            if not matching_accounts:
+                # No existing account found, create new one
                 db_account = Account(
                     platform="INSTAGRAM",
                     platform_id=platform_id,
@@ -346,6 +378,105 @@ class InstagramParser(BasePlatformParser):
                     status=status,
                 )
                 session.add(db_account)
+            
+            elif len(matching_accounts) == 1:
+                # Exactly one matching account found, update it
+                db_account = matching_accounts[0]
+                db_account.username = username
+                db_account.title = full_name or username or "Unknown"
+                db_account.description = biography
+                db_account.subscribers_count = subscribers
+                db_account.status = status
+                db_account.updated_at = datetime.now(timezone.utc)
+                
+                # Always update platform_id to the latest value from API
+                # This handles the case where account was seeded with username as platform_id
+                # and now we have the numeric platform_id from the API
+                if db_account.platform_id != platform_id:
+                    logger.info(
+                        "Updating platform_id for account %s: %s -> %s",
+                        username,
+                        db_account.platform_id,
+                        platform_id,
+                    )
+                    db_account.platform_id = platform_id
+            
+            else:
+                # Multiple matching accounts found (duplicates) - implement deduplication
+                logger.warning(
+                    "Found %d duplicate accounts for platform_id=%s, username=%s. Starting deduplication.",
+                    len(matching_accounts),
+                    platform_id,
+                    username,
+                )
+                
+                # Select primary account: prioritize numeric platform_id over username-based
+                # A numeric platform_id does not equal its username (production-grade identifier)
+                primary_account: Account | None = None
+                for account in matching_accounts:
+                    if account.platform_id != account.username:
+                        primary_account = account
+                        break
+                
+                # If no account with numeric platform_id found, use the first one
+                if primary_account is None:
+                    primary_account = matching_accounts[0]
+                
+                # Update primary account with latest data
+                primary_account.username = username
+                primary_account.title = full_name or username or "Unknown"
+                primary_account.description = biography
+                primary_account.subscribers_count = subscribers
+                primary_account.status = status
+                primary_account.updated_at = datetime.now(timezone.utc)
+                
+                # Always ensure platform_id is set to the correct numeric identifier
+                if primary_account.platform_id != platform_id:
+                    logger.info(
+                        "Updating platform_id for primary account %s: %s -> %s",
+                        username,
+                        primary_account.platform_id,
+                        platform_id,
+                    )
+                    primary_account.platform_id = platform_id
+                
+                # Process duplicate accounts: reassign child rows and delete duplicates
+                for duplicate in matching_accounts:
+                    if duplicate.id == primary_account.id:
+                        continue  # Skip the primary account
+                    
+                    # Update content table: reassign to primary account
+                    content_update_stmt = (
+                        update(Content)
+                        .where(Content.account_id == duplicate.id)
+                        .values(account_id=primary_account.id)
+                    )
+                    await session.execute(content_update_stmt)
+                    
+                    # Update comments table: reassign to primary account
+                    comment_update_stmt = (
+                        update(Comment)
+                        .where(Comment.account_id == duplicate.id)
+                        .values(account_id=primary_account.id)
+                    )
+                    await session.execute(comment_update_stmt)
+                    
+                    logger.info(
+                        "Reassigned content and comments from duplicate account %d to primary account %d",
+                        duplicate.id,
+                        primary_account.id,
+                    )
+                    
+                    # Delete the duplicate account
+                    await session.delete(duplicate)
+                    logger.info(
+                        "Deleted duplicate account with id=%d, platform_id=%s, username=%s",
+                        duplicate.id,
+                        duplicate.platform_id,
+                        duplicate.username,
+                    )
+                
+                db_account = primary_account
 
             await session.commit()
             await session.refresh(db_account)
@@ -469,7 +600,9 @@ class InstagramParser(BasePlatformParser):
 
                 # Extract duration safely
                 # Static images may return 0.0 or have missing duration
-                duration = item.get("video_duration") or item.get("duration", 0.0)
+                duration = item.get("video_duration") or item.get(
+                    "duration", 0.0
+                )
                 # Valid video must have duration strictly between 0 and 120 seconds
                 if not (0.0 < duration <= 120.0):
                     continue
@@ -521,6 +654,20 @@ class InstagramParser(BasePlatformParser):
             account_id, platform_ids
         )
 
+        # Calculate metrics for logging
+        total = len(valid_items)
+        skipped = len(existing_transcripts)
+        to_fetch = total - skipped
+
+        # Log high-level parsing metrics
+        logger.info(
+            "Account %d: found %d videos. %d already transcribed (skipping API calls). %d require new transcripts.",
+            account_id,
+            total,
+            skipped,
+            to_fetch,
+        )
+
         # Fetch transcripts concurrently for eligible videos
         semaphore = asyncio.Semaphore(5)
         transcript_tasks = []
@@ -532,7 +679,7 @@ class InstagramParser(BasePlatformParser):
                 continue
 
             # Extract shortcode to construct post permalink for transcript API
-            # Note: extract_instagram_video_url() is still used later (line ~615)
+            # Note: extract_instagram_video_url() is still used later
             # to save the CDN video URL in raw_metadata
             shortcode = item.get("code") or item.get("shortcode")
             if not shortcode:
@@ -542,9 +689,7 @@ class InstagramParser(BasePlatformParser):
             post_url = f"https://instagram.com/p/{shortcode}"
 
             eligible_items.append(item)
-            transcript_tasks.append(
-                self._fetch_transcript(semaphore, post_url)
-            )
+            transcript_tasks.append(self._fetch_transcript(semaphore, post_url))
 
         transcripts: dict[str, str | None] = {}
         if transcript_tasks:
@@ -589,7 +734,10 @@ class InstagramParser(BasePlatformParser):
                     async with self.session_maker() as session:
                         # Cross-platform links
                         await queue_discovered_accounts(
-                            session, contacts_dict, profile.get("username", "")
+                            session,
+                            contacts_dict,
+                            profile.get("username", ""),
+                            "pending",
                         )
                         # Same-platform mentions
                         await queue_discovered_mentions(
@@ -597,6 +745,7 @@ class InstagramParser(BasePlatformParser):
                             "INSTAGRAM",
                             mentions,
                             profile.get("username", ""),
+                            "pending",
                         )
                         await session.commit()
                 except Exception as e:
@@ -663,10 +812,14 @@ class InstagramParser(BasePlatformParser):
     def _extract_video_url(self, item: dict[str, Any]) -> str | None:
         """Extract video URL from Instagram post item with robust fallback logic.
 
-        Implements a three-tier extraction strategy:
-        1. Check video_versions array (most reliable, used by Instagram internally)
-        2. Fallback to video_url field
-        3. Final fallback to extract_instagram_video_url helper
+        Implements a multi-tier extraction strategy to handle various Instagram
+        API response structures:
+        1. Check nested "media" object for video_versions
+        2. Check video_versions as a list of dicts
+        3. Check video_versions as a dict with numeric keys
+        4. Fallback to video_url at media or item level
+        5. Fallback to carousel_media list (recursive extraction)
+        6. Final fallback to extract_instagram_video_url helper
 
         Args:
             item: Instagram post dictionary.
@@ -674,7 +827,35 @@ class InstagramParser(BasePlatformParser):
         Returns:
             Video URL string if found, otherwise None.
         """
-        # Tier 1: Check video_versions array (most reliable source)
+        # Tier 1: Check nested "media" object
+        media = item.get("media")
+        if isinstance(media, dict):
+            # Check video_versions inside media object (list format)
+            video_versions = media.get("video_versions")
+            if isinstance(video_versions, list) and len(video_versions) > 0:
+                first_video = video_versions[0]
+                if isinstance(first_video, dict):
+                    url = first_video.get("url")
+                    if isinstance(url, str) and url:
+                        return url
+
+            # Check video_versions inside media object (dict format with numeric keys)
+            if isinstance(video_versions, dict) and video_versions:
+                # Extract URL from the first available key
+                first_key = next(iter(video_versions), None)
+                if first_key is not None:
+                    first_item = video_versions[first_key]
+                    if isinstance(first_item, dict):
+                        url = first_item.get("url")
+                        if isinstance(url, str) and url:
+                            return url
+
+            # Fallback to video_url at media level
+            video_url = media.get("video_url")
+            if isinstance(video_url, str) and video_url:
+                return video_url
+
+        # Tier 2: Check video_versions at item level (list format)
         video_versions = item.get("video_versions")
         if isinstance(video_versions, list) and len(video_versions) > 0:
             first_video = video_versions[0]
@@ -683,18 +864,43 @@ class InstagramParser(BasePlatformParser):
                 if isinstance(url, str) and url:
                     return url
 
-        # Tier 2: Fallback to video_url field
+        # Tier 3: Check video_versions at item level (dict format with numeric keys)
+        if isinstance(video_versions, dict) and video_versions:
+            # Extract URL from the first available key
+            first_key = next(iter(video_versions), None)
+            if first_key is not None:
+                first_item = video_versions[first_key]
+                if isinstance(first_item, dict):
+                    url = first_item.get("url")
+                    if isinstance(url, str) and url:
+                        return url
+
+        # Tier 4: Fallback to video_url at item level
         video_url = item.get("video_url")
         if isinstance(video_url, str) and video_url:
             return video_url
 
-        # Tier 3: Final fallback to extract_instagram_video_url
+        # Tier 5: Fallback to carousel_media list (recursive extraction)
+        carousel_media = item.get("carousel_media")
+        if isinstance(carousel_media, list) and len(carousel_media) > 0:
+            # Recursively extract video URL from the first carousel item
+            first_carousel_item = carousel_media[0]
+            if isinstance(first_carousel_item, dict):
+                carousel_video_url = self._extract_video_url(first_carousel_item)
+                if isinstance(carousel_video_url, str) and carousel_video_url:
+                    return carousel_video_url
+
+        # Tier 6: Final fallback to extract_instagram_video_url helper
         return extract_instagram_video_url(item)
 
     async def _fetch_transcript(
         self, semaphore: asyncio.Semaphore, post_url: str
     ) -> str | None:
-        """Fetch media transcript with rate limiting using semaphore.
+        """Fetch media transcript using client-side retries.
+
+        Delegates retry logic to the HTTP client's built-in exponential backoff
+        configured via environment settings. Rate limiting is handled by the
+        semaphore wrapper.
 
         Args:
             semaphore: Asyncio semaphore for rate limiting.
@@ -703,8 +909,7 @@ class InstagramParser(BasePlatformParser):
         Returns:
             Transcript text if available, otherwise None.
         """
-        # Transcript request log with required format
-        logger.debug("Requesting transcript for post: %s", post_url)
+        logger.debug("Requesting transcript: %s", post_url[:50])
 
         async with semaphore:
             try:
@@ -713,45 +918,33 @@ class InstagramParser(BasePlatformParser):
                     params={"url": post_url},
                 )
                 # Parse the transcripts list from the API response
-                # Scrape Creators API returns: [{"id": "...", "shortcode": "...", "text": "..."}]
-                # or ["transcript text"] (list of strings)
-                # or [null] / [] if empty
                 transcripts = response.get("transcripts")
                 if isinstance(transcripts, list) and len(transcripts) > 0:
                     first_item = transcripts[0]
 
                     # Skip None values in the list
                     if first_item is None:
-                        logger.debug(
-                            "No transcript available for post: %s", post_url[:50]
-                        )
+                        logger.debug("No transcript: %s", post_url[:50])
                         return None
 
                     transcript_text: str | None = None
 
                     if isinstance(first_item, str) and first_item:
-                        # Handle case where API returns list of strings
                         transcript_text = first_item
                     elif isinstance(first_item, dict):
-                        # Handle case where API returns list of dictionaries
                         text_value = first_item.get("text")
                         if isinstance(text_value, str) and text_value:
                             transcript_text = text_value
 
                     if transcript_text:
-                        # Transcript success log with required format, handling None safely
-                        logger.debug(
-                            "Successfully retrieved transcript for post %s",
-                            post_url[:50],
-                        )
+                        logger.debug("Got transcript: %s", post_url[:50])
                         return transcript_text
 
-                logger.debug(
-                    "No transcript available for post: %s", post_url[:50]
-                )
+                logger.debug("No transcript: %s", post_url[:50])
                 return None
+
             except Exception as e:
-                logger.error("Transcript fetch failed for %s: %s", post_url, e)
+                logger.warning("Transcript permanently failed for %s: %s", post_url, e)
                 return None
 
     async def _get_existing_transcripts(

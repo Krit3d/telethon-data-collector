@@ -14,6 +14,7 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account, Content
@@ -25,12 +26,13 @@ async def queue_discovered_accounts(
     session: AsyncSession,
     contacts_dict: dict[str, Any],
     parent_handle: str,
+    status: str = "pending",
 ) -> None:
     """Queue discovered accounts from profile contacts for cross-platform spidering.
 
     Processes emails, Telegram handles, and external links from the contacts
     dictionary and inserts new account records into the accounts table with
-    status "pending" for platforms Instagram, TikTok, YouTube, Threads, and Telegram.
+    the specified status for platforms Instagram, TikTok, YouTube, Threads, and Telegram.
 
     Uses a SELECT-then-INSERT pattern with transaction safety to avoid
     unique constraint violations.
@@ -39,6 +41,7 @@ async def queue_discovered_accounts(
         session: SQLAlchemy async session for database operations.
         contacts_dict: Dictionary containing emails, telegram_handles, and external_links.
         parent_handle: Handle of the parent account whose bio was scanned.
+        status: Status to assign to newly discovered accounts (default: "pending").
     """
     telegram_handles: list[str] = contacts_dict.get("telegram_handles", [])
     external_links: list[str] = contacts_dict.get("external_links", [])
@@ -55,7 +58,7 @@ async def queue_discovered_accounts(
         if not handle:
             continue
         clean_handle = handle.lstrip("@")
-        await _queue_single_account(session, "TELEGRAM", clean_handle, parent_handle)
+        await _queue_single_account(session, "TELEGRAM", clean_handle, parent_handle, status)
 
     # Process external links for Instagram, TikTok, YouTube, Threads
     for link in external_links:
@@ -70,7 +73,7 @@ async def queue_discovered_accounts(
             if match:
                 instagram_handle = match.group(1)
                 if instagram_handle and instagram_handle != "p":
-                    await _queue_single_account(session, "INSTAGRAM", instagram_handle, parent_handle)
+                    await _queue_single_account(session, "INSTAGRAM", instagram_handle, parent_handle, status)
 
         # TikTok: tiktok.com/@username
         elif "tiktok.com/" in link_lower:
@@ -78,7 +81,7 @@ async def queue_discovered_accounts(
             if match:
                 tiktok_username = match.group(1)
                 if tiktok_username:
-                    await _queue_single_account(session, "TIKTOK", tiktok_username, parent_handle)
+                    await _queue_single_account(session, "TIKTOK", tiktok_username, parent_handle, status)
 
         # YouTube: youtube.com/@handle, youtube.com/channel/UC..., youtu.be/
         elif "youtube.com/" in link_lower or "youtu.be/" in link_lower:
@@ -92,7 +95,7 @@ async def queue_discovered_accounts(
                 continue
 
             if platform_id:
-                await _queue_single_account(session, "YOUTUBE", platform_id, parent_handle)
+                await _queue_single_account(session, "YOUTUBE", platform_id, parent_handle, status)
 
         # Threads: threads.net/@username or threads.net/username
         elif "threads.net/" in link_lower:
@@ -101,7 +104,7 @@ async def queue_discovered_accounts(
             else:
                 platform_id = link.split("/")[-1].split("?")[0].split("/")[0]
             if platform_id:
-                await _queue_single_account(session, "THREADS", platform_id, parent_handle)
+                await _queue_single_account(session, "THREADS", platform_id, parent_handle, status)
 
 
 async def queue_discovered_mentions(
@@ -109,20 +112,22 @@ async def queue_discovered_mentions(
     platform: str,
     mentions: list[str],
     parent_handle: str,
+    status: str = "pending",
 ) -> None:
-    """Queue discovered @username mentions for the current platform into the database with status 'pending'.
+    """Queue discovered @username mentions for the current platform into the database.
 
     Args:
         session: SQLAlchemy async session for database operations.
         platform: Platform name (INSTAGRAM, TIKTOK, YOUTUBE, THREADS).
         mentions: List of usernames extracted from @mentions (without @ symbol).
         parent_handle: Handle of the parent account that contained the mentions.
+        status: Status to assign to newly discovered accounts (default: "pending").
     """
     for username in mentions:
         if not username or len(username) < 3:
             continue
         # Avoid queueing obvious non-user names or system tags
-        await _queue_single_account(session, platform, username, parent_handle)
+        await _queue_single_account(session, platform, username, parent_handle, status)
 
 
 async def _queue_single_account(
@@ -130,17 +135,19 @@ async def _queue_single_account(
     platform: str,
     platform_id: str,
     parent_handle: str,
+    status: str = "pending",
 ) -> None:
     """Queue a single account for cross-platform spidering if it doesn't already exist.
 
     Checks for an existing account record first to avoid unique constraint violations,
-    then inserts a new record with "pending" status if not found.
+    then inserts a new record with the specified status if not found.
 
     Args:
         session: SQLAlchemy async session for database operations.
         platform: Platform name (INSTAGRAM, TIKTOK, YOUTUBE, THREADS, TELEGRAM).
         platform_id: Platform-specific identifier (handle, username, channel ID, etc.).
         parent_handle: Handle of the parent account that led to this discovery.
+        status: Status to assign to the account (default: "pending").
     """
     stmt = select(Account).where(
         Account.platform == platform,
@@ -150,20 +157,30 @@ async def _queue_single_account(
     existing = result.scalar_one_or_none()
 
     if not existing:
-        new_account = Account(
-            platform=platform,
-            platform_id=platform_id,
-            username=platform_id,
-            title=platform_id,
-            status="pending",
-        )
-        session.add(new_account)
-        logger.info(
-            "[SPIDER] Queued discovered %s account: %s from bio of parent account %s.",
-            platform,
-            platform_id,
-            parent_handle,
-        )
+        try:
+            new_account = Account(
+                platform=platform,
+                platform_id=platform_id,
+                username=platform_id,
+                title=platform_id,
+                status=status,
+            )
+            session.add(new_account)
+            await session.flush()
+            logger.info(
+                "[SPIDER] Queued discovered %s account: %s from bio of parent account %s.",
+                platform,
+                platform_id,
+                parent_handle,
+            )
+        except IntegrityError as e:
+            # Handle race condition where another process inserted the same account
+            logger.debug(
+                "Integrity error while queuing %s account %s (likely duplicate): %s",
+                platform,
+                platform_id,
+                e,
+            )
 
 
 async def upsert_virtual_bio_post(

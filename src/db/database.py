@@ -252,12 +252,14 @@ class Database:
         """Reset all accounts with status='processing' back to 'pending'.
 
         This recovers from crashes/restarts where accounts were left in processing state.
+        Only affects TELEGRAM platform accounts to prevent status leakage to other platforms.
         """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
                     update(Account)
                     .where(Account.status == "processing")
+                    .where(Account.platform == "TELEGRAM")
                     .values(status="pending")
                 )
                 result = await session.execute(stmt)
@@ -675,7 +677,11 @@ class Database:
             # Start transaction with row-level lock
             async with session.begin():
                 # Build query with optional hash requirement
-                stmt = select(Account).where(Account.status == "pending")
+                # Always filter by TELEGRAM platform to prevent status leakage
+                stmt = select(Account).where(
+                    Account.status == "pending",
+                    Account.platform == "TELEGRAM",
+                )
                 if require_hash:
                     stmt = stmt.where(Account.access_hash.is_not(None))
 
@@ -701,12 +707,16 @@ class Database:
                 return account
 
     async def mark_account_processed(self, account_id: int) -> None:
-        """Mark an account as successfully processed (status='parsed')."""
+        """Mark an account as successfully processed (status='ready_for_parsing').
+
+        Only affects TELEGRAM platform accounts to prevent status leakage.
+        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
                     select(Account)
                     .where(Account.id == account_id)
+                    .where(Account.platform == "TELEGRAM")
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
@@ -719,12 +729,16 @@ class Database:
                     )
 
     async def mark_account_rejected(self, account_id: int) -> None:
-        """Mark an account as rejected (status='rejected')."""
+        """Mark an account as rejected (status='rejected').
+
+        Only affects TELEGRAM platform accounts to prevent status leakage.
+        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
                     select(Account)
                     .where(Account.id == account_id)
+                    .where(Account.platform == "TELEGRAM")
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
@@ -765,6 +779,7 @@ class Database:
                     shard_stmt = (
                         select(Account)
                         .where(Account.status == "ready_for_parsing")
+                        .where(Account.platform == "TELEGRAM")
                         .where(Account.is_author_blog == True)  # noqa: E712
                         .where(Account.access_hash.is_not(None))
                         # Shard condition: Account.id % total_sessions == session_index
@@ -798,9 +813,11 @@ class Database:
 
                 # Stage 2: Fallback - claim ANY available account
                 # This prevents idle workers when some sessions are in cooldown
+                # Always filter by TELEGRAM platform to prevent status leakage
                 fallback_stmt = (
                     select(Account)
                     .where(Account.status == "ready_for_parsing")
+                    .where(Account.platform == "TELEGRAM")
                     .where(Account.is_author_blog == True)  # noqa: E712
                     .where(Account.access_hash.is_not(None))
                     .order_by(func.random())
@@ -823,12 +840,16 @@ class Database:
                 return account
 
     async def mark_account_parsed(self, account_id: int) -> None:
-        """Mark an account as completely parsed (content are saved)."""
+        """Mark an account as completely parsed (content are saved).
+
+        Only affects TELEGRAM platform accounts to prevent status leakage.
+        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
                     select(Account)
                     .where(Account.id == account_id)
+                    .where(Account.platform == "TELEGRAM")
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
@@ -841,12 +862,16 @@ class Database:
                     )
 
     async def mark_account_pending(self, account_id: int) -> None:
-        """Return an account to pending status (e.g., if a worker failed due to a shadowban)."""
+        """Return an account to pending status (e.g., if a worker failed due to a shadowban).
+
+        Only affects TELEGRAM platform accounts to prevent status leakage.
+        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
                     select(Account)
                     .where(Account.id == account_id)
+                    .where(Account.platform == "TELEGRAM")
                     .with_for_update()
                 )
                 result = await session.execute(stmt)
@@ -866,6 +891,8 @@ class Database:
         This is used to store the session-local correct access_hash after
         successful resolution by username.
 
+        Only affects TELEGRAM platform accounts to prevent status leakage.
+
         Args:
             account_id: Telegram account ID.
             access_hash: The resolved access_hash for this session.
@@ -875,6 +902,7 @@ class Database:
                 stmt = (
                     select(Account)
                     .where(Account.id == account_id)
+                    .where(Account.platform == "TELEGRAM")
                     .with_for_update()
                 )
                 result = await session.execute(stmt)

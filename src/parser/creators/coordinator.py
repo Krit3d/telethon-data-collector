@@ -261,8 +261,10 @@ class CreatorsCoordinator:
                         return
 
                     # Get the updated account to check subscriber count
+                    # Use db_account_id returned from parse_profile to ensure we're
+                    # operating on the correctly resolved/merged database record
                     async with self.session_maker() as session:
-                        stmt = select(Account).where(Account.id == account_id)
+                        stmt = select(Account).where(Account.id == db_account_id)
                         result = await session.execute(stmt)
                         account = result.scalar_one_or_none()
 
@@ -274,24 +276,27 @@ class CreatorsCoordinator:
                                     f"Marking as rejected."
                                 )
                                 await self._update_account_status(
-                                    account_id, STATUS_REJECTED
+                                    db_account_id, STATUS_REJECTED
                                 )
                                 return
 
                     # Execute parse_content to fetch and store content
+                    # Use db_account_id to ensure operations run against the correctly
+                    # resolved/merged database record
                     logger.debug(
                         f"Parsing content for {username} on {platform}"
                     )
                     await parser.parse_content(
-                        account_id=account_id,
+                        account_id=db_account_id,
                         platform_id=username,  # Using username as platform_id for API calls
                         max_items=50,
                     )
 
                     # On successful completion, update status to "parsed"
-                    await self._update_account_status(account_id, STATUS_PARSED)
+                    # Use db_account_id for status update
+                    await self._update_account_status(db_account_id, STATUS_PARSED)
                     logger.info(
-                        f"Successfully processed account {account_id} "
+                        f"Successfully processed account {db_account_id} "
                         f"({username} on {platform})"
                     )
 

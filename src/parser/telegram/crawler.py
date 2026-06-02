@@ -210,7 +210,11 @@ class Worker(BaseTelegramWorker):
         is_author_blog: bool,
         access_hash: int | None = None,
     ) -> None:
-        """Save or update account in database."""
+        """Save or update account in database.
+
+        Explicitly sets platform to TELEGRAM to prevent status leakage
+        to other platform accounts.
+        """
         account_data = {
             "id": account_id,
             "username": username,
@@ -220,6 +224,7 @@ class Worker(BaseTelegramWorker):
             "status": "pending",
             "is_author_blog": is_author_blog,
             "access_hash": access_hash,
+            "platform": "TELEGRAM",
         }
 
         await self.db.upsert_account(account_data)
@@ -250,8 +255,12 @@ class Worker(BaseTelegramWorker):
             raise RuntimeError("Telegram client is not initialized")
 
         # Check if account already exists in DB
+        # Filter by TELEGRAM platform to prevent status leakage
         async with self.db.async_session() as session:
-            stmt = select(AccountModel).where(AccountModel.id == rec_channel.id)
+            stmt = select(AccountModel).where(
+                AccountModel.id == rec_channel.id,
+                AccountModel.platform == "TELEGRAM",
+            )
             result = await session.execute(stmt)
             existing = result.scalar_one_or_none()
 

@@ -27,7 +27,7 @@ class ScrapeCreatorsClient:
     Focuses exclusively on transport concerns:
     * Lazy `aiohttp.ClientSession` initialisation protected by an `asyncio.Lock`
     * Configurable base URL, header name, and authentication scheme (via `Settings`)
-    * Resilient `_request` helper with up to 3 retries, exponential backoff,
+    * Resilient `_request` helper with configurable retries, exponential backoff,
       and strict HTTP 429 (Rate-Limit) handling
     * Generic `get` / `post` convenience methods that return raw parsed JSON
 
@@ -40,7 +40,7 @@ class ScrapeCreatorsClient:
 
         Args:
             settings: Application settings containing the API key, base URL,
-                header name, and authentication scheme.
+                header name, authentication scheme, and network retry configuration.
 
         Raises:
             ValueError: If the Scrape Creators API key is not configured.
@@ -62,12 +62,12 @@ class ScrapeCreatorsClient:
         self.last_credits_remaining: int | None = None
 
     async def __aenter__(self) -> "ScrapeCreatorsClient":
-        """Async context manager entry – ensure the session is initialised."""
+        """Async context manager entry - ensure the session is initialised."""
         await self._ensure_session()
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Async context manager exit – close the underlying session."""
+        """Async context manager exit - close the underlying session."""
         await self.close()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
@@ -108,16 +108,41 @@ class ScrapeCreatorsClient:
             return f"{self._auth_scheme} {self._api_key}"
         return self._api_key
 
+    def _get_network_retries(self) -> int:
+        """Get the network retries configuration from settings with fallback.
+
+        Returns:
+            The number of network retries to use. Defaults to 3 if not
+            configured or set to None.
+        """
+        retries = getattr(self._settings, 'network_retries', None)
+        if retries is None:
+            return 3
+        return retries
+
+    def _get_network_retry_base_delay(self) -> float:
+        """Get the network retry base delay configuration from settings with fallback.
+
+        Returns:
+            The base delay in seconds for retry backoff. Defaults to 1.0 if not
+            configured or set to None.
+        """
+        delay = getattr(self._settings, 'network_retry_base_delay_s', None)
+        if delay is None:
+            return 1.0
+        return delay
+
     async def _request(
         self,
         method: str,
         endpoint: str,
         params: dict | None = None,
         json_data: dict | None = None,
+        max_retries: int | None = None,
     ) -> dict:
-        """Perform an HTTP request with retries, backoff, and rate-limit handling.
+        """Perform an HTTP request with retries, fixed-interval delays, and rate-limit handling.
 
-        Retries up to 3 times on:
+        Retries up to the specified number of times on:
         * Network errors (`aiohttp.ClientError`, `asyncio.TimeoutError`)
         * HTTP 429 Too Many Requests (with Retry-After header support)
         * Server errors (HTTP 5xx)
@@ -128,13 +153,18 @@ class ScrapeCreatorsClient:
         on subsequent attempts.
 
         For 429 responses the client honours the ``Retry-After`` header when
-        present, falling back to exponential backoff.
+        present, falling back to a fixed delay.
+
+        The retry configuration uses a fixed delay between retries:
+        * ``network_retry_base_delay_s``: Fixed delay in seconds (default: 1.0)
 
         Args:
             method: HTTP method (GET, POST, etc.).
             endpoint: API endpoint path (leading ``/`` is optional).
             params: Optional query-string parameters.
             json_data: Optional JSON body for POST/PUT requests.
+            max_retries: Maximum number of retries. If not provided, defaults to 5
+                (which means 6 total attempts).
 
         Returns:
             Parsed JSON response as a dictionary.
@@ -148,8 +178,15 @@ class ScrapeCreatorsClient:
             ValueError: When the response body cannot be parsed as JSON.
         """
         session = await self._ensure_session()
-        max_retries = 3
-        base_backoff = 1.0
+
+        # Determine retry configuration: use explicit parameter if provided,
+        # otherwise default to 5 retries (6 total attempts)
+        if max_retries is not None:
+            actual_max_retries = max_retries
+        else:
+            actual_max_retries = 5
+
+        fixed_delay = self._get_network_retry_base_delay()
 
         # Normalise endpoint so it always starts with a slash
         normalised_endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
@@ -162,15 +199,16 @@ class ScrapeCreatorsClient:
         if json_data is not None:
             request_kwargs["json"] = json_data
 
-        for attempt in range(max_retries + 1):
+        for attempt in range(actual_max_retries + 1):
             try:
                 async with session.request(method, full_url, **request_kwargs) as response:
                     if response.status == 429:
                         # --- Rate-limit handling ---
-                        if attempt == max_retries:
+                        if attempt == actual_max_retries:
+                            # All retries exhausted for 429 response
                             logger.error(
                                 "Max retries (%d) exceeded for 429 response on %s %s",
-                                max_retries,
+                                actual_max_retries,
                                 method,
                                 full_url,
                             )
@@ -182,18 +220,18 @@ class ScrapeCreatorsClient:
                                 wait_time = float(retry_after)
                             except ValueError:
                                 logger.warning(
-                                    "Invalid Retry-After header: '%s', using exponential backoff",
+                                    "Invalid Retry-After header: '%s', using fixed delay",
                                     retry_after,
                                 )
-                                wait_time = base_backoff * (2**attempt)
+                                wait_time = fixed_delay
                         else:
-                            wait_time = base_backoff * (2**attempt)
+                            wait_time = fixed_delay
 
                         logger.warning(
                             "Rate limited (429) on attempt %d/%d for %s %s. "
                             "Waiting %.2f seconds before retrying.",
                             attempt + 1,
-                            max_retries + 1,
+                            actual_max_retries + 1,
                             method,
                             full_url,
                             wait_time,
@@ -263,14 +301,14 @@ class ScrapeCreatorsClient:
                     if isinstance(response_dict, dict):
                         credits_remaining = response_dict.get("credits_remaining")
 
-                    # Log successful request with remaining credits
-                    logger.debug("API request success. Remaining credits: %s", credits_remaining)
-                    
-                    # Update tracked credits
+                    # Log successful request with remaining credits (concise format)
                     if credits_remaining is not None:
                         self.last_credits_remaining = int(credits_remaining)
                         # Log credits to dedicated statistics logger (configured independently)
-                        credits_logger.info("Credits remaining: %d", self.last_credits_remaining)
+                        credits_logger.debug("Credits remaining: %d", self.last_credits_remaining)
+                    else:
+                        # Concise debug log when no credits info available
+                        logger.debug("API request success: %s %s", method, normalised_endpoint)
 
                     return response_dict
 
@@ -286,26 +324,27 @@ class ScrapeCreatorsClient:
                     # For other 4xx errors (400, 401, 403, 404, etc.), raise immediately
                     # without retrying, as these indicate invalid requests
                     raise cre
-            
+
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 # Only retry for network errors, timeouts, and server errors (5xx)
                 # Client errors (4xx) should have been caught above and raised immediately
                 logger.warning(
                     "Request failed on attempt %d/%d for %s %s: %s",
                     attempt + 1,
-                    max_retries + 1,
+                    actual_max_retries + 1,
                     method,
                     full_url,
                     str(e),
                 )
-                if attempt < max_retries:
-                    wait_time = base_backoff * (2**attempt)
+                if attempt < actual_max_retries:
+                    wait_time = fixed_delay
                     logger.warning("Retrying after %.2f seconds...", wait_time)
                     await asyncio.sleep(wait_time)
                 else:
+                    # All retries exhausted - log error and re-raise the exception
                     logger.error(
                         "Max retries (%d) exceeded for %s %s",
-                        max_retries,
+                        actual_max_retries,
                         method,
                         full_url,
                     )
@@ -314,28 +353,40 @@ class ScrapeCreatorsClient:
         # Should never be reached, but keeps mypy happy
         raise RuntimeError("Max retries exceeded without success")
 
-    async def get(self, endpoint: str, params: dict | None = None) -> dict:
+    async def get(
+        self,
+        endpoint: str,
+        params: dict | None = None,
+        max_retries: int | None = None,
+    ) -> dict:
         """Send a GET request and return the raw JSON response.
 
         Args:
             endpoint: API endpoint path (e.g. ``"/v1/tiktok/profile"``).
             params: Optional query-string parameters.
+            max_retries: Maximum number of retries (default: None, uses client default).
 
         Returns:
             Parsed JSON response dictionary.
         """
         logger.debug("GET %s params=%s", endpoint, params)
-        return await self._request("GET", endpoint, params=params)
+        return await self._request("GET", endpoint, params=params, max_retries=max_retries)
 
-    async def post(self, endpoint: str, json_data: dict | None = None) -> dict:
+    async def post(
+        self,
+        endpoint: str,
+        json_data: dict | None = None,
+        max_retries: int | None = None,
+    ) -> dict:
         """Send a POST request and return the raw JSON response.
 
         Args:
             endpoint: API endpoint path (e.g. ``"/v1/instagram/posts"``).
             json_data: Optional JSON body.
+            max_retries: Maximum number of retries (default: None, uses client default).
 
         Returns:
             Parsed JSON response dictionary.
         """
         logger.debug("POST %s json=%s", endpoint, json_data)
-        return await self._request("POST", endpoint, json_data=json_data)
+        return await self._request("POST", endpoint, json_data=json_data, max_retries=max_retries)
