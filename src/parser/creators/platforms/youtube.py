@@ -28,6 +28,9 @@ from typing import Any
 
 from aiohttp import ClientResponseError
 
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -40,6 +43,8 @@ from src.parser.creators.core.utils import (
     detect_female_creator,
     upsert_virtual_bio_post,
     queue_discovered_accounts,
+    queue_discovered_mentions,
+    extract_mentions,
     parse_profile_contacts,
     parse_published_at,
 )
@@ -525,7 +530,7 @@ class YouTubeParser(BasePlatformParser):
 
             # Process and upsert content items
             await self._upsert_content(
-                all_videos, account_id, author_metadata, transcript_map
+                all_videos, account_id, author_metadata, transcript_map, handle
             )
             logger.info(
                 "Successfully upserted %d YouTube content items for account_id: %d",
@@ -559,9 +564,13 @@ class YouTubeParser(BasePlatformParser):
     ) -> str | None:
         """Fetch transcript for a single YouTube video.
 
-        Uses the Scrape Creators endpoint /v1/youtube/video/transcript
-        with the video URL parameter. Extracts the transcript segments
-        from the "transcript" key and joins them with a space.
+        Implements a zero-cost hybrid pipeline:
+        - Step 1: Try youtube-transcript-api library (free, no API credits).
+          Runs synchronously via asyncio.to_thread to avoid blocking.
+          Prioritizes Russian (ru) then English (en) transcripts.
+        - Step 2: Fall back to Scrape Creators API (/v1/youtube/video/transcript)
+          if the local extraction fails (TranscriptsDisabled, NoTranscriptFound,
+          network errors, or HTTP 429 rate limits from Google).
 
         Args:
             video: Video dictionary containing the video ID.
@@ -585,6 +594,50 @@ class YouTubeParser(BasePlatformParser):
         logger.info("Requesting transcript for video: %s", url)
 
         async with semaphore:
+            # Step 1: Free local extraction via youtube-transcript-api
+            try:
+                # Create API instance (proxies can be configured via env vars if needed)
+                api = YouTubeTranscriptApi()
+
+                # Run synchronous library call in a non-blocking thread
+                # fetch() returns FetchedTranscript (iterable of segment objects)
+                fetched_transcript = await asyncio.to_thread(
+                    api.fetch,
+                    video_id,
+                    ["ru", "en"],
+                )
+
+                # Convert FetchedTranscript segments to text
+                # Each segment is an object with .text, .start, .duration attributes
+                transcript_text = " ".join(
+                    str(segment.text) if hasattr(segment, "text") else str(segment)
+                    for segment in fetched_transcript
+                )
+
+                if transcript_text.strip():
+                    logger.info(
+                        "Successfully retrieved transcript (free) for video %s",
+                        url[:50],
+                    )
+                    return transcript_text.strip()
+
+            except (TranscriptsDisabled, NoTranscriptFound) as e:
+                logger.info(
+                    "No transcript available for video %s: %s",
+                    video_id,
+                    e,
+                )
+                return None
+            except Exception as e:
+                # Catch rate limits (HTTP 429), connection errors, etc.
+                logger.warning(
+                    "Free transcript extraction failed for video %s: %s. "
+                    "Falling back to Scrape Creators API.",
+                    video_id,
+                    e,
+                )
+
+            # Step 2: Defensive fallback to Scrape Creators API
             try:
                 response: dict[str, Any] = await self.client.get(
                     endpoint="/v1/youtube/video/transcript",
@@ -605,8 +658,10 @@ class YouTubeParser(BasePlatformParser):
                 )
 
                 if transcript_text:
-                    # Transcript success log with required format, handling None safely
-                    logger.info("Successfully retrieved transcript for video %s", url[:50])
+                    logger.info(
+                        "Successfully retrieved transcript (Scrape Creators) for video %s",
+                        url[:50],
+                    )
                     return transcript_text
                 return None
 
@@ -637,6 +692,7 @@ class YouTubeParser(BasePlatformParser):
         account_id: int,
         author_metadata: dict[str, Any],
         transcript_map: dict[str, str | None],
+        parent_handle: str,
     ) -> None:
         """Bulk upsert YouTube content records to database.
 
@@ -645,6 +701,7 @@ class YouTubeParser(BasePlatformParser):
             account_id: ID of the parent Account record.
             author_metadata: Author profile metadata to embed in each content record.
             transcript_map: Dictionary mapping video_id to transcript text.
+            parent_handle: Channel handle for discovery spider parent reference.
         """
         content_values: list[dict[str, Any]] = []
 
@@ -686,6 +743,32 @@ class YouTubeParser(BasePlatformParser):
                         "Skipping content item with no title, description, or transcript"
                     )
                     continue
+
+                # Content-based Discovery Spider
+                # Extract cross-platform links and same-platform mentions from video text
+                if content_text:
+                    try:
+                        # Parse profile contacts (cross-platform links)
+                        contacts_dict = parse_profile_contacts(content_text)
+                        # Extract same-platform mentions (e.g., @otheruser)
+                        mentions = extract_mentions(content_text)
+
+                        # Queue discovered accounts in independent session
+                        async with self.session_maker() as session:
+                            # Cross-platform links
+                            await queue_discovered_accounts(
+                                session, contacts_dict, parent_handle
+                            )
+                            # Same-platform mentions
+                            await queue_discovered_mentions(
+                                session, "YOUTUBE", mentions, parent_handle
+                            )
+                            await session.commit()
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to queue discovered accounts from YouTube video %s: %s",
+                            platform_content_id, e,
+                        )
 
                 # Extract published timestamp using shared utility
                 publish_time = (

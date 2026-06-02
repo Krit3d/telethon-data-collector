@@ -2,7 +2,7 @@
 Contact information extraction helpers for social media profile parsing.
 
 This module provides:
-    - Regex patterns for extracting emails, Telegram handles, and URLs
+    - Regex patterns for extracting emails, Telegram handles, URLs, and @mentions
     - Functions to extract and validate contact information from text
     - Helpers to parse profile contacts from biography and external URL
     - Uniform author metadata compiler for OpenSPG-compliant output
@@ -36,6 +36,9 @@ URL_PATTERN = re.compile(
     r"https?://[^\s<>\"{}|\\^`\[\]]+",
     re.IGNORECASE,
 )
+
+# Regex pattern for extracting @username mentions (general purpose)
+MENTION_PATTERN = re.compile(r"(?<=^|(?<=[^a-zA-Z0-9-_\.]))@([a-zA-Z0-9_\.]{1,30})")
 
 # Common social media domains to exclude when extracting external links
 SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset({
@@ -100,6 +103,23 @@ def extract_telegram_handles(text: str | None) -> list[str]:
 
     matches = TELEGRAM_HANDLE_PATTERN.findall(text)
     return list(set(match.lower() for match in matches))
+
+
+def extract_mentions(text: str | None) -> list[str]:
+    """Extract all @username mentions from text, normalizing them to lowercase and removing the @ symbol.
+
+    Args:
+        text: The text to search for @username mentions. Can be None.
+
+    Returns:
+        A deduplicated list of usernames without the @ symbol (lowercase).
+        Returns empty list if text is None or no mentions are found.
+    """
+    if not text:
+        return []
+
+    matches = MENTION_PATTERN.findall(text)
+    return list(set(match.lower() for match in matches if match))
 
 
 def extract_external_links(

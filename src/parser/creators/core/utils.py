@@ -32,10 +32,12 @@ from src.parser.creators.core.text import (
 from src.parser.creators.core.contacts import (
     EMAIL_PATTERN,
     TELEGRAM_HANDLE_PATTERN,
+    MENTION_PATTERN,
     URL_PATTERN,
     SOCIAL_MEDIA_DOMAINS,
     extract_emails,
     extract_telegram_handles,
+    extract_mentions,
     extract_external_links,
     parse_profile_contacts,
     normalize_telegram_handle,
@@ -50,6 +52,7 @@ from src.parser.creators.core.contacts import (
 
 from src.parser.creators.core.db import (
     queue_discovered_accounts,
+    queue_discovered_mentions,
     _queue_single_account,
     upsert_virtual_bio_post,
 )
@@ -82,10 +85,12 @@ __all__ = [
     # Contacts module
     "EMAIL_PATTERN",
     "TELEGRAM_HANDLE_PATTERN",
+    "MENTION_PATTERN",
     "URL_PATTERN",
     "SOCIAL_MEDIA_DOMAINS",
     "extract_emails",
     "extract_telegram_handles",
+    "extract_mentions",
     "extract_external_links",
     "parse_profile_contacts",
     "normalize_telegram_handle",
@@ -94,6 +99,7 @@ __all__ = [
     "compile_author_metadata",
     # DB module
     "queue_discovered_accounts",
+    "queue_discovered_mentions",
     "_queue_single_account",
     "upsert_virtual_bio_post",
     # Instagram helpers module

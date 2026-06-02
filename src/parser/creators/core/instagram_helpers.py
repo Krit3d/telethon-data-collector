@@ -79,30 +79,66 @@ def extract_instagram_content_text(node_dict: dict[str, Any]) -> str | None:
     return None
 
 
-def extract_instagram_published_at(node_dict: dict[str, Any]) -> datetime | None:
-    """Extract and convert published timestamp to timezone-aware datetime.
+def extract_instagram_published_at(node_dict: dict[str, Any]) -> datetime:
+    """Extract and convert published timestamp to timezone-aware datetime (UTC).
 
-    Converts the taken_at_timestamp field from Instagram content node
-    to a timezone-aware datetime object (UTC).
+    Robustly extracts timestamp from multiple possible fields:
+    - taken_at, taken_at_timestamp, created_at, timestamp
+
+    Handles:
+    - Integer/float UNIX timestamps (seconds or milliseconds since epoch)
+    - ISO 8601 strings (with 'Z' suffix or timezone offset)
+    - Falls back to datetime.now(timezone.utc) if extraction fails
+
+    This function NEVER returns None to prevent database NotNullViolationError.
 
     Args:
         node_dict: Content node dictionary from Instagram API response.
 
     Returns:
-        Timezone-aware datetime in UTC, or None if timestamp is invalid.
+        Timezone-aware datetime in UTC (always valid, never None).
     """
-    timestamp = node_dict.get("taken_at_timestamp")
+    # Try multiple timestamp keys in order of likelihood
+    raw_time: Any = (
+        node_dict.get("taken_at")
+        or node_dict.get("taken_at_timestamp")
+        or node_dict.get("created_at")
+        or node_dict.get("timestamp")
+    )
 
-    if timestamp:
+    # Default fallback: current UTC time (prevents NotNullViolationError)
+    published_at: datetime = datetime.now(timezone.utc)
+
+    if raw_time is not None:
         try:
-            if isinstance(timestamp, (int, float)):
-                return datetime.fromtimestamp(
-                    int(timestamp), tz=timezone.utc
-                )
-        except (ValueError, TypeError, OSError) as e:
-            logger.warning("Failed to parse timestamp %s: %s", timestamp, e)
+            if isinstance(raw_time, (int, float)):
+                # Convert to float for consistent handling
+                ts_value: float = float(raw_time)
 
-    return None
+                # Handle milliseconds timestamps (values > 9999999999)
+                if ts_value > 9999999999:
+                    ts_value = ts_value / 1000.0
+
+                published_at = datetime.fromtimestamp(ts_value, tz=timezone.utc)
+
+            elif isinstance(raw_time, str):
+                # Handle ISO 8601 strings
+                # Replace 'Z' suffix with '+00:00' for fromisoformat compatibility
+                normalized: str = raw_time.replace("Z", "+00:00")
+                published_at = datetime.fromisoformat(normalized)
+
+                # Ensure timezone-aware: attach UTC if naive
+                if published_at.tzinfo is None:
+                    published_at = published_at.replace(tzinfo=timezone.utc)
+                else:
+                    # Convert to UTC for consistency
+                    published_at = published_at.astimezone(timezone.utc)
+
+        except Exception:
+            # Any parsing failure: fall back to current UTC time
+            published_at = datetime.now(timezone.utc)
+
+    return published_at
 
 
 def extract_instagram_video_url(node_dict: dict[str, Any]) -> str | None:

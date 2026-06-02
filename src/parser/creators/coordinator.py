@@ -8,6 +8,7 @@ This module is designed to run as a production-grade background daemon with
 graceful shutdown handling for OS signals (SIGTERM, SIGINT).
 """
 
+import argparse
 import asyncio
 import logging
 import signal
@@ -35,7 +36,6 @@ STATUS_PROCESSING = "processing"
 STATUS_PARSED = "parsed"
 STATUS_REJECTED = "rejected"
 STATUS_FAILED = "failed"
-STATUS_READY_FOR_PARSING = "ready_for_parsing"
 
 # Platforms that are handled by the creators coordinator (not Telegram)
 CREATOR_PLATFORMS = ["INSTAGRAM", "THREADS", "TIKTOK", "YOUTUBE"]
@@ -64,6 +64,7 @@ class CreatorsCoordinator:
         session_maker: async_sessionmaker[AsyncSession],
         settings: Settings,
         shutdown_event: asyncio.Event | None = None,
+        platform: str | None = None,
     ) -> None:
         """
         Initialize the coordinator with database and settings.
@@ -72,10 +73,12 @@ class CreatorsCoordinator:
             session_maker: SQLAlchemy async session maker for database operations.
             settings: Application settings containing configuration values.
             shutdown_event: asyncio.Event | None for graceful shutdown coordination.
+            platform: Optional platform filter to isolate scraping queues per container.
         """
         self.session_maker = session_maker
         self.settings = settings
         self._shutdown_event = shutdown_event
+        self.platform_filter: str | None = platform
         self.min_subscribers: int = settings.creators_min_subscribers
         self.status_threshold_hours: int = (
             settings.creators_status_threshold_hours
@@ -84,7 +87,8 @@ class CreatorsCoordinator:
         logger.info(
             f"CreatorsCoordinator initialized with min_subscribers={self.min_subscribers}, "
             f"status_threshold_hours={self.status_threshold_hours}, "
-            f"poll_interval_s={self.poll_interval_s}"
+            f"poll_interval_s={self.poll_interval_s}, "
+            f"platform_filter={self.platform_filter}"
         )
 
     def is_shutdown_requested(self) -> bool:
@@ -107,9 +111,9 @@ class CreatorsCoordinator:
         Run a single ingestion cycle: query pending accounts and process them concurrently.
 
         Queries the accounts table for accounts where platform is in CREATOR_PLATFORMS
-        AND status is "pending", "ready_for_parsing", or "failed" with updated_at older
-        than the configured threshold, ordered by updated_at ascending. Processes these
-        accounts concurrently using an asyncio.Semaphore.
+        AND status is "pending" or "failed" with updated_at older than the configured
+        threshold, ordered by updated_at ascending. Processes these accounts concurrently
+        using an asyncio.Semaphore.
 
         Args:
             batch_size: Maximum number of accounts to process in this cycle.
@@ -127,13 +131,18 @@ class CreatorsCoordinator:
 
         # Query for accounts to process
         async with self.session_maker() as session:
+            # Determine platform filter condition
+            if self.platform_filter:
+                platform_condition = Account.platform == self.platform_filter
+            else:
+                platform_condition = Account.platform.in_(CREATOR_PLATFORMS)
+
             stmt = (
                 select(Account)
                 .where(
-                    Account.platform.in_(CREATOR_PLATFORMS),
+                    platform_condition,
                     (
                         (Account.status == STATUS_PENDING)
-                        | (Account.status == STATUS_READY_FOR_PARSING)
                         | (
                             (Account.status == STATUS_FAILED)
                             & (Account.updated_at < threshold_time)
@@ -333,7 +342,6 @@ class CreatorsCoordinator:
                 exc_info=e,
             )
 
-
     async def reset_orphaned_processing_accounts(self) -> None:
         """
         Reset orphaned creator accounts stuck in 'processing' status back to 'pending'.
@@ -342,14 +350,20 @@ class CreatorsCoordinator:
         'processing' status due to container restarts or crashes. It only affects
         creator platforms (INSTAGRAM, THREADS, TIKTOK, YOUTUBE) and explicitly
         excludes TELEGRAM to prevent state collisions with the Telegram crawler.
+        When platform_filter is set, only resets accounts for that specific platform.
         """
         async with self.session_maker() as session:
+            # Determine platform filter condition
+            if self.platform_filter:
+                platform_condition = Account.platform == self.platform_filter
+            else:
+                platform_condition = Account.platform.in_(CREATOR_PLATFORMS)
+
             # Create update statement for orphaned processing accounts
-            # Explicitly filter by CREATOR_PLATFORMS to exclude TELEGRAM
             stmt = (
                 update(Account)
                 .where(
-                    Account.platform.in_(CREATOR_PLATFORMS),
+                    platform_condition,
                     Account.status == STATUS_PROCESSING,
                 )
                 .values(
@@ -404,17 +418,52 @@ async def _sleep_with_shutdown_check(
     return False
 
 
+def parse_args() -> argparse.Namespace:
+    """
+    Parse CLI arguments for the creators coordinator.
+
+    Returns:
+        Parsed arguments namespace with 'platform' attribute.
+    """
+    parser = argparse.ArgumentParser(
+        description="Multi-platform creators scraping coordinator daemon"
+    )
+    parser.add_argument(
+        "--platform",
+        type=str,
+        default=None,
+        help="Process only a specific creator platform (e.g., INSTAGRAM, THREADS, TIKTOK, YOUTUBE)",
+    )
+    return parser.parse_args()
+
+
 async def main() -> None:
     """
     Main async entrypoint for the creators coordinator daemon.
 
     This function:
+    - Parses CLI arguments (--platform)
     - Loads settings via load_settings()
     - Initializes the database engine and session maker
     - Sets up signal handlers for graceful shutdown (SIGTERM, SIGINT)
     - Runs the coordinator in an infinite polling loop
     - Ensures clean exit on shutdown signals
     """
+    # Parse CLI arguments before setting up the engine
+    args: argparse.Namespace = parse_args()
+
+    # Validate platform argument if provided
+    platform_filter: str | None = None
+    if args.platform is not None:
+        platform_upper: str = args.platform.upper()
+        if platform_upper not in CREATOR_PLATFORMS:
+            raise ValueError(
+                f"Invalid platform '{args.platform}'. "
+                f"Must be one of: {', '.join(CREATOR_PLATFORMS)}"
+            )
+        platform_filter = platform_upper
+        logger.info(f"CLI argument --platform={platform_filter} validated")
+
     settings: Settings = load_settings()
 
     # Initialize database engine and session maker
@@ -434,16 +483,19 @@ async def main() -> None:
     # Create shutdown event for signal handling
     shutdown_event: asyncio.Event = asyncio.Event()
 
-    # Instantiate the coordinator
+    # Instantiate the coordinator with optional platform filter
     coordinator: CreatorsCoordinator = CreatorsCoordinator(
         session_maker=session_maker,
         settings=settings,
         shutdown_event=shutdown_event,
+        platform=platform_filter,
     )
 
     # Run auto-heal to reset orphaned processing accounts
     try:
-        logger.info("Running auto-heal to reset orphaned processing accounts...")
+        logger.info(
+            "Running auto-heal to reset orphaned processing accounts..."
+        )
         await coordinator.reset_orphaned_processing_accounts()
     except Exception as e:
         logger.error(

@@ -3,6 +3,7 @@ Async database helpers for discovered account queuing and virtual bio post upser
 
 This module provides:
     - Functions to queue discovered accounts from profile contacts for cross-platform spidering
+    - Helpers to queue discovered @username mentions for the current platform
     - Helpers to upsert virtual profile posts into the content table for semantic search
 """
 
@@ -101,6 +102,27 @@ async def queue_discovered_accounts(
                 platform_id = link.split("/")[-1].split("?")[0].split("/")[0]
             if platform_id:
                 await _queue_single_account(session, "THREADS", platform_id, parent_handle)
+
+
+async def queue_discovered_mentions(
+    session: AsyncSession,
+    platform: str,
+    mentions: list[str],
+    parent_handle: str,
+) -> None:
+    """Queue discovered @username mentions for the current platform into the database with status 'pending'.
+
+    Args:
+        session: SQLAlchemy async session for database operations.
+        platform: Platform name (INSTAGRAM, TIKTOK, YOUTUBE, THREADS).
+        mentions: List of usernames extracted from @mentions (without @ symbol).
+        parent_handle: Handle of the parent account that contained the mentions.
+    """
+    for username in mentions:
+        if not username or len(username) < 3:
+            continue
+        # Avoid queueing obvious non-user names or system tags
+        await _queue_single_account(session, platform, username, parent_handle)
 
 
 async def _queue_single_account(

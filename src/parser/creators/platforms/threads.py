@@ -33,6 +33,8 @@ from src.parser.creators.core.utils import (
     detect_female_creator,
     upsert_virtual_bio_post,
     queue_discovered_accounts,
+    queue_discovered_mentions,
+    extract_mentions,
     parse_profile_contacts,
     parse_published_at,
     compile_author_metadata,
@@ -288,7 +290,7 @@ class ThreadsParser(BasePlatformParser):
         )
 
         # Process and upsert content items
-        await self._upsert_content(collected_posts, account_id, author_metadata)
+        await self._upsert_content(collected_posts, account_id, author_metadata, platform_id)
         logger.info(
             "Successfully upserted %d Threads content items for account_id: %d",
             len(collected_posts),
@@ -346,7 +348,7 @@ class ThreadsParser(BasePlatformParser):
 
         Performs a select-then-insert database transaction to check if an Account
         on platform "INSTAGRAM" with the given username already exists. If it does
-        not exist, inserts a new Account row with status "ready_for_parsing".
+        not exist, inserts a new Account row with status "pending".
 
         This is wrapped in a try-except block to ensure that database lockups or
         unique constraint violations never interrupt the primary Threads parsing.
@@ -379,12 +381,12 @@ class ThreadsParser(BasePlatformParser):
                     title=username,
                     description=None,
                     subscribers_count=0,
-                    status="ready_for_parsing",
+                    status="pending",
                 )
                 session.add(instagram_account)
                 await session.commit()
                 logger.info(
-                    "Seeded Instagram account for username: %s with status 'ready_for_parsing'",
+                    "Seeded Instagram account for username: %s with status 'pending'",
                     username,
                 )
 
@@ -463,6 +465,7 @@ class ThreadsParser(BasePlatformParser):
         posts: list[dict[str, Any]],
         account_id: int,
         author_metadata: dict[str, Any],
+        parent_handle: str,
     ) -> None:
         """Bulk upsert Threads content records to database.
 
@@ -473,6 +476,7 @@ class ThreadsParser(BasePlatformParser):
             posts: List of post dictionaries from API responses.
             account_id: ID of the parent Account record.
             author_metadata: Author profile metadata to embed in each content record.
+            parent_handle: Threads user ID for discovery spider parent reference.
         """
         content_values: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc)
@@ -492,6 +496,32 @@ class ThreadsParser(BasePlatformParser):
 
                 # Extract content text (inline, no transcript)
                 content_text: str | None = self._extract_content_text(post)
+
+                # Content-based Discovery Spider
+                # Extract cross-platform links and same-platform mentions from post text
+                if content_text:
+                    try:
+                        # Parse profile contacts (cross-platform links)
+                        contacts_dict = parse_profile_contacts(content_text)
+                        # Extract same-platform mentions (e.g., @otheruser)
+                        mentions = extract_mentions(content_text)
+
+                        # Queue discovered accounts in independent session
+                        async with self.session_maker() as session:
+                            # Cross-platform links
+                            await queue_discovered_accounts(
+                                session, contacts_dict, parent_handle
+                            )
+                            # Same-platform mentions
+                            await queue_discovered_mentions(
+                                session, "THREADS", mentions, parent_handle
+                            )
+                            await session.commit()
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to queue discovered accounts from Threads post %s: %s",
+                            platform_content_id, e,
+                        )
 
                 # Extract published timestamp using core helper
                 timestamp = (

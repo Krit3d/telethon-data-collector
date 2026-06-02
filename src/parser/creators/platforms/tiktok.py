@@ -39,6 +39,8 @@ from src.parser.creators.core.utils import (
     detect_female_creator,
     upsert_virtual_bio_post,
     queue_discovered_accounts,
+    queue_discovered_mentions,
+    extract_mentions,
     parse_profile_contacts,
     parse_published_at,
     compile_author_metadata,
@@ -356,7 +358,7 @@ class TikTokParser(BasePlatformParser):
 
         # Process and upsert collected video items
         await self._upsert_content(
-            videos_collected, account_id, author_metadata
+            videos_collected, account_id, author_metadata, handle
         )
         logger.info(
             "Successfully upserted %d TikTok content items for account_id: %d (handle: %s)",
@@ -474,6 +476,7 @@ class TikTokParser(BasePlatformParser):
         items: list[dict[str, Any]],
         account_id: int,
         author_metadata: dict[str, Any],
+        parent_handle: str,
     ) -> None:
         """Bulk upsert TikTok content records to database.
 
@@ -481,6 +484,7 @@ class TikTokParser(BasePlatformParser):
             items: List of video item dictionaries from API responses.
             account_id: ID of the parent Account record.
             author_metadata: Author profile metadata to embed in each content record.
+            parent_handle: Creator username for discovery spider parent reference.
         """
         content_values: list[dict[str, Any]] = []
 
@@ -498,6 +502,32 @@ class TikTokParser(BasePlatformParser):
                     or item.get("title")
                     or item.get("description")
                 )
+
+                # Content-based Discovery Spider
+                # Extract cross-platform links and same-platform mentions from video description
+                if content_text:
+                    try:
+                        # Parse profile contacts (cross-platform links)
+                        contacts_dict = parse_profile_contacts(content_text)
+                        # Extract same-platform mentions (e.g., @otheruser)
+                        mentions = extract_mentions(content_text)
+
+                        # Queue discovered accounts in independent session
+                        async with self.session_maker() as session:
+                            # Cross-platform links
+                            await queue_discovered_accounts(
+                                session, contacts_dict, parent_handle
+                            )
+                            # Same-platform mentions
+                            await queue_discovered_mentions(
+                                session, "TIKTOK", mentions, parent_handle
+                            )
+                            await session.commit()
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to queue discovered accounts from TikTok video %s: %s",
+                            platform_content_id, e,
+                        )
 
                 # Extract published timestamp using core helper
                 create_time = item.get("createTime") or item.get("createdAt")
