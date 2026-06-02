@@ -223,7 +223,7 @@ class ThreadsParser(BasePlatformParser):
                     endpoint="/v1/threads/user/posts",
                     params=params,
                 )
-                logger.info(
+                logger.debug(
                     "API response for content, platform_id %s: success, remaining credits: %s",
                     platform_id,
                     response.get("credits_remaining", "N/A"),

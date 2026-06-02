@@ -95,11 +95,11 @@ services:
         max-size: "50m"
         max-file: "3"
 
-  creators:
+  creators_instagram:
     build:
       context: .
       dockerfile: docker/scraper/Dockerfile
-    container_name: tg_parser_creators
+    container_name: tg_parser_creators_instagram
     restart: always
     env_file:
       - .env
@@ -111,7 +111,94 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: python -m src.parser.creators.coordinator
+    command: python -m src.parser.creators.coordinator --platform INSTAGRAM
+    volumes:
+      - .:/app
+      - ./sessions:/app/sessions
+      - ./proxies.txt:/app/proxies.txt
+    networks:
+      - scraper_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  creators_tiktok:
+    build:
+      context: .
+      dockerfile: docker/scraper/Dockerfile
+    container_name: tg_parser_creators_tiktok
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.creators.coordinator --platform TIKTOK
+    volumes:
+      - .:/app
+      - ./sessions:/app/sessions
+      - ./proxies.txt:/app/proxies.txt
+    networks:
+      - scraper_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  creators_threads:
+    build:
+      context: .
+      dockerfile: docker/scraper/Dockerfile
+    container_name: tg_parser_creators_threads
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.creators.coordinator --platform THREADS
+    volumes:
+      - .:/app
+      - ./sessions:/app/sessions
+      - ./proxies.txt:/app/proxies.txt
+    networks:
+      - scraper_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  creators_youtube:
+    build:
+      context: .
+      dockerfile: docker/scraper/Dockerfile
+    container_name: tg_parser_creators_youtube
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.creators.coordinator --platform YOUTUBE
     volumes:
       - .:/app
       - ./sessions:/app/sessions

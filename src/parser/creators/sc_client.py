@@ -15,6 +15,10 @@ import aiohttp
 from src.config.config import Settings
 
 logger = logging.getLogger(__name__)
+# Dedicated logger for credit statistics - can be configured independently
+# To enable credit statistics, set level to INFO for this logger:
+# logging.getLogger("src.parser.creators.sc_client.credits").setLevel(logging.INFO)
+credits_logger = logging.getLogger(__name__ + ".credits")
 
 
 class ScrapeCreatorsClient:
@@ -54,6 +58,8 @@ class ScrapeCreatorsClient:
         self._auth_scheme = settings.scrape_creators_auth_scheme
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
+        # Track remaining credits for statistics/monitoring
+        self.last_credits_remaining: int | None = None
 
     async def __aenter__(self) -> "ScrapeCreatorsClient":
         """Async context manager entry – ensure the session is initialised."""
@@ -258,7 +264,13 @@ class ScrapeCreatorsClient:
                         credits_remaining = response_dict.get("credits_remaining")
 
                     # Log successful request with remaining credits
-                    logger.info("API request success. Remaining credits: %s", credits_remaining)
+                    logger.debug("API request success. Remaining credits: %s", credits_remaining)
+                    
+                    # Update tracked credits
+                    if credits_remaining is not None:
+                        self.last_credits_remaining = int(credits_remaining)
+                        # Log credits to dedicated statistics logger (configured independently)
+                        credits_logger.info("Credits remaining: %d", self.last_credits_remaining)
 
                     return response_dict
 

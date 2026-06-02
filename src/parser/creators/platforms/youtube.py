@@ -159,7 +159,7 @@ class YouTubeParser(BasePlatformParser):
                 endpoint="/v1/youtube/channel",
                 params={param_key: formatted_handle},
             )
-            logger.info(
+            logger.debug(
                 "API response status for profile %s: success, remaining credits: %s",
                 formatted_handle,
                 response.get("credits_remaining", "N/A"),
@@ -429,7 +429,7 @@ class YouTubeParser(BasePlatformParser):
                     break
 
                 # Page fetch log with required format
-                logger.info("Fetching page %d of posts for %s...", page_count, platform_id)
+                logger.debug("Fetching page %d of posts for %s...", page_count, platform_id)
 
                 # Build request parameters with correct key
                 params: dict[str, Any] = {param_key: formatted_handle}
@@ -441,7 +441,7 @@ class YouTubeParser(BasePlatformParser):
                     endpoint="/v1/youtube/channel-videos",
                     params=params,
                 )
-                logger.info(
+                logger.debug(
                     "API response status for YouTube videos, handle %s: success, remaining credits: %s",
                     formatted_handle,
                     response.get("credits_remaining", "N/A"),
@@ -591,7 +591,7 @@ class YouTubeParser(BasePlatformParser):
         url = f"https://www.youtube.com/watch?v={video_id}"
 
         # Transcript request log with required format
-        logger.info("Requesting transcript for video: %s", url)
+        logger.debug("Requesting transcript for video: %s", url)
 
         async with semaphore:
             # Step 1: Free local extraction via youtube-transcript-api
@@ -615,14 +615,14 @@ class YouTubeParser(BasePlatformParser):
                 )
 
                 if transcript_text.strip():
-                    logger.info(
+                    logger.debug(
                         "Successfully retrieved transcript (free) for video %s",
                         url[:50],
                     )
                     return transcript_text.strip()
 
             except (TranscriptsDisabled, NoTranscriptFound) as e:
-                logger.info(
+                logger.debug(
                     "No transcript available for video %s: %s",
                     video_id,
                     e,
@@ -647,7 +647,7 @@ class YouTubeParser(BasePlatformParser):
                 # Extract transcript segments from response
                 segments = response.get("transcript") or []
                 if not segments:
-                    logger.info("No transcript available for video: %s", url[:50])
+                    logger.debug("No transcript available for video: %s", url[:50])
                     return None
 
                 # Join the "text" field of each segment with a space
@@ -658,7 +658,7 @@ class YouTubeParser(BasePlatformParser):
                 )
 
                 if transcript_text:
-                    logger.info(
+                    logger.debug(
                         "Successfully retrieved transcript (Scrape Creators) for video %s",
                         url[:50],
                     )

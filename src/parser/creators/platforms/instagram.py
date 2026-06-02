@@ -402,7 +402,7 @@ class InstagramParser(BasePlatformParser):
                 break
 
             # Page fetch log with required format
-            logger.info(
+            logger.debug(
                 "Fetching page %d of posts for %s...", page_count, platform_id
             )
 
@@ -625,9 +625,10 @@ class InstagramParser(BasePlatformParser):
                         "platform_metrics": {
                             "likes": likes,
                             "comments": comments,
-                            "video_url": extract_instagram_video_url(item),
+                            "video_url": self._extract_video_url(item),
                         },
                         "author_profile_metadata": author_metadata,
+                        "raw_item_payload": item,
                     },
                     "updated_at": datetime.now(timezone.utc),
                 }
@@ -659,6 +660,37 @@ class InstagramParser(BasePlatformParser):
                         account_id,
                     )
 
+    def _extract_video_url(self, item: dict[str, Any]) -> str | None:
+        """Extract video URL from Instagram post item with robust fallback logic.
+
+        Implements a three-tier extraction strategy:
+        1. Check video_versions array (most reliable, used by Instagram internally)
+        2. Fallback to video_url field
+        3. Final fallback to extract_instagram_video_url helper
+
+        Args:
+            item: Instagram post dictionary.
+
+        Returns:
+            Video URL string if found, otherwise None.
+        """
+        # Tier 1: Check video_versions array (most reliable source)
+        video_versions = item.get("video_versions")
+        if isinstance(video_versions, list) and len(video_versions) > 0:
+            first_video = video_versions[0]
+            if isinstance(first_video, dict):
+                url = first_video.get("url")
+                if isinstance(url, str) and url:
+                    return url
+
+        # Tier 2: Fallback to video_url field
+        video_url = item.get("video_url")
+        if isinstance(video_url, str) and video_url:
+            return video_url
+
+        # Tier 3: Final fallback to extract_instagram_video_url
+        return extract_instagram_video_url(item)
+
     async def _fetch_transcript(
         self, semaphore: asyncio.Semaphore, post_url: str
     ) -> str | None:
@@ -672,7 +704,7 @@ class InstagramParser(BasePlatformParser):
             Transcript text if available, otherwise None.
         """
         # Transcript request log with required format
-        logger.info("Requesting transcript for post: %s", post_url)
+        logger.debug("Requesting transcript for post: %s", post_url)
 
         async with semaphore:
             try:
@@ -682,10 +714,19 @@ class InstagramParser(BasePlatformParser):
                 )
                 # Parse the transcripts list from the API response
                 # Scrape Creators API returns: [{"id": "...", "shortcode": "...", "text": "..."}]
+                # or ["transcript text"] (list of strings)
                 # or [null] / [] if empty
                 transcripts = response.get("transcripts")
                 if isinstance(transcripts, list) and len(transcripts) > 0:
                     first_item = transcripts[0]
+
+                    # Skip None values in the list
+                    if first_item is None:
+                        logger.debug(
+                            "No transcript available for post: %s", post_url[:50]
+                        )
+                        return None
+
                     transcript_text: str | None = None
 
                     if isinstance(first_item, str) and first_item:
@@ -699,13 +740,13 @@ class InstagramParser(BasePlatformParser):
 
                     if transcript_text:
                         # Transcript success log with required format, handling None safely
-                        logger.info(
+                        logger.debug(
                             "Successfully retrieved transcript for post %s",
                             post_url[:50],
                         )
                         return transcript_text
 
-                logger.info(
+                logger.debug(
                     "No transcript available for post: %s", post_url[:50]
                 )
                 return None
