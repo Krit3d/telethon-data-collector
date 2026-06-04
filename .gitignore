@@ -26,3 +26,6 @@ proxies.txt
 # Other data
 avatars/
 *.db
+
+# Backup directory
+backups/

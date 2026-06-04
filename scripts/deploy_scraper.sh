@@ -47,7 +47,7 @@ EOF
 # Step 2: Sync source files to remote server
 echo "Syncing source files..."
 rsync -avz --delete \
-    --exclude='.git/' --exclude='__pycache__/' --exclude='.venv/' \
+    --exclude='.git/' --exclude='__pycache__/' --exclude='.venv/' --exclude='backups/' \
     --exclude='*.pyc' --exclude='sessions/' --exclude='.env' \
     ./ "$SSH_USER@$SSH_HOST:/opt/telethon-scraper"
 

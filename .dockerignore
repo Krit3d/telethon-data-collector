@@ -28,3 +28,6 @@ avatars/
 *.db
 README.md
 .dockerignore
+
+# Backup directory
+backups/

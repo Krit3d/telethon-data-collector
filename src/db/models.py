@@ -90,6 +90,12 @@ class Account(Base):
         comment="True if account has video notes or author keywords",
     )
 
+    raw_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Arbitrary raw metadata of the author account for OpenSPG domain processing",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
