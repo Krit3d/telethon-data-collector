@@ -115,6 +115,9 @@ class CreatorsCoordinator:
         threshold, ordered by updated_at ascending. Processes these accounts concurrently
         using an asyncio.Semaphore.
 
+        A single ScrapeCreatorsClient is created and shared across all accounts in this
+        batch to optimize connection handling and track credit usage.
+
         Args:
             batch_size: Maximum number of accounts to process in this cycle.
             concurrency_limit: Maximum number of concurrent account processing tasks.
@@ -162,35 +165,62 @@ class CreatorsCoordinator:
 
         logger.info(f"Found {len(accounts)} accounts to process")
 
-        # Create semaphore for concurrency control
-        semaphore = asyncio.Semaphore(concurrency_limit)
+        # Use a single ScrapeCreatorsClient for all accounts in this batch
+        # This optimizes connection handling and allows credit tracking
+        async with ScrapeCreatorsClient(self.settings) as client:
+            # Record initial credits if available
+            initial_credits: int | None = client.last_credits_remaining
 
-        # Create tasks for processing each account
-        tasks = [
-            asyncio.create_task(
-                self._process_single_account(
-                    account_id=account.id,
-                    platform=account.platform,
-                    username=account.username,
-                    semaphore=semaphore,
+            # Create semaphore for concurrency control
+            semaphore = asyncio.Semaphore(concurrency_limit)
+
+            # Create tasks for processing each account
+            tasks = [
+                asyncio.create_task(
+                    self._process_single_account(
+                        account_id=account.id,
+                        platform=account.platform,
+                        username=account.username,
+                        semaphore=semaphore,
+                        client=client,
+                    )
                 )
-            )
-            for account in accounts
-            if account.username  # Only process accounts with a username
-        ]
+                for account in accounts
+                if account.username  # Only process accounts with a username
+            ]
 
-        if not tasks:
-            logger.info("No valid accounts with usernames to process")
-            return
+            if not tasks:
+                logger.info("No valid accounts with usernames to process")
+                return
 
-        # Wait for all tasks to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Wait for all tasks to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Log any exceptions that occurred
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(
-                    f"Unexpected error in task {i}: {result!r}", exc_info=result
+            # Log any exceptions that occurred
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(
+                        f"Unexpected error in task {i}: {result!r}", exc_info=result
+                    )
+
+            # Calculate credit usage for this batch
+            final_credits: int | None = client.last_credits_remaining
+
+            # Log batch credit summary at INFO level
+            if initial_credits is not None and final_credits is not None:
+                credits_spent = initial_credits - final_credits
+                logger.info(
+                    f"=== BATCH CREDIT SUMMARY: Spent: {credits_spent} credits | Remaining: {final_credits} ==="
+                )
+            elif final_credits is not None:
+                # Initial credits not available (first request may not have populated it)
+                logger.info(
+                    f"=== BATCH CREDIT SUMMARY: Remaining: {final_credits} ==="
+                )
+            else:
+                # Credit data not available
+                logger.info(
+                    "=== BATCH CREDIT SUMMARY: Credit data not available ==="
                 )
 
         logger.info(
@@ -203,12 +233,13 @@ class CreatorsCoordinator:
         platform: str,
         username: str | None,
         semaphore: asyncio.Semaphore,
+        client: ScrapeCreatorsClient,
     ) -> None:
         """
         Process a single account: parse profile and content, update status.
 
         Protects the execution block with the semaphore for concurrency control.
-        Instantiates ScrapeCreatorsClient using an async context manager.
+        Uses the shared ScrapeCreatorsClient passed from run_once.
         Gets the corresponding platform parser using the factory.
         Updates the account status throughout the process.
 
@@ -217,6 +248,7 @@ class CreatorsCoordinator:
             platform: Platform name (e.g., "INSTAGRAM", "THREADS", "TIKTOK", "YOUTUBE").
             username: Platform username/handle (without @ prefix).
             semaphore: asyncio.Semaphore for concurrency control.
+            client: Shared ScrapeCreatorsClient instance for API requests.
         """
         if not username:
             logger.warning(f"Account {account_id} has no username, skipping")
@@ -230,75 +262,71 @@ class CreatorsCoordinator:
             # Update status to "processing"
             await self._update_account_status(account_id, STATUS_PROCESSING)
 
-            client: ScrapeCreatorsClient | None = None
             try:
-                # Instantiate ScrapeCreatorsClient using async context manager
-                client = ScrapeCreatorsClient(self.settings)
-                async with client:
-                    # Get the platform parser using the factory
-                    parser = get_platform_parser(
-                        platform=platform,
-                        session_maker=self.session_maker,
-                        client=client,
-                        settings=self.settings,
-                    )
+                # Get the platform parser using the factory with shared client
+                parser = get_platform_parser(
+                    platform=platform,
+                    session_maker=self.session_maker,
+                    client=client,
+                    settings=self.settings,
+                )
 
-                    # Execute parse_profile to get subscriber count
-                    logger.debug(
-                        f"Parsing profile for {username} on {platform}"
-                    )
-                    db_account_id = await parser.parse_profile(username)
+                # Execute parse_profile to get subscriber count
+                logger.debug(
+                    f"Parsing profile for {username} on {platform}"
+                )
+                db_account_id = await parser.parse_profile(username)
 
-                    if db_account_id is None:
-                        # Profile parsing returned None - likely below threshold
-                        logger.info(
-                            f"Profile {username} on {platform} rejected "
-                            f"(below subscriber threshold or parsing failed)"
-                        )
-                        await self._update_account_status(
-                            account_id, STATUS_REJECTED
-                        )
-                        return
-
-                    # Get the updated account to check subscriber count
-                    # Use db_account_id returned from parse_profile to ensure we're
-                    # operating on the correctly resolved/merged database record
-                    async with self.session_maker() as session:
-                        stmt = select(Account).where(Account.id == db_account_id)
-                        result = await session.execute(stmt)
-                        account = result.scalar_one_or_none()
-
-                        if account and account.subscribers_count is not None:
-                            if account.subscribers_count < self.min_subscribers:
-                                logger.info(
-                                    f"Account {username} has {account.subscribers_count} "
-                                    f"subscribers, below threshold {self.min_subscribers}. "
-                                    f"Marking as rejected."
-                                )
-                                await self._update_account_status(
-                                    db_account_id, STATUS_REJECTED
-                                )
-                                return
-
-                    # Execute parse_content to fetch and store content
-                    # Use db_account_id to ensure operations run against the correctly
-                    # resolved/merged database record
-                    logger.debug(
-                        f"Parsing content for {username} on {platform}"
-                    )
-                    await parser.parse_content(
-                        account_id=db_account_id,
-                        platform_id=username,  # Using username as platform_id for API calls
-                        max_items=50,
-                    )
-
-                    # On successful completion, update status to "parsed"
-                    # Use db_account_id for status update
-                    await self._update_account_status(db_account_id, STATUS_PARSED)
+                if db_account_id is None:
+                    # Profile parsing returned None - likely below threshold
                     logger.info(
-                        f"Successfully processed account {db_account_id} "
-                        f"({username} on {platform})"
+                        f"Profile {username} on {platform} rejected "
+                        f"(below subscriber threshold or parsing failed)"
                     )
+                    await self._update_account_status(
+                        account_id, STATUS_REJECTED
+                    )
+                    return
+
+                # Get the updated account to check subscriber count
+                # Use db_account_id returned from parse_profile to ensure we're
+                # operating on the correctly resolved/merged database record
+                async with self.session_maker() as session:
+                    stmt = select(Account).where(Account.id == db_account_id)
+                    result = await session.execute(stmt)
+                    account = result.scalar_one_or_none()
+
+                    if account and account.subscribers_count is not None:
+                        if account.subscribers_count < self.min_subscribers:
+                            logger.info(
+                                f"Account {username} has {account.subscribers_count} "
+                                f"subscribers, below threshold {self.min_subscribers}. "
+                                f"Marking as rejected."
+                            )
+                            await self._update_account_status(
+                                db_account_id, STATUS_REJECTED
+                            )
+                            return
+
+                # Execute parse_content to fetch and store content
+                # Use db_account_id to ensure operations run against the correctly
+                # resolved/merged database record
+                logger.debug(
+                    f"Parsing content for {username} on {platform}"
+                )
+                await parser.parse_content(
+                    account_id=db_account_id,
+                    platform_id=username,  # Using username as platform_id for API calls
+                    max_items=50,
+                )
+
+                # On successful completion, update status to "parsed"
+                # Use db_account_id for status update
+                await self._update_account_status(db_account_id, STATUS_PARSED)
+                logger.info(
+                    f"Successfully processed account {db_account_id} "
+                    f"({username} on {platform})"
+                )
 
             except Exception as e:
                 # On failure, catch the exception, log it, and update status to "failed"
@@ -308,11 +336,6 @@ class CreatorsCoordinator:
                     exc_info=e,
                 )
                 await self._update_account_status(account_id, STATUS_FAILED)
-
-            finally:
-                # Ensure client is closed if not using context manager properly
-                if client and not client._session:
-                    await client.close()
 
     async def _update_account_status(
         self,

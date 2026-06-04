@@ -361,7 +361,8 @@ class InstagramParser(BasePlatformParser):
             # Query by BOTH platform_id and username to find all matching accounts
             stmt = select(Account).where(
                 Account.platform == "INSTAGRAM",
-                (Account.platform_id == platform_id) | (Account.username == username)
+                (Account.platform_id == platform_id)
+                | (Account.username == username),
             )
             result = await session.execute(stmt)
             matching_accounts = result.scalars().all()
@@ -378,7 +379,7 @@ class InstagramParser(BasePlatformParser):
                     status=status,
                 )
                 session.add(db_account)
-            
+
             elif len(matching_accounts) == 1:
                 # Exactly one matching account found, update it
                 db_account = matching_accounts[0]
@@ -388,7 +389,7 @@ class InstagramParser(BasePlatformParser):
                 db_account.subscribers_count = subscribers
                 db_account.status = status
                 db_account.updated_at = datetime.now(timezone.utc)
-                
+
                 # Always update platform_id to the latest value from API
                 # This handles the case where account was seeded with username as platform_id
                 # and now we have the numeric platform_id from the API
@@ -400,7 +401,7 @@ class InstagramParser(BasePlatformParser):
                         platform_id,
                     )
                     db_account.platform_id = platform_id
-            
+
             else:
                 # Multiple matching accounts found (duplicates) - implement deduplication
                 logger.warning(
@@ -409,7 +410,7 @@ class InstagramParser(BasePlatformParser):
                     platform_id,
                     username,
                 )
-                
+
                 # Select primary account: prioritize numeric platform_id over username-based
                 # A numeric platform_id does not equal its username (production-grade identifier)
                 primary_account: Account | None = None
@@ -417,11 +418,11 @@ class InstagramParser(BasePlatformParser):
                     if account.platform_id != account.username:
                         primary_account = account
                         break
-                
+
                 # If no account with numeric platform_id found, use the first one
                 if primary_account is None:
                     primary_account = matching_accounts[0]
-                
+
                 # Update primary account with latest data
                 primary_account.username = username
                 primary_account.title = full_name or username or "Unknown"
@@ -429,7 +430,7 @@ class InstagramParser(BasePlatformParser):
                 primary_account.subscribers_count = subscribers
                 primary_account.status = status
                 primary_account.updated_at = datetime.now(timezone.utc)
-                
+
                 # Always ensure platform_id is set to the correct numeric identifier
                 if primary_account.platform_id != platform_id:
                     logger.info(
@@ -439,12 +440,12 @@ class InstagramParser(BasePlatformParser):
                         platform_id,
                     )
                     primary_account.platform_id = platform_id
-                
+
                 # Process duplicate accounts: reassign child rows and delete duplicates
                 for duplicate in matching_accounts:
                     if duplicate.id == primary_account.id:
                         continue  # Skip the primary account
-                    
+
                     # Update content table: reassign to primary account
                     content_update_stmt = (
                         update(Content)
@@ -452,7 +453,7 @@ class InstagramParser(BasePlatformParser):
                         .values(account_id=primary_account.id)
                     )
                     await session.execute(content_update_stmt)
-                    
+
                     # Update comments table: reassign to primary account
                     comment_update_stmt = (
                         update(Comment)
@@ -460,13 +461,13 @@ class InstagramParser(BasePlatformParser):
                         .values(account_id=primary_account.id)
                     )
                     await session.execute(comment_update_stmt)
-                    
+
                     logger.info(
                         "Reassigned content and comments from duplicate account %d to primary account %d",
                         duplicate.id,
                         primary_account.id,
                     )
-                    
+
                     # Delete the duplicate account
                     await session.delete(duplicate)
                     logger.info(
@@ -475,7 +476,7 @@ class InstagramParser(BasePlatformParser):
                         duplicate.platform_id,
                         duplicate.username,
                     )
-                
+
                 db_account = primary_account
 
             await session.commit()
@@ -709,6 +710,10 @@ class InstagramParser(BasePlatformParser):
 
         # Build and upsert content items
         content_values = []
+        # Initialize memory accumulators for discovery data
+        aggregated_contacts: dict[str, list[str]] = {}
+        aggregated_mentions: set[str] = set()
+
         for item in valid_items:
             item_id = item.get("id") or item.get("media_id") or item.get("pk")
             if not item_id:
@@ -724,36 +729,22 @@ class InstagramParser(BasePlatformParser):
             # Content-based Discovery Spider
             # Extract cross-platform links and same-platform mentions from post caption
             if content_text:
-                try:
-                    # Parse profile contacts (cross-platform links)
-                    contacts_dict = parse_profile_contacts(content_text)
-                    # Extract same-platform mentions (e.g., @otheruser)
-                    mentions = extract_mentions(content_text)
+                # Parse profile contacts (cross-platform links)
+                contacts_dict = parse_profile_contacts(content_text)
+                # Extract same-platform mentions (e.g., @otheruser)
+                mentions = extract_mentions(content_text)
 
-                    # Queue discovered accounts in independent session
-                    async with self.session_maker() as session:
-                        # Cross-platform links
-                        await queue_discovered_accounts(
-                            session,
-                            contacts_dict,
-                            profile.get("username", ""),
-                            "pending",
-                        )
-                        # Same-platform mentions
-                        await queue_discovered_mentions(
-                            session,
-                            "INSTAGRAM",
-                            mentions,
-                            profile.get("username", ""),
-                            "pending",
-                        )
-                        await session.commit()
-                except Exception as e:
-                    logger.warning(
-                        "Failed to queue discovered accounts from Instagram post %s: %s",
-                        item_id,
-                        e,
-                    )
+                # Accumulate contacts, avoiding duplicates per platform
+                for platform, handles in contacts_dict.items():
+                    if platform not in aggregated_contacts:
+                        aggregated_contacts[platform] = []
+                    # Add handles that are not already in the list
+                    for handle in handles:
+                        if handle not in aggregated_contacts[platform]:
+                            aggregated_contacts[platform].append(handle)
+
+                # Accumulate mentions
+                aggregated_mentions.update(mentions)
 
             content_values.append(
                 {
@@ -782,6 +773,32 @@ class InstagramParser(BasePlatformParser):
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
+
+        # Bulk write all accumulated discovery data in a single transaction
+        if aggregated_contacts or aggregated_mentions:
+            try:
+                async with self.session_maker() as session:
+                    async with session.begin():
+                        if aggregated_contacts:
+                            await queue_discovered_accounts(
+                                session=session,
+                                contacts_dict=aggregated_contacts,
+                                parent_handle=profile.get("username", ""),
+                                status="pending",
+                            )
+                        if aggregated_mentions:
+                            await queue_discovered_mentions(
+                                session=session,
+                                platform="INSTAGRAM",
+                                mentions=list(aggregated_mentions),
+                                parent_handle=profile.get("username", ""),
+                                status="pending",
+                            )
+            except Exception as e:
+                logger.warning(
+                    "Failed to queue discovered accounts from Instagram content: %s",
+                    e,
+                )
 
         if content_values:
             async with self.session_maker() as session:
@@ -886,7 +903,9 @@ class InstagramParser(BasePlatformParser):
             # Recursively extract video URL from the first carousel item
             first_carousel_item = carousel_media[0]
             if isinstance(first_carousel_item, dict):
-                carousel_video_url = self._extract_video_url(first_carousel_item)
+                carousel_video_url = self._extract_video_url(
+                    first_carousel_item
+                )
                 if isinstance(carousel_video_url, str) and carousel_video_url:
                     return carousel_video_url
 
@@ -916,6 +935,7 @@ class InstagramParser(BasePlatformParser):
                 response = await self.client.get(
                     endpoint="/v2/instagram/media/transcript",
                     params={"url": post_url},
+                    max_retries=3,
                 )
                 # Parse the transcripts list from the API response
                 transcripts = response.get("transcripts")
@@ -944,7 +964,9 @@ class InstagramParser(BasePlatformParser):
                 return None
 
             except Exception as e:
-                logger.warning("Transcript permanently failed for %s: %s", post_url, e)
+                logger.warning(
+                    "Transcript permanently failed for %s: %s", post_url, e
+                )
                 return None
 
     async def _get_existing_transcripts(
