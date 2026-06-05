@@ -5,12 +5,15 @@ This module provides:
     - Functions to queue discovered accounts from profile contacts for cross-platform spidering
     - Helpers to queue discovered @username mentions for the current platform
     - Helpers to upsert virtual profile posts into the content table for semantic search
+    - Centralized metadata collection pipeline for parsed accounts
 """
 
+import hashlib
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -18,8 +21,166 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account, Content
+from src.parser.creators.core.utils import parse_profile_contacts
 
 logger = logging.getLogger(__name__)
+
+# Well-known multi-link / link-in-bio domains for classification
+LINK_IN_BIO_DOMAINS = {
+    "linktr.ee",
+    "taplink.cc",
+    "beacons.ai",
+    "msha.ke",
+    "solo.to",
+    "lu.ma",
+    "lnk.bio",
+    "campsite.bio",
+    "carrd.co",
+    "instabio.cc",
+}
+
+
+def generate_deterministic_id(platform: str, platform_id: str) -> int:
+    """
+    Generate a deterministic, positive 63-bit integer hash from platform and platform_id.
+    Forces MSB to 0 to fit in signed 64-bit BigInt and to prevent collision with negative Telegram IDs.
+    """
+    key = f"{platform.upper()}:{platform_id.lower()}".encode("utf-8")
+    hash_bytes = hashlib.sha256(key).digest()
+    return int.from_bytes(hash_bytes[:8], byteorder="big") & 0x7FFFFFFFFFFFFFFF
+
+
+def _parse_url_domain(url: str) -> str | None:
+    """
+    Parse URL and return the normalized domain (lowercase, without port).
+    
+    Args:
+        url: The URL to parse.
+        
+    Returns:
+        Normalized domain string or None if parsing fails.
+    """
+    try:
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return None
+        return parsed.netloc.lower()
+    except Exception:
+        return None
+
+
+def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
+    """
+    Extract platform type and platform_id from a URL based on domain matching.
+    
+    Returns:
+        Tuple of (platform, platform_id) or (None, None) if no match.
+    """
+    domain = _parse_url_domain(url)
+    if not domain:
+        return None, None
+    
+    url_lower = url.lower()
+    
+    # TELEGRAM: Filter out non-user actions
+    if any(d in domain for d in ["t.me", "telegram.me", "telegram.dog", "tglink.ru"]):
+        # Skip non-user actions
+        non_user_paths = ["/addstickers", "/addemoji", "/joinchat", "/join"]
+        if any(path in url_lower for path in non_user_paths):
+            return None, None
+        
+        # Extract username from path
+        match = re.search(r"t\.me/([^/?#]+)", url_lower)
+        if match:
+            username = match.group(1)
+            if username:
+                return "TELEGRAM", username
+        return None, None
+    
+    # VK: vk.com, vk.ru, vkontakte.ru
+    if any(d in domain for d in ["vk.com", "vk.ru", "vkontakte.ru"]):
+        match = re.search(r"vk\.com/([^/?#]+)", url_lower)
+        if match:
+            return "VK", match.group(1)
+        match = re.search(r"vk\.ru/([^/?#]+)", url_lower)
+        if match:
+            return "VK", match.group(1)
+        match = re.search(r"vkontakte\.ru/([^/?#]+)", url_lower)
+        if match:
+            return "VK", match.group(1)
+        return None, None
+    
+    # RUTUBE: rutube.ru
+    if "rutube.ru" in domain:
+        match = re.search(r"rutube\.ru/([^/?#]+)", url_lower)
+        if match:
+            return "RUTUBE", match.group(1)
+        return None, None
+    
+    # YANDEX_DZEN: dzen.ru, zen.yandex.ru, zen.yandex.com
+    if any(d in domain for d in ["dzen.ru", "zen.yandex.ru", "zen.yandex.com"]):
+        match = re.search(r"zen\.yandex\.[a-z]+/([^/?#]+)", url_lower)
+        if match:
+            return "YANDEX_DZEN", match.group(1)
+        match = re.search(r"dzen\.ru/([^/?#]+)", url_lower)
+        if match:
+            return "YANDEX_DZEN", match.group(1)
+        return None, None
+    
+    # INSTAGRAM: instagram.com, instagr.am - skip post paths
+    if any(d in domain for d in ["instagram.com", "instagr.am"]):
+        match = re.search(r"instagram\.com/([^/?#]+)", url_lower)
+        if match:
+            username = match.group(1)
+            if username and username != "p":
+                return "INSTAGRAM", username
+        match = re.search(r"instagr\.am/([^/?#]+)", url_lower)
+        if match:
+            return "INSTAGRAM", match.group(1)
+        return None, None
+    
+    # TIKTOK: tiktok.com
+    if "tiktok.com" in domain:
+        match = re.search(r"tiktok\.com/@([^/?#]+)", url)
+        if match:
+            return "TIKTOK", match.group(1)
+        return None, None
+    
+    # YOUTUBE: youtube.com, youtu.be
+    if any(d in domain for d in ["youtube.com", "youtu.be"]):
+        if "/@" in url:
+            handle = url.split("/@")[-1].split("?")[0].split("/")[0]
+            if handle:
+                return "YOUTUBE", handle
+        elif "youtube.com/channel/" in url_lower:
+            channel_id = url.split("/channel/")[-1].split("?")[0].split("/")[0]
+            if channel_id:
+                return "YOUTUBE", channel_id
+        # youtu.be links are for videos, not channels; skip
+        return None, None
+    
+    # THREADS: threads.net
+    if "threads.net" in domain:
+        if "/@" in url:
+            username = url.split("/@")[-1].split("?")[0].split("/")[0]
+            if username:
+                return "THREADS", username
+        else:
+            username = url.split("/")[-1].split("?")[0].split("/")[0]
+            if username:
+                return "THREADS", username
+        return None, None
+    
+    # LINK_IN_BIO: Check if domain or subdomains match LINK_IN_BIO_DOMAINS
+    for bio_domain in LINK_IN_BIO_DOMAINS:
+        if domain == bio_domain or domain.endswith("." + bio_domain):
+            return "LINK_IN_BIO", url
+    
+    # WEBSITE: Any other valid http/https link
+    if url_lower.startswith("http://") or url_lower.startswith("https://"):
+        return "WEBSITE", url
+    
+    return None, None
 
 
 async def queue_discovered_accounts(
@@ -32,10 +193,11 @@ async def queue_discovered_accounts(
 
     Processes emails, Telegram handles, and external links from the contacts
     dictionary and inserts new account records into the accounts table with
-    the specified status for platforms Instagram, TikTok, YouTube, Threads, and Telegram.
+    the specified status for multiple platforms including Telegram, VK, Rutube,
+    Yandex Dzen, Instagram, TikTok, YouTube, Threads, and link-in-bio services.
 
-    Uses a SELECT-then-INSERT pattern with transaction safety to avoid
-    unique constraint violations.
+    Uses domain-based parsing to classify external links into platform types
+    and extracts platform-specific identifiers using regex patterns.
 
     Args:
         session: SQLAlchemy async session for database operations.
@@ -60,51 +222,15 @@ async def queue_discovered_accounts(
         clean_handle = handle.lstrip("@")
         await _queue_single_account(session, "TELEGRAM", clean_handle, parent_handle, status)
 
-    # Process external links for Instagram, TikTok, YouTube, Threads
+    # Process external links with comprehensive platform classification
     for link in external_links:
         if not link or not isinstance(link, str):
             continue
 
-        link_lower = link.lower()
-
-        # Instagram: instagram.com/username
-        if "instagram.com/" in link_lower:
-            match = re.search(r"instagram\.com/([^/?#]+)", link)
-            if match:
-                instagram_handle = match.group(1)
-                if instagram_handle and instagram_handle != "p":
-                    await _queue_single_account(session, "INSTAGRAM", instagram_handle, parent_handle, status)
-
-        # TikTok: tiktok.com/@username
-        elif "tiktok.com/" in link_lower:
-            match = re.search(r"tiktok\.com/@([^/?#]+)", link)
-            if match:
-                tiktok_username = match.group(1)
-                if tiktok_username:
-                    await _queue_single_account(session, "TIKTOK", tiktok_username, parent_handle, status)
-
-        # YouTube: youtube.com/@handle, youtube.com/channel/UC..., youtu.be/
-        elif "youtube.com/" in link_lower or "youtu.be/" in link_lower:
-            platform_id: str | None = None
-            if "/@" in link:
-                platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
-            elif "youtube.com/channel/" in link_lower:
-                platform_id = link.split("/channel/")[-1].split("?")[0].split("/")[0]
-            elif "youtu.be/" in link_lower:
-                # youtu.be links are for videos, not channels; skip
-                continue
-
-            if platform_id:
-                await _queue_single_account(session, "YOUTUBE", platform_id, parent_handle, status)
-
-        # Threads: threads.net/@username or threads.net/username
-        elif "threads.net/" in link_lower:
-            if "/@" in link:
-                platform_id = link.split("/@")[-1].split("?")[0].split("/")[0]
-            else:
-                platform_id = link.split("/")[-1].split("?")[0].split("/")[0]
-            if platform_id:
-                await _queue_single_account(session, "THREADS", platform_id, parent_handle, status)
+        platform, platform_id = _extract_platform_info(link)
+        
+        if platform and platform_id and platform not in ("WEBSITE", "LINK_IN_BIO"):
+            await _queue_single_account(session, platform, platform_id, parent_handle, status)
 
 
 async def queue_discovered_mentions(
@@ -144,7 +270,7 @@ async def _queue_single_account(
 
     Args:
         session: SQLAlchemy async session for database operations.
-        platform: Platform name (INSTAGRAM, TIKTOK, YOUTUBE, THREADS, TELEGRAM).
+        platform: Platform name (INSTAGRAM, TIKTOK, YOUTUBE, THREADS, TELEGRAM, VK, etc.).
         platform_id: Platform-specific identifier (handle, username, channel ID, etc.).
         parent_handle: Handle of the parent account that led to this discovery.
         status: Status to assign to the account (default: "pending").
@@ -157,8 +283,10 @@ async def _queue_single_account(
     existing = result.scalar_one_or_none()
 
     if not existing:
+        generated_id = generate_deterministic_id(platform, platform_id)
         try:
             new_account = Account(
+                id=generated_id,
                 platform=platform,
                 platform_id=platform_id,
                 username=platform_id,
@@ -181,6 +309,92 @@ async def _queue_single_account(
                 platform_id,
                 e,
             )
+
+
+async def update_account_profile_metadata(
+    session: AsyncSession,
+    account_id: int,
+    biography: str | None,
+    subscribers_count: int | None = None,
+    is_author_blog: bool | None = None,
+    extra_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Centralized async helper to update account profile metadata and trigger cross-platform discovery.
+    
+    Extracts contact information from biography, structures all parsed data into raw_metadata,
+    updates the Account record, and queues discovered accounts for cross-platform spidering.
+    
+    Args:
+        session: SQLAlchemy async session for database operations.
+        account_id: Database ID of the account to update.
+        biography: Creator's biography text to extract contacts from.
+        subscribers_count: Number of subscribers / followers (optional).
+        is_author_blog: Whether the account is identified as an author blog (optional).
+        extra_meta: Additional metadata dictionary to merge into raw_metadata (optional).
+        
+    Returns:
+        The built raw_metadata dictionary for use by platform-specific parsers.
+    """
+    # Extract contacts from biography using the imported function
+    contacts: dict[str, Any] = {}
+    if biography:
+        contacts = parse_profile_contacts(biography, None)
+    
+    # Build raw_metadata dictionary
+    raw_metadata: dict[str, Any] = {
+        "contacts": {
+            "emails": contacts.get("emails", []),
+            "telegram_handles": contacts.get("telegram_handles", []),
+            "external_links": contacts.get("external_links", []),
+        },
+    }
+    
+    # Add location if available in extra_meta
+    if extra_meta:
+        if "location" in extra_meta:
+            raw_metadata["location"] = extra_meta["location"]
+        if "language" in extra_meta:
+            raw_metadata["language"] = extra_meta["language"]
+        # Merge any additional extra_meta fields
+        for key, value in extra_meta.items():
+            if key not in raw_metadata:
+                raw_metadata[key] = value
+    
+    # Select Account record by account_id
+    stmt = select(Account).where(Account.id == account_id)
+    result = await session.execute(stmt)
+    account = result.scalar_one_or_none()
+    
+    if account:
+        # Update Account fields
+        if biography is not None:
+            account.description = biography
+        if subscribers_count is not None:
+            account.subscribers_count = subscribers_count
+        if is_author_blog is not None:
+            account.is_author_blog = is_author_blog
+        
+        account.raw_metadata = raw_metadata
+        await session.flush()
+        
+        logger.info(
+            "Updated profile metadata for account_id: %d",
+            account_id,
+        )
+        
+        # Trigger cross-platform discovery using extracted contacts
+        if contacts:
+            # Get parent handle from account
+            parent_handle = account.username or account.platform_id or str(account_id)
+            await queue_discovered_accounts(session, contacts, parent_handle)
+    else:
+        logger.warning(
+            "Account with id %d not found for metadata update",
+            account_id,
+        )
+    
+    return raw_metadata
 
 
 async def upsert_virtual_bio_post(

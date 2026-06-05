@@ -115,7 +115,7 @@ class Account(Base):
         back_populates="account", cascade="all, delete-orphan"
     )
     comments: Mapped[list["Comment"]] = relationship(
-        back_populates="account", cascade="all, delete-orphan"
+        back_populates="account"
     )
 
     def __repr__(self) -> str:
