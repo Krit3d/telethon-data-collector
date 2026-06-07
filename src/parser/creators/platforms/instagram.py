@@ -342,7 +342,7 @@ class InstagramParser(BasePlatformParser):
         # Fetch profile for author metadata
         profile = await self._get_cached_or_fetch_profile(platform_id)
         if not profile:
-            return
+            raise RuntimeError(f"Could not retrieve profile metadata for {platform_id} during content parsing.")
 
         author_metadata = build_instagram_author_metadata(profile)
 
@@ -358,7 +358,7 @@ class InstagramParser(BasePlatformParser):
                 platform_id,
                 e,
             )
-            return
+            raise
 
         # Extract items from first page only
         items: list[dict[str, Any]] = response.get("items", [])
@@ -405,10 +405,21 @@ class InstagramParser(BasePlatformParser):
                 break
 
         if not valid_items:
+            # No valid content found: reject account to prevent false positives
+            # This handles accounts with empty biographies that reached Stage 2 with "processing" status
             logger.info(
-                "No valid Instagram content found for account_id: %d",
+                "No valid Instagram content found for account_id: %d. Rejecting account.",
                 account_id,
             )
+            async with self.session_maker() as session:
+                # Direct update of account status to "rejected"
+                stmt = (
+                    update(Account)
+                    .where(Account.id == account_id)
+                    .values(status="rejected", updated_at=datetime.now(timezone.utc))
+                )
+                await session.execute(stmt)
+                await session.commit()
             return
 
         logger.info(
@@ -433,7 +444,7 @@ class InstagramParser(BasePlatformParser):
                 description = caption_data
 
             # Extract hashtags
-            hashtags = item.get("hashtags", [])
+            hashtags = item.get("hashtags") or []
             if not hashtags and description:
                 hashtags = [
                     tag.strip("#") for tag in description.split()
@@ -491,7 +502,7 @@ class InstagramParser(BasePlatformParser):
                 description = caption_data
 
             # Extract hashtags
-            hashtags = item.get("hashtags", [])
+            hashtags = item.get("hashtags") or []
             if not hashtags and description:
                 hashtags = [
                     tag.strip("#") for tag in description.split()
