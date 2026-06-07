@@ -369,7 +369,7 @@ class ThreadsParser(BasePlatformParser):
                     if aggregated_contacts:
                         await queue_discovered_accounts(
                             session=session,
-                            contacts_dict=aggregated_contacts,
+                            metadata=aggregated_contacts,
                             parent_handle=platform_id,
                             status="pending",
                         )

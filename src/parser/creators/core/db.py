@@ -23,7 +23,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account, Content, Comment
-from src.parser.creators.core.contacts import parse_profile_contacts, compile_author_metadata_dict
+from src.parser.creators.core.contacts import parse_profile_contacts, compile_author_metadata
+from src.parser.creators.core.schemas import (
+    AccountMetadata,
+    MetricsEntry,
+    ContentMetadata,
+    Contacts,
+    ExternalPlatforms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +96,6 @@ INSTAGRAM_DOMAINS: frozenset[str] = frozenset({
 TELEGRAM_NON_USER_PATHS: frozenset[str] = frozenset({
     "/addstickers",
     "/addemoji",
-    "/joinchat",
-    "/join",
 })
 
 
@@ -153,23 +158,33 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
 
     url_lower = url.lower()
 
-    # TELEGRAM: Filter out non-user actions
+    # TELEGRAM: Handle both standard usernames and invite links
     if any(d in domain for d in TELEGRAM_DOMAINS):
-        # Skip non-user actions
+        # Filter out non-user actions (except invite links)
         if any(path in url_lower for path in TELEGRAM_NON_USER_PATHS):
             return None, None
 
-        # Extract username from path
+        # Check for invite links: t.me/+hash or t.me/joinchat/hash
+        # Preserve original case for invite hashes (they are case-sensitive)
+        plus_match = re.search(r"t\.me/\+([A-Za-z0-9_\-]{6,})", url)
+        if plus_match:
+            return "TELEGRAM", "+" + plus_match.group(1)
+
+        joinchat_match = re.search(r"t\.me/joinchat/([A-Za-z0-9_\-]{6,})", url)
+        if joinchat_match:
+            # Standardize on +hash format for consistency
+            return "TELEGRAM", "+" + joinchat_match.group(1)
+
+        # Standard username extraction
         match = re.search(r"t\.me/([^/?#]+)", url_lower)
         if match:
             username = match.group(1)
-            if username:
+            if username and username not in ("joinchat", "join"):
                 return "TELEGRAM", username
         return None, None
 
     # VK: vk.com, vk.ru, vkontakte.ru
     if any(d in domain for d in VK_DOMAINS):
-        # Try each domain pattern
         for pattern in [r"vk\.com/([^/?#]+)", r"vk\.ru/([^/?#]+)", r"vkontakte\.ru/([^/?#]+)"]:
             match = re.search(pattern, url_lower)
             if match:
@@ -185,11 +200,9 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
 
     # YANDEX_DZEN: dzen.ru, zen.yandex.ru, zen.yandex.com
     if any(d in domain for d in YANDEX_DZEN_DOMAINS):
-        # Try zen.yandex.* pattern first
         match = re.search(r"zen\.yandex\.[a-z]+/([^/?#]+)", url_lower)
         if match:
             return "YANDEX_DZEN", match.group(1)
-        # Then dzen.ru pattern
         match = re.search(r"dzen\.ru/([^/?#]+)", url_lower)
         if match:
             return "YANDEX_DZEN", match.group(1)
@@ -197,7 +210,6 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
 
     # INSTAGRAM: instagram.com, instagr.am - skip post paths
     if any(d in domain for d in INSTAGRAM_DOMAINS):
-        # Skip paths like /p/ (posts)
         if "/p/" in url_lower:
             return None, None
         match = re.search(r"instagram\.com/([^/?#]+)", url_lower)
@@ -217,17 +229,14 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
 
     # YOUTUBE: youtube.com, youtu.be
     if any(d in domain for d in ["youtube.com", "youtu.be"]):
-        # Extract @username
         if "/@" in url:
             handle = url.split("/@")[-1].split("?")[0].split("/")[0]
             if handle:
                 return "YOUTUBE", handle
-        # Extract channel ID
         elif "youtube.com/channel/" in url_lower:
             channel_id = url.split("/channel/")[-1].split("?")[0].split("/")[0]
             if channel_id:
                 return "YOUTUBE", channel_id
-        # youtu.be links are for videos, not channels; skip
         return None, None
 
     # THREADS: threads.net
@@ -253,6 +262,52 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
         return "WEBSITE", url
 
     return None, None
+
+
+def _convert_dict_to_account_metadata(contacts_dict: dict[str, Any]) -> AccountMetadata:
+    """
+    Convert a legacy contacts dictionary to AccountMetadata model.
+
+    This helper function handles the conversion from the old dictionary format
+    returned by parse_profile_contacts() to the new AccountMetadata Pydantic model.
+
+    Args:
+        contacts_dict: Dictionary with keys like 'emails', 'telegram_handles',
+                      'external_links', 'external_platforms'.
+
+    Returns:
+        AccountMetadata model instance.
+    """
+    emails = contacts_dict.get("emails", [])
+    telegram_handles = contacts_dict.get("telegram_handles", [])
+    external_links = contacts_dict.get("external_links", [])
+    external_platforms_dict = contacts_dict.get("external_platforms", {})
+
+    # Classify Telegram handles (using simple heuristic: treat all as channels for now)
+    telegram_channels = [h.lstrip("@") for h in telegram_handles if h]
+    telegram_personal: list[str] = []
+
+    # Build ExternalPlatforms
+    external_platforms = ExternalPlatforms(
+        vk=external_platforms_dict.get("vk"),
+        youtube=external_platforms_dict.get("youtube"),
+        threads=external_platforms_dict.get("threads"),
+        tiktok=external_platforms_dict.get("tiktok"),
+    )
+
+    # Build Contacts
+    contacts = Contacts(
+        emails=[e for e in emails if e],
+        telegram_channels=telegram_channels,
+        telegram_personal=telegram_personal,
+    )
+
+    # Build AccountMetadata
+    return AccountMetadata(
+        contacts=contacts,
+        external_platforms=external_platforms,
+        extracted_at=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -293,11 +348,9 @@ async def upsert_and_deduplicate_account(
     Returns:
         The account ID (primary ID after potential deduplication)
     """
-    # Validate platform
     if platform not in SUPPORTED_PLATFORMS:
         raise ValueError(f"Unsupported platform: {platform}. Must be one of {SUPPORTED_PLATFORMS}")
 
-    # Query for existing accounts matching platform_id or username
     conditions = []
     if platform_id:
         conditions.append(
@@ -309,7 +362,6 @@ async def upsert_and_deduplicate_account(
         )
 
     if not conditions:
-        # No platform_id or username provided, cannot match
         generated_id = generate_deterministic_id(platform, platform_id or username or title)
         new_account = Account(
             id=generated_id,
@@ -325,7 +377,6 @@ async def upsert_and_deduplicate_account(
         await session.flush()
         return generated_id
 
-    # Build OR query
     stmt = select(Account).where(
         Account.platform == platform,
         or_(*conditions),
@@ -334,7 +385,6 @@ async def upsert_and_deduplicate_account(
     existing_accounts = list(result.scalars().all())
 
     if not existing_accounts:
-        # No existing account, create new one
         generated_id = generate_deterministic_id(platform, platform_id or username or title)
         new_account = Account(
             id=generated_id,
@@ -358,7 +408,6 @@ async def upsert_and_deduplicate_account(
         return generated_id
 
     if len(existing_accounts) == 1:
-        # Exactly one account exists, update it
         account = existing_accounts[0]
         account.platform_id = platform_id or account.platform_id
         account.username = username or account.username
@@ -377,21 +426,17 @@ async def upsert_and_deduplicate_account(
         )
         return account.id
 
-    # Multiple accounts exist - need to deduplicate
-    # Find primary account: prefer numeric platform_id over username-based platform_id
     primary_account = None
     for account in existing_accounts:
         if account.platform_id and account.platform_id.isdigit():
             primary_account = account
             break
 
-    # If no account with numeric platform_id found, use the first one
     if primary_account is None:
         primary_account = existing_accounts[0]
 
     primary_id = primary_account.id
 
-    # Update primary account with the most recent data
     primary_account.platform_id = platform_id or primary_account.platform_id
     primary_account.username = username or primary_account.username
     primary_account.title = title
@@ -401,24 +446,20 @@ async def upsert_and_deduplicate_account(
     )
     primary_account.status = status
 
-    # Reassign content and comments from duplicate accounts to primary account
     duplicate_ids = [acc.id for acc in existing_accounts if acc.id != primary_id]
     if duplicate_ids:
-        # Update content.account_id for all content from duplicate accounts
         await session.execute(
             update(Content)
             .where(Content.account_id.in_(duplicate_ids))
             .values(account_id=primary_id)
         )
 
-        # Update comments.account_id for all comments from duplicate accounts
         await session.execute(
             update(Comment)
             .where(Comment.account_id.in_(duplicate_ids))
             .values(account_id=primary_id)
         )
 
-        # Delete duplicate accounts
         await session.execute(
             delete(Account).where(Account.id.in_(duplicate_ids))
         )
@@ -457,10 +498,11 @@ async def update_account_profile_metadata(
 
     This function:
     1. Uses parse_profile_contacts(biography, external_url) to extract contacts
-    2. Compiles an OpenSPG-compliant metadata dictionary using compile_author_metadata_dict
-    3. Updates the Account's raw_metadata and description with compiled values
+    2. Compiles an OpenSPG-compliant metadata using compile_author_metadata
+       (returns an AccountMetadata Pydantic model)
+    3. Updates the Account's raw_metadata with compiled metadata (exclude_none=True)
     4. Automatically runs queue_discovered_accounts to queue newly discovered accounts as "pending"
-    5. Returns the compiled metadata dictionary
+    5. Returns the compiled metadata as a dictionary
 
     Args:
         session: SQLAlchemy async session for database operations
@@ -477,14 +519,12 @@ async def update_account_profile_metadata(
         subscribers_count: Optional subscriber count for metrics_history
 
     Returns:
-        The compiled metadata dictionary
+        The compiled metadata dictionary (with None values excluded)
     """
-    # Extract contacts from biography and external_url
     contacts: dict[str, Any] = {}
     if biography or external_url:
         contacts = parse_profile_contacts(biography, external_url)
 
-    # Get account to access username/platform_id for profile link compilation
     stmt = select(Account).where(Account.id == account_id)
     result = await session.execute(stmt)
     account = result.scalar_one_or_none()
@@ -493,9 +533,8 @@ async def update_account_profile_metadata(
         logger.warning("Account with id %d not found for metadata update", account_id)
         return {}
 
-    # Compile OpenSPG-compliant metadata with new parameters
     username = account.username or account.platform_id
-    compiled_metadata = compile_author_metadata_dict(
+    compiled_metadata = compile_author_metadata(
         platform=platform,
         username=username,
         biography=biography,
@@ -508,46 +547,43 @@ async def update_account_profile_metadata(
         raw_profile_payload=raw_profile_payload,
     )
 
-    # Build metrics_history block if subscribers_count is provided
     if subscribers_count is not None:
-        metrics_entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "subscribers_count": subscribers_count,
-        }
-        # Initialize or append to metrics_history
-        if "metrics_history" not in compiled_metadata:
-            compiled_metadata["metrics_history"] = []
-        compiled_metadata["metrics_history"].append(metrics_entry)
+        metrics_entry = MetricsEntry(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            subscribers_count=subscribers_count,
+            posts_count=None,
+        )
+        compiled_metadata.metrics_history.append(metrics_entry)
 
-    # Merge extra_meta if provided
     if extra_meta:
         for key, value in extra_meta.items():
-            if key not in compiled_metadata or not compiled_metadata[key]:
-                compiled_metadata[key] = value
+            if hasattr(compiled_metadata, key):
+                current_value = getattr(compiled_metadata, key)
+                if not current_value:
+                    setattr(compiled_metadata, key, value)
+            else:
+                logger.debug(
+                    "Extra meta key '%s' not found in AccountMetadata model, skipping",
+                    key,
+                )
 
-    # Update account fields
     account.description = biography if biography is not None else account.description
-    account.raw_metadata = compiled_metadata
+    account.raw_metadata = compiled_metadata.model_dump(exclude_none=True)
+
     if subscribers_count is not None:
         account.subscribers_count = subscribers_count
     await session.flush()
 
     logger.info("Updated profile metadata for account_id: %d", account_id)
 
-    # Trigger cross-platform discovery using extracted contacts
     if contacts:
         parent_handle = account.username or account.platform_id or str(account_id)
-        # Get parent category for inheritance
-        parent_category = category
-        if not parent_category:
-            raw_metadata = account.raw_metadata
-            if raw_metadata is not None:
-                parent_category = raw_metadata.get("category")
+        parent_category = category or compiled_metadata.category
         await queue_discovered_accounts(
-            session, contacts, parent_handle, category=parent_category
+            session, compiled_metadata, parent_handle, status="pending", category=parent_category
         )
 
-    return compiled_metadata
+    return compiled_metadata.model_dump(exclude_none=True)
 
 
 # ---------------------------------------------------------------------------
@@ -586,15 +622,16 @@ async def bulk_upsert_content(
 
     now = datetime.now(timezone.utc)
 
-    # Prepare values for insert
     insert_values = []
     for values in content_values:
-        # Ensure required fields are present
         if "account_id" not in values or "platform_content_id" not in values:
             logger.warning("Skipping content value missing required fields: %s", values)
             continue
 
-        # Set defaults
+        raw_metadata = values.get("raw_metadata")
+        if raw_metadata is not None:
+            raw_metadata = _clean_content_raw_metadata(raw_metadata)
+
         prepared = {
             "account_id": values["account_id"],
             "platform_content_id": values["platform_content_id"],
@@ -605,7 +642,7 @@ async def bulk_upsert_content(
             "reactions_count": values.get("reactions_count"),
             "comments_count": values.get("comments_count"),
             "shares_count": values.get("shares_count"),
-            "raw_metadata": values.get("raw_metadata"),
+            "raw_metadata": raw_metadata,
             "updated_at": now,
             "created_at": now,
             "is_embedded": values.get("is_embedded", False),
@@ -617,7 +654,6 @@ async def bulk_upsert_content(
     if not insert_values:
         return
 
-    # Bulk insert with ON CONFLICT DO UPDATE
     stmt = pg_insert(Content).values(insert_values)
     stmt = stmt.on_conflict_do_update(
         constraint="uq_content_account_platform_id",
@@ -637,13 +673,50 @@ async def bulk_upsert_content(
     logger.debug("Bulk upserted %d content items", len(insert_values))
 
 
+def _clean_content_raw_metadata(raw_metadata: dict[str, Any] | ContentMetadata | Any) -> dict[str, Any] | None:
+    """
+    Clean and serialize raw_metadata to prevent database bloat.
+
+    This helper function:
+    1. If raw_metadata is a ContentMetadata model, dump it with exclude_none=True
+    2. If raw_metadata is a dict, attempt to validate it against ContentMetadata
+       - If validation succeeds, dump with exclude_none=True
+       - If validation fails, filter out None values manually
+    3. If raw_metadata is neither, return None
+
+    Args:
+        raw_metadata: The raw_metadata to clean (can be dict, ContentMetadata, or other).
+
+    Returns:
+        Cleaned dictionary with None values excluded, or None.
+    """
+    if raw_metadata is None:
+        return None
+
+    if isinstance(raw_metadata, ContentMetadata):
+        return raw_metadata.model_dump(exclude_none=True)
+
+    if isinstance(raw_metadata, dict):
+        try:
+            validated = ContentMetadata.model_validate(raw_metadata)
+            return validated.model_dump(exclude_none=True)
+        except Exception:
+            return {k: v for k, v in raw_metadata.items() if v is not None}
+
+    logger.warning(
+        "Unexpected raw_metadata type: %s, expected dict or ContentMetadata",
+        type(raw_metadata).__name__,
+    )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Account queuing for cross-platform spidering
 # ---------------------------------------------------------------------------
 
 async def queue_discovered_accounts(
     session: AsyncSession,
-    contacts_dict: dict[str, Any],
+    metadata: AccountMetadata | dict[str, Any],
     parent_handle: str,
     status: str = "pending",
     category: str | None = None,
@@ -651,43 +724,44 @@ async def queue_discovered_accounts(
     """
     Queue discovered accounts from profile contacts for cross-platform spidering.
 
-    Processes emails, Telegram handles (channels only, not personal), and
-    external links from the contacts dictionary and inserts new account records
-    into the accounts table with the specified status for multiple platforms
-    including Telegram, VK, Rutube, Yandex Dzen, Instagram, TikTok, YouTube,
-    Threads, and link-in-bio services.
+    Accepts either an AccountMetadata model or a raw dictionary (for backward compatibility).
+    If a dict is passed, it will be converted to AccountMetadata using best-effort conversion.
 
-    Uses domain-based parsing to classify external links into platform types
-    and extracts platform-specific identifiers using regex patterns.
+    Processes contacts from AccountMetadata model:
+    - Telegram channels from metadata.contacts.telegram_channels
+    - External platforms from metadata.external_platforms (VK, YouTube, Threads, TikTok)
+    - Other external links from metadata.external_platforms.unsupported
+      applying _extract_platform_info to detect secondary channels
 
     Implements category inheritance: newly queued accounts inherit the parent's
     category in their raw_metadata.
 
     Args:
         session: SQLAlchemy async session for database operations
-        contacts_dict: Dictionary containing emails, telegram_handles, external_links,
-            and external_platforms
+        metadata: AccountMetadata Pydantic model or dict containing contacts and platforms
         parent_handle: Handle of the parent account whose bio was scanned
         status: Status to assign to newly discovered accounts (default: "pending")
         category: Optional category to inherit to newly queued accounts
     """
-    # Use telegram_channels from contacts dict (not telegram_handles)
-    # This prevents personal advertising profiles from cluttering the queue
-    telegram_channels: list[str] = []
-    contacts = contacts_dict.get("contacts", {})
-    if isinstance(contacts, dict):
-        telegram_channels = contacts.get("telegram_channels", [])
-    external_links: list[str] = contacts_dict.get("external_links", [])
-    external_platforms: dict[str, str] = contacts_dict.get("external_platforms", {})
+    # Convert dict to AccountMetadata if needed (backward compatibility)
+    if isinstance(metadata, dict):
+        metadata = _convert_dict_to_account_metadata(metadata)
 
-    if not telegram_channels and not external_links and not external_platforms:
+    telegram_channels: list[str] = []
+    external_platforms: ExternalPlatforms | None = None
+
+    if metadata.contacts:
+        telegram_channels = metadata.contacts.telegram_channels
+
+    external_platforms = metadata.external_platforms
+
+    if not telegram_channels and not external_platforms:
         logger.debug(
             "[SPIDER] No external social accounts discovered in bio of parent account %s.",
             parent_handle,
         )
         return
 
-    # Process Telegram channels (NOT personal handles)
     for handle in telegram_channels:
         if not handle:
             continue
@@ -696,33 +770,28 @@ async def queue_discovered_accounts(
             session, "TELEGRAM", clean_handle, parent_handle, status, category
         )
 
-    # Process external platforms from structured external_platforms map
-    platform_mapping = {
-        "vk": "VK",
-        "youtube": "YOUTUBE",
-        "threads": "THREADS",
-        "tiktok": "TIKTOK",
-    }
-    for platform_slug, handle in external_platforms.items():
-        if not handle:
-            continue
-        platform_name = platform_mapping.get(platform_slug.lower())
-        if platform_name:
-            await _queue_single_account(
-                session, platform_name, handle, parent_handle, status, category
-            )
+    if external_platforms:
+        platform_mapping = {
+            "vk": "VK",
+            "youtube": "YOUTUBE",
+            "threads": "THREADS",
+            "tiktok": "TIKTOK",
+        }
 
-    # Process external links with comprehensive platform classification
-    for link in external_links:
-        if not link or not isinstance(link, str):
-            continue
+        for platform_slug, platform_name in platform_mapping.items():
+            handle = getattr(external_platforms, platform_slug, None)
+            if handle:
+                await _queue_single_account(
+                    session, platform_name, handle, parent_handle, status, category
+                )
 
-        platform, platform_id = _extract_platform_info(link)
-
-        if platform and platform_id and platform not in ("WEBSITE", "LINK_IN_BIO"):
-            await _queue_single_account(
-                session, platform, platform_id, parent_handle, status, category
-            )
+        if external_platforms.unsupported:
+            for platform_name, url in external_platforms.unsupported.items():
+                platform, platform_id = _extract_platform_info(url)
+                if platform and platform_id and platform not in ("WEBSITE", "LINK_IN_BIO"):
+                    await _queue_single_account(
+                        session, platform, platform_id, parent_handle, status, category
+                    )
 
 
 async def queue_discovered_mentions(
@@ -745,7 +814,6 @@ async def queue_discovered_mentions(
     for username in mentions:
         if not username or len(username) < 3:
             continue
-        # Avoid queuing obvious non-user names or system tags
         await _queue_single_account(session, platform, username, parent_handle, status)
 
 
@@ -782,7 +850,6 @@ async def _queue_single_account(
     if not existing:
         generated_id = generate_deterministic_id(platform, platform_id)
         try:
-            # Build raw_metadata with category inheritance
             raw_metadata = {}
             if category is not None:
                 raw_metadata["category"] = category
@@ -806,7 +873,6 @@ async def _queue_single_account(
                 category or "none",
             )
         except IntegrityError as e:
-            # Handle race condition where another process inserted the same account
             logger.debug(
                 "Integrity error while queuing %s account %s (likely duplicate): %s",
                 platform,
@@ -828,7 +894,7 @@ async def upsert_virtual_bio_post(
     full_name: str | None,
     biography: str | None,
     subscribers_count: int,
-    raw_metadata: dict[str, Any] | None = None,
+    raw_metadata: AccountMetadata | dict[str, Any] | None = None,
 ) -> None:
     """
     Upsert a virtual profile post into the content table for semantic search.
@@ -843,9 +909,10 @@ async def upsert_virtual_bio_post(
         - is_embedded = False (picked up by embedding worker)
         - has_media = False
 
-    Accepts an optional raw_metadata parameter that will be written directly
-    to the database. This can be used to store additional metadata such as
-    female_heuristic results.
+    Accepts an optional raw_metadata parameter that can be:
+        - AccountMetadata model (will be dumped with exclude_none=True)
+        - dict (will be attempted to parse as AccountMetadata, or cleaned with exclude_none)
+        - None (no raw_metadata will be stored)
 
     Uses PostgreSQL ON CONFLICT DO UPDATE on the "uq_content_account_platform_id"
     constraint for high-throughput, concurrent-safe upserts.
@@ -859,7 +926,7 @@ async def upsert_virtual_bio_post(
         full_name: Creator's display name / title, or None
         biography: Creator's biography text, or None
         subscribers_count: Number of subscribers / followers
-        raw_metadata: Optional dictionary to store in raw_metadata field
+        raw_metadata: Optional AccountMetadata model or dict to store in raw_metadata field
     """
     virtual_content_id = f"profile_bio_{platform_id}"
     compiled_text = (
@@ -872,6 +939,8 @@ async def upsert_virtual_bio_post(
     )
 
     now = datetime.now(timezone.utc)
+
+    processed_metadata = _clean_account_raw_metadata(raw_metadata)
 
     stmt = pg_insert(Content).values(
         account_id=account_id,
@@ -886,7 +955,7 @@ async def upsert_virtual_bio_post(
         has_media=False,
         is_embedded=False,
         is_graph_extracted=False,
-        raw_metadata=raw_metadata,
+        raw_metadata=processed_metadata,
         updated_at=now,
     )
     stmt = stmt.on_conflict_do_update(
@@ -904,3 +973,42 @@ async def upsert_virtual_bio_post(
         platform,
         virtual_content_id,
     )
+
+
+def _clean_account_raw_metadata(
+    raw_metadata: AccountMetadata | dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """
+    Clean and serialize raw_metadata for account/virtual bio post.
+
+    This helper function:
+    1. If raw_metadata is an AccountMetadata model, dump it with exclude_none=True
+    2. If raw_metadata is a dict, attempt to validate it against AccountMetadata
+       - If validation succeeds, dump with exclude_none=True
+       - If validation fails, filter out None values manually
+    3. If raw_metadata is None, return None
+
+    Args:
+        raw_metadata: The raw_metadata to clean (can be AccountMetadata, dict, or None).
+
+    Returns:
+        Cleaned dictionary with None values excluded, or None.
+    """
+    if raw_metadata is None:
+        return None
+
+    if isinstance(raw_metadata, AccountMetadata):
+        return raw_metadata.model_dump(exclude_none=True)
+
+    if isinstance(raw_metadata, dict):
+        try:
+            validated = AccountMetadata.model_validate(raw_metadata)
+            return validated.model_dump(exclude_none=True)
+        except Exception:
+            return {k: v for k, v in raw_metadata.items() if v is not None}
+
+    logger.warning(
+        "Unexpected raw_metadata type: %s, expected AccountMetadata, dict, or None",
+        type(raw_metadata).__name__,
+    )
+    return None

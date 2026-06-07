@@ -803,8 +803,7 @@ class YouTubeParser(BasePlatformParser):
                         # Queue discovered accounts in independent session
                         async with self.session_maker() as session:
                             # Cross-platform links
-                            await queue_discovered_accounts(
-                                session, contacts_dict, handle
+                            await queue_discovered_accounts(session, contacts_dict, handle
                             )
                             # Same-platform mentions
                             await queue_discovered_mentions(

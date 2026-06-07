@@ -40,6 +40,12 @@ TELEGRAM_HANDLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Telegram invite link patterns: t.me/+hash, t.me/joinchat/hash
+TELEGRAM_INVITE_PATTERN = re.compile(
+    r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_\-]{6,})",
+    re.IGNORECASE,
+)
+
 # URL pattern for extracting external links
 URL_PATTERN = re.compile(
     r"https?://[^\s<>\"{}|\\^`\[\]]+",
@@ -202,7 +208,7 @@ def extract_external_platforms(
 
 
 def extract_telegram_handles(text: str | None) -> list[str]:
-    """Extract Telegram handles from text.
+    """Extract Telegram handles and invite links from text.
 
     Finds Telegram usernames from various formats:
     - @username
@@ -211,20 +217,46 @@ def extract_telegram_handles(text: str | None) -> list[str]:
     - https://t.me/username
     - https://telegram.me/username
 
-    Normalizes them to clean usernames without @ or URL prefixes.
+    Also extracts Telegram invite links:
+    - t.me/+hash (invite hash with + prefix)
+    - t.me/joinchat/hash (legacy joinchat format)
+
+    Filters out:
+    - Invalid matches like "joinchat" or "join" as usernames
+    - Bot accounts (usernames ending with "bot", case-insensitive)
 
     Args:
         text: The text to search for Telegram handles. Can be None.
 
     Returns:
-        A deduplicated list of clean Telegram usernames (without @ or URL).
+        A deduplicated list of clean Telegram identifiers (usernames and invite hashes).
         Returns empty list if text is None or no handles are found.
     """
     if not text:
         return []
 
-    matches = TELEGRAM_HANDLE_PATTERN.findall(text)
-    return list(set(match.lower() for match in matches))
+    handles: set[str] = set()
+
+    # Extract standard usernames
+    username_matches = TELEGRAM_HANDLE_PATTERN.findall(text)
+    for match in username_matches:
+        normalized = match.lower()
+        # Filter out invalid usernames like "joinchat" or "join"
+        if normalized in ("joinchat", "join"):
+            continue
+        # Filter out bot accounts (usernames ending with "bot")
+        if normalized.endswith("bot"):
+            continue
+        handles.add(normalized)
+
+    # Extract invite links (+hash or joinchat/hash)
+    for plus_match in re.finditer(r"t\.me/\+([A-Za-z0-9_\-]{6,})", text, re.IGNORECASE):
+        handles.add("+" + plus_match.group(1))
+
+    for joinchat_match in re.finditer(r"t\.me/joinchat/([A-Za-z0-9_\-]{6,})", text, re.IGNORECASE):
+        handles.add("joinchat/" + joinchat_match.group(1))
+
+    return list(handles)
 
 
 def extract_mentions(text: str | None) -> list[str]:
@@ -352,17 +384,27 @@ def parse_profile_contacts(
 
 
 def normalize_telegram_handle(handle: str) -> str:
-    """Normalize a Telegram handle to clean username format.
+    """Normalize a Telegram handle to clean format.
 
-    Removes @, t.me/, telegram.me/ prefixes and converts to lowercase.
+    For standard usernames:
+    - Removes @, t.me/, telegram.me/ prefixes
+    - Converts to lowercase
+
+    For invite links (starting with + or containing joinchat/):
+    - Removes domain prefixes (t.me/, https://t.me/, etc.)
+    - Preserves the original case of the invite hash
+    - Telegram invite hashes are case-sensitive
 
     Args:
-        handle: The Telegram handle to normalize.
+        handle: The Telegram handle or invite link to normalize.
 
     Returns:
-        Normalized Telegram username without prefixes.
+        Normalized Telegram identifier (username in lowercase, invite hash in original case).
     """
     handle = handle.strip()
+
+    # Check if it's an invite link (preserve case for invite hashes)
+    is_invite = handle.startswith("+") or "/joinchat/" in handle or handle.startswith("joinchat/")
 
     if handle.startswith("@"):
         handle = handle[1:]
@@ -379,6 +421,9 @@ def normalize_telegram_handle(handle: str) -> str:
             handle = handle[len(prefix):]
             break
 
+    # For invite links, preserve original case; for usernames, convert to lowercase
+    if is_invite:
+        return handle
     return handle.lower()
 
 
@@ -480,10 +525,10 @@ def classify_telegram_handles(
                     is_channel = True
                     break
 
-        # Check for invite link formats (channels)
-        if not is_personal and handle:
-            if "joinchat" in handle_lower or "/+" in handle_lower or "t.me/+" in handle_lower:
-                is_channel = True
+        # Check for invite link formats (channels) - always classify as channel
+        if handle and (handle.startswith("+") or handle.startswith("joinchat/") or
+                      "joinchat" in handle_lower or "/+" in handle_lower or "t.me/+" in handle_lower):
+            is_channel = True
 
         # Default classification: if no clear personal indicators, treat as channel
         if not is_personal and not is_channel:

@@ -607,7 +607,7 @@ class InstagramParser(BasePlatformParser):
                     if aggregated_contacts:
                         await queue_discovered_accounts(
                             session=session,
-                            contacts_dict=aggregated_contacts,
+                            metadata=aggregated_contacts,
                             parent_handle=profile.get("username", ""),
                             status="pending",
                         )
