@@ -23,7 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account, Content, Comment
-from src.parser.creators.core.contacts import parse_profile_contacts, compile_author_metadata
+from src.parser.creators.core.contacts import parse_profile_contacts, compile_author_metadata, URL_PATTERN
 from src.parser.creators.core.schemas import (
     AccountMetadata,
     MetricsEntry,
@@ -730,8 +730,8 @@ async def queue_discovered_accounts(
     Processes contacts from AccountMetadata model:
     - Telegram channels from metadata.contacts.telegram_channels
     - External platforms from metadata.external_platforms (VK, YouTube, Threads, TikTok)
-    - Other external links from metadata.external_platforms.unsupported
-      applying _extract_platform_info to detect secondary channels
+    - Scans URLs from metadata.biography, metadata.website, and metadata.link_in_bio
+      using _extract_platform_info to detect secondary social platforms
 
     Implements category inheritance: newly queued accounts inherit the parent's
     category in their raw_metadata.
@@ -749,27 +749,38 @@ async def queue_discovered_accounts(
 
     telegram_channels: list[str] = []
     external_platforms: ExternalPlatforms | None = None
+    biography: str | None = None
+    website: str | None = None
+    link_in_bio: str | None = None
 
     if metadata.contacts:
         telegram_channels = metadata.contacts.telegram_channels
 
     external_platforms = metadata.external_platforms
+    biography = metadata.biography
+    website = metadata.website
+    link_in_bio = metadata.link_in_bio
 
-    if not telegram_channels and not external_platforms:
-        logger.debug(
-            "[SPIDER] No external social accounts discovered in bio of parent account %s.",
-            parent_handle,
-        )
-        return
+    # Track queued platform+id pairs to avoid duplicates
+    queued_accounts: set[tuple[str, str]] = set()
 
+    # Helper to queue account if not already queued
+    async def _queue_if_new(platform: str, platform_id: str) -> None:
+        key = (platform, platform_id)
+        if key not in queued_accounts:
+            queued_accounts.add(key)
+            await _queue_single_account(
+                session, platform, platform_id, parent_handle, status, category
+            )
+
+    # Queue Telegram channels
     for handle in telegram_channels:
         if not handle:
             continue
         clean_handle = handle.lstrip("@")
-        await _queue_single_account(
-            session, "TELEGRAM", clean_handle, parent_handle, status, category
-        )
+        await _queue_if_new("TELEGRAM", clean_handle)
 
+    # Queue standard external platforms
     if external_platforms:
         platform_mapping = {
             "vk": "VK",
@@ -781,17 +792,46 @@ async def queue_discovered_accounts(
         for platform_slug, platform_name in platform_mapping.items():
             handle = getattr(external_platforms, platform_slug, None)
             if handle:
-                await _queue_single_account(
-                    session, platform_name, handle, parent_handle, status, category
-                )
+                await _queue_if_new(platform_name, handle)
 
-        if external_platforms.unsupported:
-            for platform_name, url in external_platforms.unsupported.items():
-                platform, platform_id = _extract_platform_info(url)
-                if platform and platform_id and platform not in ("WEBSITE", "LINK_IN_BIO"):
-                    await _queue_single_account(
-                        session, platform, platform_id, parent_handle, status, category
-                    )
+    # Scan URLs from biography, website, and link_in_bio for additional platforms
+    urls_to_scan: list[str] = []
+
+    # Extract URLs from biography
+    if biography:
+        bio_urls = URL_PATTERN.findall(biography)
+        urls_to_scan.extend(bio_urls)
+
+    # Add website URL if present
+    if website:
+        urls_to_scan.append(website)
+
+    # Add link_in_bio URL if present
+    if link_in_bio:
+        urls_to_scan.append(link_in_bio)
+
+    # Deduplicate URLs while preserving order
+    seen_urls: set[str] = set()
+    unique_urls: list[str] = []
+    for url in urls_to_scan:
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_urls.append(url)
+
+    # Extract platform info from each URL and queue discovered accounts
+    for url in unique_urls:
+        platform, platform_id = _extract_platform_info(url)
+        if platform and platform_id:
+            # Skip WEBSITE and LINK_IN_BIO - they are not social platform accounts
+            if platform in ("WEBSITE", "LINK_IN_BIO"):
+                continue
+            await _queue_if_new(platform, platform_id)
+
+    if not queued_accounts:
+        logger.debug(
+            "[SPIDER] No external social accounts discovered in bio of parent account %s.",
+            parent_handle,
+        )
 
 
 async def queue_discovered_mentions(

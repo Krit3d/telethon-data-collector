@@ -17,8 +17,7 @@ from src.parser.creators.core.schemas import (
     AccountMetadata,
     Contacts,
     ExternalPlatforms,
-    GeoData,
-    MetricsEntry,
+    GeoData
 )
 
 logger = logging.getLogger(__name__)
@@ -708,24 +707,6 @@ def compile_author_metadata(
         threads=external_platforms_dict.get("threads"),
         tiktok=external_platforms_dict.get("tiktok"),
     )
-
-    # Check for unsupported platforms (platforms in external_links not in known platforms)
-    unsupported: dict[str, str] | None = None
-    for link in remaining_external_links:
-        # Try to extract platform name from URL
-        domain_match = re.search(r"https?://(?:www\.)?([^/]+)", link)
-        if domain_match:
-            domain = domain_match.group(1).lower()
-            # Skip if already in external_platforms or social media domains
-            if domain not in SOCIAL_MEDIA_DOMAINS:
-                if unsupported is None:
-                    unsupported = {}
-                # Use domain as platform name
-                platform_name = domain.split(".")[0]
-                unsupported[platform_name] = link
-
-    if unsupported:
-        external_platforms.unsupported = unsupported
 
     # Build Contacts model
     contacts = Contacts(

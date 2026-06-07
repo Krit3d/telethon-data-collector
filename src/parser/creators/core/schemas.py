@@ -67,14 +67,12 @@ class ExternalPlatforms(BaseModel):
         youtube: YouTube channel URL or handle.
         threads: Threads profile URL or handle.
         tiktok: TikTok profile URL or handle.
-        unsupported: Dictionary mapping unsupported platform names to handles.
     """
 
     vk: str | None = None
     youtube: str | None = None
     threads: str | None = None
     tiktok: str | None = None
-    unsupported: dict[str, str] | None = None
 
 
 class AccountMetadata(BaseModel):
