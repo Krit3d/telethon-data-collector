@@ -4,8 +4,8 @@ Text processing and validation helpers for social media profile parsing.
 This module provides:
     - Cyrillic (Russian) text detection
     - AI-slop / theme-page / meme-page detection via stop-words
-    - Female creator detection based on Russian biography indicators
     - Timezone-aware datetime parser for published_at timestamps
+    - WebVTT subtitle content cleaning utilities
 """
 
 import logging
@@ -86,26 +86,6 @@ SLOP_STOP_WORDS: frozenset[str] = frozenset({
     "сохрани",
 })
 
-# ---------------------------------------------------------------------------
-# Female indicator patterns for biography scanning
-# ---------------------------------------------------------------------------
-
-# Russian female indicator patterns for biography scanning
-FEMALE_INDICATOR_PATTERNS: list[re.Pattern[str]] = [
-    # Direct female role indicators
-    re.compile(r"\bблогерша\b", re.IGNORECASE),
-    re.compile(r"\bмама\b", re.IGNORECASE),
-    re.compile(r"\bосновательница\b", re.IGNORECASE),
-    re.compile(r"\bсоздала\b", re.IGNORECASE),
-    re.compile(r"\bавторка\b", re.IGNORECASE),
-    re.compile(r"\bэкспертка\b", re.IGNORECASE),
-    re.compile(r"\bдевушка\b", re.IGNORECASE),
-    # Verbs ending in "ась" or "ла" (female past tense indicators)
-    re.compile(r"\b\w+[аэоуыяёю]ла\b", re.IGNORECASE),
-    re.compile(r"\b\w+ась\b", re.IGNORECASE),
-    re.compile(r"\b\w+лась\b", re.IGNORECASE),
-]
-
 
 def is_russian_text(text: str | None) -> bool:
     """Check if text contains any Cyrillic (Russian) characters.
@@ -145,30 +125,6 @@ def is_slop_or_theme_page(username: str | None, biography: str | None) -> bool:
         search_text += biography.lower()
 
     return any(stop_word in search_text for stop_word in SLOP_STOP_WORDS)
-
-
-def detect_female_creator(biography: str | None) -> bool:
-    """Detect if a creator is likely female based on Russian biography text.
-
-    Scans the biography for Russian female indicators such as:
-    - Female role words: "блогерша", "мама", "основательница", "создала",
-      "авторка", "экспертка", "девушка"
-    - Verbs ending in "ась" or "ла" (female past tense forms)
-
-    Args:
-        biography: The biography text to scan, or None.
-
-    Returns:
-        True if female indicators are detected, False otherwise.
-    """
-    if not biography:
-        return False
-
-    for pattern in FEMALE_INDICATOR_PATTERNS:
-        if pattern.search(biography):
-            return True
-
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -262,3 +218,45 @@ def parse_published_at(timestamp: Any) -> datetime:
 
     # --- Final fallback ---------------------------------------------------
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# WebVTT subtitle content cleaning
+# ---------------------------------------------------------------------------
+
+# Pre-compile VTT cleaning regex patterns for performance
+_VTT_HEADER_PATTERN = re.compile(r"^WEBVTT[\s\S]*?(?:\n\n|\Z)", re.MULTILINE)
+_VTT_TIMESTAMP_PATTERN = re.compile(
+    r"\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}[^\n]*\n?",
+    re.MULTILINE,
+)
+_VTT_METADATA_PATTERN = re.compile(r"\{.*?\}", re.MULTILINE)
+_VTT_EMPTY_LINES_PATTERN = re.compile(r"\n{3,}")
+_VTT_CONSECUTIVE_DUPLICATES_PATTERN = re.compile(r"^(.*)(\n\1)+$", re.MULTILINE)
+
+
+def clean_vtt_content(vtt_content: str) -> str:
+    """Clean VTT subtitle content by removing headers, timestamps, and metadata.
+
+    Args:
+        vtt_content: Raw VTT subtitle content.
+
+    Returns:
+        Cleaned text content with headers, timestamps, and metadata removed.
+    """
+    # Remove WEBVTT header
+    content = _VTT_HEADER_PATTERN.sub("", vtt_content)
+
+    # Remove timestamp lines
+    content = _VTT_TIMESTAMP_PATTERN.sub("", content)
+
+    # Remove metadata tags
+    content = _VTT_METADATA_PATTERN.sub("", content)
+
+    # Normalize whitespace and remove empty lines
+    content = _VTT_EMPTY_LINES_PATTERN.sub("\n\n", content)
+
+    # Remove consecutive duplicate lines
+    content = _VTT_CONSECUTIVE_DUPLICATES_PATTERN.sub(r"\1", content)
+
+    return content.strip()

@@ -10,10 +10,8 @@ Features:
     - Profile parsing with account upsert to accounts table
     - Minimum and maximum subscriber threshold enforcement (3k-150k)
     - Russian language content filtering
-    - AI-slop and theme-page filtering
-    - Female creator detection
     - Virtual profile post creation for semantic search over biographies
-    - YouTube content fetching via v1 API with pagination using continuationToken
+    - YouTube content fetching via v1 API (single call, no pagination)
     - Concurrent transcript fetching using asyncio.Semaphore (limit 5)
     - PostgreSQL ON CONFLICT DO UPDATE for high-throughput concurrency
     - Raw metadata preservation for OpenSPG processing
@@ -27,23 +25,22 @@ from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import ClientResponseError
-
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.config.config import Settings
 from src.db.models import Account, Content
-from src.parser.creators.core.utils import (
-    is_russian_text,
-    is_slop_or_theme_page,
-    detect_female_creator,
+from src.parser.creators.core.db import (
+    upsert_and_deduplicate_account,
+    update_account_profile_metadata,
+    bulk_upsert_content,
     upsert_virtual_bio_post,
     queue_discovered_accounts,
     queue_discovered_mentions,
+)
+from src.parser.creators.core.utils import (
+    is_russian_text,
+    is_slop_or_theme_page,
     extract_mentions,
     parse_profile_contacts,
     parse_published_at,
@@ -61,6 +58,9 @@ MAX_SUBSCRIBERS: int = 150000
 
 # Semaphore limit for concurrent transcript fetching
 TRANSCRIPT_SEMAPHORE_LIMIT: int = 5
+
+# Maximum number of videos to collect
+MAX_VIDEOS: int = 10
 
 
 class YouTubeParser(BasePlatformParser):
@@ -194,684 +194,6 @@ class YouTubeParser(BasePlatformParser):
             )
             return None
 
-    async def parse_profile(self, handle: str) -> int | None:
-        """Fetch YouTube profile, upsert account to database, return account ID.
-
-        Parses the YouTube channel profile for the given handle, checks if the channel
-        meets the subscriber threshold (3k-150k), verifies Russian language content,
-        filters out AI-slop and theme pages, detects female creators, extracts
-        author profile metadata (external links, contacts, location, language),
-        upserts the account information to the accounts table, creates a virtual
-        profile post for semantic search, queues discovered accounts for cross-platform
-        spidering, and returns the database ID.
-
-        Args:
-            handle: YouTube channel handle (without @ prefix) or custom URL.
-
-        Returns:
-            Database ID of the upserted account record, or None if the profile
-            could not be parsed or doesn't meet the filtering criteria.
-        """
-        logger.info("Starting YouTube profile parse for handle: %s", handle)
-
-        channel = await self._get_cached_or_fetch_profile(handle)
-        if not channel:
-            return None
-
-        # Extract channel ID and subscriber count
-        channel_id: str = str(
-            channel.get("id")
-            or channel.get("channelId")
-            or channel.get("channel_id")
-            or ""
-        )
-        if not channel_id:
-            logger.error(
-                "Could not extract channel ID for YouTube handle %s", handle
-            )
-            return None
-
-        subscriber_count: int = self._extract_subscriber_count(channel)
-
-        # Check if account meets subscriber thresholds [3000, 150000]
-        if (
-            subscriber_count < MIN_SUBSCRIBERS
-            or subscriber_count > MAX_SUBSCRIBERS
-        ):
-            logger.info(
-                "YouTube handle %s has %d subscribers, outside threshold [%d, %d]. Rejecting.",
-                handle,
-                subscriber_count,
-                MIN_SUBSCRIBERS,
-                MAX_SUBSCRIBERS,
-            )
-            await self._upsert_account(channel, status="rejected")
-            return None
-
-        # Extract description and full_name for filtering
-        description: str | None = (
-            channel.get("description")
-            or channel.get("bio")
-            or channel.get("channelDescription")
-        )
-        full_name: str | None = (
-            channel.get("title")
-            or channel.get("channelTitle")
-            or channel.get("name")
-        )
-
-        # Check for Russian language content in description OR full_name
-        if not (is_russian_text(description) or is_russian_text(full_name)):
-            logger.info(
-                "YouTube handle %s does not contain Russian text in description or title. Rejecting.",
-                handle,
-            )
-            await self._upsert_account(channel, status="rejected")
-            return None
-
-        # Check for AI-slop / theme-page / meme-page
-        username: str | None = (
-            channel.get("handle")
-            or channel.get("customUrl")
-            or channel.get("username")
-        )
-        if is_slop_or_theme_page(username, description):
-            logger.info(
-                "YouTube handle %s detected as AI-slop or theme page. Rejecting.",
-                handle,
-            )
-            await self._upsert_account(channel, status="rejected")
-            return None
-
-        # Detect female creator
-        female_heuristic = detect_female_creator(description)
-        if female_heuristic:
-            logger.info("YouTube handle %s detected as female creator.", handle)
-
-        # Upsert account with 'parsed' status
-        account_id: int = await self._upsert_account(channel, status="parsed")
-        logger.info(
-            "Successfully parsed YouTube profile %s, account ID: %d, subscribers: %d",
-            handle,
-            account_id,
-            subscriber_count,
-        )
-
-        # Upsert virtual profile post for semantic search over biography
-        raw_metadata: dict[str, Any] = {}
-        if female_heuristic:
-            raw_metadata["female_heuristic"] = True
-
-        async with self.session_maker() as session:
-            await upsert_virtual_bio_post(
-                session=session,
-                account_id=account_id,
-                platform="YOUTUBE",
-                platform_id=channel_id,
-                username=username,
-                full_name=full_name,
-                biography=description,
-                subscribers_count=subscriber_count,
-                raw_metadata=raw_metadata if raw_metadata else None,
-            )
-            await session.commit()
-
-        # Queue discovered accounts from contacts for cross-platform spidering
-        contacts_dict: dict[str, Any] = parse_profile_contacts(
-            description, None
-        )
-        async with self.session_maker() as session:
-            await queue_discovered_accounts(session, contacts_dict, handle)
-            await session.commit()
-
-        return account_id
-
-    async def parse_content(
-        self,
-        account_id: int,
-        platform_id: str,
-        max_items: int = 50,
-    ) -> None:
-        """Fetch YouTube content via v1 API, fetch transcripts, and bulk upsert to content table.
-
-        Implements Smart Adaptive Pagination:
-        - Early exit on page 1 if no videos found (dead channels)
-        - 5-page ceiling to limit credit usage
-        - Collects up to max_items (50) valid videos/Shorts
-
-        Retrieves YouTube videos for the given channel using the Scrape Creators
-        API v1 with pagination support (using continuationToken), parses the data,
-        concurrently fetches transcripts for all videos using a semaphore limit of 5,
-        and performs a bulk upsert into the content table using PostgreSQL
-        ON CONFLICT DO UPDATE.
-
-        The content text is formed by concatenating title, description, and transcript
-        from the video payload. Unlike Instagram, YouTube videos have no duration
-        limit for transcript fetching.
-
-        The raw_metadata field contains:
-            - "author_profile_metadata": Profile-level data (contacts, links, location, etc.)
-            - "platform_metrics": Platform-specific engagement metrics
-
-        Args:
-            account_id: Database ID of the parent account record.
-            platform_id: YouTube channel ID (UC...) or handle.
-            max_items: Maximum number of content items to fetch (default: 50).
-        """
-        # Smart Adaptive Pagination: 5-page ceiling to limit credit usage
-        MAX_PAGES_TO_CHECK: int = 5
-
-        logger.info(
-            "Starting YouTube content parse for account_id: %d, platform_id: %s, max_items: %d",
-            account_id,
-            platform_id,
-            max_items,
-        )
-
-        # Fetch the account's username (handle) from the database
-        handle: str = platform_id  # fallback to platform_id (channel ID)
-        try:
-            async with self.session_maker() as session:
-                stmt = select(Account.username).where(Account.id == account_id)
-                result = await session.execute(stmt)
-                db_username: str | None = result.scalar_one_or_none()
-                if db_username:
-                    handle = db_username
-                    logger.debug(
-                        "Using username '%s' as handle for account_id: %d",
-                        handle,
-                        account_id,
-                    )
-                else:
-                    logger.warning(
-                        "Username not found for account_id: %d, falling back to platform_id: %s",
-                        account_id,
-                        platform_id,
-                    )
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch username for account_id: %d: %s. Using platform_id as fallback.",
-                account_id,
-                e,
-            )
-
-        # Format handle for API call
-        formatted_handle = self._format_handle(handle)
-
-        # Determine correct parameter key (channelId for UC..., handle otherwise)
-        param_key = self._get_api_param_key(formatted_handle)
-        if param_key == "channelId":
-            logger.debug(
-                "Using channelId parameter for handle: %s", formatted_handle
-            )
-        else:
-            logger.debug(
-                "Using handle parameter for handle: %s", formatted_handle
-            )
-
-        # Collect all videos using pagination with continuationToken
-        all_videos: list[dict[str, Any]] = []
-        continuation_token: str | None = None
-
-        # Track page count for safety limit
-        page_count = 0
-
-        try:
-            while len(all_videos) < max_items:
-                page_count += 1
-
-                # Ceiling Check: stop pagination after MAX_PAGES_TO_CHECK pages
-                if page_count >= MAX_PAGES_TO_CHECK:
-                    logger.info(
-                        "Reached page limit (%d) for account %s, stopping pagination with %d videos collected",
-                        MAX_PAGES_TO_CHECK, platform_id, len(all_videos)
-                    )
-                    break
-
-                # Page fetch log with required format
-                logger.debug("Fetching page %d of posts for %s...", page_count, platform_id)
-
-                # Build request parameters with correct key
-                params: dict[str, Any] = {param_key: formatted_handle}
-                if continuation_token:
-                    params["continuationToken"] = continuation_token
-
-                # Fetch videos from v1 API
-                response: dict[str, Any] = await self.client.get(
-                    endpoint="/v1/youtube/channel-videos",
-                    params=params,
-                )
-                logger.debug(
-                    "API response status for YouTube videos, handle %s: success, remaining credits: %s",
-                    formatted_handle,
-                    response.get("credits_remaining", "N/A"),
-                )
-
-                # Extract videos from response (v1 API returns videos at root level)
-                videos: list[dict[str, Any]] = response.get("videos", [])
-                if not videos:
-                    logger.info(
-                        "No more videos found for handle %s", formatted_handle
-                    )
-                    break
-
-                all_videos.extend(videos)
-                logger.debug(
-                    "Fetched %d videos, total collected: %d",
-                    len(videos),
-                    len(all_videos),
-                )
-
-                # Early Exit Check: After processing page 1, if no videos found,
-                # immediately break to avoid wasting credits on dead channels
-                if page_count == 1 and len(all_videos) == 0:
-                    logger.info(
-                        "Early exit: No videos found on page 1 for %s. Stopping to avoid credit waste.",
-                        platform_id
-                    )
-                    break
-
-                # Check for continuation token at root level
-                continuation_token = response.get("continuationToken")
-                if not continuation_token:
-                    logger.debug(
-                        "No more pages for handle %s", formatted_handle
-                    )
-                    break
-
-            if not all_videos:
-                logger.info(
-                    "No YouTube videos found for account_id: %d", account_id
-                )
-                return
-
-            # Limit to max_items
-            all_videos = all_videos[:max_items]
-
-            # Build author profile metadata once (reused for all content items)
-            channel_data: dict[str, Any] = (
-                self._cached_profile if self._cached_profile else {}
-            )
-            author_metadata = self._build_author_profile_metadata(channel_data)
-
-            # Fetch transcripts concurrently with semaphore limit of 5
-            transcript_map: dict[str, str | None] = {}
-            if all_videos:
-                logger.info(
-                    "Fetching transcripts for %d videos with semaphore limit %d",
-                    len(all_videos),
-                    TRANSCRIPT_SEMAPHORE_LIMIT,
-                )
-                semaphore = asyncio.Semaphore(TRANSCRIPT_SEMAPHORE_LIMIT)
-                tasks = [
-                    self._fetch_transcript(video, semaphore)
-                    for video in all_videos
-                ]
-                transcript_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Build map of video_id -> transcript text
-                for video, result in zip(all_videos, transcript_results):
-                    video_id = str(
-                        video.get("id")
-                        or video.get("videoId")
-                        or video.get("video_id")
-                        or ""
-                    )
-                    if isinstance(result, Exception):
-                        logger.warning(
-                            "Failed to fetch transcript for video %s: %s",
-                            video_id,
-                            result,
-                        )
-                        transcript_map[video_id] = None
-                    else:
-                        # result is str | None at this point (Exception already handled)
-                        transcript_map[video_id] = result if isinstance(result, (str, type(None))) else None
-
-            # Process and upsert content items
-            await self._upsert_content(
-                all_videos, account_id, author_metadata, transcript_map, handle
-            )
-            logger.info(
-                "Successfully upserted %d YouTube content items for account_id: %d",
-                len(all_videos),
-                account_id,
-            )
-
-        except ClientResponseError as e:
-            if e.status == 404:
-                logger.warning(
-                    "YouTube videos for %s not found (404).", formatted_handle
-                )
-            else:
-                logger.error(
-                    "YouTube videos API request failed for %s with HTTP %d: %s",
-                    formatted_handle,
-                    e.status,
-                    e,
-                )
-        except Exception as e:
-            logger.error(
-                "Failed to parse YouTube videos for account_id %d: %s",
-                account_id,
-                e,
-                exc_info=True,
-            )
-            raise
-
-    async def _fetch_transcript(
-        self, video: dict[str, Any], semaphore: asyncio.Semaphore
-    ) -> str | None:
-        """Fetch transcript for a single YouTube video.
-
-        Implements a zero-cost hybrid pipeline:
-        - Step 1: Try youtube-transcript-api library (free, no API credits).
-          Runs synchronously via asyncio.to_thread to avoid blocking.
-          Prioritizes Russian (ru) then English (en) transcripts.
-        - Step 2: Fall back to Scrape Creators API (/v1/youtube/video/transcript)
-          if the local extraction fails (TranscriptsDisabled, NoTranscriptFound,
-          network errors, or HTTP 429 rate limits from Google).
-
-        Args:
-            video: Video dictionary containing the video ID.
-            semaphore: asyncio.Semaphore to limit concurrent requests.
-
-        Returns:
-            Joined transcript text, or None if fetching fails or no transcript available.
-        """
-        video_id = str(
-            video.get("id")
-            or video.get("videoId")
-            or video.get("video_id")
-            or ""
-        )
-        if not video_id:
-            return None
-
-        url = f"https://www.youtube.com/watch?v={video_id}"
-
-        # Transcript request log with required format
-        logger.debug("Requesting transcript for video: %s", url)
-
-        async with semaphore:
-            # Step 1: Free local extraction via youtube-transcript-api
-            try:
-                # Create API instance (proxies can be configured via env vars if needed)
-                api = YouTubeTranscriptApi()
-
-                # Run synchronous library call in a non-blocking thread
-                # fetch() returns FetchedTranscript (iterable of segment objects)
-                fetched_transcript = await asyncio.to_thread(
-                    api.fetch,
-                    video_id,
-                    ["ru", "en"],
-                )
-
-                # Convert FetchedTranscript segments to text
-                # Each segment is an object with .text, .start, .duration attributes
-                transcript_text = " ".join(
-                    str(segment.text) if hasattr(segment, "text") else str(segment)
-                    for segment in fetched_transcript
-                )
-
-                if transcript_text.strip():
-                    logger.debug(
-                        "Successfully retrieved transcript (free) for video %s",
-                        url[:50],
-                    )
-                    return transcript_text.strip()
-
-            except (TranscriptsDisabled, NoTranscriptFound) as e:
-                logger.debug(
-                    "No transcript available for video %s: %s",
-                    video_id,
-                    e,
-                )
-                return None
-            except Exception as e:
-                # Catch rate limits (HTTP 429), connection errors, etc.
-                logger.warning(
-                    "Free transcript extraction failed for video %s: %s. "
-                    "Falling back to Scrape Creators API.",
-                    video_id,
-                    e,
-                )
-
-            # Step 2: Defensive fallback to Scrape Creators API
-            try:
-                response: dict[str, Any] = await self.client.get(
-                    endpoint="/v1/youtube/video/transcript",
-                    params={"url": url},
-                )
-
-                # Extract transcript segments from response
-                segments = response.get("transcript") or []
-                if not segments:
-                    logger.debug("No transcript available for video: %s", url[:50])
-                    return None
-
-                # Join the "text" field of each segment with a space
-                transcript_text = " ".join(
-                    segment.get("text", "")
-                    for segment in segments
-                    if isinstance(segment, dict)
-                )
-
-                if transcript_text:
-                    logger.debug(
-                        "Successfully retrieved transcript (Scrape Creators) for video %s",
-                        url[:50],
-                    )
-                    return transcript_text
-                return None
-
-            except ClientResponseError as e:
-                if e.status == 404:
-                    logger.debug(
-                        "Transcript not found for video %s (404)", video_id
-                    )
-                else:
-                    logger.warning(
-                        "Failed to fetch transcript for video %s: HTTP %d: %s",
-                        video_id,
-                        e.status,
-                        e,
-                    )
-                return None
-            except Exception as e:
-                logger.warning(
-                    "Error fetching transcript for video %s: %s",
-                    video_id,
-                    e,
-                )
-                return None
-
-    async def _upsert_content(
-        self,
-        videos: list[dict[str, Any]],
-        account_id: int,
-        author_metadata: dict[str, Any],
-        transcript_map: dict[str, str | None],
-        parent_handle: str,
-    ) -> None:
-        """Bulk upsert YouTube content records to database.
-
-        Args:
-            videos: List of YouTube video dictionaries from API responses.
-            account_id: ID of the parent Account record.
-            author_metadata: Author profile metadata to embed in each content record.
-            transcript_map: Dictionary mapping video_id to transcript text.
-            parent_handle: Channel handle for discovery spider parent reference.
-        """
-        content_values: list[dict[str, Any]] = []
-
-        for video in videos:
-            try:
-                # Extract platform_content_id from video id
-                platform_content_id: str = str(
-                    video.get("id")
-                    or video.get("videoId")
-                    or video.get("video_id")
-                    or ""
-                )
-                if not platform_content_id:
-                    logger.warning("Skipping content item with no ID")
-                    continue
-
-                # Extract title and description, concatenate for content text
-                title: str = video.get("title") or ""
-                description: str | None = video.get("description") or video.get(
-                    "videoDescription"
-                )
-
-                # Concatenate title and description for text column
-                if description:
-                    content_text: str = f"{title} {description}".strip()
-                else:
-                    content_text: str = title.strip()
-
-                # Append transcript to content text if available
-                transcript = transcript_map.get(platform_content_id)
-                if transcript:
-                    if content_text:
-                        content_text = f"{content_text}\n\n[TRANSCRIPT]\n{transcript}"
-                    else:
-                        content_text = f"[TRANSCRIPT]\n{transcript}"
-
-                if not content_text:
-                    logger.warning(
-                        "Skipping content item with no title, description, or transcript"
-                    )
-                    continue
-
-                # Content-based Discovery Spider
-                # Extract cross-platform links and same-platform mentions from video text
-                if content_text:
-                    try:
-                        # Parse profile contacts (cross-platform links)
-                        contacts_dict = parse_profile_contacts(content_text)
-                        # Extract same-platform mentions (e.g., @otheruser)
-                        mentions = extract_mentions(content_text)
-
-                        # Queue discovered accounts in independent session
-                        async with self.session_maker() as session:
-                            # Cross-platform links
-                            await queue_discovered_accounts(
-                                session, contacts_dict, parent_handle
-                            )
-                            # Same-platform mentions
-                            await queue_discovered_mentions(
-                                session, "YOUTUBE", mentions, parent_handle
-                            )
-                            await session.commit()
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to queue discovered accounts from YouTube video %s: %s",
-                            platform_content_id, e,
-                        )
-
-                # Extract published timestamp using shared utility
-                publish_time = (
-                    video.get("publishedAt")
-                    or video.get("publishDate")
-                    or video.get("published")
-                )
-                published_at = parse_published_at(publish_time)
-
-                # Extract engagement metrics
-                statistics = video.get("statistics") or video.get("stats") or {}
-                views: int | None = (
-                    video.get("viewCount")
-                    or statistics.get("viewCount")
-                    or video.get("views")
-                )
-                reactions_count: int | None = (
-                    video.get("likeCount")
-                    or statistics.get("likeCount")
-                    or video.get("likes")
-                )
-                comments_count: int | None = (
-                    video.get("commentCount")
-                    or statistics.get("commentCount")
-                    or video.get("comments")
-                )
-                shares_count: int | None = (
-                    video.get("shareCount")
-                    or statistics.get("shareCount")
-                    or video.get("shares")
-                )
-
-                # Build platform metrics
-                platform_metrics: dict[str, Any] = {
-                    "views": views,
-                    "likes": reactions_count,
-                    "comments": comments_count,
-                    "shares": shares_count,
-                    "duration": video.get("duration"),
-                    "definition": video.get("definition"),
-                }
-
-                # Build raw_metadata with author_profile_metadata and platform_metrics
-                raw_metadata: dict[str, Any] = {
-                    "author_profile_metadata": author_metadata,
-                    "platform_metrics": platform_metrics,
-                }
-
-                content_values.append(
-                    {
-                        "account_id": account_id,
-                        "platform_content_id": platform_content_id,
-                        "content": content_text,
-                        "transcription": transcript,  # Store transcript in transcription column
-                        "published_at": published_at,
-                        "views": views,
-                        "reactions_count": reactions_count,
-                        "comments_count": comments_count,
-                        "shares_count": shares_count,
-                        "has_media": True,  # YouTube videos are media
-                        "raw_metadata": raw_metadata,
-                        "is_embedded": False,
-                        "is_graph_extracted": False,
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                )
-
-            except Exception as e:
-                logger.error(
-                    "Failed to process YouTube video item: %s",
-                    e,
-                    exc_info=True,
-                )
-                continue
-
-        if not content_values:
-            logger.info("No valid YouTube content items to upsert")
-            return
-
-        # Bulk upsert using PostgreSQL ON CONFLICT on uq_content_account_platform_id
-        async with self.session_maker() as session:
-            stmt = pg_insert(Content).values(content_values)
-            stmt = stmt.on_conflict_do_update(
-                constraint="uq_content_account_platform_id",
-                set_=dict(
-                    content=stmt.excluded.content,
-                    transcription=stmt.excluded.transcription,
-                    views=stmt.excluded.views,
-                    reactions_count=stmt.excluded.reactions_count,
-                    comments_count=stmt.excluded.comments_count,
-                    shares_count=stmt.excluded.shares_count,
-                    raw_metadata=stmt.excluded.raw_metadata,
-                    updated_at=stmt.excluded.updated_at,
-                ),
-            )
-            await session.execute(stmt)
-            await session.commit()
-            logger.debug(
-                "Bulk upserted %d YouTube content items for account_id: %d",
-                len(content_values),
-                account_id,
-            )
-
     def _extract_subscriber_count(self, channel: dict[str, Any]) -> int:
         """Extract subscriber count from YouTube channel object.
 
@@ -932,7 +254,6 @@ class YouTubeParser(BasePlatformParser):
         contacts_dict: dict[str, Any] = parse_profile_contacts(
             description, None
         )
-        # parse_profile_contacts returns: {emails, telegram_handles, external_links, raw_bio}
 
         # Build contacts list in the format expected by OpenSPG
         contacts: list[str] = []
@@ -998,85 +319,606 @@ class YouTubeParser(BasePlatformParser):
         # Remove None values for cleaner JSON
         return {k: v for k, v in author_metadata.items() if v is not None}
 
-    async def _upsert_account(
-        self, channel: dict[str, Any], status: str = "parsed"
-    ) -> int:
-        """Upsert YouTube account record using select-then-insert/update pattern.
+    async def parse_profile(self, handle: str) -> int | None:
+        """Fetch YouTube profile, upsert account to database, return account ID.
 
-        Uses a select-then-upsert transaction pattern to avoid InvalidColumnReferenceError
-        caused by missing unique constraint on (platform, platform_id) in the accounts table.
+        Parses the YouTube channel profile for the given handle, checks if the channel
+        meets the subscriber threshold (3k-150k), verifies Russian language content,
+        filters out AI-slop and theme pages, upserts the account information to the
+        accounts table, creates a virtual profile post for semantic search, queues
+        discovered accounts for cross-platform spidering, and returns the database ID.
 
         Args:
-            channel: Channel object from Scrape Creators API response.
-            status: Account status ('parsed', 'rejected', etc.).
+            handle: YouTube channel handle (without @ prefix) or custom URL.
 
         Returns:
-            ID of the account record (auto-generated by PostgreSQL for new records).
+            Database ID of the upserted account record, or None if the profile
+            could not be parsed or doesn't meet the filtering criteria.
         """
-        platform_id: str = str(
+        logger.info("Starting YouTube profile parse for handle: %s", handle)
+
+        channel = await self._get_cached_or_fetch_profile(handle)
+        if not channel:
+            return None
+
+        # Extract channel ID and subscriber count
+        channel_id: str = str(
             channel.get("id")
             or channel.get("channelId")
             or channel.get("channel_id")
             or ""
         )
-        username: str | None = (
-            channel.get("handle")
-            or channel.get("customUrl")
-            or channel.get("username")
+        if not channel_id:
+            logger.error(
+                "Could not extract channel ID for YouTube handle %s", handle
+            )
+            return None
+
+        subscriber_count: int = self._extract_subscriber_count(channel)
+
+        # Check if account meets subscriber thresholds [3000, 150000]
+        if (
+            subscriber_count < MIN_SUBSCRIBERS
+            or subscriber_count > MAX_SUBSCRIBERS
+        ):
+            logger.info(
+                "YouTube handle %s has %d subscribers, outside threshold [%d, %d]. Rejecting.",
+                handle,
+                subscriber_count,
+                MIN_SUBSCRIBERS,
+                MAX_SUBSCRIBERS,
+            )
+            async with self.session_maker() as session:
+                await upsert_and_deduplicate_account(
+                    session=session,
+                    platform="YOUTUBE",
+                    platform_id=channel_id,
+                    username=channel.get("handle") or channel.get("customUrl"),
+                    title=channel.get("title") or channel.get("name") or "Unknown",
+                    description=channel.get("description") or channel.get("bio"),
+                    subscribers_count=subscriber_count,
+                    status="rejected",
+                )
+                await session.commit()
+            return None
+
+        # Extract description and full_name for filtering
+        description: str | None = (
+            channel.get("description")
+            or channel.get("bio")
+            or channel.get("channelDescription")
         )
         full_name: str | None = (
             channel.get("title")
             or channel.get("channelTitle")
             or channel.get("name")
         )
-        description: str | None = (
-            channel.get("description")
-            or channel.get("bio")
-            or channel.get("channelDescription")
-        )
-        subscriber_count: int = self._extract_subscriber_count(channel)
 
-        async with self.session_maker() as session:
-            # Select existing account by platform and platform_id
-            stmt = select(Account).where(
-                Account.platform == "YOUTUBE",
-                Account.platform_id == platform_id,
+        # Check for Russian language content in description OR full_name
+        # This is our zero-cost filter against foreign spam
+        if not (is_russian_text(description) or is_russian_text(full_name)):
+            logger.info(
+                "YouTube handle %s does not contain Russian text in description or title. Rejecting.",
+                handle,
             )
-            result = await session.execute(stmt)
-            db_account: Account | None = result.scalar_one_or_none()
-
-            if db_account:
-                # Update existing record
-                db_account.username = username
-                db_account.title = full_name or username or "Unknown"
-                db_account.description = description
-                db_account.subscribers_count = subscriber_count
-                db_account.status = status
-                db_account.updated_at = datetime.now(timezone.utc)
-                logger.debug(
-                    "Updated existing YouTube account %s (ID: %d, status: %s)",
-                    username,
-                    db_account.id,
-                    status,
-                )
-            else:
-                # Create new record (let PostgreSQL generate ID)
-                db_account = Account(
+            async with self.session_maker() as session:
+                await upsert_and_deduplicate_account(
+                    session=session,
                     platform="YOUTUBE",
-                    platform_id=platform_id,
-                    username=username,
-                    title=full_name or username or "Unknown",
+                    platform_id=channel_id,
+                    username=channel.get("handle") or channel.get("customUrl"),
+                    title=full_name or "Unknown",
                     description=description,
                     subscribers_count=subscriber_count,
-                    status=status,
+                    status="rejected",
                 )
-                session.add(db_account)
-                logger.debug(
-                    "Created new YouTube account %s (status: %s)",
-                    username,
-                    status,
+                await session.commit()
+            return None
+
+        # Check for AI-slop / theme-page / meme-page
+        username: str | None = (
+            channel.get("handle")
+            or channel.get("customUrl")
+            or channel.get("username")
+        )
+        if is_slop_or_theme_page(username, description):
+            logger.info(
+                "YouTube handle %s detected as AI-slop or theme page. Rejecting.",
+                handle,
+            )
+            async with self.session_maker() as session:
+                await upsert_and_deduplicate_account(
+                    session=session,
+                    platform="YOUTUBE",
+                    platform_id=channel_id,
+                    username=username,
+                    title=full_name or "Unknown",
+                    description=description,
+                    subscribers_count=subscriber_count,
+                    status="rejected",
                 )
+                await session.commit()
+            return None
+
+        # Upsert account with 'processing' status
+        async with self.session_maker() as session:
+            account_id: int = await upsert_and_deduplicate_account(
+                session=session,
+                platform="YOUTUBE",
+                platform_id=channel_id,
+                username=username,
+                title=full_name or "Unknown",
+                description=description,
+                subscribers_count=subscriber_count,
+                status="processing",
+            )
+
+            # Update biography and trigger cross-platform queue discovery
+            await update_account_profile_metadata(
+                session=session,
+                account_id=account_id,
+                platform="YOUTUBE",
+                biography=description,
+            )
+
+            # Create a standard virtual profile post in the Content table
+            await upsert_virtual_bio_post(
+                session=session,
+                account_id=account_id,
+                platform="YOUTUBE",
+                platform_id=channel_id,
+                username=username,
+                full_name=full_name,
+                biography=description,
+                subscribers_count=subscriber_count,
+                raw_metadata=None,  # No female flags
+            )
 
             await session.commit()
-            await session.refresh(db_account)
-            return db_account.id
+
+        # Update account status to 'parsed'
+        async with self.session_maker() as session:
+            await upsert_and_deduplicate_account(
+                session=session,
+                platform="YOUTUBE",
+                platform_id=channel_id,
+                username=username,
+                title=full_name or "Unknown",
+                description=description,
+                subscribers_count=subscriber_count,
+                status="parsed",
+            )
+            await session.commit()
+
+        logger.info(
+            "Successfully parsed YouTube profile %s, account ID: %d, subscribers: %d",
+            handle,
+            account_id,
+            subscriber_count,
+        )
+
+        return account_id
+
+    async def parse_content(
+        self,
+        account_id: int,
+        platform_id: str,
+        max_items: int = MAX_VIDEOS,
+    ) -> None:
+        """Fetch YouTube content via v1 API, fetch transcripts, and bulk upsert to content table.
+
+        Performs exactly ONE API call to '/v1/youtube/channel-videos' (no pagination).
+        Collects a MAXIMUM of 10 items.
+
+        Retrieves YouTube videos for the given channel using the Scrape Creators
+        API v1, parses the data, concurrently fetches transcripts for videos that
+        don't contain target keywords (using a semaphore limit of 5),
+        and performs a bulk upsert into the content table using PostgreSQL
+        ON CONFLICT DO UPDATE.
+
+        The content text is formed by concatenating title, description, and transcript
+        from the video payload.
+
+        The raw_metadata field contains:
+            - "author_profile_metadata": Profile-level data (contacts, links, location, etc.)
+            - "platform_metrics": Platform-specific engagement metrics including video_url
+
+        Args:
+            account_id: Database ID of the parent account record.
+            platform_id: YouTube channel ID (UC...) or handle.
+            max_items: Maximum number of content items to fetch (default: 10).
+        """
+        logger.info(
+            "Starting YouTube content parse for account_id: %d, platform_id: %s, max_items: %d",
+            account_id,
+            platform_id,
+            max_items,
+        )
+
+        # Fetch the account's username (handle) from the database
+        handle: str = platform_id  # fallback to platform_id (channel ID)
+        try:
+            async with self.session_maker() as session:
+                stmt = select(Account.username).where(Account.id == account_id)
+                result = await session.execute(stmt)
+                db_username: str | None = result.scalar_one_or_none()
+                if db_username:
+                    handle = db_username
+                    logger.debug(
+                        "Using username '%s' as handle for account_id: %d",
+                        handle,
+                        account_id,
+                    )
+                else:
+                    logger.warning(
+                        "Username not found for account_id: %d, falling back to platform_id: %s",
+                        account_id,
+                        platform_id,
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch username for account_id: %d: %s. Using platform_id as fallback.",
+                account_id,
+                e,
+            )
+
+        # Format handle for API call
+        formatted_handle = self._format_handle(handle)
+
+        # Determine correct parameter key (channelId for UC..., handle otherwise)
+        param_key = self._get_api_param_key(formatted_handle)
+        if param_key == "channelId":
+            logger.debug(
+                "Using channelId parameter for handle: %s", formatted_handle
+            )
+        else:
+            logger.debug(
+                "Using handle parameter for handle: %s", formatted_handle
+            )
+
+        try:
+            # Exactly ONE API call to fetch videos (no pagination)
+            params: dict[str, Any] = {param_key: formatted_handle}
+            response: dict[str, Any] = await self.client.get(
+                endpoint="/v1/youtube/channel-videos",
+                params=params,
+            )
+            logger.debug(
+                "API response status for YouTube videos, handle %s: success, remaining credits: %s",
+                formatted_handle,
+                response.get("credits_remaining", "N/A"),
+            )
+
+            # Extract videos from response (v1 API returns videos at root level)
+            videos: list[dict[str, Any]] = response.get("videos", [])
+            if not videos:
+                logger.info(
+                    "No videos found for handle %s", formatted_handle
+                )
+                return
+
+            # Limit to max_items (maximum 10)
+            videos = videos[:max_items]
+            logger.info(
+                "Fetched %d videos for handle %s",
+                len(videos),
+                formatted_handle,
+            )
+
+            # Build author profile metadata once (reused for all content items)
+            channel_data: dict[str, Any] = (
+                self._cached_profile if self._cached_profile else {}
+            )
+            author_metadata = self._build_author_profile_metadata(channel_data)
+
+            # Get compiled semantic keywords pattern from settings
+            keywords_pattern = self.settings.semantic_keywords_pattern
+
+            # Process videos and fetch transcripts concurrently
+            content_values: list[dict[str, Any]] = []
+            transcript_tasks: list[tuple[
+                dict[str, Any],
+                str,
+                str,
+                datetime | None,
+                int | None,
+                int | None,
+                int | None,
+                int | None,
+                dict[str, Any],
+            ]] = []
+
+            for video in videos:
+                video_id: str = str(
+                    video.get("id")
+                    or video.get("videoId")
+                    or video.get("video_id")
+                    or ""
+                )
+                if not video_id:
+                    continue
+
+                # Extract title and description
+                title: str = video.get("title") or ""
+                description: str | None = video.get("description") or video.get(
+                    "videoDescription"
+                )
+
+                # Concatenate title and description for content text
+                if description:
+                    content_text: str = f"{title} {description}".strip()
+                else:
+                    content_text: str = title.strip()
+
+                # Check if content contains target keywords using compiled regex pattern
+                has_target_keyword: bool = bool(keywords_pattern.search(content_text))
+
+                # Build video URL for downstream audio embedding extraction
+                video_url: str = f"https://www.youtube.com/watch?v={video_id}"
+
+                # Extract published timestamp using shared utility
+                publish_time = (
+                    video.get("publishedAt")
+                    or video.get("publishDate")
+                    or video.get("published")
+                )
+                published_at = parse_published_at(publish_time)
+
+                # Extract engagement metrics
+                statistics = video.get("statistics") or video.get("stats") or {}
+                views: int | None = (
+                    video.get("viewCount")
+                    or statistics.get("viewCount")
+                    or video.get("views")
+                )
+                reactions_count: int | None = (
+                    video.get("likeCount")
+                    or statistics.get("likeCount")
+                    or video.get("likes")
+                )
+                comments_count: int | None = (
+                    video.get("commentCount")
+                    or statistics.get("commentCount")
+                    or video.get("comments")
+                )
+                shares_count: int | None = (
+                    video.get("shareCount")
+                    or statistics.get("shareCount")
+                    or video.get("shares")
+                )
+
+                # Build platform metrics with video_url
+                platform_metrics: dict[str, Any] = {
+                    "views": views,
+                    "likes": reactions_count,
+                    "comments": comments_count,
+                    "shares": shares_count,
+                    "duration": video.get("duration"),
+                    "definition": video.get("definition"),
+                    "video_url": video_url,
+                }
+
+                # Build raw_metadata
+                raw_metadata: dict[str, Any] = {
+                    "author_profile_metadata": author_metadata,
+                    "platform_metrics": platform_metrics,
+                }
+
+                # If content has target keyword, skip transcript
+                if has_target_keyword:
+                    logger.debug(
+                        "Video %s contains target keyword, skipping transcript",
+                        video_id,
+                    )
+                    content_values.append(
+                        {
+                            "account_id": account_id,
+                            "platform_content_id": video_id,
+                            "content": content_text,
+                            "transcription": None,
+                            "published_at": published_at,
+                            "views": views,
+                            "reactions_count": reactions_count,
+                            "comments_count": comments_count,
+                            "shares_count": shares_count,
+                            "has_media": True,
+                            "raw_metadata": raw_metadata,
+                            "is_embedded": False,
+                            "is_graph_extracted": False,
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    )
+                else:
+                    # Queue transcript fetching task
+                    transcript_tasks.append(
+                        (video, video_id, content_text, published_at, views,
+                         reactions_count, comments_count, shares_count,
+                         raw_metadata)
+                    )
+
+            # Fetch transcripts concurrently for videos without target keywords
+            if transcript_tasks:
+                logger.info(
+                    "Fetching transcripts for %d videos concurrently",
+                    len(transcript_tasks),
+                )
+                semaphore = asyncio.Semaphore(TRANSCRIPT_SEMAPHORE_LIMIT)
+                tasks = [
+                    self._fetch_transcript(video, video_id, semaphore)
+                    for video, video_id, *_ in transcript_tasks
+                ]
+                transcript_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Process transcript results
+                for (video, video_id, content_text, published_at, views,
+                     reactions_count, comments_count, shares_count,
+                     raw_metadata), result in zip(transcript_tasks, transcript_results):
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "Failed to fetch transcript for video %s: %s",
+                            video_id,
+                            result,
+                        )
+                        transcript_text = None
+                    else:
+                        transcript_text = result
+
+                    # Append transcript to content text if available
+                    if transcript_text:
+                        if content_text:
+                            content_text = f"{content_text}\n\n[TRANSCRIPT]\n{transcript_text}"
+                        else:
+                            content_text = f"[TRANSCRIPT]\n{transcript_text}"
+
+                    content_values.append(
+                        {
+                            "account_id": account_id,
+                            "platform_content_id": video_id,
+                            "content": content_text,
+                            "transcription": transcript_text,
+                            "published_at": published_at,
+                            "views": views,
+                            "reactions_count": reactions_count,
+                            "comments_count": comments_count,
+                            "shares_count": shares_count,
+                            "has_media": True,
+                            "raw_metadata": raw_metadata,
+                            "is_embedded": False,
+                            "is_graph_extracted": False,
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    )
+
+            # Content-based Discovery Spider
+            # Extract cross-platform links and same-platform mentions from video text
+            for video in videos:
+                video_content_text = f"{video.get('title', '')} {video.get('description', '')}"
+                if video_content_text:
+                    try:
+                        # Parse profile contacts (cross-platform links)
+                        contacts_dict = parse_profile_contacts(video_content_text)
+                        # Extract same-platform mentions (e.g., @otheruser)
+                        mentions = extract_mentions(video_content_text)
+
+                        # Queue discovered accounts in independent session
+                        async with self.session_maker() as session:
+                            # Cross-platform links
+                            await queue_discovered_accounts(
+                                session, contacts_dict, handle
+                            )
+                            # Same-platform mentions
+                            await queue_discovered_mentions(
+                                session, "YOUTUBE", mentions, handle
+                            )
+                            await session.commit()
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to queue discovered accounts from YouTube video %s: %s",
+                            video.get("id") or video.get("videoId"),
+                            e,
+                        )
+
+            # Bulk upsert content to database
+            async with self.session_maker() as session:
+                await bulk_upsert_content(
+                    session=session,
+                    content_values=content_values,
+                )
+                await session.commit()
+
+            logger.info(
+                "Successfully upserted %d YouTube content items for account_id: %d",
+                len(content_values),
+                account_id,
+            )
+
+        except ClientResponseError as e:
+            if e.status == 404:
+                logger.warning(
+                    "YouTube videos for %s not found (404).", formatted_handle
+                )
+            else:
+                logger.error(
+                    "YouTube videos API request failed for %s with HTTP %d: %s",
+                    formatted_handle,
+                    e.status,
+                    e,
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to parse YouTube videos for account_id %d: %s",
+                account_id,
+                e,
+                exc_info=True,
+            )
+            raise
+
+    async def _fetch_transcript(
+        self,
+        video: dict[str, Any],
+        video_id: str,
+        semaphore: asyncio.Semaphore,
+    ) -> str | None:
+        """Fetch transcript for a single YouTube video using Scrape Creators API.
+
+        Args:
+            video: Video dictionary containing the video ID.
+            video_id: YouTube video ID.
+            semaphore: asyncio.Semaphore to limit concurrent requests.
+
+        Returns:
+            Joined transcript text, or None if fetching fails or no transcript available.
+        """
+        url = f"https://www.youtube.com/watch?v={video_id}"
+
+        # Transcript request log with required format
+        logger.debug("Requesting transcript for video: %s", url)
+
+        async with semaphore:
+            try:
+                response: dict[str, Any] = await self.client.get(
+                    endpoint="/v1/youtube/video/transcript",
+                    params={"url": url},
+                )
+
+                # Extract transcript segments from response
+                segments = response.get("transcript") or []
+                if not segments:
+                    logger.debug("No transcript available for video: %s", url[:50])
+                    return None
+
+                # Join the "text" field of each segment with a space
+                transcript_text = " ".join(
+                    segment.get("text", "")
+                    for segment in segments
+                    if isinstance(segment, dict)
+                )
+
+                if transcript_text:
+                    logger.debug(
+                        "Successfully retrieved transcript for video %s",
+                        url[:50],
+                    )
+                    return transcript_text
+                return None
+
+            except ClientResponseError as e:
+                if e.status == 404:
+                    logger.debug(
+                        "Transcript not found for video %s (404)", video_id
+                    )
+                else:
+                    logger.warning(
+                        "Failed to fetch transcript for video %s: HTTP %d: %s",
+                        video_id,
+                        e.status,
+                        e,
+                    )
+                return None
+            except Exception as e:
+                logger.warning(
+                    "Error fetching transcript for video %s: %s",
+                    video_id,
+                    e,
+                )
+                return None

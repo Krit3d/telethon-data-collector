@@ -18,11 +18,10 @@ src.parser.creators.core.utils will continue to work unchanged.
 
 from src.parser.creators.core.text import (
     SLOP_STOP_WORDS,
-    FEMALE_INDICATOR_PATTERNS,
     is_russian_text,
     is_slop_or_theme_page,
-    detect_female_creator,
     parse_published_at,
+    clean_vtt_content,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,6 +50,7 @@ from src.parser.creators.core.contacts import (
 # ---------------------------------------------------------------------------
 
 from src.parser.creators.core.db import (
+    upsert_and_deduplicate_account,
     queue_discovered_accounts,
     queue_discovered_mentions,
     _queue_single_account,
@@ -77,11 +77,10 @@ from src.parser.creators.core.instagram_helpers import (
 __all__ = [
     # Text module
     "SLOP_STOP_WORDS",
-    "FEMALE_INDICATOR_PATTERNS",
     "is_russian_text",
     "is_slop_or_theme_page",
-    "detect_female_creator",
     "parse_published_at",
+    "clean_vtt_content",
     # Contacts module
     "EMAIL_PATTERN",
     "TELEGRAM_HANDLE_PATTERN",
@@ -98,6 +97,7 @@ __all__ = [
     "is_valid_telegram_handle",
     "compile_author_metadata",
     # DB module
+    "upsert_and_deduplicate_account",
     "queue_discovered_accounts",
     "queue_discovered_mentions",
     "_queue_single_account",

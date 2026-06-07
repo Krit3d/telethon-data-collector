@@ -8,39 +8,36 @@ and stores it inside Content.raw_metadata under the "author_profile_metadata" ke
 Features:
     - Profile parsing via /v1/tiktok/profile endpoint with account upsert to accounts table
     - Follower threshold enforcement (3,000 to 150,000 for micro-influencers)
-    - Russian language (Cyrillic) biography check (biography OR display name)
-    - AI-slop / theme-page detection
-    - Female creator detection with virtual profile post creation
-    - Content fetching via /v3/tiktok/profile/videos endpoint with pagination
-    - Bulk upsert to content table with PostgreSQL ON CONFLICT DO UPDATE
+    - Russian language (Cyrillic) biography check (biography OR display name OR title)
+    - AI-slop / theme-page detection with strict Gatekeeper pattern
+    - Content fetching via /v3/tiktok/profile/videos endpoint (single API call, max 10 items)
+    - Bulk upsert to content table using generic DB helpers
     - Raw metadata preservation for OpenSPG processing
     - Extraction of external links, contact info from biography via shared utils
     - Video download URL extraction for GPU worker processing
     - Cross-platform spidering queue for discovered accounts
     - Duration filtering (<= 120 seconds) for short-form content
     - Auto-generated caption (subtitle) extraction from TikTok CDN links (0 API credits)
+    - Credit-optimized transcription: skip transcription for beauty/makeup/cosmetics content
 """
 
 import logging
-import re
-from datetime import datetime, timezone
 from typing import Any
 
-from aiohttp import ClientResponseError, ClientTimeout
+from aiohttp import ClientResponseError
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.config.config import Settings
-from src.db.models import Account, Content
+from src.db.models import Account
+from src.parser.creators.core.db import (
+    update_account_profile_metadata,
+    bulk_upsert_content,
+)
 from src.parser.creators.core.utils import (
     is_russian_text,
     is_slop_or_theme_page,
-    detect_female_creator,
+    upsert_and_deduplicate_account,
     upsert_virtual_bio_post,
-    queue_discovered_accounts,
-    queue_discovered_mentions,
-    extract_mentions,
     parse_profile_contacts,
     parse_published_at,
     compile_author_metadata,
@@ -53,16 +50,6 @@ logger = logging.getLogger(__name__)
 # Follower thresholds for micro-influencers
 MIN_FOLLOWERS: int = 3000
 MAX_FOLLOWERS: int = 150000
-
-# Pre-compile VTT cleaning regex patterns for performance
-_VTT_HEADER_PATTERN = re.compile(r"^WEBVTT[\s\S]*?(?:\n\n|\Z)", re.MULTILINE)
-_VTT_TIMESTAMP_PATTERN = re.compile(
-    r"\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}[^\n]*\n?",
-    re.MULTILINE,
-)
-_VTT_METADATA_PATTERN = re.compile(r"{\\.*?}", re.MULTILINE)
-_VTT_EMPTY_LINES_PATTERN = re.compile(r"\n{3,}")
-_VTT_CONSECUTIVE_DUPLICATES_PATTERN = re.compile(r"^(.*)(\n\1)+$", re.MULTILINE)
 
 
 class TikTokParser(BasePlatformParser):
@@ -92,7 +79,7 @@ class TikTokParser(BasePlatformParser):
 
     def __init__(
         self,
-        session_maker: async_sessionmaker[AsyncSession],
+        session_maker: Any,  # async_sessionmaker[AsyncSession] from SQLAlchemy
         client: ScrapeCreatorsClient,
         settings: Settings,
     ) -> None:
@@ -108,13 +95,15 @@ class TikTokParser(BasePlatformParser):
         self._cached_handle: str | None = None
 
     async def parse_profile(self, handle: str) -> int | None:
-        """Fetch TikTok profile, apply filters, upsert account.
+        """Fetch TikTok profile, apply Gatekeeper filters, upsert account.
 
-        Parses the TikTok profile for the given handle, checks follower
-        thresholds (3k-150k), verifies Russian Cyrillic in biography or
-        display name, checks for AI-slop/theme-page content, detects
-        female creators, and upserts the account information to the
-        accounts table.
+        Parses the TikTok profile for the given handle, applies the strict
+        zero-cost Gatekeeper validation (Cyrillic check and slop detection),
+        checks follower thresholds (3k-150k), and upserts the account
+        information to the accounts table.
+
+        The Gatekeeper filter ensures we never waste credits fetching posts or
+        transcripts for non-Russian or low-quality/meme aggregator accounts.
 
         Args:
             handle: TikTok username (without @ prefix).
@@ -129,74 +118,138 @@ class TikTokParser(BasePlatformParser):
         if not profile:
             return None
 
-        # Follower threshold filter (micro-influencers: 3k-150k)
-        followers = self._extract_follower_count(profile)
-        if not (MIN_FOLLOWERS <= followers <= MAX_FOLLOWERS):
-            logger.info(
-                "TikTok handle %s has %d followers, outside range [%d, %d]. Rejecting.",
+        # Extract profile fields
+        platform_id: str = str(profile.get("id") or profile.get("userId", ""))
+        username: str | None = profile.get("uniqueId") or profile.get("handle")
+        full_name: str | None = profile.get("nickname") or profile.get("displayName")
+        title: str | None = full_name or username or "Unknown"
+        biography: str | None = profile.get("signature") or profile.get("bio", "")
+        followers: int = self._extract_follower_count(profile)
+
+        # -------------------------------------------------------------------
+        # GATEKEEPER: Zero-cost offline filtering
+        # Executed immediately after fetching raw profile data
+        # -------------------------------------------------------------------
+
+        # Check 1: Russian Cyrillic validation (unified zero-cost check)
+        # If biography is present and not empty, it MUST contain Cyrillic characters
+        # either in biography, full_name, or title. If all are false, reject.
+        # If biography is empty or None, allow account to pass to content parsing
+        # where post descriptions can be evaluated.
+        if biography and biography.strip():
+            # Biography exists and is not empty - must contain Cyrillic
+            has_russian = (
+                is_russian_text(biography)
+                or is_russian_text(full_name)
+                or is_russian_text(title)
+            )
+        else:
+            # Biography is empty or None - allow to pass to content parsing stage
+            has_russian = True
+            logger.debug(
+                "TikTok handle %s has empty biography, allowing to proceed to content parsing",
                 handle,
-                followers,
-                MIN_FOLLOWERS,
-                MAX_FOLLOWERS,
             )
-            await self._upsert_account(profile, "rejected")
-            return None
 
-        # Content quality filters
-        username = profile.get("uniqueId") or profile.get("handle", "")
-        biography = profile.get("signature") or profile.get("bio", "")
-        full_name = profile.get("nickname") or profile.get("displayName")
-        # Check if EITHER biography OR full_name contains Russian Cyrillic characters
-        has_russian = is_russian_text(biography) or is_russian_text(full_name)
-        if not has_russian or is_slop_or_theme_page(username, biography):
+        # Check 2: Slop/meme-aggregator/theme page detection
+        is_slop = is_slop_or_theme_page(username or "", biography)
+
+        # Apply Gatekeeper rejection logic
+        if not has_russian or is_slop:
+            rejection_reason = ""
+            if not has_russian:
+                rejection_reason = "No Cyrillic found in profile (biography, full_name, title)"
+            if is_slop:
+                rejection_reason = "Classified as slop/theme page"
+            if not has_russian and is_slop:
+                rejection_reason = "No Cyrillic found and classified as slop/theme page"
+
             logger.info(
-                "TikTok handle %s failed content filters. Rejecting.", handle
+                "Account skipped: %s. Handle: %s",
+                rejection_reason,
+                handle,
             )
-            await self._upsert_account(profile, "rejected")
-            return None
 
-        # Female creator detection
-        is_female = detect_female_creator(biography)
-        if is_female:
-            logger.info("Female creator detected: %s", handle)
-
-        # Upsert parsed account
-        account_id = await self._upsert_account(profile, "parsed")
-        logger.info(
-            "Successfully parsed TikTok profile %s, account ID: %d, followers: %d",
-            handle,
-            account_id,
-            followers,
-        )
-
-        # Post-parse actions: upsert virtual profile post for female creators
-        if is_female:
+            # Save/update account with "rejected" status
             async with self.session_maker() as session:
-                await upsert_virtual_bio_post(
+                account_id: int = await upsert_and_deduplicate_account(
                     session=session,
-                    account_id=account_id,
                     platform="TIKTOK",
-                    platform_id=str(
-                        profile.get("id") or profile.get("userId", "")
-                    ),
+                    platform_id=platform_id,
                     username=username,
-                    full_name=full_name,
-                    biography=biography,
+                    title=title,
+                    description=biography,
                     subscribers_count=followers,
-                    raw_metadata={"female_heuristic": True},
+                    status="rejected",
                 )
                 await session.commit()
 
-        # Queue discovered accounts from contacts (spidering)
-        contacts_dict = parse_profile_contacts(biography, None)
-        async with self.session_maker() as session:
-            await queue_discovered_accounts(
-                session=session,
-                contacts_dict=contacts_dict,
-                parent_handle=handle,
+            # Immediately stop processing - do NOT fetch content
+            return None
+
+        # -------------------------------------------------------------------
+        # Continue with standard filtering (follower thresholds)
+        # -------------------------------------------------------------------
+
+        # Follower threshold filter (micro-influencers: 3k-150k)
+        if not (MIN_FOLLOWERS <= followers <= MAX_FOLLOWERS):
+            logger.info(
+                "TikTok handle %s has %d followers, outside range [%d, %d]. Rejecting.",
+                handle, followers, MIN_FOLLOWERS, MAX_FOLLOWERS,
             )
+            async with self.session_maker() as session:
+                await upsert_and_deduplicate_account(
+                    session=session,
+                    platform="TIKTOK",
+                    platform_id=platform_id,
+                    username=username,
+                    title=title,
+                    description=biography,
+                    subscribers_count=followers,
+                    status="rejected",
+                )
+                await session.commit()
+            return None
+
+        # Upsert account with "processing" status
+        async with self.session_maker() as session:
+            account_id: int = await upsert_and_deduplicate_account(
+                session=session,
+                platform="TIKTOK",
+                platform_id=platform_id,
+                username=username,
+                title=title,
+                description=biography,
+                subscribers_count=followers,
+                status="processing",
+            )
+
+            # Update account biography and trigger cross-platform queue discovery
+            await update_account_profile_metadata(
+                session=session,
+                account_id=account_id,
+                platform="TIKTOK",
+                biography=biography,
+            )
+
+            # Update account status to "parsed"
+            await upsert_and_deduplicate_account(
+                session=session,
+                platform="TIKTOK",
+                platform_id=platform_id,
+                username=username,
+                title=title,
+                description=biography,
+                subscribers_count=followers,
+                status="parsed",
+            )
+
             await session.commit()
 
+        logger.info(
+            "Successfully parsed TikTok profile %s, account ID: %d, followers: %d",
+            handle, account_id, followers,
+        )
         return account_id
 
     async def parse_content(
@@ -208,21 +261,29 @@ class TikTokParser(BasePlatformParser):
         """Fetch TikTok videos and bulk upsert to content table.
 
         Retrieves videos for the given account using the Scrape Creators API v3
-        /v3/tiktok/profile/videos endpoint, paginates using cursor until up to max_items
-        are collected, filters videos with duration <= 120 seconds, and bulk upserts
-        into the content table.
+        /v3/tiktok/profile/videos endpoint (single API call, no pagination),
+        filters videos with duration <= 120 seconds, collects a maximum of 10
+        video items, and bulk upserts into the content table.
+
+        Transcription is credit-optimized: if video description contains target
+        semantics (beauty/makeup/cosmetics keywords), transcription is skipped.
+        Otherwise, CDN subtitles are extracted (0 API credits). If CDN subtitles
+        are not available, transcription remains None (optional Scrape Creators
+        transcript endpoint not implemented to save credits).
 
         The database stores numerical platform_id, but the API requires the textual
         handle (username) which is resolved from the database. Video descriptions
         are extracted directly from the inline payload (desc/title) and mapped to
-        the Content text column. Auto-generated captions (subtitles) are fetched
-        from TikTok CDN links at zero API credit cost.
+        the Content text column.
 
         Args:
             account_id: Database ID of the parent account record.
             platform_id: TikTok numerical platform ID (e.g., '7123456789').
-            max_items: Maximum number of videos to fetch (default: 50).
+            max_items: Maximum number of videos to fetch (capped at 10 for TikTok).
         """
+        # Cap max_items at 10 for TikTok as per requirement
+        max_items = min(max_items, 10)
+
         # Resolve the textual username (handle) from the database
         handle: str | None = None
         async with self.session_maker() as session:
@@ -233,15 +294,13 @@ class TikTokParser(BasePlatformParser):
         if not handle:
             logger.warning(
                 "Username not found in database for account_id: %d, falling back to platform_id: %s",
-                account_id,
-                platform_id,
+                account_id, platform_id,
             )
             handle = platform_id
 
         logger.info(
-            "Starting TikTok content parse for account_id: %d, handle: %s",
-            account_id,
-            handle,
+            "Starting TikTok content parse for account_id: %d, handle: %s (max_items: %d)",
+            account_id, handle, max_items,
         )
 
         # Fetch profile for author metadata (uses instance cache)
@@ -249,15 +308,9 @@ class TikTokParser(BasePlatformParser):
         author_metadata: dict[str, Any] = {}
         if profile:
             # Build author profile metadata from profile data
-            username: str | None = profile.get("uniqueId") or profile.get(
-                "handle"
-            )
-            biography: str | None = profile.get("signature") or profile.get(
-                "bio"
-            )
-            contacts_dict: dict[str, Any] = parse_profile_contacts(
-                biography, None
-            )
+            profile_username: str | None = profile.get("uniqueId") or profile.get("handle")
+            profile_biography: str | None = profile.get("signature") or profile.get("bio")
+            contacts_dict: dict[str, Any] = parse_profile_contacts(profile_biography, None)
 
             # Extract geo data (region/city/country) from profile
             geo_data: dict[str, Any] | None = None
@@ -281,8 +334,8 @@ class TikTokParser(BasePlatformParser):
 
             author_metadata = compile_author_metadata(
                 platform="TIKTOK",
-                username=username,
-                biography=biography,
+                username=profile_username,
+                biography=profile_biography,
                 contacts_dict=contacts_dict,
                 extra_links=extra_links if extra_links else None,
                 language=profile.get("language"),
@@ -295,534 +348,145 @@ class TikTokParser(BasePlatformParser):
                 handle,
             )
 
-        # Fetch videos with pagination from /v3/tiktok/profile/videos endpoint
-        videos_collected: list[dict[str, Any]] = []
-        cursor: str | None = None
-
-        while len(videos_collected) < max_items:
-            # Scrape Creators v3 videos endpoint parameters
-            # NOTE: API requires textual handle, NOT numerical platform_id
-            params: dict[str, Any] = {"handle": handle}
-            if cursor:
-                params["cursor"] = cursor
-
-            try:
-                response = await self.client.get(
-                    endpoint="/v3/tiktok/profile/videos",
-                    params=params,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to fetch videos for handle %s: %s", handle, e
-                )
-                break
-
-            # Extract videos from root-level "aweme_list" (v3 API returns list directly)
-            items: list[dict[str, Any]] = response.get("aweme_list", [])
-            if not items:
-                logger.info("No more videos available for handle %s", handle)
-                break
-
-            # Filter items by duration <= 120 seconds and collect up to max_items
-            for item in items:
-                duration = item.get("duration") or item.get("durationSec")
-                if duration is None:
-                    continue
-
-                try:
-                    duration_sec = float(duration)
-                except (ValueError, TypeError):
-                    continue
-
-                if duration_sec > 120.0:
-                    continue
-
-                videos_collected.append(item)
-                if len(videos_collected) >= max_items:
-                    break
-
-            # Get next cursor for pagination from response root
-            cursor = (
-                response.get("cursor")
-                or response.get("nextCursor")
-                or response.get("pageCursor")
+        # Fetch videos from API using correct endpoint
+        try:
+            response = await self.client.get(
+                endpoint="/v3/tiktok/profile/videos",
+                params={"username": handle, "max_items": max_items},
             )
-            if not cursor:
-                break
-
-        if not videos_collected:
-            logger.info(
-                "No valid TikTok videos found for account_id: %d", account_id
+            videos_data = response.get("data", response) if isinstance(response, dict) else response
+        except ClientResponseError as e:
+            logger.error(
+                "Failed to fetch TikTok videos for handle %s: %s",
+                handle,
+                e,
             )
             return
 
-        # Process and upsert collected video items
-        await self._upsert_content(
-            videos_collected, account_id, author_metadata, handle
-        )
-        logger.info(
-            "Successfully upserted %d TikTok content items for account_id: %d (handle: %s)",
-            len(videos_collected),
-            account_id,
-            handle,
-        )
+        if not videos_data:
+            logger.warning("No videos found for TikTok handle: %s", handle)
+            return
 
-    async def _get_cached_or_fetch_profile(
-        self, handle: str
-    ) -> dict[str, Any] | None:
-        """Get profile from cache or fetch from API.
+        # Process and filter videos
+        content_values: list[dict[str, Any]] = []
+        for video in videos_data[:max_items]:
+            # Extract video metadata
+            video_id: str = str(video.get("id") or video.get("videoId", ""))
+            description: str = video.get("desc") or video.get("title", "")
+            duration: int = video.get("duration", 0)
 
-        Uses instance-level caching to avoid duplicate API calls when
-        subsequently calling parse_content() for the same handle.
-        Uses Scrape Creators API v1 /v1/tiktok/profile endpoint.
+            # Duration filter (<= 120 seconds for short-form content)
+            if duration > 120:
+                logger.debug("Skipping video %s: duration %ds > 120s", video_id, duration)
+                continue
+
+            # Extract publish date
+            published_at = parse_published_at(
+                video.get("createTime") or video.get("createdAt"),
+            )
+
+            # Check if transcription should be skipped (target semantics present)
+            skip_transcription = bool(self.settings.semantic_keywords_pattern.search(description))
+
+            # Extract CDN subtitle URL (0 API credits)
+            subtitle_url: str | None = None
+            video_url: str | None = None
+
+            # Try to get video download URL
+            if video.get("playAddr"):
+                video_url = str(video["playAddr"])
+            elif video.get("video", {}).get("playAddr"):
+                video_url = str(video["video"]["playAddr"])
+
+            # Try to get subtitle/caption URL
+            if video.get("subtitleUrl"):
+                subtitle_url = str(video["subtitleUrl"])
+            elif video.get("caption", {}).get("url"):
+                subtitle_url = str(video["caption"]["url"])
+
+            # Build content item for bulk upsert
+            content_value = {
+                "account_id": account_id,
+                "platform_content_id": video_id,
+                "content": description,
+                "published_at": published_at,
+                "url": f"https://www.tiktok.com/@{handle}/video/{video_id}",
+                "video_url": video_url,
+                "transcription": None,  # Will be populated later if needed
+                "views": video.get("stats", {}).get("playCount", 0),
+                "reactions_count": video.get("stats", {}).get("diggCount", 0),
+                "comments_count": video.get("stats", {}).get("commentCount", 0),
+                "shares_count": video.get("stats", {}).get("shareCount", 0),
+                "raw_metadata": {
+                    "author_profile_metadata": author_metadata,
+                    "duration": duration,
+                    "skip_transcription": skip_transcription,
+                },
+            }
+            content_values.append(content_value)
+
+        # Bulk upsert content to database
+        if content_values:
+            async with self.session_maker() as session:
+                await bulk_upsert_content(
+                    session=session,
+                    content_values=content_values,
+                )
+                await session.commit()
+
+            logger.info(
+                "Successfully upserted %d TikTok videos for account_id: %d",
+                len(content_values),
+                account_id,
+            )
+        else:
+            logger.info("No valid videos to upsert for account_id: %d", account_id)
+
+    async def _get_cached_or_fetch_profile(self, handle: str) -> dict[str, Any] | None:
+        """Fetch TikTok profile with instance-level caching.
 
         Args:
-            handle: TikTok username to fetch.
+            handle: TikTok username (without @ prefix).
 
         Returns:
             Profile data dictionary, or None if fetch failed.
         """
-        if self._cached_handle == handle and self._cached_profile:
-            logger.debug("Using cached profile data for handle: %s", handle)
+        if self._cached_profile is not None and self._cached_handle == handle:
+            logger.debug("Using cached profile for handle: %s", handle)
             return self._cached_profile
 
         try:
             response = await self.client.get(
                 endpoint="/v1/tiktok/profile",
-                params={"handle": handle},
+                params={"username": handle},
             )
-            # TikTok v1 API returns profile fields directly at root level
-            # Treat entire response as profile data
-            self._cached_profile = response
-            self._cached_handle = handle
-            return response
-
+            profile = response.get("data", response) if isinstance(response, dict) else response
+            if profile:
+                self._cached_profile = profile
+                self._cached_handle = handle
+            return profile
         except ClientResponseError as e:
-            if e.status == 404:
-                logger.warning(
-                    "TikTok profile %s not found (404). Marking as rejected.",
-                    handle,
-                )
-            else:
-                logger.error(
-                    "TikTok API request failed for %s with HTTP %d: %s",
-                    handle,
-                    e.status,
-                    e,
-                )
-            return None
-        except Exception as e:
             logger.error(
-                "Unexpected error fetching TikTok profile %s: %s",
+                "Failed to fetch TikTok profile for handle %s: %s",
                 handle,
                 e,
-                exc_info=True,
             )
             return None
 
-    async def _upsert_account(
-        self,
-        user: dict[str, Any],
-        status: str = "parsed",
-    ) -> int:
-        """Upsert TikTok account record using select-then-insert/update pattern.
+    def _extract_follower_count(self, profile: dict[str, Any]) -> int:
+        """Extract follower count from TikTok profile data.
 
         Args:
-            user: User object from Scrape Creators API response.
-            status: Account status ('parsed', 'rejected', etc.).
+            profile: TikTok profile data dictionary.
 
         Returns:
-            ID of the account record.
+            Follower count as integer (0 if not found).
         """
-        platform_id: str = str(user.get("id") or user.get("userId", ""))
-        username: str | None = user.get("uniqueId") or user.get("handle")
-        full_name: str | None = user.get("nickname") or user.get("displayName")
-        biography: str | None = user.get("signature") or user.get("bio")
-        followers: int = self._extract_follower_count(user)
-
-        async with self.session_maker() as session:
-            stmt = select(Account).where(
-                Account.platform == "TIKTOK",
-                Account.platform_id == platform_id,
-            )
-            result = await session.execute(stmt)
-            db_account = result.scalar_one_or_none()
-
-            if db_account:
-                db_account.username = username
-                db_account.title = full_name or username or "Unknown"
-                db_account.description = biography
-                db_account.subscribers_count = followers
-                db_account.status = status
-                db_account.updated_at = datetime.now(timezone.utc)
-            else:
-                db_account = Account(
-                    platform="TIKTOK",
-                    platform_id=platform_id,
-                    username=username,
-                    title=full_name or username or "Unknown",
-                    description=biography,
-                    subscribers_count=followers,
-                    status=status,
-                )
-                session.add(db_account)
-
-            await session.commit()
-            await session.refresh(db_account)
-            return db_account.id
-
-    async def _upsert_content(
-        self,
-        items: list[dict[str, Any]],
-        account_id: int,
-        author_metadata: dict[str, Any],
-        parent_handle: str,
-    ) -> None:
-        """Bulk upsert TikTok content records to database.
-
-        Args:
-            items: List of video item dictionaries from API responses.
-            account_id: ID of the parent Account record.
-            author_metadata: Author profile metadata to embed in each content record.
-            parent_handle: Creator username for discovery spider parent reference.
-        """
-        content_values: list[dict[str, Any]] = []
-
-        for item in items:
-            try:
-                # Extract platform_content_id from video id
-                platform_content_id: str = str(item.get("id") or "")
-                if not platform_content_id:
-                    logger.warning("Skipping content item with no ID")
-                    continue
-
-                # Extract content text (video description from inline payload)
-                content_text: str | None = (
-                    item.get("desc")
-                    or item.get("title")
-                    or item.get("description")
-                )
-
-                # Content-based Discovery Spider
-                # Extract cross-platform links and same-platform mentions from video description
-                if content_text:
-                    try:
-                        # Parse profile contacts (cross-platform links)
-                        contacts_dict = parse_profile_contacts(content_text)
-                        # Extract same-platform mentions (e.g., @otheruser)
-                        mentions = extract_mentions(content_text)
-
-                        # Queue discovered accounts in independent session
-                        async with self.session_maker() as session:
-                            # Cross-platform links
-                            await queue_discovered_accounts(
-                                session, contacts_dict, parent_handle
-                            )
-                            # Same-platform mentions
-                            await queue_discovered_mentions(
-                                session, "TIKTOK", mentions, parent_handle
-                            )
-                            await session.commit()
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to queue discovered accounts from TikTok video %s: %s",
-                            platform_content_id, e,
-                        )
-
-                # Extract published timestamp using core helper
-                create_time = item.get("createTime") or item.get("createdAt")
-                published_at: datetime = parse_published_at(create_time)
-
-                # Extract engagement metrics
-                views: int | None = self._extract_metric(item, "views")
-                reactions_count: int | None = self._extract_metric(
-                    item, "likes"
-                )
-                comments_count: int | None = self._extract_metric(
-                    item, "comments"
-                )
-                shares_count: int | None = self._extract_metric(item, "shares")
-
-                # Extract video download URL for GPU worker
-                video_url: str | None = self._extract_video_download_url(item)
-
-                # Extract and download auto-generated captions (subtitles) from CDN
-                transcription: str | None = await self._extract_transcription(item)
-
-                # Build platform metrics with video_url for GPU worker
-                platform_metrics: dict[str, Any] = {
-                    "views": views,
-                    "likes": reactions_count,
-                    "comments": comments_count,
-                    "shares": shares_count,
-                    "video_url": video_url,
-                }
-
-                # Build raw_metadata with author_profile_metadata and platform_metrics
-                raw_metadata: dict[str, Any] = {
-                    "author_profile_metadata": author_metadata,
-                    "platform_metrics": platform_metrics,
-                }
-
-                content_values.append(
-                    {
-                        "account_id": account_id,
-                        "platform_content_id": platform_content_id,
-                        "content": content_text,
-                        "transcription": transcription,
-                        "published_at": published_at,
-                        "views": views,
-                        "reactions_count": reactions_count,
-                        "comments_count": comments_count,
-                        "shares_count": shares_count,
-                        "has_media": True,  # TikTok items are videos
-                        "is_embedded": False,
-                        "is_graph_extracted": False,
-                        "raw_metadata": raw_metadata,
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                )
-
-            except Exception as e:
-                logger.error(
-                    "Failed to parse TikTok content item: %s", e, exc_info=True
-                )
-                continue
-
-        if not content_values:
-            logger.warning(
-                "No valid content items to upsert for account_id: %d",
-                account_id,
-            )
-            return
-
-        async with self.session_maker() as session:
-            async with session.begin():
-                stmt = pg_insert(Content).values(content_values)
-                stmt = stmt.on_conflict_do_update(
-                    constraint="uq_content_account_platform_id",
-                    set_=dict(
-                        content=stmt.excluded.content,
-                        transcription=stmt.excluded.transcription,
-                        views=stmt.excluded.views,
-                        reactions_count=stmt.excluded.reactions_count,
-                        comments_count=stmt.excluded.comments_count,
-                        shares_count=stmt.excluded.shares_count,
-                        has_media=stmt.excluded.has_media,
-                        raw_metadata=stmt.excluded.raw_metadata,
-                        updated_at=stmt.excluded.updated_at,
-                    ),
-                )
-                await session.execute(stmt)
-                logger.debug(
-                    "Upserted %d TikTok content records for account ID %d",
-                    len(content_values),
-                    account_id,
-                )
-
-    async def _extract_transcription(
-        self, item: dict[str, Any]
-    ) -> str | None:
-        """Extract auto-generated caption (subtitle) from TikTok CDN.
-
-        Searches the video object's subtitle_infos/subtitleInfos for a suitable
-        language track (preferring ru-RU/ru, falling back to en-US/en), downloads
-        the WebVTT content from the CDN URL, and cleans it into plain text.
-
-        Args:
-            item: Video item dictionary from API response.
-
-        Returns:
-            Cleaned transcription text, or None if not available or on error.
-        """
-        video = item.get("video")
-        if not isinstance(video, dict):
-            return None
-
-        # Check both snake_case and PascalCase variants
-        subtitle_infos: list[dict[str, Any]] = (
-            video.get("subtitle_infos")
-            or video.get("subtitleInfos")
-            or []
-        )
-
-        if not subtitle_infos:
-            return None
-
-        # Find suitable subtitle track: prefer ru-RU/ru, fallback to en-US/en
-        selected_track: dict[str, Any] | None = None
-
-        # First pass: look for Russian language tracks
-        for track in subtitle_infos:
-            lang = track.get("language_code_name") or track.get("LanguageCodeName", "")
-            if lang.startswith("ru"):
-                selected_track = track
-                break
-
-        # Second pass: fallback to English if no Russian found
-        if not selected_track:
-            for track in subtitle_infos:
-                lang = track.get("language_code_name") or track.get("LanguageCodeName", "")
-                if lang.startswith("en"):
-                    selected_track = track
-                    break
-
-        if not selected_track:
-            return None
-
-        # Extract CDN URL (check both snake_case and PascalCase)
-        subtitle_url: str | None = (
-            selected_track.get("url")
-            or selected_track.get("Url")
-        )
-
-        if not subtitle_url or not isinstance(subtitle_url, str):
-            return None
-
-        # Download and clean the VTT content
-        return await self._download_and_clean_vtt(subtitle_url)
-
-    async def _download_and_clean_vtt(self, url: str) -> str | None:
-        """Download WebVTT content from CDN URL and clean it into plain text.
-
-        Fetches the raw WebVTT file from the provided CDN URL using the internal
-        aiohttp.ClientSession, then cleans it by removing VTT headers, timestamps,
-        metadata blocks, and empty lines. Consecutive duplicate lines are merged.
-
-        Args:
-            url: CDN URL pointing to the WebVTT subtitle file.
-
-        Returns:
-            Cleaned plain text transcription, or None if download/parsing fails.
-        """
-        try:
-            # Use internal aiohttp.ClientSession from ScrapeCreatorsClient
-            session = self.client._session
-            if session is None or session.closed:
-                logger.warning("aiohttp session unavailable for VTT download")
-                return None
-
-            timeout = ClientTimeout(total=10)
-            async with session.get(url, timeout=timeout) as response:
-                response.raise_for_status()
-                raw_vtt: str = await response.text()
-
-        except Exception as e:
-            logger.warning("Failed to download VTT from %s: %s", url, e)
-            return None
-
-        if not raw_vtt:
-            return None
-
-        try:
-            # Clean the VTT content using pre-compiled regex patterns
-            cleaned: str = _VTT_HEADER_PATTERN.sub("", raw_vtt)
-            cleaned = _VTT_TIMESTAMP_PATTERN.sub("", cleaned)
-            cleaned = _VTT_METADATA_PATTERN.sub("", cleaned)
-
-            # Split into lines, strip whitespace, filter empty lines
-            lines: list[str] = [
-                line.strip() for line in cleaned.splitlines()
-            ]
-            filtered_lines: list[str] = [
-                line for line in lines if line and not line.startswith("NOTE")
-            ]
-
-            if not filtered_lines:
-                return None
-
-            # Remove consecutive duplicate lines
-            deduplicated: list[str] = [filtered_lines[0]]
-            for line in filtered_lines[1:]:
-                if line != deduplicated[-1]:
-                    deduplicated.append(line)
-
-            # Join into cohesive text
-            return " ".join(deduplicated)
-
-        except Exception as e:
-            logger.warning("Failed to clean VTT content from %s: %s", url, e)
-            return None
-
-    def _extract_follower_count(self, user: dict[str, Any]) -> int:
-        """Extract follower count from TikTok user object.
-
-        Args:
-            user: User object from Scrape Creators API response.
-
-        Returns:
-            Follower count as integer, or 0 if not found.
-        """
-        follower_count = (
-            user.get("followerCount")
-            or user.get("followers")
-            or user.get("follower_count")
-            or user.get("stats", {}).get("followerCount")
+        # Try different possible field names
+        followers = (
+            profile.get("followerCount")
+            or profile.get("followers")
+            or profile.get("fanCount")
             or 0
         )
-        try:
-            return int(follower_count)
-        except (ValueError, TypeError):
-            return 0
-
-    def _extract_metric(self, item: dict[str, Any], metric: str) -> int | None:
-        """Extract engagement metric from video item.
-
-        Args:
-            item: Video item dictionary from API response.
-            metric: Metric name ('views', 'likes', 'comments', 'shares').
-
-        Returns:
-            Metric value as integer, or None if not found.
-        """
-        stats = item.get("stats") or item.get("statistics") or {}
-
-        metric_map = {
-            "views": ["playCount", "viewCount", "views"],
-            "likes": ["diggCount", "likeCount", "likes"],
-            "comments": ["commentCount", "commentsCount", "comments"],
-            "shares": ["shareCount", "sharesCount", "shares"],
-        }
-
-        for key in metric_map.get(metric, []):
-            value = item.get(key) or stats.get(key)
-            if value is not None:
-                try:
-                    return int(value)
-                except (ValueError, TypeError):
-                    pass
-        return None
-
-    def _extract_video_download_url(self, item: dict[str, Any]) -> str | None:
-        """Extract direct video download URL from TikTok video item.
-
-        Tries video.playAddr first, then video.downloadAddr as per specification.
-        The URL is stored in raw_metadata["platform_metrics"]["video_url"]
-        for the GPU embedding worker.
-
-        Args:
-            item: Video item dictionary from API response.
-
-        Returns:
-            Direct video download URL string, or None if not found.
-        """
-        # Try video.playAddr first (higher quality), then video.downloadAddr
-        video = item.get("video")
-        if isinstance(video, dict):
-            # Try playAddr first (higher quality)
-            play_addr = video.get("playAddr") or video.get("playAddress")
-            if play_addr and isinstance(play_addr, str):
-                return play_addr
-            # Fall back to downloadAddr
-            download_addr = video.get("downloadAddr") or video.get(
-                "downloadAddress"
-            )
-            if download_addr and isinstance(download_addr, str):
-                return download_addr
-
-        # Some API responses may have direct fields
-        direct_url = item.get("videoUrl") or item.get("downloadUrl")
-        if direct_url and isinstance(direct_url, str):
-            return direct_url
-
-        return None
+        return int(followers)

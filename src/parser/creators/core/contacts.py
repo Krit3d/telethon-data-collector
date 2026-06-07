@@ -58,6 +58,37 @@ SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset({
     "whatsapp.com",
 })
 
+# External platform domains for structured extraction
+# Maps platform slug to list of domains to match
+EXTERNAL_PLATFORM_DOMAINS: dict[str, list[str]] = {
+    "vk": ["vk.com", "vk.ru", "vkontakte.ru"],
+    "youtube": ["youtube.com", "youtu.be"],
+    "threads": ["threads.net", "threads.com"],
+    "tiktok": ["tiktok.com"],
+}
+
+# Keywords to identify personal Telegram contacts (PR, management, advertising)
+TELEGRAM_PERSONAL_KEYWORDS: frozenset[str] = frozenset({
+    "manager", "pr", "admin", "sales", "cooperation",
+    "reklama", "advertising", "write", "contact",
+})
+
+# Keywords to identify Telegram channels (TGK)
+TELEGRAM_CHANNEL_KEYWORDS: frozenset[str] = frozenset({
+    "channel", "канал", "тгк", "телега", "блог", "blog",
+    "t.me/joinchat", "t.me/+", "telegram.me/joinchat",
+})
+
+# Russian phrases indicating personal contact for advertising
+TELEGRAM_PERSONAL_PHRASES: list[str] = [
+    "по рекламе",
+    "пишите",
+    "сотрудничество",
+    "реклама",
+    "advertising",
+    "for ads",
+]
+
 
 def extract_emails(text: str | None) -> list[str]:
     """Extract all email addresses from the provided text.
@@ -77,6 +108,88 @@ def extract_emails(text: str | None) -> list[str]:
 
     emails = EMAIL_PATTERN.findall(text)
     return list(set(email.lower() for email in emails))
+
+
+def extract_external_platforms(
+    text: str | None,
+) -> dict[str, str]:
+    """Extract and classify social media links into structured external_platforms map.
+
+    Parses the text for URLs matching known platform domains (VK, YouTube,
+    Threads, TikTok) and extracts clean handles/usernames from those URLs.
+
+    Args:
+        text: The text to search for platform URLs. Can be None.
+
+    Returns:
+        A dictionary mapping platform slug to extracted handle/username.
+        Example: {"vk": "username", "youtube": "@channel_name"}
+    """
+    if not text:
+        return {}
+
+    external_platforms: dict[str, str] = {}
+    urls = URL_PATTERN.findall(text)
+
+    for url in urls:
+        url_lower = url.lower()
+
+        # VK: vk.com/username or vk.com/id12345
+        for domain in EXTERNAL_PLATFORM_DOMAINS["vk"]:
+            if domain in url_lower:
+                match = re.search(rf"{re.escape(domain)}/([^/?#]+)", url_lower)
+                if match:
+                    handle = match.group(1)
+                    if handle and handle not in ("id", "club", "public"):
+                        external_platforms["vk"] = handle
+                        break
+                break
+
+        # YouTube: youtube.com/@handle or youtu.be/channel_id
+        for domain in EXTERNAL_PLATFORM_DOMAINS["youtube"]:
+            if domain in url_lower:
+                # Try @handle format first (new YouTube format)
+                match = re.search(rf"{re.escape(domain)}/@([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["youtube"] = f"@{match.group(1)}"
+                    break
+                # Try /channel/ format
+                match = re.search(rf"{re.escape(domain)}/channel/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["youtube"] = match.group(1)
+                    break
+                # Try /c/ format
+                match = re.search(rf"{re.escape(domain)}/c/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["youtube"] = match.group(1)
+                    break
+                # Try /user/ format
+                match = re.search(rf"{re.escape(domain)}/user/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["youtube"] = match.group(1)
+                    break
+                break
+
+        # Threads: threads.net/@username
+        for domain in EXTERNAL_PLATFORM_DOMAINS["threads"]:
+            if domain in url_lower:
+                match = re.search(rf"{re.escape(domain)}/@?([^/?#]+)", url_lower)
+                if match:
+                    handle = match.group(1)
+                    if handle:
+                        external_platforms["threads"] = handle
+                    break
+                break
+
+        # TikTok: tiktok.com/@username
+        for domain in EXTERNAL_PLATFORM_DOMAINS["tiktok"]:
+            if domain in url_lower:
+                match = re.search(rf"{re.escape(domain)}/@([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["tiktok"] = match.group(1)
+                break
+
+    return external_platforms
 
 
 def extract_telegram_handles(text: str | None) -> list[str]:
@@ -129,7 +242,8 @@ def extract_external_links(
     """Extract all HTTP/HTTPS links from text.
 
     Excludes social network domains and optionally additional domains
-    specified in exclude_domains parameter.
+    specified in exclude_domains parameter. Also excludes domains that
+    are classified into external_platforms to avoid duplication.
 
     Args:
         text: The text to search for URLs. Can be None.
@@ -143,9 +257,12 @@ def extract_external_links(
     if not text:
         return []
 
-    effective_excludes = SOCIAL_MEDIA_DOMAINS.copy()
+    # Build extended exclude list including external platform domains
+    extended_excludes = SOCIAL_MEDIA_DOMAINS.copy()
+    for domains in EXTERNAL_PLATFORM_DOMAINS.values():
+        extended_excludes = extended_excludes.union(set(domains))
     if exclude_domains:
-        effective_excludes = effective_excludes.union(exclude_domains)
+        extended_excludes = extended_excludes.union(exclude_domains)
 
     urls = URL_PATTERN.findall(text)
 
@@ -154,7 +271,7 @@ def extract_external_links(
         domain_match = re.search(r"https?://(?:www\.)?([^/]+)", url)
         if domain_match:
             domain = domain_match.group(1).lower()
-            if not any(excluded in domain for excluded in effective_excludes):
+            if not any(excluded in domain for excluded in extended_excludes):
                 external_links.append(url)
 
     # Deduplicate while preserving order
@@ -171,13 +288,12 @@ def extract_external_links(
 def parse_profile_contacts(
     biography: str | None,
     external_url: str | None = None,
-) -> dict[str, list[str] | str]:
+) -> dict[str, Any]:
     """Parse profile contacts from biography text and external URL.
 
     Combines multiple extraction functions to parse emails, Telegram handles,
-    and external links from a social media profile's biography and optional
-    external URL field. Also extracts platform-specific handles from known
-    social URLs (Instagram, TikTok, YouTube, Threads).
+    external links, and structured external platforms from a social media
+    profile's biography and optional external URL field.
 
     Args:
         biography: The biography or description text of the profile. Can be None.
@@ -188,7 +304,8 @@ def parse_profile_contacts(
         A structured dictionary containing:
         - emails: List of extracted email addresses
         - telegram_handles: List of extracted Telegram usernames
-        - external_links: List of external links (excluding social media)
+        - external_links: List of external links (excluding social media and external platforms)
+        - external_platforms: Dict mapping platform slug to handle (vk, youtube, threads, tiktok)
         - raw_bio: The original biography text
     """
     combined_text = biography or ""
@@ -201,6 +318,7 @@ def parse_profile_contacts(
 
     emails = extract_emails(combined_text)
     telegram_handles = extract_telegram_handles(combined_text)
+    external_platforms = extract_external_platforms(combined_text)
     external_links = extract_external_links(combined_text)
 
     # Also extract links from raw_external_url directly if provided
@@ -208,13 +326,18 @@ def parse_profile_contacts(
         domain_match = re.search(r"https?://(?:www\.)?([^/]+)", external_url)
         if domain_match:
             domain = domain_match.group(1).lower()
-            if not any(excluded in domain for excluded in SOCIAL_MEDIA_DOMAINS):
+            # Check against extended excludes (including external platform domains)
+            extended_excludes = SOCIAL_MEDIA_DOMAINS.copy()
+            for domains in EXTERNAL_PLATFORM_DOMAINS.values():
+                extended_excludes = extended_excludes.union(set(domains))
+            if not any(excluded in domain for excluded in extended_excludes):
                 external_links.append(external_url)
 
     return {
         "emails": emails,
         "telegram_handles": telegram_handles,
         "external_links": external_links,
+        "external_platforms": external_platforms,
         "raw_bio": biography or "",
     }
 
@@ -244,7 +367,7 @@ def normalize_telegram_handle(handle: str) -> str:
         "http://telegram.me/",
     ]:
         if handle.lower().startswith(prefix):
-            handle = handle[len(prefix) :]
+            handle = handle[len(prefix):]
             break
 
     return handle.lower()
@@ -284,6 +407,91 @@ def is_valid_telegram_handle(handle: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{4,31}", normalized))
 
 
+def classify_telegram_handles(
+    biography: str | None,
+    handles: list[str],
+) -> tuple[list[str], list[str]]:
+    """Classify Telegram handles into channels (TGK) vs personal contacts.
+
+    Analyzes the biography text and handle names to determine if a Telegram
+    handle is likely a channel (TGK) or a personal contact (PR, management, etc.).
+
+    Personal profiles are identified by keywords like:
+        - manager, pr, admin, sales, cooperation, reklama, write
+        - Russian phrases: "по рекламе", "пишите", "сотрудничество"
+
+    Channels (TGK) are identified by keywords like:
+        - channel, канал, тгк, телега, блог, blog
+        - Invite formats: t.me/joinchat/..., t.me/+...
+
+    Args:
+        biography: The biography text to analyze for context. Can be None.
+        handles: List of Telegram handles to classify.
+
+    Returns:
+        A tuple of two lists: (telegram_channels, telegram_personal)
+    """
+    if not handles:
+        return ([], [])
+
+    bio_lower = biography.lower() if biography else ""
+    telegram_channels: list[str] = []
+    telegram_personal: list[str] = []
+
+    for handle in handles:
+        if not handle:
+            continue
+
+        handle_lower = handle.lower()
+        normalized_handle = normalize_telegram_handle(handle)
+
+        # Check if handle or bio context indicates personal contact
+        is_personal = False
+        is_channel = False
+
+        # Check handle name for personal keywords
+        for keyword in TELEGRAM_PERSONAL_KEYWORDS:
+            if keyword in handle_lower:
+                is_personal = True
+                break
+
+        # Check biography for personal contact phrases
+        if not is_personal and biography:
+            for phrase in TELEGRAM_PERSONAL_PHRASES:
+                if phrase in bio_lower:
+                    # Check if this phrase is near the current handle
+                    # Simple check: if phrase exists in bio, mark as personal contact
+                    is_personal = True
+                    break
+
+        # Check handle name for channel keywords
+        if not is_personal:
+            for keyword in TELEGRAM_CHANNEL_KEYWORDS:
+                if keyword in handle_lower:
+                    is_channel = True
+                    break
+
+        # Check for invite link formats (channels)
+        if not is_personal and handle:
+            if "joinchat" in handle_lower or "/+" in handle_lower or "t.me/+" in handle_lower:
+                is_channel = True
+
+        # Default classification: if no clear personal indicators, treat as channel
+        if not is_personal and not is_channel:
+            is_channel = True
+
+        if is_personal:
+            telegram_personal.append(normalized_handle)
+        else:
+            telegram_channels.append(normalized_handle)
+
+    # Deduplicate while preserving order
+    telegram_channels = list(dict.fromkeys(telegram_channels))
+    telegram_personal = list(dict.fromkeys(telegram_personal))
+
+    return (telegram_channels, telegram_personal)
+
+
 # ---------------------------------------------------------------------------
 # Platform profile link templates
 # ---------------------------------------------------------------------------
@@ -310,6 +518,8 @@ def compile_author_metadata(
     location: str | None = None,
     language: str | None = None,
     geo_data: dict[str, Any] | None = None,
+    category: str | None = None,
+    raw_profile_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compile a standardized, OpenSPG-compliant author profile metadata dict.
 
@@ -334,11 +544,14 @@ def compile_author_metadata(
         username: Creator's username on the platform, or ``None``.
         biography: Profile biography / description text, or ``None``.
         contacts_dict: Dictionary containing extracted contacts with keys
-            ``emails`` (list of strings) and ``telegram_handles`` (list of strings).
+            ``emails`` (list of strings), ``telegram_handles`` (list of strings),
+            ``external_links`` (list of strings), ``external_platforms`` (dict).
         extra_links: Optional list of additional external links to include.
         location: Optional human-readable location string.
         language: Optional language code or label.
         geo_data: Optional dictionary with structured geographic data.
+        category: Optional category string for the account.
+        raw_profile_payload: Optional raw JSON payload from the platform API.
 
     Returns:
         A dictionary with the following keys (all values guaranteed non-``None``):
@@ -346,13 +559,16 @@ def compile_author_metadata(
         - ``profile_link`` (str): Full URL to the creator's profile.
         - ``bio_description`` (str): The biography text.
         - ``external_links`` (list[str]): All external / non-social links.
-        - ``contacts`` (list[str]): Normalized contact strings
-          (``email:...`` and ``telegram:@...``).
+        - ``external_platforms`` (dict): Structured map of platform slugs to handles.
+        - ``contacts`` (dict): Structured contacts with ``telegram_channels`` and
+          ``telegram_personal`` lists.
         - ``advertising_contacts`` (list[str]): Same as ``contacts``; kept for
           OpenSPG schema compatibility.
         - ``language`` (str): Language information, if provided.
         - ``location`` (str): Location string, if provided.
         - ``geo_data`` (dict): Structured geo data, if provided.
+        - ``category`` (str): Category string, if provided.
+        - ``raw_profile_payload`` (dict): Raw JSON payload, if provided.
     """
     # Build profile link
     profile_link: str = ""
@@ -365,6 +581,16 @@ def compile_author_metadata(
             safe_platform = (platform or "unknown").lower().replace(" ", "")
             profile_link = f"https://{safe_platform}.com/{username}"
 
+    # Classify Telegram handles into channels vs personal contacts
+    telegram_handles = contacts_dict.get("telegram_handles", []) if contacts_dict else []
+    telegram_channels: list[str] = []
+    telegram_personal: list[str] = []
+
+    if telegram_handles:
+        telegram_channels, telegram_personal = classify_telegram_handles(
+            biography, telegram_handles
+        )
+
     # Normalize contacts to standardized format
     contacts: list[str] = []
 
@@ -374,13 +600,10 @@ def compile_author_metadata(
             if email and isinstance(email, str):
                 contacts.append(f"email:{email.lower().strip()}")
 
-    telegram_handles = contacts_dict.get("telegram_handles", []) if contacts_dict else []
-    if isinstance(telegram_handles, list):
-        for handle in telegram_handles:
-            if handle and isinstance(handle, str):
-                normalized = normalize_telegram_handle(handle)
-                if normalized:
-                    contacts.append(f"telegram:@{normalized}")
+    # Add Telegram channels to contacts (not personal handles)
+    for handle in telegram_channels:
+        if handle and isinstance(handle, str):
+            contacts.append(f"telegram:@{handle}")
 
     # External links: combine from contacts_dict and extra_links parameter
     external_links: list[str] = []
@@ -398,12 +621,19 @@ def compile_author_metadata(
             seen.add(link)
             unique_external.append(link)
 
+    # Get external_platforms from contacts_dict
+    external_platforms = contacts_dict.get("external_platforms", {}) if contacts_dict else {}
+
     # Build result dict, only including non-None values
     result: dict[str, Any] = {
         "profile_link": profile_link,
         "bio_description": biography or "",
         "external_links": unique_external,
-        "contacts": contacts,
+        "external_platforms": external_platforms,
+        "contacts": {
+            "telegram_channels": telegram_channels,
+            "telegram_personal": telegram_personal,
+        },
         "advertising_contacts": contacts.copy(),
     }
 
@@ -413,5 +643,9 @@ def compile_author_metadata(
         result["location"] = location
     if geo_data is not None:
         result["geo_data"] = geo_data
+    if category is not None:
+        result["category"] = category
+    if raw_profile_payload is not None:
+        result["raw_profile_payload"] = raw_profile_payload
 
     return result
