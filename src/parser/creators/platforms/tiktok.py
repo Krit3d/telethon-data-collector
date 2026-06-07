@@ -40,7 +40,7 @@ from src.parser.creators.core.utils import (
     upsert_virtual_bio_post,
     parse_profile_contacts,
     parse_published_at,
-    compile_author_metadata,
+    compile_author_metadata_dict,
 )
 from src.parser.creators.platforms.base import BasePlatformParser
 from src.parser.creators.sc_client import ScrapeCreatorsClient
@@ -332,7 +332,7 @@ class TikTokParser(BasePlatformParser):
             if website:
                 extra_links.append(str(website))
 
-            author_metadata = compile_author_metadata(
+            author_metadata = compile_author_metadata_dict(
                 platform="TIKTOK",
                 username=profile_username,
                 biography=profile_biography,

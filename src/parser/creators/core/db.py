@@ -23,7 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account, Content, Comment
-from src.parser.creators.core.contacts import parse_profile_contacts, compile_author_metadata
+from src.parser.creators.core.contacts import parse_profile_contacts, compile_author_metadata_dict
 
 logger = logging.getLogger(__name__)
 
@@ -457,7 +457,7 @@ async def update_account_profile_metadata(
 
     This function:
     1. Uses parse_profile_contacts(biography, external_url) to extract contacts
-    2. Compiles an OpenSPG-compliant metadata dictionary using compile_author_metadata
+    2. Compiles an OpenSPG-compliant metadata dictionary using compile_author_metadata_dict
     3. Updates the Account's raw_metadata and description with compiled values
     4. Automatically runs queue_discovered_accounts to queue newly discovered accounts as "pending"
     5. Returns the compiled metadata dictionary
@@ -495,7 +495,7 @@ async def update_account_profile_metadata(
 
     # Compile OpenSPG-compliant metadata with new parameters
     username = account.username or account.platform_id
-    compiled_metadata = compile_author_metadata(
+    compiled_metadata = compile_author_metadata_dict(
         platform=platform,
         username=username,
         biography=biography,

@@ -10,7 +10,16 @@ This module provides:
 
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
+
+from src.parser.creators.core.schemas import (
+    AccountMetadata,
+    Contacts,
+    ExternalPlatforms,
+    GeoData,
+    MetricsEntry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -503,6 +512,20 @@ PLATFORM_PROFILE_LINKS: dict[str, str] = {
     "THREADS": "https://threads.net/@{username}",
 }
 
+# Link-in-bio domains to identify services like taplink, linktree, etc.
+LINK_IN_BIO_DOMAINS: frozenset[str] = frozenset({
+    "linktr.ee",
+    "taplink.cc",
+    "beacons.ai",
+    "linkin.bio",
+    "bio.link",
+    "lnk.bio",
+    "solo.to",
+    "campsite.bio",
+    "linkbio.co",
+    "my.link",
+})
+
 
 # ---------------------------------------------------------------------------
 # Uniform author metadata compiler
@@ -520,15 +543,12 @@ def compile_author_metadata(
     geo_data: dict[str, Any] | None = None,
     category: str | None = None,
     raw_profile_payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Compile a standardized, OpenSPG-compliant author profile metadata dict.
+) -> AccountMetadata:
+    """Compile a standardized, OpenSPG-compliant author profile metadata.
 
     This helper normalizes contact information and constructs a uniform
     metadata structure suitable for cross-platform storage and downstream
-    processing.
-
-    Emails are prefixed with ``email:`` and Telegram handles with ``telegram:``
-    to create a machine-readable contact format.
+    processing. Returns an AccountMetadata Pydantic model instance.
 
     The profile link is formatted according to the platform convention:
 
@@ -536,8 +556,6 @@ def compile_author_metadata(
     - **TIKTOK**:   ``https://www.tiktok.com/@{username}``
     - **YOUTUBE**:  ``https://youtube.com/@{username}``
     - **THREADS**:  ``https://threads.net/@{username}``
-
-    All ``None`` values are stripped from the output to produce clean JSON.
 
     Args:
         platform: Platform identifier string (e.g. ``"INSTAGRAM"``, ``"YOUTUBE"``).
@@ -554,32 +572,32 @@ def compile_author_metadata(
         raw_profile_payload: Optional raw JSON payload from the platform API.
 
     Returns:
-        A dictionary with the following keys (all values guaranteed non-``None``):
+        An AccountMetadata Pydantic model instance with the following fields:
 
-        - ``profile_link`` (str): Full URL to the creator's profile.
-        - ``bio_description`` (str): The biography text.
-        - ``external_links`` (list[str]): All external / non-social links.
-        - ``external_platforms`` (dict): Structured map of platform slugs to handles.
-        - ``contacts`` (dict): Structured contacts with ``telegram_channels`` and
-          ``telegram_personal`` lists.
-        - ``advertising_contacts`` (list[str]): Same as ``contacts``; kept for
-          OpenSPG schema compatibility.
+        - ``profile_url`` (str): Full URL to the creator's profile.
+        - ``biography`` (str): The biography text.
+        - ``contacts`` (Contacts): Structured contacts with emails, phones,
+          telegram_channels, and telegram_personal lists.
+        - ``external_platforms`` (ExternalPlatforms): Structured map of platform slugs.
+        - ``link_in_bio`` (str): First matched link-in-bio URL if any.
+        - ``website`` (str): Primary website URL if available.
         - ``language`` (str): Language information, if provided.
         - ``location`` (str): Location string, if provided.
-        - ``geo_data`` (dict): Structured geo data, if provided.
+        - ``geo_data`` (GeoData): Structured geo data, if provided.
         - ``category`` (str): Category string, if provided.
         - ``raw_profile_payload`` (dict): Raw JSON payload, if provided.
+        - ``extracted_at`` (str): Current UTC timestamp in ISO 8601 format.
     """
-    # Build profile link
-    profile_link: str = ""
+    # Build profile URL
+    profile_url: str = ""
     if username:
         template = PLATFORM_PROFILE_LINKS.get(platform.upper() if platform else "", "")
         if template:
-            profile_link = template.format(username=username)
+            profile_url = template.format(username=username)
         else:
             # Fallback: lowercase platform name as subdomain
             safe_platform = (platform or "unknown").lower().replace(" ", "")
-            profile_link = f"https://{safe_platform}.com/{username}"
+            profile_url = f"https://{safe_platform}.com/{username}"
 
     # Classify Telegram handles into channels vs personal contacts
     telegram_handles = contacts_dict.get("telegram_handles", []) if contacts_dict else []
@@ -591,19 +609,10 @@ def compile_author_metadata(
             biography, telegram_handles
         )
 
-    # Normalize contacts to standardized format
-    contacts: list[str] = []
-
+    # Extract emails
     emails = contacts_dict.get("emails", []) if contacts_dict else []
-    if isinstance(emails, list):
-        for email in emails:
-            if email and isinstance(email, str):
-                contacts.append(f"email:{email.lower().strip()}")
-
-    # Add Telegram channels to contacts (not personal handles)
-    for handle in telegram_channels:
-        if handle and isinstance(handle, str):
-            contacts.append(f"telegram:@{handle}")
+    if not isinstance(emails, list):
+        emails = []
 
     # External links: combine from contacts_dict and extra_links parameter
     external_links: list[str] = []
@@ -621,31 +630,126 @@ def compile_author_metadata(
             seen.add(link)
             unique_external.append(link)
 
-    # Get external_platforms from contacts_dict
-    external_platforms = contacts_dict.get("external_platforms", {}) if contacts_dict else {}
+    # Identify link-in-bio URL (first match from known link-in-bio domains)
+    link_in_bio: str | None = None
+    website: str | None = None
+    remaining_external_links: list[str] = []
 
-    # Build result dict, only including non-None values
-    result: dict[str, Any] = {
-        "profile_link": profile_link,
-        "bio_description": biography or "",
-        "external_links": unique_external,
-        "external_platforms": external_platforms,
-        "contacts": {
-            "telegram_channels": telegram_channels,
-            "telegram_personal": telegram_personal,
-        },
-        "advertising_contacts": contacts.copy(),
-    }
+    for link in unique_external:
+        domain_match = re.search(r"https?://(?:www\.)?([^/]+)", link)
+        if domain_match:
+            domain = domain_match.group(1).lower()
+            if any(bio_domain in domain for bio_domain in LINK_IN_BIO_DOMAINS):
+                if link_in_bio is None:
+                    link_in_bio = link
+                continue
+            # First non-link-in-bio, non-social link becomes website
+            if website is None and domain not in SOCIAL_MEDIA_DOMAINS:
+                website = link
+                continue
+        remaining_external_links.append(link)
 
-    if language is not None:
-        result["language"] = language
-    if location is not None:
-        result["location"] = location
-    if geo_data is not None:
-        result["geo_data"] = geo_data
-    if category is not None:
-        result["category"] = category
-    if raw_profile_payload is not None:
-        result["raw_profile_payload"] = raw_profile_payload
+    # Get external_platforms from contacts_dict and convert to ExternalPlatforms model
+    external_platforms_dict = (
+        contacts_dict.get("external_platforms", {}) if contacts_dict else {}
+    )
+    if not isinstance(external_platforms_dict, dict):
+        external_platforms_dict = {}
 
-    return result
+    # Build ExternalPlatforms model
+    external_platforms = ExternalPlatforms(
+        vk=external_platforms_dict.get("vk"),
+        youtube=external_platforms_dict.get("youtube"),
+        threads=external_platforms_dict.get("threads"),
+        tiktok=external_platforms_dict.get("tiktok"),
+    )
+
+    # Check for unsupported platforms (platforms in external_links not in known platforms)
+    unsupported: dict[str, str] | None = None
+    for link in remaining_external_links:
+        # Try to extract platform name from URL
+        domain_match = re.search(r"https?://(?:www\.)?([^/]+)", link)
+        if domain_match:
+            domain = domain_match.group(1).lower()
+            # Skip if already in external_platforms or social media domains
+            if domain not in SOCIAL_MEDIA_DOMAINS:
+                if unsupported is None:
+                    unsupported = {}
+                # Use domain as platform name
+                platform_name = domain.split(".")[0]
+                unsupported[platform_name] = link
+
+    if unsupported:
+        external_platforms.unsupported = unsupported
+
+    # Build Contacts model
+    contacts = Contacts(
+        emails=[email.lower().strip() for email in emails if email and isinstance(email, str)],
+        telegram_channels=telegram_channels,
+        telegram_personal=telegram_personal,
+    )
+
+    # Build GeoData model if provided
+    geo_data_model: GeoData | None = None
+    if geo_data and isinstance(geo_data, dict):
+        geo_data_model = GeoData(
+            city=geo_data.get("city"),
+            country=geo_data.get("country"),
+            coordinates=geo_data.get("coordinates"),
+        )
+
+    # Build AccountMetadata model
+    return AccountMetadata(
+        profile_url=profile_url or None,
+        biography=biography or None,
+        category=category,
+        language=language,
+        location=location,
+        contacts=contacts,
+        external_platforms=external_platforms,
+        link_in_bio=link_in_bio,
+        website=website,
+        geo_data=geo_data_model,
+        metrics_history=[],  # Empty by default, can be populated separately
+        raw_profile_payload=raw_profile_payload,
+        extracted_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def compile_author_metadata_dict(
+    platform: str,
+    username: str | None,
+    biography: str | None,
+    contacts_dict: dict[str, Any],
+    extra_links: list[str] | None = None,
+    location: str | None = None,
+    language: str | None = None,
+    geo_data: dict[str, Any] | None = None,
+    category: str | None = None,
+    raw_profile_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compile author metadata and return as a dictionary.
+
+    Convenience wrapper around compile_author_metadata that returns a dict
+    instead of an AccountMetadata model. Useful for backward compatibility
+    or when a dict output is required.
+
+    Args:
+        Same as compile_author_metadata.
+
+    Returns:
+        A dictionary representation of AccountMetadata with None values excluded.
+    """
+    account_metadata = compile_author_metadata(
+        platform=platform,
+        username=username,
+        biography=biography,
+        contacts_dict=contacts_dict,
+        extra_links=extra_links,
+        location=location,
+        language=language,
+        geo_data=geo_data,
+        category=category,
+        raw_profile_payload=raw_profile_payload,
+    )
+    return account_metadata.model_dump(exclude_none=True)

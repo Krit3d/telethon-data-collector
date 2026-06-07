@@ -42,7 +42,7 @@ from src.parser.creators.core.contacts import (
     normalize_telegram_handle,
     is_valid_email,
     is_valid_telegram_handle,
-    compile_author_metadata,
+    compile_author_metadata_dict,
 )
 
 # ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ __all__ = [
     "normalize_telegram_handle",
     "is_valid_email",
     "is_valid_telegram_handle",
-    "compile_author_metadata",
+    "compile_author_metadata_dict",
     # DB module
     "upsert_and_deduplicate_account",
     "queue_discovered_accounts",
