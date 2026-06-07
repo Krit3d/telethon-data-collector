@@ -12,6 +12,10 @@ Refactored to use centralized db.py architecture:
 - Eliminates pagination (single page fetch only)
 - Limits to max 10 videos to reduce credit consumption
 - Implements conditional transcript fetching based on semantic keywords
+
+Implements Two-Stage Russian Language Check:
+- Stage 1 (parse_profile): Check biography/full_name for Cyrillic
+- Stage 2 (parse_content): Check post captions/hashtags for Cyrillic
 """
 
 import asyncio
@@ -66,7 +70,13 @@ class InstagramParser(BasePlatformParser):
         self._cached_handle: str | None = None
 
     async def parse_profile(self, handle: str) -> int | None:
-        """Fetch Instagram profile, apply filters, upsert account.
+        """Fetch Instagram profile, apply Stage 1 Russian language check, upsert account.
+
+        Stage 1 Russian Language Check:
+        - Extract biography, full_name, and username
+        - If biography is empty/None after stripping: pass to Stage 2 with "processing" status
+        - If biography is NOT empty: check Cyrillic in biography OR full_name
+        - If no Cyrillic found: reject account immediately
 
         Args:
             handle: Instagram username (without @ prefix).
@@ -83,6 +93,11 @@ class InstagramParser(BasePlatformParser):
         if not profile:
             return None
 
+        # Extract profile fields for Stage 1 validation
+        username = profile.get("username", "")
+        biography = profile.get("biography")  # May be None from API
+        full_name = profile.get("full_name", "")
+
         # Subscriber threshold filter
         subscribers = extract_instagram_subscribers(profile)
 
@@ -93,58 +108,15 @@ class InstagramParser(BasePlatformParser):
                 list(profile.keys()),
             )
 
-        # Apply quality filters
-        username = profile.get("username", "")
-        biography = profile.get("biography", "")
-        full_name = profile.get("full_name", "")
-
-        # Unified validation structure
-        is_rejected = False
-        rejection_reason = ""
-
-        # Check subscriber range
+        # Apply subscriber range filter
         if not (MIN_SUBSCRIBERS <= subscribers <= MAX_SUBSCRIBERS):
-            is_rejected = True
-            rejection_reason = f"subscriber count {subscribers} is outside range [{MIN_SUBSCRIBERS}, {MAX_SUBSCRIBERS}]"
             logger.warning(
-                "Instagram handle %s REJECTED: %s.",
+                "Instagram handle %s REJECTED: subscriber count %d is outside range [%d, %d].",
                 handle,
-                rejection_reason,
+                subscribers,
+                MIN_SUBSCRIBERS,
+                MAX_SUBSCRIBERS,
             )
-
-        # Check for Cyrillic characters - unified zero-cost validation
-        if not is_rejected:
-            # Only apply Cyrillic validation if biography is present and not empty
-            biography_stripped = biography.strip() if biography else ""
-            if biography_stripped:
-                # Biography is non-empty: MUST contain Cyrillic in either biography or full_name
-                has_cyrillic_bio = is_russian_text(biography)
-                has_cyrillic_name = is_russian_text(full_name)
-
-                if not (has_cyrillic_bio or has_cyrillic_name):
-                    is_rejected = True
-                    rejection_reason = "Non-empty biography and name contain no Cyrillic characters"
-                    logger.warning(
-                        "Instagram handle %s REJECTED: %s.",
-                        handle,
-                        rejection_reason,
-                    )
-            # If biography is empty or None, skip rejection on this step
-            # Allow the account to pass to content parsing where post texts will be evaluated
-
-        # Check for slop/theme stop-words
-        if not is_rejected:
-            if is_slop_or_theme_page(username, biography):
-                is_rejected = True
-                rejection_reason = "Matched slop/theme stop-words"
-                logger.warning(
-                    "Instagram handle %s REJECTED: %s.",
-                    handle,
-                    rejection_reason,
-                )
-
-        # If rejected, perform single database write and return
-        if is_rejected:
             async with self.session_maker() as session:
                 account_id = await upsert_and_deduplicate_account(
                     session=session,
@@ -152,14 +124,104 @@ class InstagramParser(BasePlatformParser):
                     platform_id=str(profile.get("id") or username),
                     username=username,
                     title=full_name or username or "Unknown",
-                    description=biography,
+                    description=biography or "",
                     subscribers_count=subscribers,
                     status="rejected",
                 )
                 await session.commit()
                 return account_id
 
-        # Upsert account with "processing" status using centralized function
+        # Check for slop/theme stop-words
+        if is_slop_or_theme_page(username, biography or ""):
+            logger.warning(
+                "Instagram handle %s REJECTED: Matched slop/theme stop-words.",
+                handle,
+            )
+            async with self.session_maker() as session:
+                account_id = await upsert_and_deduplicate_account(
+                    session=session,
+                    platform="INSTAGRAM",
+                    platform_id=str(profile.get("id") or username),
+                    username=username,
+                    title=full_name or username or "Unknown",
+                    description=biography or "",
+                    subscribers_count=subscribers,
+                    status="rejected",
+                )
+                await session.commit()
+                return account_id
+
+        # ===================================================================
+        # STAGE 1: RUSSIAN LANGUAGE CHECK (BIOGRAPHY)
+        # ===================================================================
+        biography_stripped = biography.strip() if biography else ""
+
+        if not biography_stripped:
+            # Biography is empty/None: let account pass to Stage 2 for post validation
+            logger.info(
+                "Instagram handle %s: biography is empty, passing to Stage 2 content validation.",
+                handle,
+            )
+            async with self.session_maker() as session:
+                account_id = await upsert_and_deduplicate_account(
+                    session=session,
+                    platform="INSTAGRAM",
+                    platform_id=str(profile.get("id") or username),
+                    username=username,
+                    title=full_name or username or "Unknown",
+                    description=biography or "",
+                    subscribers_count=subscribers,
+                    status="processing",
+                )
+
+                # Update profile metadata using centralized function
+                await update_account_profile_metadata(
+                    session=session,
+                    account_id=account_id,
+                    platform="INSTAGRAM",
+                    biography=biography or "",
+                    external_url=profile.get("external_url"),
+                )
+
+                await session.commit()
+
+            logger.info(
+                "Successfully parsed Instagram profile %s, account ID: %d, subscribers: %d",
+                handle,
+                account_id,
+                subscribers,
+            )
+            return account_id
+
+        # Biography is NOT empty: check for Cyrillic characters
+        has_cyrillic_bio = is_russian_text(biography)
+        has_cyrillic_name = is_russian_text(full_name)
+
+        if not (has_cyrillic_bio or has_cyrillic_name):
+            # No Cyrillic found in biography or full_name: reject account
+            logger.warning(
+                "Instagram handle %s REJECTED: Non-empty biography and name contain no Cyrillic characters.",
+                handle,
+            )
+            async with self.session_maker() as session:
+                account_id = await upsert_and_deduplicate_account(
+                    session=session,
+                    platform="INSTAGRAM",
+                    platform_id=str(profile.get("id") or username),
+                    username=username,
+                    title=full_name or username or "Unknown",
+                    description=biography or "",
+                    subscribers_count=subscribers,
+                    status="rejected",
+                )
+                await session.commit()
+                return account_id
+
+        # Cyrillic found in biography or full_name: pass to Stage 2
+        logger.info(
+            "Instagram handle %s: Stage 1 PASSED (Cyrillic detected). Passing to Stage 2.",
+            handle,
+        )
         async with self.session_maker() as session:
             account_id = await upsert_and_deduplicate_account(
                 session=session,
@@ -167,18 +229,17 @@ class InstagramParser(BasePlatformParser):
                 platform_id=str(profile.get("id") or username),
                 username=username,
                 title=full_name or username or "Unknown",
-                description=biography,
+                description=biography or "",
                 subscribers_count=subscribers,
                 status="processing",
             )
 
             # Update profile metadata using centralized function
-            # This handles biography parsing, raw_metadata generation, and cross-platform spidering
             await update_account_profile_metadata(
                 session=session,
                 account_id=account_id,
                 platform="INSTAGRAM",
-                biography=biography,
+                biography=biography or "",
                 external_url=profile.get("external_url"),
             )
 
@@ -190,7 +251,6 @@ class InstagramParser(BasePlatformParser):
             account_id,
             subscribers,
         )
-
         return account_id
 
     async def _get_cached_or_fetch_profile(
@@ -521,8 +581,8 @@ class InstagramParser(BasePlatformParser):
         aggregated_contacts: dict[str, list[str]] = {}
         aggregated_mentions: set[str] = set()
 
-        # Determine language based on Cyrillic detection
-        language = "ru" if has_cyrillic else "en"
+        # Stage 2 Cyrillic validation passed, language is Russian
+        language = "ru"
 
         # Get category from profile or use fallback
         # Instagram doesn't provide category directly, so we use fallback

@@ -288,7 +288,7 @@ class CreatorsCoordinator:
                     )
                     return
 
-                # Get the updated account to check subscriber count
+                # Get the updated account to check status and subscriber count
                 # Use db_account_id returned from parse_profile to ensure we're
                 # operating on the correctly resolved/merged database record
                 async with self.session_maker() as session:
@@ -296,17 +296,25 @@ class CreatorsCoordinator:
                     result = await session.execute(stmt)
                     account = result.scalar_one_or_none()
 
-                    if account and account.subscribers_count is not None:
-                        if account.subscribers_count < self.min_subscribers:
-                            logger.info(
-                                f"Account {username} has {account.subscribers_count} "
-                                f"subscribers, below threshold {self.min_subscribers}. "
-                                f"Marking as rejected."
-                            )
-                            await self._update_account_status(
-                                db_account_id, STATUS_REJECTED
-                            )
-                            return
+                # Check if account was rejected during profile parsing
+                if account and account.status == STATUS_REJECTED:
+                    logger.info(
+                        f"Account {username} was rejected during profile parsing. "
+                        f"Skipping content parse."
+                    )
+                    return
+
+                if account and account.subscribers_count is not None:
+                    if account.subscribers_count < self.min_subscribers:
+                        logger.info(
+                            f"Account {username} has {account.subscribers_count} "
+                            f"subscribers, below threshold {self.min_subscribers}. "
+                            f"Marking as rejected."
+                        )
+                        await self._update_account_status(
+                            db_account_id, STATUS_REJECTED
+                        )
+                        return
 
                 # Execute parse_content to fetch and store content
                 # Use db_account_id to ensure operations run against the correctly
@@ -320,13 +328,32 @@ class CreatorsCoordinator:
                     max_items=50,
                 )
 
-                # On successful completion, update status to "parsed"
-                # Use db_account_id for status update
-                await self._update_account_status(db_account_id, STATUS_PARSED)
-                logger.info(
-                    f"Successfully processed account {db_account_id} "
-                    f"({username} on {platform})"
-                )
+                # After content parsing, check the current status before updating to "parsed"
+                # The status may have been changed to rejected or failed during content parsing
+                async with self.session_maker() as session:
+                    stmt = select(Account).where(Account.id == db_account_id)
+                    result = await session.execute(stmt)
+                    account_after_content = result.scalar_one_or_none()
+
+                if account_after_content and account_after_content.status in (
+                    STATUS_REJECTED,
+                    STATUS_FAILED,
+                ):
+                    logger.info(
+                        f"Account {username} status is '{account_after_content.status}' "
+                        f"after content parsing. Not updating to '{STATUS_PARSED}'."
+                    )
+                    return
+
+                # Only update status to "parsed" if account is still in "processing" state
+                if account_after_content and account_after_content.status == STATUS_PROCESSING:
+                    # On successful completion, update status to "parsed"
+                    # Use db_account_id for status update
+                    await self._update_account_status(db_account_id, STATUS_PARSED)
+                    logger.info(
+                        f"Successfully processed account {db_account_id} "
+                        f"({username} on {platform})"
+                    )
 
             except Exception as e:
                 # On failure, catch the exception, log it, and update status to "failed"
