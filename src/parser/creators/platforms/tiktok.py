@@ -29,14 +29,13 @@ from sqlalchemy import select
 
 from src.config.config import Settings
 from src.db.models import Account
-from src.parser.creators.core.db import (
-    update_account_profile_metadata,
-    bulk_upsert_content,
-)
+from src.parser.creators.core.queries import SearchQueriesManager
 from src.parser.creators.core.utils import (
     is_russian_text,
     is_slop_or_theme_page,
     upsert_and_deduplicate_account,
+    update_account_profile_metadata,
+    bulk_upsert_content,
     upsert_virtual_bio_post,
     parse_profile_contacts,
     parse_published_at,
@@ -93,6 +92,7 @@ class TikTokParser(BasePlatformParser):
         super().__init__(session_maker, client, settings)
         self._cached_profile: dict[str, Any] | None = None
         self._cached_handle: str | None = None
+        self._queries_manager = SearchQueriesManager(settings.search_queries_path)
 
     async def parse_profile(self, handle: str) -> int | None:
         """Fetch TikTok profile, apply Gatekeeper filters, upsert account.
@@ -386,7 +386,8 @@ class TikTokParser(BasePlatformParser):
             )
 
             # Check if transcription should be skipped (target semantics present)
-            skip_transcription = bool(self.settings.semantic_keywords_pattern.search(description))
+            keywords_pattern = self._queries_manager.get_compiled_keywords_pattern()
+            skip_transcription = bool(keywords_pattern.search(description))
 
             # Extract CDN subtitle URL (0 API credits)
             subtitle_url: str | None = None

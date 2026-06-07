@@ -22,15 +22,13 @@ from typing import Any
 
 from aiohttp import ClientResponseError
 
-from src.parser.creators.core.db import (
+from src.parser.creators.core.utils import (
     upsert_and_deduplicate_account,
     update_account_profile_metadata,
     upsert_virtual_bio_post,
     bulk_upsert_content,
     queue_discovered_accounts,
     queue_discovered_mentions,
-)
-from src.parser.creators.core.utils import (
     is_russian_text,
     is_slop_or_theme_page,
     parse_profile_contacts,

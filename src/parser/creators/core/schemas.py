@@ -214,3 +214,42 @@ class ContentMetadata(BaseModel):
         if "extracted_at" not in kwargs:
             kwargs["extracted_at"] = datetime.now(timezone.utc).isoformat()
         return cls(**kwargs)
+
+
+class InstagramContentMetadata(ContentMetadata):
+    """
+    Instagram-specific content metadata.
+
+    Inherits all fields from ContentMetadata and adds Instagram-specific
+    fields for Reel detection and validation.
+
+    Attributes:
+        is_reel: Whether the post is an Instagram Reel.
+    """
+
+    is_reel: bool | None = None
+
+
+class TikTokContentMetadata(ContentMetadata):
+    """
+    TikTok-specific content metadata.
+
+    Inherits all fields from ContentMetadata for TikTok video content.
+    TikTok videos are always short-form, so no additional type field is needed.
+    """
+
+
+class YouTubeContentMetadata(ContentMetadata):
+    """
+    YouTube-specific content metadata.
+
+    Inherits all fields from ContentMetadata and adds YouTube-specific
+    fields for Shorts detection and video duration tracking.
+
+    Attributes:
+        is_short: Whether the video is a YouTube Short.
+        duration_seconds: Video duration in seconds.
+    """
+
+    is_short: bool | None = None
+    duration_seconds: float | None = None

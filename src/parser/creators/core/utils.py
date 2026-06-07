@@ -51,6 +51,8 @@ from src.parser.creators.core.contacts import (
 
 from src.parser.creators.core.db import (
     upsert_and_deduplicate_account,
+    update_account_profile_metadata,
+    bulk_upsert_content,
     queue_discovered_accounts,
     queue_discovered_mentions,
     _queue_single_account,
@@ -98,6 +100,8 @@ __all__ = [
     "compile_author_metadata_dict",
     # DB module
     "upsert_and_deduplicate_account",
+    "update_account_profile_metadata",
+    "bulk_upsert_content",
     "queue_discovered_accounts",
     "queue_discovered_mentions",
     "_queue_single_account",

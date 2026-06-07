@@ -14,8 +14,8 @@ Refactored to use centralized db.py architecture:
 - Implements conditional transcript fetching based on semantic keywords
 
 Implements Two-Stage Russian Language Check:
-- Stage 1 (parse_profile): Check biography/full_name for Cyrillic
-- Stage 2 (parse_content): Check post captions/hashtags for Cyrillic
+- Stage1 (parse_profile): Check biography/full_name for Cyrillic
+- Stage2 (parse_content): Check post captions/hashtags for Cyrillic
 """
 
 import asyncio
@@ -24,15 +24,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import ClientResponseError
-from sqlalchemy import update
+from sqlalchemy import update, select
 from src.db.models import Account
 
-from src.parser.creators.core.db import (
+from src.parser.creators.core.queries import SearchQueriesManager
+from src.parser.creators.core.utils import (
     upsert_and_deduplicate_account,
     update_account_profile_metadata,
     bulk_upsert_content,
-)
-from src.parser.creators.core.utils import (
     extract_instagram_subscribers,
     is_russian_text,
     is_slop_or_theme_page,
@@ -68,13 +67,14 @@ class InstagramParser(BasePlatformParser):
         super().__init__(session_maker, client, settings)
         self._cached_profile: dict[str, Any] | None = None
         self._cached_handle: str | None = None
+        self._queries_manager = SearchQueriesManager(settings.search_queries_path)
 
     async def parse_profile(self, handle: str) -> int | None:
-        """Fetch Instagram profile, apply Stage 1 Russian language check, upsert account.
+        """Fetch Instagram profile, apply Stage1 Russian language check, upsert account.
 
-        Stage 1 Russian Language Check:
+        Stage1 Russian Language Check:
         - Extract biography, full_name, and username
-        - If biography is empty/None after stripping: pass to Stage 2 with "processing" status
+        - If biography is empty/None after stripping: pass to Stage2 with "processing" status
         - If biography is NOT empty: check Cyrillic in biography OR full_name
         - If no Cyrillic found: reject account immediately
 
@@ -93,7 +93,7 @@ class InstagramParser(BasePlatformParser):
         if not profile:
             return None
 
-        # Extract profile fields for Stage 1 validation
+        # Extract profile fields for Stage1 validation
         username = profile.get("username", "")
         biography = profile.get("biography")  # May be None from API
         full_name = profile.get("full_name", "")
@@ -152,14 +152,14 @@ class InstagramParser(BasePlatformParser):
                 return account_id
 
         # ===================================================================
-        # STAGE 1: RUSSIAN LANGUAGE CHECK (BIOGRAPHY)
+        # STAGE1: RUSSIAN LANGUAGE CHECK (BIOGRAPHY)
         # ===================================================================
         biography_stripped = biography.strip() if biography else ""
 
         if not biography_stripped:
-            # Biography is empty/None: let account pass to Stage 2 for post validation
+            # Biography is empty/None: let account pass to Stage2 for post validation
             logger.info(
-                "Instagram handle %s: biography is empty, passing to Stage 2 content validation.",
+                "Instagram handle %s: biography is empty, passing to Stage2 content validation.",
                 handle,
             )
             async with self.session_maker() as session:
@@ -217,9 +217,9 @@ class InstagramParser(BasePlatformParser):
                 await session.commit()
                 return account_id
 
-        # Cyrillic found in biography or full_name: pass to Stage 2
+        # Cyrillic found in biography or full_name: pass to Stage2
         logger.info(
-            "Instagram handle %s: Stage 1 PASSED (Cyrillic detected). Passing to Stage 2.",
+            "Instagram handle %s: Stage1 PASSED (Cyrillic detected). Passing to Stage2.",
             handle,
         )
         async with self.session_maker() as session:
@@ -326,7 +326,7 @@ class InstagramParser(BasePlatformParser):
         - Collects maximum of 10 valid videos (not 50) to limit credit usage
         - Conditional transcript fetching based on semantic keywords
         - Extracts and saves high-quality MP4 URL for GPU embedding
-        - Stage 2 Cyrillic validation: rejects account if no Russian text in posts
+        - Stage2 Cyrillic validation: rejects account if no Russian text in posts
 
         Args:
             account_id: Database ID of the associated account.
@@ -338,6 +338,17 @@ class InstagramParser(BasePlatformParser):
             account_id,
             platform_id,
         )
+
+        # Query database to get existing account category from raw_metadata
+        account_category = "unknown"
+        async with self.session_maker() as session:
+            stmt = select(Account.raw_metadata).where(Account.id == account_id)
+            result = await session.execute(stmt)
+            raw_metadata = result.scalar_one_or_none()
+            if raw_metadata and isinstance(raw_metadata, dict):
+                category = raw_metadata.get("category")
+                if category and isinstance(category, str):
+                    account_category = category
 
         # Fetch profile for author metadata
         profile = await self._get_cached_or_fetch_profile(platform_id)
@@ -406,7 +417,7 @@ class InstagramParser(BasePlatformParser):
 
         if not valid_items:
             # No valid content found: reject account to prevent false positives
-            # This handles accounts with empty biographies that reached Stage 2 with "processing" status
+            # This handles accounts with empty biographies that reached Stage2 with "processing" status
             logger.info(
                 "No valid Instagram content found for account_id: %d. Rejecting account.",
                 account_id,
@@ -429,7 +440,7 @@ class InstagramParser(BasePlatformParser):
         )
 
         # ===================================================================
-        # STAGE 2: CYRILLIC VALIDATION (SIEVE)
+        # STAGE2: CYRILLIC VALIDATION (SIEVE)
         # Combine all post text and check for Russian characters
         # If no Cyrillic found, reject account and exit without DB writes
         # ===================================================================
@@ -479,7 +490,7 @@ class InstagramParser(BasePlatformParser):
 
         # Cyrillic detected - proceed with parsing
         logger.info(
-            "Stage 2 Cyrillic validation PASSED for account_id: %d. Proceeding with content parsing.",
+            "Stage2 Cyrillic validation PASSED for account_id: %d. Proceeding with content parsing.",
             account_id,
         )
 
@@ -509,10 +520,11 @@ class InstagramParser(BasePlatformParser):
                     if tag.startswith("#")
                 ]
 
-            # Check if content matches target semantics using dynamic settings
+            # Check if content matches target semantics using SearchQueriesManager
             combined_text = description + " " + " ".join(hashtags)
+            keywords_pattern = self._queries_manager.get_compiled_keywords_pattern()
             has_target_semantics = (
-                self.settings.semantic_keywords_pattern.search(combined_text) is not None
+                keywords_pattern.search(combined_text) is not None
             )
 
             likes, comments = extract_instagram_metrics(item)
@@ -589,15 +601,15 @@ class InstagramParser(BasePlatformParser):
 
         # Build final content values for bulk upsert
         final_content_values = []
-        aggregated_contacts: dict[str, list[str]] = {}
+        # Accumulated contacts structured to match parse_profile_contacts() output format
+        aggregated_emails: list[str] = []
+        aggregated_telegram_handles: list[str] = []
+        aggregated_external_links: list[str] = []
+        aggregated_external_platforms: dict[str, str] = {}
         aggregated_mentions: set[str] = set()
 
-        # Stage 2 Cyrillic validation passed, language is Russian
+        # Stage2 Cyrillic validation passed, language is Russian
         language = "ru"
-
-        # Get category from profile or use fallback
-        # Instagram doesn't provide category directly, so we use fallback
-        category = profile.get("category") or "unknown"
 
         for item_data in items_data:
             item = item_data["item"]
@@ -611,13 +623,26 @@ class InstagramParser(BasePlatformParser):
                 # Extract same-platform mentions (e.g., @otheruser)
                 mentions = extract_mentions(content_text)
 
-                # Accumulate contacts
-                for platform, handles in contacts_dict.items():
-                    if platform not in aggregated_contacts:
-                        aggregated_contacts[platform] = []
-                    for handle in handles:
-                        if handle not in aggregated_contacts[platform]:
-                            aggregated_contacts[platform].append(handle)
+                # Accumulate emails: distinct flat list
+                for email in contacts_dict.get("emails", []):
+                    if email and email not in aggregated_emails:
+                        aggregated_emails.append(email)
+
+                # Accumulate telegram_handles: distinct flat list
+                for handle in contacts_dict.get("telegram_handles", []):
+                    if handle and handle not in aggregated_telegram_handles:
+                        aggregated_telegram_handles.append(handle)
+
+                # Accumulate external_links: distinct flat list
+                for link in contacts_dict.get("external_links", []):
+                    if link and link not in aggregated_external_links:
+                        aggregated_external_links.append(link)
+
+                # Accumulate external_platforms: dict mapping platform slugs to handles
+                # If multiple items mention the same platform, keep the first handle discovered
+                for platform_slug, handle in contacts_dict.get("external_platforms", {}).items():
+                    if handle and platform_slug not in aggregated_external_platforms:
+                        aggregated_external_platforms[platform_slug] = handle
 
                 # Accumulate mentions
                 aggregated_mentions.update(mentions)
@@ -634,7 +659,7 @@ class InstagramParser(BasePlatformParser):
             # platform_metrics: clean flat numerical values
             raw_metadata = {
                 "video_url": video_url,
-                "category": category,
+                "category": account_category,
                 "language": language,
                 "post_type": post_type,
                 "platform_metrics": {
@@ -671,6 +696,15 @@ class InstagramParser(BasePlatformParser):
                 }
             )
 
+        # Build aggregated_contacts dict for queue_discovered_accounts
+        aggregated_contacts: dict[str, Any] = {
+            "emails": aggregated_emails,
+            "telegram_handles": aggregated_telegram_handles,
+            "external_links": aggregated_external_links,
+            "external_platforms": aggregated_external_platforms,
+            "raw_bio": "",
+        }
+
         # Bulk write all accumulated discovery data
         if aggregated_contacts or aggregated_mentions:
             try:
@@ -681,6 +715,7 @@ class InstagramParser(BasePlatformParser):
                             metadata=aggregated_contacts,
                             parent_handle=profile.get("username", ""),
                             status="pending",
+                            category=account_category,
                         )
                     if aggregated_mentions:
                         await queue_discovered_mentions(
@@ -689,6 +724,7 @@ class InstagramParser(BasePlatformParser):
                             mentions=list(aggregated_mentions),
                             parent_handle=profile.get("username", ""),
                             status="pending",
+                            category=account_category,
                         )
                     await session.commit()
             except Exception as e:
@@ -729,7 +765,7 @@ class InstagramParser(BasePlatformParser):
         Returns:
             Video URL string if found, otherwise None.
         """
-        # Tier 1: Check nested "media" object
+        # Tier1: Check nested "media" object
         media = item.get("media")
         if isinstance(media, dict):
             # Check video_versions inside media object (list format)
@@ -757,7 +793,7 @@ class InstagramParser(BasePlatformParser):
             if isinstance(video_url, str) and video_url:
                 return video_url
 
-        # Tier 2: Check video_versions at item level (list format)
+        # Tier2: Check video_versions at item level (list format)
         video_versions = item.get("video_versions")
         if isinstance(video_versions, list) and len(video_versions) > 0:
             first_video = video_versions[0]
@@ -766,7 +802,7 @@ class InstagramParser(BasePlatformParser):
                 if isinstance(url, str) and url:
                     return url
 
-        # Tier 3: Check video_versions at item level (dict format with numeric keys)
+        # Tier3: Check video_versions at item level (dict format with numeric keys)
         if isinstance(video_versions, dict) and video_versions:
             # Extract URL from the first available key
             first_key = next(iter(video_versions), None)
@@ -777,12 +813,12 @@ class InstagramParser(BasePlatformParser):
                     if isinstance(url, str) and url:
                         return url
 
-        # Tier 4: Fallback to video_url at item level
+        # Tier4: Fallback to video_url at item level
         video_url = item.get("video_url")
         if isinstance(video_url, str) and video_url:
             return video_url
 
-        # Tier 5: Fallback to carousel_media list (recursive extraction)
+        # Tier5: Fallback to carousel_media list (recursive extraction)
         carousel_media = item.get("carousel_media")
         if isinstance(carousel_media, list) and len(carousel_media) > 0:
             # Recursively extract video URL from the first carousel item
@@ -794,7 +830,7 @@ class InstagramParser(BasePlatformParser):
                 if isinstance(carousel_video_url, str) and carousel_video_url:
                     return carousel_video_url
 
-        # Tier 6: Final fallback to extract_instagram_video_url helper
+        # Tier6: Final fallback to extract_instagram_video_url helper
         return extract_instagram_video_url(item)
 
     async def _fetch_transcript(

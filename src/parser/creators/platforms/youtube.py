@@ -30,15 +30,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.config.config import Settings
 from src.db.models import Account, Content
-from src.parser.creators.core.db import (
+from src.parser.creators.core.queries import SearchQueriesManager
+from src.parser.creators.core.utils import (
     upsert_and_deduplicate_account,
     update_account_profile_metadata,
     bulk_upsert_content,
     upsert_virtual_bio_post,
     queue_discovered_accounts,
     queue_discovered_mentions,
-)
-from src.parser.creators.core.utils import (
     is_russian_text,
     is_slop_or_theme_page,
     extract_mentions,
@@ -98,6 +97,7 @@ class YouTubeParser(BasePlatformParser):
         super().__init__(session_maker, client, settings)
         self._cached_profile: dict[str, Any] | None = None
         self._cached_handle: str | None = None
+        self._queries_manager = SearchQueriesManager(settings.search_queries_path)
 
     def _format_handle(self, handle: str) -> str:
         """Format YouTube handle with proper prefix for API calls.
@@ -611,8 +611,8 @@ class YouTubeParser(BasePlatformParser):
             )
             author_metadata = self._build_author_profile_metadata(channel_data)
 
-            # Get compiled semantic keywords pattern from settings
-            keywords_pattern = self.settings.semantic_keywords_pattern
+            # Get compiled semantic keywords pattern from queries manager
+            keywords_pattern = self._queries_manager.get_compiled_keywords_pattern()
 
             # Process videos and fetch transcripts concurrently
             content_values: list[dict[str, Any]] = []

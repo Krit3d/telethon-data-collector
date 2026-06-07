@@ -1,8 +1,6 @@
 import argparse
-import json
 import logging
 import os
-import re
 from pathlib import Path
 
 from pydantic import (
@@ -265,59 +263,10 @@ class Settings(BaseSettings):
         return c
 
     # ---- Search queries and semantic keywords ----
-    _search_queries_path: Path = Field(
+    search_queries_path: Path = Field(
         default=Path(__file__).parent / "search_queries.json",
-        exclude=True,
         description="Path to JSON file containing search queries and semantic keywords",
     )
-
-    @property
-    def search_queries(self) -> list[str]:
-        """Load search queries from JSON file.
-
-        Returns:
-            List of search query strings. Returns empty list if file cannot be loaded.
-        """
-        try:
-            with open(self._search_queries_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("queries", [])
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            logging.warning(f"Failed to load search queries from {self._search_queries_path}: {e}")
-            return []
-
-    @property
-    def semantic_keywords(self) -> frozenset[str]:
-        """Load semantic keywords from JSON file as a frozenset.
-
-        Returns:
-            Frozenset of semantic keyword strings. Returns empty frozenset if file cannot be loaded.
-        """
-        try:
-            with open(self._search_queries_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                keywords = data.get("keywords", [])
-                return frozenset(keywords)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            logging.warning(f"Failed to load semantic keywords from {self._search_queries_path}: {e}")
-            return frozenset()
-
-    @property
-    def semantic_keywords_pattern(self) -> re.Pattern:
-        """Compiled regex pattern for semantic keyword matching.
-
-        The pattern matches whole words (using word boundaries) and is case-insensitive.
-        Returns a pattern that never matches if no keywords are available.
-
-        Returns:
-            Compiled regex pattern for matching semantic keywords.
-        """
-        keywords = self.semantic_keywords
-        if not keywords:
-            # Return a pattern that never matches
-            return re.compile(r"(?!x)x")
-        pattern = r"\b(" + "|".join(re.escape(kw) for kw in keywords) + r")\b"
-        return re.compile(pattern, re.IGNORECASE)
 
 
 # ----- Helper functions -----

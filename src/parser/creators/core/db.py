@@ -175,8 +175,8 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
             # Standardize on +hash format for consistency
             return "TELEGRAM", "+" + joinchat_match.group(1)
 
-        # Standard username extraction
-        match = re.search(r"t\.me/([^/?#]+)", url_lower)
+        # Standard username extraction (supports optional /s/ prefix for web-view links)
+        match = re.search(r"t\.me/(?:s/)?([^/?#]+)", url_lower)
         if match:
             username = match.group(1)
             if username and username not in ("joinchat", "join"):
@@ -534,6 +534,17 @@ async def update_account_profile_metadata(
         return {}
 
     username = account.username or account.platform_id
+
+    # Resolve category with inheritance logic
+    resolved_category = category
+    if resolved_category is None:
+        # Check if account has raw_metadata with category
+        if account.raw_metadata and isinstance(account.raw_metadata, dict):
+            resolved_category = account.raw_metadata.get("category")
+        # If still None, fall back to "unknown"
+        if resolved_category is None:
+            resolved_category = "unknown"
+
     compiled_metadata = compile_author_metadata(
         platform=platform,
         username=username,
@@ -543,7 +554,7 @@ async def update_account_profile_metadata(
         location=location,
         language=language,
         geo_data=geo_data,
-        category=category,
+        category=resolved_category,
         raw_profile_payload=raw_profile_payload,
     )
 
@@ -578,9 +589,8 @@ async def update_account_profile_metadata(
 
     if contacts:
         parent_handle = account.username or account.platform_id or str(account_id)
-        parent_category = category or compiled_metadata.category
         await queue_discovered_accounts(
-            session, compiled_metadata, parent_handle, status="pending", category=parent_category
+            session, compiled_metadata, parent_handle, status="pending", category=resolved_category
         )
 
     return compiled_metadata.model_dump(exclude_none=True)
@@ -840,6 +850,7 @@ async def queue_discovered_mentions(
     mentions: list[str],
     parent_handle: str,
     status: str = "pending",
+    category: str | None = None,
 ) -> None:
     """
     Queue discovered @username mentions for the current platform into the database.
@@ -850,11 +861,12 @@ async def queue_discovered_mentions(
         mentions: List of usernames extracted from @mentions (without @ symbol)
         parent_handle: Handle of the parent account that contained the mentions
         status: Status to assign to newly discovered accounts (default: "pending")
+        category: Optional category to inherit to newly queued accounts
     """
     for username in mentions:
         if not username or len(username) < 3:
             continue
-        await _queue_single_account(session, platform, username, parent_handle, status)
+        await _queue_single_account(session, platform, username, parent_handle, status, category)
 
 
 async def _queue_single_account(
@@ -890,9 +902,8 @@ async def _queue_single_account(
     if not existing:
         generated_id = generate_deterministic_id(platform, platform_id)
         try:
-            raw_metadata = {}
-            if category is not None:
-                raw_metadata["category"] = category
+            # Safe dict assignment: only set category if provided, otherwise None
+            raw_metadata = {"category": category} if category else None
 
             new_account = Account(
                 id=generated_id,
@@ -901,7 +912,7 @@ async def _queue_single_account(
                 username=platform_id,
                 title=platform_id,
                 status=status,
-                raw_metadata=raw_metadata if raw_metadata else None,
+                raw_metadata=raw_metadata,
             )
             session.add(new_account)
             await session.flush()
