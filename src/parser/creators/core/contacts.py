@@ -54,6 +54,11 @@ URL_PATTERN = re.compile(
 # Regex pattern for extracting @username mentions (general purpose)
 MENTION_PATTERN = re.compile(r"(?<=^|(?<=[^a-zA-Z0-9-_\.]))@([a-zA-Z0-9_\.]{1,30})")
 
+# Phone number pattern for Russian formats
+PHONE_PATTERN = re.compile(
+    r"\b(?:\+?7|8)[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{2}[-.\s]?\d{2}\b"
+)
+
 # Common social media domains to exclude when extracting external links
 SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset({
     "instagram.com",
@@ -275,6 +280,36 @@ def extract_mentions(text: str | None) -> list[str]:
     return list(set(match.lower() for match in matches if match))
 
 
+def extract_phones(text: str | None) -> list[str]:
+    """Extract phone numbers from text using PHONE_PATTERN regex.
+
+    Finds phone numbers matching common Russian formats, cleans them
+    by keeping only digits and leading '+', and deduplicates while
+    preserving order.
+
+    Args:
+        text: The text to search for phone numbers. Can be None.
+
+    Returns:
+        A deduplicated list of cleaned phone numbers.
+        Returns empty list if text is None or no phones are found.
+    """
+    if not text:
+        return []
+
+    # Find all matches, clean them by keeping digits and leading '+' if present
+    matches = PHONE_PATTERN.findall(text)
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_phones: list[str] = []
+    for phone in matches:
+        cleaned = "".join(c for c in phone if c.isdigit() or c == "+")
+        if cleaned not in seen:
+            seen.add(cleaned)
+            unique_phones.append(cleaned)
+    return unique_phones
+
+
 def extract_external_links(
     text: str | None,
     exclude_domains: set[str] | None = None,
@@ -358,6 +393,7 @@ def parse_profile_contacts(
 
     emails = extract_emails(combined_text)
     telegram_handles = extract_telegram_handles(combined_text)
+    phones = extract_phones(combined_text)
     external_platforms = extract_external_platforms(combined_text)
     external_links = extract_external_links(combined_text)
 
@@ -375,6 +411,7 @@ def parse_profile_contacts(
 
     return {
         "emails": emails,
+        "phones": phones,
         "telegram_handles": telegram_handles,
         "external_links": external_links,
         "external_platforms": external_platforms,
@@ -658,6 +695,11 @@ def compile_author_metadata(
     if not isinstance(emails, list):
         emails = []
 
+    # Extract phones
+    phones = contacts_dict.get("phones", []) if contacts_dict else []
+    if not isinstance(phones, list):
+        phones = []
+
     # External links: combine from contacts_dict and extra_links parameter
     external_links: list[str] = []
     links_from_dict = contacts_dict.get("external_links", []) if contacts_dict else []
@@ -711,6 +753,7 @@ def compile_author_metadata(
     # Build Contacts model
     contacts = Contacts(
         emails=[email.lower().strip() for email in emails if email and isinstance(email, str)],
+        phones=[p for p in phones if p and isinstance(p, str)],
         telegram_channels=telegram_channels,
         telegram_personal=telegram_personal,
     )

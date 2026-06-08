@@ -180,6 +180,11 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
         if match:
             username = match.group(1)
             if username and username not in ("joinchat", "join"):
+                # Filter out Telegram bot usernames (case-insensitive)
+                # Bot usernames end with "bot" (e.g., "mybot", "newsbot")
+                username_lower = username.lower()
+                if username_lower.endswith("bot"):
+                    return None, None
                 return "TELEGRAM", username
         return None, None
 
@@ -284,7 +289,17 @@ def _convert_dict_to_account_metadata(contacts_dict: dict[str, Any]) -> AccountM
     external_platforms_dict = contacts_dict.get("external_platforms", {})
 
     # Classify Telegram handles (using simple heuristic: treat all as channels for now)
-    telegram_channels = [h.lstrip("@") for h in telegram_handles if h]
+    # Filter out bot usernames (case-insensitive): usernames ending with "bot"
+    telegram_channels = []
+    for handle in telegram_handles:
+        if not handle:
+            continue
+        username = handle.lstrip("@")
+        # Bot usernames end with "bot" or "_bot" (case-insensitive)
+        # Note: endswith("bot") catches both "bot" and "_bot" endings
+        if username.lower().endswith("bot"):
+            continue
+        telegram_channels.append(username)
     telegram_personal: list[str] = []
 
     # Build ExternalPlatforms

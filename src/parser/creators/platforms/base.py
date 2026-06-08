@@ -91,3 +91,20 @@ class BasePlatformParser(abc.ABC):
                 should not be silently ignored.
         """
         raise NotImplementedError("Subclasses must implement parse_content()")
+
+    @abc.abstractmethod
+    async def discover_candidates(self, query: str, category: str) -> int:
+        """Discover candidate accounts/profiles on the platform using search query.
+
+        Queries the Scrape Creators API search endpoint for the platform,
+        extracts candidate profiles, performs initial filtering, and registers
+        them in the database with "pending" status and category stored in raw_metadata.
+
+        Args:
+            query: The search query string.
+            category: The category name associated with this query.
+
+        Returns:
+            The number of newly discovered or updated accounts.
+        """
+        raise NotImplementedError("Subclasses must implement discover_candidates()")

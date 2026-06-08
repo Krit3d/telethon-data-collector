@@ -9,7 +9,7 @@ Refactored to use centralized db.py architecture:
 - Uses upsert_and_deduplicate_account for account operations
 - Uses update_account_profile_metadata for profile metadata
 - Uses bulk_upsert_content for content operations
-- Eliminates pagination (single page fetch only)
+- Implements conditional two-page pagination to guarantee 10 valid videos
 - Limits to max 10 videos to reduce credit consumption
 - Implements conditional transcript fetching based on semantic keywords
 
@@ -20,6 +20,7 @@ Implements Two-Stage Russian Language Check:
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,6 +29,11 @@ from sqlalchemy import update, select
 from src.db.models import Account
 
 from src.parser.creators.core.queries import SearchQueriesManager
+from src.parser.creators.core.schemas import (
+    InstagramContentMetadata,
+    PlatformMetrics,
+    AuthorProfileSnapshot,
+)
 from src.parser.creators.core.utils import (
     upsert_and_deduplicate_account,
     update_account_profile_metadata,
@@ -41,7 +47,6 @@ from src.parser.creators.core.utils import (
     extract_instagram_content_text,
     extract_instagram_published_at,
     extract_instagram_metrics,
-    build_instagram_author_metadata,
     parse_profile_contacts,
     extract_instagram_video_url,
 )
@@ -253,6 +258,189 @@ class InstagramParser(BasePlatformParser):
         )
         return account_id
 
+    async def discover_candidates(self, query: str, category: str) -> int:
+        """Discover Instagram creator candidates using Scrape Creators search API.
+
+        Queries the /v1/instagram/search/profiles endpoint to find Instagram profiles
+        matching the given search query, then filters and upserts valid candidates
+        into the database for further processing.
+
+        Args:
+            query: Search query string (e.g., "fitness influencer").
+            category: Category name for the discovered accounts (e.g., "fitness").
+
+        Returns:
+            Number of successfully discovered and stored candidate accounts.
+            Returns 0 if the API request fails or an exception occurs.
+        """
+        logger.info(
+            "Starting Instagram candidate discovery for query: '%s', category: '%s'",
+            query,
+            category,
+        )
+
+        try:
+            # Call Scrape Creators API to search for profiles
+            response = await self.client.get(
+                endpoint="/v1/instagram/search/profiles",
+                params={"query": query},
+            )
+
+            if not response:
+                logger.warning(
+                    "Empty response from Instagram search API for query: '%s'",
+                    query,
+                )
+                return 0
+
+            # Robustly extract profiles from response
+            # API might return them under "profiles", "data", or "items"
+            profiles: list[dict[str, Any]] = []
+            if isinstance(response.get("profiles"), list):
+                profiles = response["profiles"]
+            elif isinstance(response.get("data"), list):
+                profiles = response["data"]
+            elif isinstance(response.get("items"), list):
+                profiles = response["items"]
+            elif isinstance(response, list):
+                # Response might be a list directly
+                profiles = response
+            else:
+                logger.warning(
+                    "Unexpected Instagram search API response structure for query: '%s'. "
+                    "Response keys: %s",
+                    query,
+                    list(response.keys()) if isinstance(response, dict) else type(response),
+                )
+                return 0
+
+            if not profiles:
+                logger.info(
+                    "No profiles found in Instagram search results for query: '%s'",
+                    query,
+                )
+                return 0
+
+            discovered_count = 0
+
+            # Process each profile
+            for profile in profiles:
+                if not isinstance(profile, dict):
+                    continue
+
+                # Safely retrieve username (or handle)
+                username = profile.get("username") or profile.get("handle")
+                if not username or not isinstance(username, str):
+                    logger.debug(
+                        "Skipping profile with missing username in search results: %s",
+                        profile.get("id", "unknown"),
+                    )
+                    continue
+
+                # Safely extract subscriber/follower count
+                followers = profile.get("follower_count") or profile.get("followers")
+                if followers is None:
+                    # Try nested paths
+                    followers = (
+                        profile.get("stats", {}).get("followers")
+                        or profile.get("user", {}).get("follower_count")
+                    )
+
+                # Convert to int if possible, default to 0
+                try:
+                    followers = int(followers) if followers is not None else 0
+                except (ValueError, TypeError):
+                    followers = 0
+
+                # Perform subscriber range check
+                # Skip if followers == 0 (invalid data) or outside [MIN, MAX] range
+                if followers == 0:
+                    logger.debug(
+                        "Skipping Instagram profile %s: follower count is 0",
+                        username,
+                    )
+                    continue
+
+                if not (MIN_SUBSCRIBERS <= followers <= MAX_SUBSCRIBERS):
+                    logger.debug(
+                        "Skipping Instagram profile %s: follower count %d outside range [%d, %d]",
+                        username,
+                        followers,
+                        MIN_SUBSCRIBERS,
+                        MAX_SUBSCRIBERS,
+                    )
+                    continue
+
+                # Extract profile fields for upsert
+                profile_id = profile.get("id")
+                full_name = profile.get("full_name", "")
+                biography = profile.get("biography", "") or ""
+
+                # Upsert account using centralized helper
+                async with self.session_maker() as session:
+                    try:
+                        account_id = await upsert_and_deduplicate_account(
+                            session=session,
+                            platform="INSTAGRAM",
+                            platform_id=str(profile_id or username),
+                            username=username,
+                            title=full_name or username,
+                            description=biography,
+                            subscribers_count=followers,
+                            status="pending",
+                        )
+
+                        # Prepare raw metadata dict with category and search metadata
+                        meta: dict[str, Any] = {
+                            "category": category,
+                            "discovery_query": query,
+                            "search_metadata": profile,
+                        }
+
+                        # Execute explicit SQLAlchemy update to store meta
+                        # This guarantees Phase 2 processing (parse_content) can read the category name
+                        stmt = (
+                            update(Account)
+                            .where(Account.id == account_id)
+                            .values(raw_metadata=meta, updated_at=datetime.now(timezone.utc))
+                        )
+                        await session.execute(stmt)
+                        await session.commit()
+
+                        discovered_count += 1
+                        logger.debug(
+                            "Discovered and stored Instagram candidate: %s (account_id: %d)",
+                            username,
+                            account_id,
+                        )
+
+                    except Exception as e:
+                        logger.error(
+                            "Failed to upsert Instagram profile %s: %s",
+                            username,
+                            e,
+                            exc_info=True,
+                        )
+                        # Continue processing other profiles
+                        continue
+
+            logger.info(
+                "Instagram candidate discovery completed for query: '%s'. "
+                "Discovered %d valid candidates.",
+                query,
+                discovered_count,
+            )
+            return discovered_count
+
+        except Exception as e:
+            logger.error(
+                "Instagram candidate discovery failed for query: '%s': %s",
+                query,
+                e,
+                exc_info=True,
+            )
+            return 0
+
     async def _get_cached_or_fetch_profile(
         self, handle: str
     ) -> dict[str, Any] | None:
@@ -316,14 +504,80 @@ class InstagramParser(BasePlatformParser):
             )
             return None
 
+    def _has_sufficient_semantics(
+        self,
+        bio: str | None,
+        external_url: str | None,
+        caption: str | None,
+        hashtags: list[str],
+        has_target_semantics: bool,
+    ) -> bool:
+        """Decide if a post has enough semantic content to skip transcription.
+
+        Returns True (skip transcription) ONLY when ALL of the following hold:
+        1. ``has_target_semantics`` is True (matched search query keywords).
+        2. The caption is "rich enough":
+           - ``caption`` length is strictly greater than 120 characters, OR
+           - ``hashtags`` list contains 3 or more items.
+        3. The account bio or external URL contains at least one contact/social
+           indicator (email, Telegram handle/link, or any HTTP/HTTPS URL).
+
+        Returns False in all other cases, meaning a transcript MUST be requested.
+        
+        Note:
+            Telegram pattern matches:
+            - Standard usernames: @username
+            - Classic links: t.me/username, telegram.me/username, telegram.dog/username
+            - Private channels: t.me/+invitehash (with + character)
+            - Custom domains and slugs with hyphens
+            - Text mentions: тг, тгк, телеграм, tg, telegram, канал (as distinct words)
+        """
+        # Condition A: must have matched target semantics
+        # Return False immediately (always transcribe) if no target semantics
+        if not has_target_semantics:
+            return False
+
+        # Condition B: caption must be rich enough
+        # Return False immediately (always transcribe) if caption is too short AND has few hashtags
+        caption_len = len(caption) if caption else 0
+        if caption_len <= 120 and len(hashtags) < 3:
+            return False
+
+        # Condition C: bio or external_url must contain a contact/social indicator
+        # Check case-insensitively by converting to lower case
+        bio = bio or ""
+        external_url = external_url or ""
+        combined = (bio + " " + external_url).lower()
+
+        # Email pattern
+        has_email = bool(re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", combined))
+        
+        # Improved Telegram pattern (case-insensitive)
+        # Matches: @username, t.me/*, telegram.me/*, telegram.dog/*, and text mentions
+        telegram_pattern = r"@\w+|t\.me/[a-zA-Z0-9_\+\-]+|telegram\.(?:me|dog)/[a-zA-Z0-9_\+\-]+|\b(?:тг|тгк|телеграм|tg|telegram|канал)\b"
+        has_telegram = bool(re.search(telegram_pattern, combined, re.IGNORECASE))
+        
+        # Any http(s) URL
+        has_external_link = bool(re.search(r"https?://", combined))
+
+        # Return False immediately (always transcribe) if no valid contact details present
+        if not (has_email or has_telegram or has_external_link):
+            return False
+
+        # All hurdles passed: skip transcription
+        return True
+
     async def parse_content(
         self, account_id: int, platform_id: str, max_items: int = 10
     ) -> None:
-        """Parse timeline content via single-page posts endpoint.
+        """Parse timeline content via conditional two-page pagination.
 
-        Implements lightweight credit-efficient parsing:
-        - Exactly ONE API call to /v2/instagram/user/posts (no pagination)
-        - Collects maximum of 10 valid videos (not 50) to limit credit usage
+        Implements efficient credit-efficient parsing:
+        - First API call to /v2/instagram/user/posts (page 1)
+        - Filter for valid videos under 120 seconds (Reels)
+        - If fewer than 10 valid videos AND more_available is true
+          AND cursor exists: fetch page 2 via cursor/max_id
+        - Combine results from both pages, deduplicate, limit to 10
         - Conditional transcript fetching based on semantic keywords
         - Extracts and saves high-quality MP4 URL for GPU embedding
         - Stage2 Cyrillic validation: rejects account if no Russian text in posts
@@ -355,11 +609,21 @@ class InstagramParser(BasePlatformParser):
         if not profile:
             raise RuntimeError(f"Could not retrieve profile metadata for {platform_id} during content parsing.")
 
-        author_metadata = build_instagram_author_metadata(profile)
+        # Extract bio and external_url from profile for semantics helper
+        profile_biography = profile.get("biography")
+        profile_external_url = profile.get("external_url")
 
-        # Single API call - NO pagination, NO next_max_id loops
+        # Build author profile snapshot from profile data
+        author_profile_snapshot = AuthorProfileSnapshot(
+            username=profile.get("username", ""),
+            title=profile.get("full_name") or profile.get("username", ""),
+        )
+
+        # ===================================================================
+        # STEP 1: FETCH PAGE 1
+        # ===================================================================
         try:
-            response = await self.client.get(
+            response_page1 = await self.client.get(
                 endpoint="/v2/instagram/user/posts",
                 params={"handle": platform_id},
             )
@@ -371,18 +635,20 @@ class InstagramParser(BasePlatformParser):
             )
             raise
 
-        # Extract items from first page only
-        items: list[dict[str, Any]] = response.get("items", [])
+        # Extract items from page 1
+        items_page1: list[dict[str, Any]] = response_page1.get("items", [])
 
-        if not items:
+        if not items_page1:
             logger.info("No items found for %s", platform_id)
             return
 
-        # Filter for valid videos under 120 seconds (max 10 items)
+        # ===================================================================
+        # STEP 2: FILTER VALID VIDEOS FROM PAGE 1
+        # ===================================================================
         valid_items: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
 
-        for item in items:
+        for item in items_page1:
             item_id = item.get("id") or item.get("media_id") or item.get("pk")
             if not item_id:
                 continue
@@ -415,6 +681,79 @@ class InstagramParser(BasePlatformParser):
             if len(valid_items) >= max_items:
                 break
 
+        # ===================================================================
+        # STEP 3: CONDITIONAL PAGINATION (PAGE 2)
+        # ===================================================================
+        # Check if we need to fetch page 2
+        if len(valid_items) < max_items:
+            # Check if API response indicates more content is available
+            more_available = response_page1.get("more_available", False)
+
+            # Get cursor from profile_grid_items_cursor or next_max_id
+            cursor = (
+                response_page1.get("profile_grid_items_cursor")
+                or response_page1.get("next_max_id")
+            )
+
+            if more_available and cursor:
+                logger.info(
+                    "Fetching page 2 for %s (collected %d valid videos from page 1)",
+                    platform_id,
+                    len(valid_items),
+                )
+
+                try:
+                    response_page2 = await self.client.get(
+                        endpoint="/v2/instagram/user/posts",
+                        params={"handle": platform_id, "cursor": cursor},
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to fetch page 2 for %s: %s. Proceeding with page 1 results only.",
+                        platform_id,
+                        e,
+                    )
+                else:
+                    # Extract items from page 2
+                    items_page2: list[dict[str, Any]] = response_page2.get("items", [])
+
+                    # Filter valid videos from page 2 and append to valid_items
+                    for item in items_page2:
+                        if len(valid_items) >= max_items:
+                            break
+
+                        item_id = item.get("id") or item.get("media_id") or item.get("pk")
+                        if not item_id:
+                            continue
+
+                        # Deduplicate
+                        if item_id in seen_ids:
+                            continue
+                        seen_ids.add(item_id)
+
+                        # Check if it's a valid video under 120 seconds
+                        is_video = (
+                            item.get("media_type") == 2
+                            or item.get("is_video") is True
+                            or (
+                                isinstance(item.get("video_versions"), list)
+                                and bool(item.get("video_versions"))
+                            )
+                        )
+                        if not is_video:
+                            continue
+
+                        # Extract duration safely
+                        duration = item.get("video_duration") or item.get("duration", 0.0)
+                        # Valid video must have duration strictly between 0 and 120 seconds
+                        if not (0.0 < duration <= 120.0):
+                            continue
+
+                        valid_items.append(item)
+
+        # ===================================================================
+        # HANDLE EDGE CASES
+        # ===================================================================
         if not valid_items:
             # No valid content found: reject account to prevent false positives
             # This handles accounts with empty biographies that reached Stage2 with "processing" status
@@ -434,7 +773,7 @@ class InstagramParser(BasePlatformParser):
             return
 
         logger.info(
-            "Fetched %d valid video items for account_id: %d (single page, max 10)",
+            "Fetched %d valid video items for account_id: %d (after conditional pagination)",
             len(valid_items),
             account_id,
         )
@@ -555,7 +894,17 @@ class InstagramParser(BasePlatformParser):
                 "transcript": None,
             }
 
-            if not has_target_semantics:
+            # Decide whether transcript is needed using _has_sufficient_semantics
+            # Only Reels (duration <= 120s) are eligible for transcription
+            needs_transcript = not self._has_sufficient_semantics(
+                bio=profile_biography,
+                external_url=profile_external_url,
+                caption=description,
+                hashtags=hashtags,
+                has_target_semantics=has_target_semantics,
+            ) and post_type == "reel"
+
+            if needs_transcript:
                 # Request transcript via GET method
                 shortcode = item.get("code") or item.get("shortcode")
                 if shortcode:
@@ -591,13 +940,11 @@ class InstagramParser(BasePlatformParser):
                 else:
                     transcript_map[item_id] = None
 
-            # Update items_data with transcripts
+            # Update items_data with transcripts (transcript only, NOT content_text)
             for item_data in items_data:
                 item_id = item_data["item_id"]
                 if item_id in transcript_map:
                     item_data["transcript"] = transcript_map[item_id]
-                    if transcript_map[item_id]:
-                        item_data["content_text"] = transcript_map[item_id]
 
         # Build final content values for bulk upsert
         final_content_values = []
@@ -654,24 +1001,25 @@ class InstagramParser(BasePlatformParser):
             video_url = item_data["video_url"]
             post_type = item_data["post_type"]
 
-            # Build raw_metadata with new structure
-            # Root level keys: video_url, category, language, post_type
-            # platform_metrics: clean flat numerical values
-            raw_metadata = {
-                "video_url": video_url,
-                "category": account_category,
-                "language": language,
-                "post_type": post_type,
-                "platform_metrics": {
-                    "likes": likes,
-                    "comments_count": comments,
-                    "views": views,
-                    "shares": None,  # Instagram API doesn't always provide shares
-                    "plays": views,  # Use views as plays for Instagram
-                },
-                "author_profile_metadata": author_metadata,
-                "raw_item_payload": item,
-            }
+            # Build raw_metadata using Pydantic models
+            platform_metrics = PlatformMetrics(
+                likes=likes,
+                comments_count=comments,
+                views=views,
+                shares=None,  # Instagram API doesn't always provide shares
+                plays=views,  # Use views as plays for Instagram
+            )
+
+            content_metadata = InstagramContentMetadata.create_with_timestamp(
+                video_url=video_url,
+                category=account_category,
+                language=language,
+                post_type=post_type,
+                platform_metrics=platform_metrics,
+                author_profile_snapshot=author_profile_snapshot,
+                raw_item_payload=item,
+                is_reel=post_type == "reel",
+            )
 
             # Map to Content model columns explicitly
             # views -> views (int | None)
@@ -691,7 +1039,7 @@ class InstagramParser(BasePlatformParser):
                     "has_media": True,
                     "is_embedded": False,
                     "is_graph_extracted": False,
-                    "raw_metadata": raw_metadata,
+                    "raw_metadata": content_metadata,
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
