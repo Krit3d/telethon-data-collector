@@ -47,6 +47,7 @@ SUPPORTED_PLATFORMS: frozenset[str] = frozenset({
     "TIKTOK",
     "YOUTUBE",
     "THREADS",
+    "OK",
     "LINK_IN_BIO",
     "WEBSITE",
 })
@@ -62,6 +63,10 @@ LINK_IN_BIO_DOMAINS: frozenset[str] = frozenset({
     "lnk.bio",
     "campsite.bio",
     "carrd.co",
+    "linkin.bio",
+    "bio.link",
+    "linkbio.co",
+    "my.link",
 })
 
 # Telegram domains for platform detection
@@ -92,10 +97,23 @@ INSTAGRAM_DOMAINS: frozenset[str] = frozenset({
     "instagr.am",
 })
 
-# Non-user action paths to filter out for Telegram
+# Telegram non-user action paths to filter out to prevent corrupted pending accounts
 TELEGRAM_NON_USER_PATHS: frozenset[str] = frozenset({
     "/addstickers",
     "/addemoji",
+    "/share",
+    "/socks",
+    "/proxy",
+    "/setlanguage",
+    "/bg",
+    "/addtheme",
+    "/invoice",
+})
+
+# Odnoklassniki (OK) domains for platform detection
+OK_DOMAINS: frozenset[str] = frozenset({
+    "ok.ru",
+    "odnoklassniki.ru",
 })
 
 
@@ -164,19 +182,22 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
         if any(path in url_lower for path in TELEGRAM_NON_USER_PATHS):
             return None, None
 
-        # Check for invite links: t.me/+hash or t.me/joinchat/hash
+        # Build dynamic Telegram domain pattern (domains are case-insensitive; invite hashes are case-sensitive)
+        telegram_domain_regex = "|".join(re.escape(d) for d in TELEGRAM_DOMAINS)
+
+        # Check for invite links: domain/+hash or domain/joinchat/hash
         # Preserve original case for invite hashes (they are case-sensitive)
-        plus_match = re.search(r"t\.me/\+([A-Za-z0-9_\-]{6,})", url)
+        plus_match = re.search(rf"(?:{telegram_domain_regex})/\+([A-Za-z0-9_\-]{{6,}})", url, re.IGNORECASE)
         if plus_match:
             return "TELEGRAM", "+" + plus_match.group(1)
 
-        joinchat_match = re.search(r"t\.me/joinchat/([A-Za-z0-9_\-]{6,})", url)
+        joinchat_match = re.search(rf"(?:{telegram_domain_regex})/joinchat/([A-Za-z0-9_\-]{{6,}})", url, re.IGNORECASE)
         if joinchat_match:
             # Standardize on +hash format for consistency
             return "TELEGRAM", "+" + joinchat_match.group(1)
 
         # Standard username extraction (supports optional /s/ prefix for web-view links)
-        match = re.search(r"t\.me/(?:s/)?([^/?#]+)", url_lower)
+        match = re.search(rf"(?:{telegram_domain_regex})/(?:s/)?([^/?#]+)", url_lower)
         if match:
             username = match.group(1)
             if username and username not in ("joinchat", "join"):
@@ -190,6 +211,11 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
 
     # VK: vk.com, vk.ru, vkontakte.ru
     if any(d in domain for d in VK_DOMAINS):
+        # Skip common post/asset path prefixes to prevent creating corrupted pending accounts
+        vk_skip_paths = {"/wall", "/photo", "/video", "/album", "/topic", "/doc", "/clip"}
+        if any(path in url_lower for path in vk_skip_paths):
+            return None, None
+
         for pattern in [r"vk\.com/([^/?#]+)", r"vk\.ru/([^/?#]+)", r"vkontakte\.ru/([^/?#]+)"]:
             match = re.search(pattern, url_lower)
             if match:
@@ -205,6 +231,13 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
 
     # YANDEX_DZEN: dzen.ru, zen.yandex.ru, zen.yandex.com
     if any(d in domain for d in YANDEX_DZEN_DOMAINS):
+        # Check for /id/ path prefix (channel IDs)
+        # Handles both dzen.ru/id/... and zen.yandex.ru/id/...
+        id_match = re.search(r"(?:dzen\.ru|zen\.yandex\.[a-z]+)/id/([^/?#]+)", url_lower)
+        if id_match:
+            return "YANDEX_DZEN", f"id/{id_match.group(1)}"
+
+        # Standard non-id paths: extract single segment after domain
         match = re.search(r"zen\.yandex\.[a-z]+/([^/?#]+)", url_lower)
         if match:
             return "YANDEX_DZEN", match.group(1)
@@ -213,9 +246,11 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
             return "YANDEX_DZEN", match.group(1)
         return None, None
 
-    # INSTAGRAM: instagram.com, instagr.am - skip post paths
+    # INSTAGRAM: instagram.com, instagr.am - skip post/reel/story paths
     if any(d in domain for d in INSTAGRAM_DOMAINS):
-        if "/p/" in url_lower:
+        # Skip non-user paths: posts, reels, stories
+        instagram_non_user_paths = {"/p/", "/reel/", "/reels/", "/stories/"}
+        if any(path in url_lower for path in instagram_non_user_paths):
             return None, None
         match = re.search(r"instagram\.com/([^/?#]+)", url_lower)
         if match:
@@ -234,14 +269,26 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
 
     # YOUTUBE: youtube.com, youtu.be
     if any(d in domain for d in ["youtube.com", "youtu.be"]):
+        # New format: /@handle
         if "/@" in url:
             handle = url.split("/@")[-1].split("?")[0].split("/")[0]
             if handle:
                 return "YOUTUBE", handle
+        # Legacy format: /channel/ID
         elif "youtube.com/channel/" in url_lower:
             channel_id = url.split("/channel/")[-1].split("?")[0].split("/")[0]
             if channel_id:
                 return "YOUTUBE", channel_id
+        # Legacy format: /c/custom_handle
+        elif "youtube.com/c/" in url_lower:
+            custom_handle = url.split("/c/")[-1].split("?")[0].split("/")[0]
+            if custom_handle:
+                return "YOUTUBE", custom_handle
+        # Legacy format: /user/username
+        elif "youtube.com/user/" in url_lower:
+            username = url.split("/user/")[-1].split("?")[0].split("/")[0]
+            if username:
+                return "YOUTUBE", username
         return None, None
 
     # THREADS: threads.net
@@ -254,6 +301,19 @@ def _extract_platform_info(url: str) -> tuple[str | None, str | None]:
             username = url.split("/")[-1].split("?")[0].split("/")[0]
             if username:
                 return "THREADS", username
+        return None, None
+
+    # OK (Odnoklassniki): ok.ru, odnoklassniki.ru
+    if any(d in domain for d in OK_DOMAINS):
+        # Skip generic system paths
+        generic_paths = {"profile", "group", "live", "messages"}
+        path_match = re.search(r"ok\.ru/([^/?#]+)", url_lower)
+        if not path_match:
+            path_match = re.search(r"odnoklassniki\.ru/([^/?#]+)", url_lower)
+        if path_match:
+            username = path_match.group(1)
+            if username and username not in generic_paths:
+                return "OK", username
         return None, None
 
     # LINK_IN_BIO: Check if domain or subdomains match LINK_IN_BIO_DOMAINS
@@ -697,6 +757,12 @@ async def bulk_upsert_content(
 
     logger.debug("Bulk upserted %d content items", len(insert_values))
 
+    # Process external links from content texts (safe integration)
+    try:
+        await process_content_external_links(session, content_values)
+    except Exception as e:
+        logger.error("Failed to process external links from content batch: %s", e, exc_info=True)
+
 
 def _clean_content_raw_metadata(raw_metadata: dict[str, Any] | ContentMetadata | Any) -> dict[str, Any] | None:
     """
@@ -709,30 +775,38 @@ def _clean_content_raw_metadata(raw_metadata: dict[str, Any] | ContentMetadata |
        - If validation fails, filter out None values manually
     3. If raw_metadata is neither, return None
 
+    All returned dictionaries include a top-level "schema_version": 1 field
+    for future-proofing GPU extraction workers.
+
     Args:
         raw_metadata: The raw_metadata to clean (can be dict, ContentMetadata, or other).
 
     Returns:
-        Cleaned dictionary with None values excluded, or None.
+        Cleaned dictionary with None values excluded and schema_version injected, or None.
     """
     if raw_metadata is None:
         return None
 
-    if isinstance(raw_metadata, ContentMetadata):
-        return raw_metadata.model_dump(exclude_none=True)
+    result: dict[str, Any] = {}
 
-    if isinstance(raw_metadata, dict):
+    if isinstance(raw_metadata, ContentMetadata):
+        result = raw_metadata.model_dump(exclude_none=True)
+    elif isinstance(raw_metadata, dict):
         try:
             validated = ContentMetadata.model_validate(raw_metadata)
-            return validated.model_dump(exclude_none=True)
+            result = validated.model_dump(exclude_none=True)
         except Exception:
-            return {k: v for k, v in raw_metadata.items() if v is not None}
+            result = {k: v for k, v in raw_metadata.items() if v is not None}
+    else:
+        logger.warning(
+            "Unexpected raw_metadata type: %s, expected dict or ContentMetadata",
+            type(raw_metadata).__name__,
+        )
+        return None
 
-    logger.warning(
-        "Unexpected raw_metadata type: %s, expected dict or ContentMetadata",
-        type(raw_metadata).__name__,
-    )
-    return None
+    # Inject schema_version for GPU extraction workers
+    result["schema_version"] = 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -948,6 +1022,102 @@ async def _queue_single_account(
 
 
 # ---------------------------------------------------------------------------
+# Post content external links extractor
+# ---------------------------------------------------------------------------
+
+async def process_content_external_links(
+    session: AsyncSession,
+    content_values: list[dict[str, Any]],
+    status: str = "pending",
+) -> None:
+    """
+    Extract external links from content texts and queue discovered accounts.
+
+    This function:
+    1. Gathers all unique account_ids from content_values
+    2. Fetches parent usernames/handles from the DB (id -> username or platform_id)
+    3. For each content dict, combines 'content' and 'transcription' fields
+    4. Searches for URLs using URL_PATTERN
+    5. For each discovered URL, uses _extract_platform_info to determine platform and ID
+    6. Skips platforms equal to "WEBSITE" or "LINK_IN_BIO"
+    7. For social platforms, calls _queue_single_account to save them as pending
+       under the inherited parent's category (if applicable)
+
+    Args:
+        session: SQLAlchemy async session for database operations
+        content_values: List of content dictionaries with 'account_id', 'content',
+                        and optional 'transcription' keys
+        status: Status to assign to newly discovered accounts (default: "pending")
+    """
+    if not content_values:
+        return
+
+    # Gather unique account_ids
+    account_ids = {v["account_id"] for v in content_values if "account_id" in v}
+    if not account_ids:
+        return
+
+    # Fetch full account records to populate both parent_handle_map and parent_category_map in a single query
+    stmt = select(Account).where(Account.id.in_(account_ids))
+    result = await session.execute(stmt)
+    parent_handle_map: dict[int, str] = {}
+    parent_category_map: dict[int, str | None] = {}
+
+    for account in result.scalars():
+        account_id = account.id
+        # Use username if available, otherwise platform_id
+        handle = account.username or account.platform_id or str(account_id)
+        parent_handle_map[account_id] = handle
+        # Extract category from raw_metadata if present
+        category = None
+        if account.raw_metadata and isinstance(account.raw_metadata, dict):
+            category = account.raw_metadata.get("category")
+        parent_category_map[account_id] = category
+
+    # Process each content item
+    for content_dict in content_values:
+        account_id = content_dict.get("account_id")
+        if not account_id:
+            continue
+
+        parent_handle = parent_handle_map.get(account_id, str(account_id))
+        parent_category = parent_category_map.get(account_id)
+
+        # Combine content and transcription fields
+        text_parts = []
+        content = content_dict.get("content")
+        transcription = content_dict.get("transcription")
+
+        if content:
+            text_parts.append(content)
+        if transcription:
+            text_parts.append(transcription)
+
+        if not text_parts:
+            continue
+
+        combined_text = " ".join(text_parts)
+
+        # Find all URLs in the combined text
+        urls = URL_PATTERN.findall(combined_text)
+
+        # Process each URL
+        for url in urls:
+            platform, platform_id = _extract_platform_info(url)
+            if not platform or not platform_id:
+                continue
+
+            # Skip WEBSITE and LINK_IN_BIO platforms
+            if platform in ("WEBSITE", "LINK_IN_BIO"):
+                continue
+
+            # Queue the discovered account
+            await _queue_single_account(
+                session, platform, platform_id, parent_handle, status, parent_category
+            )
+
+
+# ---------------------------------------------------------------------------
 # Virtual bio post upsert for semantic search
 # ---------------------------------------------------------------------------
 
@@ -1054,27 +1224,35 @@ def _clean_account_raw_metadata(
        - If validation fails, filter out None values manually
     3. If raw_metadata is None, return None
 
+    All returned dictionaries include a top-level "schema_version": 1 field
+    for future-proofing GPU extraction workers.
+
     Args:
         raw_metadata: The raw_metadata to clean (can be AccountMetadata, dict, or None).
 
     Returns:
-        Cleaned dictionary with None values excluded, or None.
+        Cleaned dictionary with None values excluded and schema_version injected, or None.
     """
     if raw_metadata is None:
         return None
 
-    if isinstance(raw_metadata, AccountMetadata):
-        return raw_metadata.model_dump(exclude_none=True)
+    result: dict[str, Any] = {}
 
-    if isinstance(raw_metadata, dict):
+    if isinstance(raw_metadata, AccountMetadata):
+        result = raw_metadata.model_dump(exclude_none=True)
+    elif isinstance(raw_metadata, dict):
         try:
             validated = AccountMetadata.model_validate(raw_metadata)
-            return validated.model_dump(exclude_none=True)
+            result = validated.model_dump(exclude_none=True)
         except Exception:
-            return {k: v for k, v in raw_metadata.items() if v is not None}
+            result = {k: v for k, v in raw_metadata.items() if v is not None}
+    else:
+        logger.warning(
+            "Unexpected raw_metadata type: %s, expected AccountMetadata, dict, or None",
+            type(raw_metadata).__name__,
+        )
+        return None
 
-    logger.warning(
-        "Unexpected raw_metadata type: %s, expected AccountMetadata, dict, or None",
-        type(raw_metadata).__name__,
-    )
-    return None
+    # Inject schema_version for GPU extraction workers
+    result["schema_version"] = 1
+    return result

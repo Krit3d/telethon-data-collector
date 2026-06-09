@@ -630,6 +630,7 @@ class Database:
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 
+    @with_retry_on_deadlock()
     async def get_accounts_batch(
         self, account_ids: Sequence[int]
     ) -> dict[int, Account]:
@@ -891,6 +892,7 @@ class Database:
                         content_id,
                     )
 
+    @with_retry_on_deadlock()
     async def get_random_pending_account(
         self, require_hash: bool = False
     ) -> Account | None:
@@ -987,6 +989,7 @@ class Database:
                     account.status = "rejected"
                     logger.debug("Marked account id=%s as rejected", account_id)
 
+    @with_retry_on_deadlock()
     async def get_account_for_parsing(
         self,
         session_index: int | None = None,

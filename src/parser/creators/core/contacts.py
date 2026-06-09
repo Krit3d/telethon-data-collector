@@ -32,10 +32,23 @@ EMAIL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Telegram handle patterns: @username, t.me/username, https://telegram.me/username
-TELEGRAM_HANDLE_PATTERN = re.compile(
-    r"(?:@|t\.me/|telegram\.me/|https?://t\.me/|https?://telegram\.me/)"
+# Matcher A (Strict URLs):
+# Matches Telegram URLs (t.me, telegram.me, telegram.dog, tglink.ru)
+# with or without protocol. These are ALWAYS classified as Telegram.
+TELEGRAM_URL_PATTERN = re.compile(
+    r"(?:t\.me/|telegram\.me/|telegram\.dog/|tglink\.ru/"
+    r"|https?://t\.me/|https?://telegram\.me/|https?://telegram\.dog/|https?://tglink\.ru/)"
     r"([A-Za-z0-9_]{5,32})",
+    re.IGNORECASE,
+)
+
+# Matcher B (Contextual Mentions):
+# Matches naked '@username' ONLY if preceded by Telegram-specific
+# indicator keywords (tg, тг, telegram, телега, канал, channel)
+# within ~15-20 characters (reasonable distance, ignoring spaces/colons/dashes).
+# This prevents native platform mentions (Instagram @mentions, etc.) from being misclassified.
+TELEGRAM_CONTEXTUAL_PATTERN = re.compile(
+    r"(?:tg|тг|telegram|телега|канал|channel)[\s:\-]{0,15}?@([A-Za-z0-9_]{5,32})",
     re.IGNORECASE,
 )
 
@@ -75,6 +88,15 @@ SOCIAL_MEDIA_DOMAINS: frozenset[str] = frozenset({
     "telegram.me",
     "wa.me",
     "whatsapp.com",
+    "vk.com",
+    "vk.ru",
+    "vkontakte.ru",
+    "dzen.ru",
+    "zen.yandex.ru",
+    "zen.yandex.com",
+    "rutube.ru",
+    "ok.ru",
+    "odnoklassniki.ru",
 })
 
 # External platform domains for structured extraction
@@ -214,12 +236,15 @@ def extract_external_platforms(
 def extract_telegram_handles(text: str | None) -> list[str]:
     """Extract Telegram handles and invite links from text.
 
-    Finds Telegram usernames from various formats:
-    - @username
-    - t.me/username
-    - telegram.me/username
-    - https://t.me/username
-    - https://telegram.me/username
+    Uses two distinct matchers:
+    - Matcher A (Strict URLs): Matches Telegram URLs (t.me, telegram.me, etc.)
+      with or without protocol. These are ALWAYS classified as Telegram.
+    - Matcher B (Contextual Mentions): Matches naked '@username' ONLY if
+      preceded by Telegram-specific indicator keywords (tg, тг, telegram,
+      телега, канал, channel) within ~15 characters (ignoring spaces/colons/dashes).
+
+    A naked '@username' in Instagram/TikTok/YouTube biography without Telegram
+    context is treated as a native platform mention and completely ignored.
 
     Also extracts Telegram invite links:
     - t.me/+hash (invite hash with + prefix)
@@ -241,14 +266,26 @@ def extract_telegram_handles(text: str | None) -> list[str]:
 
     handles: set[str] = set()
 
-    # Extract standard usernames
-    username_matches = TELEGRAM_HANDLE_PATTERN.findall(text)
-    for match in username_matches:
+    # Matcher A: Extract from strict Telegram URLs (always Telegram)
+    url_matches = TELEGRAM_URL_PATTERN.findall(text)
+    for match in url_matches:
         normalized = match.lower()
         # Filter out invalid usernames like "joinchat" or "join"
         if normalized in ("joinchat", "join"):
             continue
         # Filter out bot accounts (usernames ending with "bot")
+        if normalized.endswith("bot"):
+            continue
+        handles.add(normalized)
+
+    # Matcher B: Extract contextual @mentions (only with Telegram keywords)
+    contextual_matches = TELEGRAM_CONTEXTUAL_PATTERN.findall(text)
+    for match in contextual_matches:
+        normalized = match.lower()
+        # Filter out invalid usernames
+        if normalized in ("joinchat", "join"):
+            continue
+        # Filter out bot accounts
         if normalized.endswith("bot"):
             continue
         handles.add(normalized)
@@ -598,11 +635,14 @@ LINK_IN_BIO_DOMAINS: frozenset[str] = frozenset({
     "linktr.ee",
     "taplink.cc",
     "beacons.ai",
+    "msha.ke",
+    "solo.to",
+    "lu.ma",
+    "lnk.bio",
+    "campsite.bio",
+    "carrd.co",
     "linkin.bio",
     "bio.link",
-    "lnk.bio",
-    "solo.to",
-    "campsite.bio",
     "linkbio.co",
     "my.link",
 })

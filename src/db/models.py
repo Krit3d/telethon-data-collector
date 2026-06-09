@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     ForeignKey,
+    Index,
     String,
     Text,
     Integer,
@@ -35,6 +36,14 @@ class Account(Base):
     """Table storing platform account information (e.g., Telegram channels)."""
 
     __tablename__ = "accounts"
+    __table_args__ = (
+        Index(
+            "idx_accounts_raw_metadata_gin",
+            "raw_metadata",
+            postgresql_using="gin",
+            postgresql_ops={"raw_metadata": "jsonb_path_ops"},
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -129,6 +138,12 @@ class Content(Base):
     __table_args__ = (
         UniqueConstraint(
             "account_id", "platform_content_id", name="uq_content_account_platform_id"
+        ),
+        Index(
+            "idx_content_raw_metadata_gin",
+            "raw_metadata",
+            postgresql_using="gin",
+            postgresql_ops={"raw_metadata": "jsonb_path_ops"},
         ),
     )
 

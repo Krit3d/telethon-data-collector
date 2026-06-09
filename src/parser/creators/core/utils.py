@@ -30,7 +30,8 @@ from src.parser.creators.core.text import (
 
 from src.parser.creators.core.contacts import (
     EMAIL_PATTERN,
-    TELEGRAM_HANDLE_PATTERN,
+    TELEGRAM_URL_PATTERN,
+    TELEGRAM_CONTEXTUAL_PATTERN,
     MENTION_PATTERN,
     URL_PATTERN,
     SOCIAL_MEDIA_DOMAINS,
@@ -85,7 +86,8 @@ __all__ = [
     "clean_vtt_content",
     # Contacts module
     "EMAIL_PATTERN",
-    "TELEGRAM_HANDLE_PATTERN",
+    "TELEGRAM_URL_PATTERN",
+    "TELEGRAM_CONTEXTUAL_PATTERN",
     "MENTION_PATTERN",
     "URL_PATTERN",
     "SOCIAL_MEDIA_DOMAINS",

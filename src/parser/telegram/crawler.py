@@ -537,11 +537,11 @@ class Worker(BaseTelegramWorker):
                     else:
                         # Could not resolve account by any method
                         logger.info(
-                            "Worker %d: Account %s could not be resolved, marking as processed",
+                            "Worker %d: Account %s could not be resolved, marking as rejected",
                             self.worker_id,
                             account.username or account.id,
                         )
-                        await self._mark_processed(account.id)
+                        await self._mark_rejected(account.id)
                         continue
 
                     # Process each recommendation
