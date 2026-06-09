@@ -6,6 +6,8 @@ different platforms (Instagram, Threads, TikTok, YouTube), and updates their scr
 
 This module is designed to run as a production-grade background daemon with
 graceful shutdown handling for OS signals (SIGTERM, SIGINT).
+
+Uses atomic database methods to eliminate race conditions and deadlocks.
 """
 
 import argparse
@@ -13,17 +15,12 @@ import asyncio
 import logging
 import signal
 import sys
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, update, func
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy import select
 
 from src.config.config import Settings, load_settings
+from src.db.database import Database
 from src.db.models import Account
 from src.parser.creators.core.queries import SearchQueriesManager
 from src.parser.creators.platforms import get_platform_parser
@@ -58,11 +55,13 @@ class CreatorsCoordinator:
     Queries the database for accounts that need processing, processes them
     concurrently with configurable concurrency limits, and updates their
     scraping status in the database.
+
+    Uses atomic database methods to eliminate race conditions and deadlocks.
     """
 
     def __init__(
         self,
-        session_maker: async_sessionmaker[AsyncSession],
+        db: Database,
         settings: Settings,
         shutdown_event: asyncio.Event | None = None,
         platform: str | None = None,
@@ -71,12 +70,12 @@ class CreatorsCoordinator:
         Initialize the coordinator with database and settings.
 
         Args:
-            session_maker: SQLAlchemy async session maker for database operations.
+            db: Database instance for atomic database operations.
             settings: Application settings containing configuration values.
             shutdown_event: asyncio.Event | None for graceful shutdown coordination.
             platform: Optional platform filter to isolate scraping queues per container.
         """
-        self.session_maker = session_maker
+        self.db = db
         self.settings = settings
         self._shutdown_event = shutdown_event
         self.platform_filter: str | None = platform
@@ -129,7 +128,6 @@ class CreatorsCoordinator:
 
     async def _ensure_pending_queue(
         self,
-        session: AsyncSession,
         platform: str,
         client: ScrapeCreatorsClient,
     ) -> None:
@@ -143,23 +141,14 @@ class CreatorsCoordinator:
         with fresh "pending" candidates.
 
         Args:
-            session: Active SQLAlchemy async session for database operations.
             platform: Platform name to check and discover candidates for.
             client: Shared ScrapeCreatorsClient instance for API requests.
         """
         # Determine the platform to filter by
         active_platform = self.platform_filter if self.platform_filter else platform
 
-        # Count pending accounts for the active platform
-        count_stmt = (
-            select(func.count(Account.id))
-            .where(
-                Account.platform == active_platform,
-                Account.status == STATUS_PENDING,
-            )
-        )
-        result = await session.execute(count_stmt)
-        pending_count = result.scalar_one()
+        # Count pending accounts for the active platform using atomic method
+        pending_count = await self.db.count_pending_creator_accounts(active_platform)
 
         logger.debug(
             f"Pending accounts for platform '{active_platform}': {pending_count}"
@@ -184,7 +173,7 @@ class CreatorsCoordinator:
             # Get the platform parser
             parser = get_platform_parser(
                 platform=active_platform,
-                session_maker=self.session_maker,
+                session_maker=self.db.async_session,
                 client=client,
                 settings=self.settings,
             )
@@ -212,9 +201,6 @@ class CreatorsCoordinator:
                         exc_info=e,
                     )
 
-                # Small delay between search calls to avoid overwhelming the API
-                await asyncio.sleep(1.0)
-
             logger.info("Stage 1 (Discovery) completed for this cycle.")
         else:
             logger.debug(
@@ -239,7 +225,7 @@ class CreatorsCoordinator:
         concurrency_limit: int = 3,
     ) -> None:
         """
-        Run a single ingestion cycle: ensure pending queue, query accounts, and process them.
+        Run a single ingestion cycle: ensure pending queue, claim accounts, and process them.
 
         This method implements a self-feeding 3-stage pipeline:
         - Stage 1 (Discovery): Ensures the pending queue has enough candidates by
@@ -249,6 +235,8 @@ class CreatorsCoordinator:
 
         A single ScrapeCreatorsClient is created and shared across all operations in
         this batch to optimize connection handling and track credit usage.
+
+        Uses atomic claim_creator_accounts to eliminate race conditions.
 
         Args:
             batch_size: Maximum number of accounts to process in this cycle.
@@ -271,40 +259,15 @@ class CreatorsCoordinator:
             # Stage 1: Ensure pending queue is populated (Discovery)
             # This runs BEFORE querying for pending accounts to ensure the queue
             # is populated if it's running low
-            async with self.session_maker() as session:
-                await self._ensure_pending_queue(session, platform, client)
+            await self._ensure_pending_queue(platform, client)
 
-            # Calculate the threshold datetime for re-processing
-            threshold_time = datetime.now(timezone.utc) - timedelta(
-                hours=self.status_threshold_hours
+            # Stage 2: Atomically claim accounts for processing
+            # This eliminates race conditions by using CTE with FOR UPDATE SKIP LOCKED
+            accounts = await self.db.claim_creator_accounts(
+                platforms=[self.platform_filter] if self.platform_filter else CREATOR_PLATFORMS,
+                batch_size=batch_size,
+                status_threshold_hours=self.status_threshold_hours,
             )
-
-            # Query for accounts to process
-            async with self.session_maker() as session:
-                # Determine platform filter condition
-                if self.platform_filter:
-                    platform_condition = Account.platform == self.platform_filter
-                else:
-                    platform_condition = Account.platform.in_(CREATOR_PLATFORMS)
-
-                stmt = (
-                    select(Account)
-                    .where(
-                        platform_condition,
-                        (
-                            (Account.status == STATUS_PENDING)
-                            | (
-                                (Account.status == STATUS_FAILED)
-                                & (Account.updated_at < threshold_time)
-                            )
-                        ),
-                    )
-                    .order_by(Account.updated_at.asc())
-                    .limit(batch_size)
-                )
-
-                result = await session.execute(stmt)
-                accounts = result.scalars().all()
 
             if not accounts:
                 logger.info("No accounts to process in this cycle")
@@ -382,7 +345,7 @@ class CreatorsCoordinator:
         Protects the execution block with the semaphore for concurrency control.
         Uses the shared ScrapeCreatorsClient passed from run_once.
         Gets the corresponding platform parser using the factory.
-        Updates the account status throughout the process.
+        Updates the account status throughout the process using atomic database methods.
 
         Args:
             account_id: Database ID of the account to process.
@@ -400,14 +363,11 @@ class CreatorsCoordinator:
                 f"Processing account {account_id} (platform={platform}, username={username})"
             )
 
-            # Update status to "processing"
-            await self._update_account_status(account_id, STATUS_PROCESSING)
-
             try:
                 # Get the platform parser using the factory with shared client
                 parser = get_platform_parser(
                     platform=platform,
-                    session_maker=self.session_maker,
+                    session_maker=self.db.async_session,
                     client=client,
                     settings=self.settings,
                 )
@@ -424,7 +384,7 @@ class CreatorsCoordinator:
                         f"Profile {username} on {platform} rejected "
                         f"(below subscriber threshold or parsing failed)"
                     )
-                    await self._update_account_status(
+                    await self.db.update_creator_account_status(
                         account_id, STATUS_REJECTED
                     )
                     return
@@ -432,7 +392,7 @@ class CreatorsCoordinator:
                 # Get the updated account to check status and subscriber count
                 # Use db_account_id returned from parse_profile to ensure we're
                 # operating on the correctly resolved/merged database record
-                async with self.session_maker() as session:
+                async with self.db.async_session() as session:
                     stmt = select(Account).where(Account.id == db_account_id)
                     result = await session.execute(stmt)
                     account = result.scalar_one_or_none()
@@ -452,7 +412,7 @@ class CreatorsCoordinator:
                             f"subscribers, below threshold {self.min_subscribers}. "
                             f"Marking as rejected."
                         )
-                        await self._update_account_status(
+                        await self.db.update_creator_account_status(
                             db_account_id, STATUS_REJECTED
                         )
                         return
@@ -471,7 +431,7 @@ class CreatorsCoordinator:
 
                 # After content parsing, check the current status before updating to "parsed"
                 # The status may have been changed to rejected or failed during content parsing
-                async with self.session_maker() as session:
+                async with self.db.async_session() as session:
                     stmt = select(Account).where(Account.id == db_account_id)
                     result = await session.execute(stmt)
                     account_after_content = result.scalar_one_or_none()
@@ -490,7 +450,7 @@ class CreatorsCoordinator:
                 if account_after_content and account_after_content.status == STATUS_PROCESSING:
                     # On successful completion, update status to "parsed"
                     # Use db_account_id for status update
-                    await self._update_account_status(db_account_id, STATUS_PARSED)
+                    await self.db.update_creator_account_status(db_account_id, STATUS_PARSED)
                     logger.info(
                         f"Successfully processed account {db_account_id} "
                         f"({username} on {platform})"
@@ -503,40 +463,7 @@ class CreatorsCoordinator:
                     f"({username} on {platform}): {e!r}",
                     exc_info=e,
                 )
-                await self._update_account_status(account_id, STATUS_FAILED)
-
-    async def _update_account_status(
-        self,
-        account_id: int,
-        status: str,
-    ) -> None:
-        """
-        Update the account status and refresh the updated_at timestamp.
-
-        Args:
-            account_id: Database ID of the account to update.
-            status: New status value (e.g., "processing", "parsed", "failed").
-        """
-        try:
-            async with self.session_maker() as session:
-                stmt = (
-                    update(Account)
-                    .where(Account.id == account_id)
-                    .values(
-                        status=status,
-                        updated_at=datetime.now(timezone.utc),
-                    )
-                )
-                await session.execute(stmt)
-                await session.commit()
-                logger.debug(
-                    f"Updated account {account_id} status to '{status}'"
-                )
-        except Exception as e:
-            logger.error(
-                f"Failed to update account {account_id} status to '{status}': {e!r}",
-                exc_info=e,
-            )
+                await self.db.update_creator_account_status(account_id, STATUS_FAILED)
 
     async def reset_orphaned_processing_accounts(self) -> None:
         """
@@ -547,39 +474,19 @@ class CreatorsCoordinator:
         creator platforms (INSTAGRAM, THREADS, TIKTOK, YOUTUBE) and explicitly
         excludes TELEGRAM to prevent state collisions with the Telegram crawler.
         When platform_filter is set, only resets accounts for that specific platform.
+
+        Uses the atomic reset_orphaned_creator_accounts database method.
         """
-        async with self.session_maker() as session:
-            # Determine platform filter condition
-            if self.platform_filter:
-                platform_condition = Account.platform == self.platform_filter
-            else:
-                platform_condition = Account.platform.in_(CREATOR_PLATFORMS)
+        count = await self.db.reset_orphaned_creator_accounts(
+            platforms=[self.platform_filter] if self.platform_filter else CREATOR_PLATFORMS
+        )
 
-            # Create update statement for orphaned processing accounts
-            stmt = (
-                update(Account)
-                .where(
-                    platform_condition,
-                    Account.status == STATUS_PROCESSING,
-                )
-                .values(
-                    status=STATUS_PENDING,
-                    updated_at=datetime.now(timezone.utc),
-                )
-                .returning(Account.id)
+        if count > 0:
+            logger.info(
+                f"Successfully restored {count} orphaned creator accounts to 'pending'"
             )
-            result = await session.execute(stmt)
-            updated_rows = result.fetchall()
-            await session.commit()
-
-            # Log the number of reset rows
-            count = len(updated_rows)
-            if count > 0:
-                logger.info(
-                    f"Successfully restored {count} orphaned creator accounts to 'pending'"
-                )
-            else:
-                logger.info("No orphaned creator accounts found to restore")
+        else:
+            logger.info("No orphaned creator accounts found to restore")
 
     async def run_discovery(self) -> None:
         """
@@ -591,8 +498,8 @@ class CreatorsCoordinator:
         - For each platform, instantiates the parser via get_platform_parser()
         - Calls await parser.discover_candidates(query, category) for each query
         - Logs the number of discovered accounts
-        - Adds a safe delay of 1.0 second between queries to avoid overwhelming the API
         - Checks for shutdown requests after each iteration
+        - Relies on concurrency_limit semaphore for API rate limiting (no artificial sleeps)
         """
         logger.info("Starting candidate discovery phase...")
 
@@ -623,7 +530,7 @@ class CreatorsCoordinator:
             async with ScrapeCreatorsClient(self.settings) as client:
                 parser = get_platform_parser(
                     platform=platform,
-                    session_maker=self.session_maker,
+                    session_maker=self.db.async_session,
                     client=client,
                     settings=self.settings,
                 )
@@ -651,11 +558,8 @@ class CreatorsCoordinator:
                             f"category='{category}' on platform={platform}: {e!r}",
                             exc_info=e,
                         )
-
-                    # Safe delay between queries to avoid overwhelming the Scrape Creators API
-                    await asyncio.sleep(1.0)
-
-            logger.info(f"Completed discovery for platform: {platform}")
+    
+                logger.info(f"Completed discovery for platform: {platform}")
 
         logger.info("Candidate discovery phase completed.")
 
@@ -745,26 +649,16 @@ async def main() -> None:
 
     settings: Settings = load_settings()
 
-    # Initialize database engine and session maker
-    engine = create_async_engine(
-        settings.db_url,
-        echo=False,
-        pool_size=10,
-        max_overflow=5,
-        pool_timeout=15.0,
-        pool_pre_ping=True,
-        pool_recycle=3600,
-    )
-    session_maker: async_sessionmaker[AsyncSession] = async_sessionmaker(
-        engine, class_=AsyncSession, expire_on_commit=False
-    )
+    # Initialize database using Database class for optimized connection pooling
+    db = Database(settings.db_url, echo=False)
 
     # Create shutdown event for signal handling
     shutdown_event: asyncio.Event = asyncio.Event()
 
     # Instantiate the coordinator with optional platform filter
+    # Pass db instance for atomic database operations
     coordinator: CreatorsCoordinator = CreatorsCoordinator(
-        session_maker=session_maker,
+        db=db,
         settings=settings,
         shutdown_event=shutdown_event,
         platform=platform_filter,
@@ -794,11 +688,13 @@ async def main() -> None:
                 f"Error during candidate discovery phase: {e!r}",
                 exc_info=e,
             )
+            # Close database gracefully before exiting
+            await db.close()
             sys.exit(1)
 
-        # Close database engine and exit cleanly without running the daemon loop
+        # Close database gracefully and exit cleanly without running the daemon loop
         logger.info("Closing database connections...")
-        await engine.dispose()
+        await db.close()
         logger.info("Discovery phase completed. Exiting.")
         sys.exit(0)
 
@@ -872,9 +768,9 @@ async def main() -> None:
         # Graceful shutdown: finish current processing, commit transactions, close connections
         logger.info("Shutting down gracefully...")
 
-        # Close database engine
+        # Close database connections gracefully using Database class
         logger.info("Closing database connections...")
-        await engine.dispose()
+        await db.close()
 
         logger.info("Creators coordinator daemon stopped cleanly.")
         sys.exit(0)

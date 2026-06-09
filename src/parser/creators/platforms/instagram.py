@@ -549,19 +549,18 @@ class InstagramParser(BasePlatformParser):
         external_url = external_url or ""
         combined = (bio + " " + external_url).lower()
 
-        # Email pattern
-        has_email = bool(re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", combined))
+        # Use parse_profile_contacts to extract structured contacts
+        contacts = parse_profile_contacts(combined)
+        has_email = len(contacts.get("emails", [])) > 0
+        has_external_platform = len(contacts.get("external_platforms", {})) > 0
         
-        # Improved Telegram pattern (case-insensitive)
+        # Telegram pattern (case-insensitive)
         # Matches: @username, t.me/*, telegram.me/*, telegram.dog/*, and text mentions
         telegram_pattern = r"@\w+|t\.me/[a-zA-Z0-9_\+\-]+|telegram\.(?:me|dog)/[a-zA-Z0-9_\+\-]+|\b(?:тг|тгк|телеграм|tg|telegram|канал)\b"
         has_telegram = bool(re.search(telegram_pattern, combined, re.IGNORECASE))
-        
-        # Any http(s) URL
-        has_external_link = bool(re.search(r"https?://", combined))
 
         # Return False immediately (always transcribe) if no valid contact details present
-        if not (has_email or has_telegram or has_external_link):
+        if not (has_email or has_telegram or has_external_platform):
             return False
 
         # All hurdles passed: skip transcription
@@ -913,6 +912,9 @@ class InstagramParser(BasePlatformParser):
 
             items_data.append(item_data)
 
+        # Initialize transcript_map before the conditional block
+        transcript_map: dict[str, str | None] = {}
+
         # Fetch transcripts concurrently for items that need them
         if items_needing_transcripts:
             semaphore = asyncio.Semaphore(5)
@@ -926,7 +928,6 @@ class InstagramParser(BasePlatformParser):
             )
 
             # Build transcript mapping
-            transcript_map: dict[str, str | None] = {}
             for (item_id, _), result in zip(
                 items_needing_transcripts, results, strict=False
             ):
@@ -954,6 +955,25 @@ class InstagramParser(BasePlatformParser):
         aggregated_external_links: list[str] = []
         aggregated_external_platforms: dict[str, str] = {}
         aggregated_mentions: set[str] = set()
+
+        # Extract contacts from parent profile's biography and external URL
+        # Combine bio and external_url into a single string for contact extraction
+        bio_text = f"{profile_biography or ''} {profile_external_url or ''}".strip()
+        if bio_text:
+            bio_contacts = parse_profile_contacts(bio_text)
+            # Merge bio_contacts into aggregate collection variables
+            for email in bio_contacts.get("emails", []):
+                if email and email not in aggregated_emails:
+                    aggregated_emails.append(email)
+            for handle in bio_contacts.get("telegram_handles", []):
+                if handle and handle not in aggregated_telegram_handles:
+                    aggregated_telegram_handles.append(handle)
+            for link in bio_contacts.get("external_links", []):
+                if link and link not in aggregated_external_links:
+                    aggregated_external_links.append(link)
+            for platform_slug, handle in bio_contacts.get("external_platforms", {}).items():
+                if handle and platform_slug not in aggregated_external_platforms:
+                    aggregated_external_platforms[platform_slug] = handle
 
         # Stage2 Cyrillic validation passed, language is Russian
         language = "ru"
@@ -1050,7 +1070,7 @@ class InstagramParser(BasePlatformParser):
             "telegram_handles": aggregated_telegram_handles,
             "external_links": aggregated_external_links,
             "external_platforms": aggregated_external_platforms,
-            "raw_bio": "",
+            "raw_bio": profile_biography or "",
         }
 
         # Bulk write all accumulated discovery data
@@ -1226,6 +1246,13 @@ class InstagramParser(BasePlatformParser):
                             transcript_text = text_value
 
                     if transcript_text:
+                        # Check for placeholder error text from the API
+                        if "please provide the video or audio file" in transcript_text.lower():
+                            logger.debug(
+                                "Transcript API returned placeholder error text for post: %s",
+                                post_url[:50],
+                            )
+                            return None
                         logger.debug("Got transcript: %s", post_url[:50])
                         return transcript_text
 

@@ -3,13 +3,15 @@ Asynchronous CRUD operations for accounts and content using SQLAlchemy 2.0.
 """
 
 import asyncio
+import functools
 import logging
 import random
-from datetime import datetime, timezone
-from typing import Any, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Sequence, TypeVar
 
 from sqlalchemy import case, func, select, update, text
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -20,6 +22,85 @@ from sqlalchemy.orm import joinedload
 from src.db.models import Base, Account, Content
 
 logger = logging.getLogger(__name__)
+
+# Type variable for generic async function signature
+T = TypeVar("T")
+
+
+def with_retry_on_deadlock(
+    max_retries: int = 3,
+    base_delay: float = 0.5,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """
+    Decorator to retry database operations on deadlock or serialization failure.
+
+    Catches SQLAlchemy OperationalError and DBAPIError with specific PostgreSQL error codes:
+    - 40P01: deadlock detected
+    - 40001: serialization failure
+
+    Implements exponential backoff with jitter to avoid thundering herd.
+
+    Args:
+        max_retries: Maximum number of retry attempts (default: 3).
+        base_delay: Base delay in seconds for exponential backoff (default: 0.5).
+
+    Returns:
+        Decorated async function with retry logic.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            last_exception: OperationalError | DBAPIError | Exception | None = None
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except (OperationalError, DBAPIError) as e:
+                    last_exception = e
+                    # Extract error message from exception or its orig attribute
+                    error_msg = str(e).lower()
+                    if hasattr(e, "orig") and e.orig is not None:
+                        error_msg += " " + str(e.orig).lower()
+
+                    # Check for deadlock (40P01) or serialization failure (40001)
+                    is_deadlock = "40p01" in error_msg or "deadlock detected" in error_msg
+                    is_serialization = "40001" in error_msg or "serialization failure" in error_msg
+
+                    if not (is_deadlock or is_serialization):
+                        # Not a retryable error, re-raise immediately
+                        raise
+
+                    if attempt == max_retries:
+                        logger.error(
+                            "Failed after %d retries on deadlock/serialization failure: %s",
+                            max_retries,
+                            e,
+                        )
+                        raise
+
+                    # Exponential backoff with jitter: 0.5 * (2 ** attempt) + random jitter
+                    delay = base_delay * (2 ** attempt)
+                    jitter = random.uniform(0, 0.1)
+                    total_delay = delay + jitter
+
+                    logger.warning(
+                        "Attempt %d/%d failed with retryable error: %s. "
+                        "Retrying in %.2f seconds...",
+                        attempt,
+                        max_retries,
+                        e,
+                        total_delay,
+                    )
+                    await asyncio.sleep(total_delay)
+
+            # This should never be reached, but satisfies type checker
+            if last_exception is not None:
+                raise last_exception
+
+        return wrapper
+
+    return decorator
 
 
 class Database:
@@ -278,6 +359,158 @@ class Database:
         await self.engine.dispose()
         logger.info("Database connections closed")
 
+    @with_retry_on_deadlock()
+    async def count_pending_creator_accounts(self, platform: str) -> int:
+        """
+        Count accounts with pending status for a specific platform.
+
+        Args:
+            platform: Platform name (e.g., 'INSTAGRAM', 'YOUTUBE').
+
+        Returns:
+            Number of pending accounts for the specified platform.
+        """
+        async with self.async_session() as session:
+            stmt = (
+                select(func.count(Account.id))
+                .where(Account.platform == platform)
+                .where(Account.status == "pending")
+            )
+            result = await session.execute(stmt)
+            count = result.scalar()
+            return count if count is not None else 0
+
+    @with_retry_on_deadlock()
+    async def claim_creator_accounts(
+        self, platforms: list[str], batch_size: int, status_threshold_hours: int
+    ) -> list[Account]:
+        """
+        Atomically fetch and mark accounts as 'processing' using CTE with FOR UPDATE SKIP LOCKED.
+
+        This method implements a deadlock-resistant claiming mechanism for creator accounts
+        across multiple platforms. It uses a CTE subquery to select eligible accounts
+        and atomically updates their status to prevent race conditions.
+
+        Args:
+            platforms: List of platform names to claim accounts from.
+            batch_size: Maximum number of accounts to claim in one batch.
+            status_threshold_hours: Hours after which failed accounts can be retried.
+
+        Returns:
+            List of claimed Account objects with status set to 'processing'.
+        """
+        threshold_time = datetime.now(timezone.utc) - timedelta(hours=status_threshold_hours)
+
+        async with self.async_session() as session:
+            async with session.begin():
+                # Build CTE subquery to select eligible accounts
+                subq = (
+                    select(Account.id)
+                    .where(Account.platform.in_(platforms))
+                    .where(
+                        (Account.status == "pending")
+                        | (
+                            (Account.status == "failed")
+                            & (Account.updated_at < threshold_time)
+                        )
+                    )
+                    .order_by(Account.updated_at.asc())
+                    .limit(batch_size)
+                    .with_for_update(skip_locked=True)
+                    .cte("eligible_accounts")
+                )
+
+                # Atomically update selected accounts
+                stmt = (
+                    update(Account)
+                    .where(Account.id.in_(select(subq.c.id)))
+                    .values(status="processing", updated_at=datetime.now(timezone.utc))
+                    .returning(Account)
+                )
+
+                result = await session.execute(stmt)
+                claimed_accounts = list(result.scalars().all())
+
+                if claimed_accounts:
+                    logger.info(
+                        "Claimed %d creator accounts for processing",
+                        len(claimed_accounts),
+                    )
+                else:
+                    logger.debug("No creator accounts available to claim")
+
+                return claimed_accounts
+
+    @with_retry_on_deadlock()
+    async def update_creator_account_status(
+        self, account_id: int, status: str
+    ) -> None:
+        """
+        Update the status and updated_at timestamp for a specific account.
+
+        Args:
+            account_id: The database ID of the account to update.
+            status: New status value (e.g., 'pending', 'processing', 'completed', 'failed').
+        """
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    update(Account)
+                    .where(Account.id == account_id)
+                    .values(status=status, updated_at=datetime.now(timezone.utc))
+                )
+                result = await session.execute(stmt)
+
+                if result.rowcount > 0:  # type: ignore[attr-defined]
+                    logger.debug(
+                        "Updated account id=%s status to '%s'",
+                        account_id,
+                        status,
+                    )
+                else:
+                    logger.warning(
+                        "Account id=%s not found when updating status",
+                        account_id,
+                    )
+
+    @with_retry_on_deadlock()
+    async def reset_orphaned_creator_accounts(
+        self, platforms: list[str]
+    ) -> int:
+        """
+        Reset accounts stuck in 'processing' status back to 'pending'.
+
+        This recovers from worker crashes or restarts where accounts were left
+        in processing state. Only affects accounts from the specified platforms.
+
+        Args:
+            platforms: List of platform names to reset accounts for.
+
+        Returns:
+            Number of accounts reset to 'pending' status.
+        """
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    update(Account)
+                    .where(Account.platform.in_(platforms))
+                    .where(Account.status == "processing")
+                    .values(status="pending", updated_at=datetime.now(timezone.utc))
+                )
+                result = await session.execute(stmt)
+                reset_count = result.rowcount  # type: ignore[attr-defined]
+
+                if reset_count > 0:
+                    logger.info(
+                        "Reset %d orphaned creator accounts to pending",
+                        reset_count,
+                    )
+                else:
+                    logger.debug("No orphaned creator accounts found")
+
+                return reset_count
+
+    @with_retry_on_deadlock()
     async def upsert_account(self, account_data: dict[str, Any]) -> Account:
         """
         Insert or update an account record.
@@ -331,6 +564,7 @@ class Database:
 
                 return account
 
+    @with_retry_on_deadlock()
     async def upsert_content(self, content_data: dict[str, Any]) -> Content:
         """
         Insert or update a content record.
@@ -490,6 +724,7 @@ class Database:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    @with_retry_on_deadlock()
     async def mark_content_embedded(self, content_ids: list[int]) -> None:
         """Mark multiple content items as embedded in a single batch update.
 
@@ -595,6 +830,7 @@ class Database:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    @with_retry_on_deadlock()
     async def mark_content_extracted(self, content_id: int) -> None:
         """Mark a content as extracted (is_graph_extracted = True).
 
@@ -624,6 +860,7 @@ class Database:
                         content_id,
                     )
 
+    @with_retry_on_deadlock()
     async def mark_content_graphed(self, content_id: int) -> None:
         """Mark a content as processed for knowledge graph (is_graph_extracted = True).
 
@@ -706,6 +943,7 @@ class Database:
 
                 return account
 
+    @with_retry_on_deadlock()
     async def mark_account_processed(self, account_id: int) -> None:
         """Mark an account as successfully processed (status='ready_for_parsing').
 
@@ -728,6 +966,7 @@ class Database:
                         "Marked account id=%s as processed", account_id
                     )
 
+    @with_retry_on_deadlock()
     async def mark_account_rejected(self, account_id: int) -> None:
         """Mark an account as rejected (status='rejected').
 
@@ -839,6 +1078,7 @@ class Database:
 
                 return account
 
+    @with_retry_on_deadlock()
     async def mark_account_parsed(self, account_id: int) -> None:
         """Mark an account as completely parsed (content are saved).
 
@@ -861,6 +1101,7 @@ class Database:
                         "Marked account id=%s as COMPLETELY PARSED", account_id
                     )
 
+    @with_retry_on_deadlock()
     async def mark_account_pending(self, account_id: int) -> None:
         """Return an account to pending status (e.g., if a worker failed due to a shadowban).
 
@@ -883,6 +1124,7 @@ class Database:
                         "Returned account id=%s to pending state", account_id
                     )
 
+    @with_retry_on_deadlock()
     async def update_account_access_hash(
         self, account_id: int, access_hash: int
     ) -> None:
