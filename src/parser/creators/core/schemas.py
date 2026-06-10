@@ -8,7 +8,7 @@ and related structures used in social media parsing and contact extraction.
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class GeoData(BaseModel):
@@ -199,6 +199,50 @@ class ContentMetadata(BaseModel):
     author_profile_snapshot: AuthorProfileSnapshot | None = None
     raw_item_payload: dict[str, Any] | None = None
     extracted_at: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def prune_raw_payload(cls, data: Any) -> Any:
+        """
+        Prune heavy, redundant fields from raw_item_payload before validation.
+
+        This validator removes memory-intensive fields from the raw API payload
+        to prevent database bloat when storing in JSONB columns. The pruned
+        fields are typically large nested objects that are not needed for
+        analysis but consume significant storage space.
+
+        Args:
+            data: Input data dictionary or object before validation.
+
+        Returns:
+            Modified data with heavy fields removed from raw_item_payload,
+            or unmodified data if not a dictionary.
+        """
+        # Only process if data is a dictionary
+        if not isinstance(data, dict):
+            return data
+
+        # Check if raw_item_payload exists and is a dictionary
+        raw_payload = data.get("raw_item_payload")
+        if not isinstance(raw_payload, dict):
+            return data
+
+        # List of heavy fields to remove from raw_item_payload
+        heavy_fields = [
+            "video_dash_manifest",
+            "image_versions2",
+            "user",
+            "owner",
+            "clips_metadata",
+            "scrubber_spritesheet_info_candidates",
+            "organic_tracking_token",
+        ]
+
+        # Safely remove each heavy field if present
+        for field in heavy_fields:
+            raw_payload.pop(field, None)
+
+        return data
 
     @classmethod
     def create_with_timestamp(cls, **kwargs) -> "ContentMetadata":
