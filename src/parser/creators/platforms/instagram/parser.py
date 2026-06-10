@@ -53,6 +53,17 @@ class InstagramParser(BasePlatformParser):
         super().__init__(session_maker, client, settings)
         self._queries_manager = SearchQueriesManager(settings.search_queries_path)
 
+    async def _fetch_account_category(self, account_id: int) -> str | None:
+        async with self.session_maker() as session:
+            stmt = select(Account.raw_metadata).where(Account.id == account_id)
+            result = await session.execute(stmt)
+            raw_metadata = result.scalar_one_or_none()
+            if raw_metadata and isinstance(raw_metadata, dict):
+                category = raw_metadata.get("category")
+                if category and isinstance(category, str):
+                    return category
+        return None
+
     async def parse_profile(self, handle: str) -> int | None:
         logger.info("Starting Instagram profile parse for handle: %s", handle)
 
@@ -133,12 +144,16 @@ class InstagramParser(BasePlatformParser):
                     status="processing",
                 )
 
+                existing_category = await self._fetch_account_category(account_id)
+
                 await update_account_profile_metadata(
                     session=session,
                     account_id=account_id,
                     platform="INSTAGRAM",
                     biography=biography or "",
                     external_url=profile.get("external_url"),
+                    category=existing_category,
+                    subscribers_count=subscribers,
                 )
 
                 await session.commit()
@@ -188,12 +203,16 @@ class InstagramParser(BasePlatformParser):
                 status="processing",
             )
 
+            existing_category = await self._fetch_account_category(account_id)
+
             await update_account_profile_metadata(
                 session=session,
                 account_id=account_id,
                 platform="INSTAGRAM",
                 biography=biography or "",
                 external_url=profile.get("external_url"),
+                category=existing_category,
+                subscribers_count=subscribers,
             )
 
             await session.commit()
@@ -367,15 +386,7 @@ class InstagramParser(BasePlatformParser):
             platform_id,
         )
 
-        account_category = "unknown"
-        async with self.session_maker() as session:
-            stmt = select(Account.raw_metadata).where(Account.id == account_id)
-            result = await session.execute(stmt)
-            raw_metadata = result.scalar_one_or_none()
-            if raw_metadata and isinstance(raw_metadata, dict):
-                category = raw_metadata.get("category")
-                if category and isinstance(category, str):
-                    account_category = category
+        account_category = await self._fetch_account_category(account_id) or "unknown"
 
         profile = await fetch_instagram_profile(self.client, platform_id)
         if not profile:
@@ -565,7 +576,7 @@ class InstagramParser(BasePlatformParser):
             items_data=items_data,
         )
 
-        final_content_values = []
+        final_content_values: list[dict[str, Any]] = []
 
         for item_data in items_data:
             item = item_data["item"]
@@ -609,7 +620,7 @@ class InstagramParser(BasePlatformParser):
                     "has_media": True,
                     "is_embedded": False,
                     "is_graph_extracted": False,
-                    "raw_metadata": content_metadata,
+                    "raw_metadata": content_metadata.model_dump(mode="json", exclude_none=False),
                     "updated_at": datetime.now(timezone.utc),
                 }
             )

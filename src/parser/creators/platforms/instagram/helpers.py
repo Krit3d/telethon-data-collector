@@ -16,7 +16,6 @@ _KEYS_TO_KEEP = {
     "video_duration",
     "duration",
     "is_video",
-    "video_versions",
     "play_count",
     "video_view_count",
     "comment_count",
@@ -45,19 +44,21 @@ def extract_instagram_subscribers(user_dict: dict[str, Any]) -> int:
 
 
 def extract_instagram_content_text(node_dict: dict[str, Any]) -> str | None:
-    edge_media_to_caption = node_dict.get("edge_media_to_caption")
-    if isinstance(edge_media_to_caption, dict):
-        edges = edge_media_to_caption.get("edges", [])
-        if isinstance(edges, list) and edges:
-            first_edge = edges[0]
-            if isinstance(first_edge, dict):
-                text_node = first_edge.get("node", {})
-                if isinstance(text_node, dict) and text_node.get("text"):
-                    return str(text_node["text"])
+    caption = node_dict.get("caption")
+    if isinstance(caption, dict):
+        text = caption.get("text")
+        if text and isinstance(text, str):
+            return text
+    elif isinstance(caption, str) and caption:
+        return caption
 
-    accessibility_caption = node_dict.get("accessibility_caption")
-    if accessibility_caption and isinstance(accessibility_caption, str):
-        return accessibility_caption
+    caption_text = node_dict.get("caption_text")
+    if caption_text and isinstance(caption_text, str):
+        return caption_text
+
+    text = node_dict.get("text")
+    if text and isinstance(text, str):
+        return text
 
     return None
 
@@ -128,24 +129,20 @@ def extract_instagram_metrics(
     node_dict: dict[str, Any],
 ) -> tuple[int | None, int | None]:
     likes_count: int | None = None
-    edge_media_preview_like = node_dict.get("edge_media_preview_like")
-    if isinstance(edge_media_preview_like, dict):
-        count = edge_media_preview_like.get("count")
-        if count is not None:
-            try:
-                likes_count = int(count)
-            except (ValueError, TypeError):
-                pass
+    raw_likes = node_dict.get("like_count") or node_dict.get("likes")
+    if raw_likes is not None:
+        try:
+            likes_count = int(raw_likes)
+        except (ValueError, TypeError):
+            pass
 
     comments_count: int | None = None
-    edge_media_to_comment = node_dict.get("edge_media_to_comment")
-    if isinstance(edge_media_to_comment, dict):
-        count = edge_media_to_comment.get("count")
-        if count is not None:
-            try:
-                comments_count = int(count)
-            except (ValueError, TypeError):
-                pass
+    raw_comments = node_dict.get("comment_count") or node_dict.get("comments")
+    if raw_comments is not None:
+        try:
+            comments_count = int(raw_comments)
+        except (ValueError, TypeError):
+            pass
 
     return (likes_count, comments_count)
 

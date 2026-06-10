@@ -223,7 +223,7 @@ async def update_account_profile_metadata(
                 )
 
     account.description = biography if biography is not None else account.description
-    account.raw_metadata = compiled_metadata.model_dump(exclude_none=True)
+    account.raw_metadata = compiled_metadata.model_dump(mode="json", exclude_none=False)
 
     if subscribers_count is not None:
         account.subscribers_count = subscribers_count
@@ -237,4 +237,4 @@ async def update_account_profile_metadata(
             session, compiled_metadata, parent_handle, status="pending", category=resolved_category
         )
 
-    return compiled_metadata.model_dump(exclude_none=True)
+    return compiled_metadata.model_dump(mode="json", exclude_none=False)
