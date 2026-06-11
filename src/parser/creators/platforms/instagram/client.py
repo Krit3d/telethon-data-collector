@@ -38,14 +38,14 @@ async def fetch_instagram_profile(
                 "Instagram profile %s not found (404). Marking as rejected.",
                 handle,
             )
-        else:
-            logger.error(
-                "Instagram API request failed for %s with HTTP %d: %s",
-                handle,
-                e.status,
-                e,
-            )
-        return None
+            return None
+        logger.error(
+            "Instagram API request failed for %s with HTTP %d: %s",
+            handle,
+            e.status,
+            e,
+        )
+        raise
     except Exception as e:
         logger.error(
             "Unexpected error fetching Instagram profile %s: %s",
@@ -53,7 +53,7 @@ async def fetch_instagram_profile(
             e,
             exc_info=True,
         )
-        return None
+        raise
 
 
 async def fetch_video_transcript(
@@ -66,7 +66,6 @@ async def fetch_video_transcript(
             response = await client.get(
                 endpoint="/v2/instagram/media/transcript",
                 params={"url": post_url},
-                max_retries=2,
             )
             transcripts = response.get("transcripts")
             if isinstance(transcripts, list) and len(transcripts) > 0:

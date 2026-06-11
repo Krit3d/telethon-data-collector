@@ -154,6 +154,169 @@ async def upsert_and_deduplicate_account(
     return primary_id
 
 
+def _extract_raw_field(raw: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = raw.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_email(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    if "@" in cleaned and "." in cleaned:
+        return cleaned
+    return None
+
+
+def _normalize_phone(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(ch for ch in value if ch.isdigit() or ch == "+")
+    if len(cleaned) >= 7:
+        return cleaned
+    return None
+
+
+def _enrich_contacts_from_payload(
+    contacts: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    existing_emails: set[str] = set(e.lower() for e in contacts.get("emails", []) if isinstance(e, str))
+    existing_phones: set[str] = set(
+        "".join(ch for ch in p if ch.isdigit() or ch == "+")
+        for p in contacts.get("phones", [])
+        if isinstance(p, str)
+    )
+
+    email_keys = ("public_email", "business_email", "email")
+    for key in email_keys:
+        raw_value = payload.get(key)
+        normalized = _normalize_email(raw_value if isinstance(raw_value, str) else None)
+        if normalized and normalized not in existing_emails:
+            existing_emails.add(normalized)
+            contacts.setdefault("emails", []).append(normalized)
+
+    phone_keys = (
+        "contact_phone_number",
+        "business_phone_number",
+        "public_phone_number",
+        "phone_number",
+    )
+    for key in phone_keys:
+        raw_value = payload.get(key)
+        normalized = _normalize_phone(raw_value if isinstance(raw_value, str) else None)
+        if normalized and normalized not in existing_phones:
+            existing_phones.add(normalized)
+            contacts.setdefault("phones", []).append(normalized)
+
+    return contacts
+
+
+def _extract_geo_from_payload(
+    payload: dict[str, Any],
+) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    city: str | None = None
+    country: str | None = None
+    coords: list[float] | None = None
+
+    city_raw = _extract_raw_field(payload, "city_name", "city")
+    if isinstance(city_raw, str) and city_raw.strip():
+        city = city_raw.strip()
+
+    address_fields = ("address", "location", "place")
+    if city is None:
+        for af in address_fields:
+            addr = payload.get(af)
+            if isinstance(addr, dict):
+                inner_city = addr.get("city_name") or addr.get("city") or addr.get("name")
+                if isinstance(inner_city, str) and inner_city.strip():
+                    city = inner_city.strip()
+                    break
+
+    country_raw = _extract_raw_field(payload, "country_code", "country", "country_name")
+    if isinstance(country_raw, str) and country_raw.strip():
+        country = country_raw.strip()
+
+    lat_raw = _extract_raw_field(payload, "latitude", "lat")
+    lng_raw = _extract_raw_field(payload, "longitude", "lng", "lon")
+    if isinstance(lat_raw, (int, float)) and isinstance(lng_raw, (int, float)):
+        coords = [float(lat_raw), float(lng_raw)]
+
+    geo_data: dict[str, Any] | None = None
+    if city or country or coords:
+        geo_data = {}
+        if city:
+            geo_data["city"] = city
+        if country:
+            geo_data["country"] = country
+        if coords:
+            geo_data["coordinates"] = coords
+
+    return city, country, geo_data
+
+
+def _extract_external_url_from_payload(
+    payload: dict[str, Any],
+) -> str | None:
+    direct = payload.get("external_url")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    bio_links = payload.get("bio_links")
+    if isinstance(bio_links, list):
+        for entry in bio_links:
+            if isinstance(entry, str) and entry.strip():
+                return entry.strip()
+            if isinstance(entry, dict):
+                url_val = entry.get("url") or entry.get("link") or entry.get("href")
+                if isinstance(url_val, str) and url_val.strip():
+                    return url_val.strip()
+
+    return None
+
+
+def _load_existing_metrics_history(
+    raw_metadata: dict[str, Any] | None,
+) -> list[MetricsEntry]:
+    if not raw_metadata or not isinstance(raw_metadata, dict):
+        return []
+
+    history_raw = raw_metadata.get("metrics_history")
+    if not isinstance(history_raw, list):
+        return []
+
+    parsed: list[MetricsEntry] = []
+    for entry in history_raw:
+        if isinstance(entry, dict):
+            try:
+                parsed.append(MetricsEntry(**entry))
+            except Exception:
+                logger.debug("Skipping malformed metrics_history entry: %s", entry)
+        elif isinstance(entry, MetricsEntry):
+            parsed.append(entry)
+
+    return parsed
+
+
+def _metrics_entry_matches(a: MetricsEntry, b: MetricsEntry) -> bool:
+    return (
+        a.subscribers_count == b.subscribers_count
+        and a.posts_count == b.posts_count
+    )
+
+
+def _deduplicate_metrics(history: list[MetricsEntry]) -> list[MetricsEntry]:
+    unique: list[MetricsEntry] = []
+    for entry in history:
+        if unique and _metrics_entry_matches(unique[-1], entry):
+            continue
+        unique.append(entry)
+    return unique
+
+
 async def update_account_profile_metadata(
     session: AsyncSession,
     account_id: int,
@@ -169,10 +332,6 @@ async def update_account_profile_metadata(
     subscribers_count: int | None = None,
     posts_count: int | None = None,
 ) -> dict[str, Any]:
-    contacts: dict[str, Any] = {}
-    if biography or external_url:
-        contacts = parse_profile_contacts(biography, external_url)
-
     stmt = select(Account).where(Account.id == account_id)
     result = await session.execute(stmt)
     account = result.scalar_one_or_none()
@@ -181,14 +340,49 @@ async def update_account_profile_metadata(
         logger.warning("Account with id %d not found for metadata update", account_id)
         return {}
 
+    raw_metadata_dict: dict[str, Any] = {}
+    if account.raw_metadata and isinstance(account.raw_metadata, dict):
+        raw_metadata_dict = account.raw_metadata
+
+    payload: dict[str, Any] = raw_profile_payload if isinstance(raw_profile_payload, dict) else {}
+
+    if external_url is None and payload:
+        external_url = _extract_external_url_from_payload(payload)
+
+    contacts: dict[str, Any] = {}
+    if biography or external_url:
+        contacts = parse_profile_contacts(biography, external_url)
+
+    if payload:
+        contacts = _enrich_contacts_from_payload(contacts, payload)
+
+    found_city: str | None = None
+    found_country: str | None = None
+    extracted_geo: dict[str, Any] | None = None
+
+    if payload:
+        found_city, found_country, extracted_geo = _extract_geo_from_payload(payload)
+
+    if extracted_geo is not None:
+        if geo_data is None:
+            geo_data = extracted_geo
+        else:
+            for key in ("city", "country", "coordinates"):
+                if key not in geo_data or geo_data[key] is None:
+                    geo_data[key] = extracted_geo.get(key)
+
+    if location is None and payload:
+        parts = [p for p in (found_city, found_country) if p]
+        if parts:
+            location = ", ".join(parts)
+
     username = account.username or account.platform_id
 
     resolved_category = category
     if resolved_category is None:
-        if account.raw_metadata and isinstance(account.raw_metadata, dict):
-            resolved_category = account.raw_metadata.get("category")
-        if resolved_category is None:
-            resolved_category = "unknown"
+        resolved_category = raw_metadata_dict.get("category")
+    if resolved_category is None:
+        resolved_category = "unknown"
 
     compiled_metadata = compile_author_metadata(
         platform=platform,
@@ -203,13 +397,23 @@ async def update_account_profile_metadata(
         raw_profile_payload=raw_profile_payload,
     )
 
+    compiled_metadata.metrics_history = _load_existing_metrics_history(raw_metadata_dict)
+
     if subscribers_count is not None or posts_count is not None:
-        metrics_entry = MetricsEntry(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+        now_iso = datetime.now(timezone.utc).isoformat()
+        new_entry = MetricsEntry(
+            timestamp=now_iso,
             subscribers_count=subscribers_count,
             posts_count=posts_count,
         )
-        compiled_metadata.metrics_history.append(metrics_entry)
+        if compiled_metadata.metrics_history:
+            last = compiled_metadata.metrics_history[-1]
+            if not (_metrics_entry_matches(last, new_entry) and last.timestamp == now_iso):
+                compiled_metadata.metrics_history.append(new_entry)
+        else:
+            compiled_metadata.metrics_history.append(new_entry)
+
+    compiled_metadata.metrics_history = _deduplicate_metrics(compiled_metadata.metrics_history)
 
     if extra_meta:
         for key, value in extra_meta.items():

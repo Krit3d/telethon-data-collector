@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
-import random
 from typing import Any
 
 import aiohttp
 
 from src.config.config import Settings
+
 
 logger = logging.getLogger(__name__)
 credits_logger = logging.getLogger(__name__ + ".credits")
@@ -30,6 +30,7 @@ class ScrapeCreatorsClient:
         self._auth_scheme = settings.scrape_creators_auth_scheme
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
+        self.global_semaphore = asyncio.Semaphore(settings.creators_concurrency)
         self.last_credits_remaining: int | None = None
 
     async def __aenter__(self) -> ScrapeCreatorsClient:
@@ -86,7 +87,7 @@ class ScrapeCreatorsClient:
         if max_retries is not None:
             actual_max_retries = max_retries
         else:
-            actual_max_retries = 5
+            actual_max_retries = self._get_network_retries()
 
         fixed_delay = self._get_network_retry_base_delay()
 
@@ -100,7 +101,11 @@ class ScrapeCreatorsClient:
         if json_data is not None:
             request_kwargs["json"] = json_data
 
+        if "transcript" in endpoint:
+            request_kwargs["timeout"] = aiohttp.ClientTimeout(total=35.0)
+
         for attempt in range(actual_max_retries + 1):
+            is_server_fault = False
             try:
                 async with session.request(method, full_url, **request_kwargs) as response:
                     if response.status == 429:
@@ -166,6 +171,7 @@ class ScrapeCreatorsClient:
                         response.raise_for_status()
 
                     if 500 <= response.status < 600:
+                        is_server_fault = True
                         raise aiohttp.ClientError(f"Server error: {response.status}")
 
                     try:
@@ -209,7 +215,7 @@ class ScrapeCreatorsClient:
                     str(e),
                 )
                 if attempt < actual_max_retries:
-                    wait_time = fixed_delay * (2 ** attempt) + random.uniform(0.1, 0.5)
+                    wait_time = fixed_delay
                     logger.warning("Retrying after %.2f seconds...", wait_time)
                     await asyncio.sleep(wait_time)
                 else:

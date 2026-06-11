@@ -1,8 +1,9 @@
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +16,30 @@ from src.parser.creators.core.db.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def is_song_lyrics(text: str | None) -> bool:
+    if not text:
+        return False
+
+    text = text.strip()
+    if not text:
+        return False
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) > 4:
+        unique_lines = set(lines)
+        duplicate_ratio = 1 - len(unique_lines) / len(lines)
+        if duplicate_ratio > 0.35:
+            return True
+
+    words = re.findall(r'\b[a-zA-Zа-яА-ЯёЁ]{3,}\b', text)
+    if len(words) > 15:
+        unique_words = set(w.lower() for w in words)
+        if len(unique_words) / len(words) < 0.48:
+            return True
+
+    return False
 
 
 async def bulk_upsert_content(
@@ -36,11 +61,17 @@ async def bulk_upsert_content(
         if raw_metadata is not None:
             raw_metadata = clean_content_raw_metadata(raw_metadata)
 
+        transcription = values.get("transcription")
+        if isinstance(transcription, str) and transcription.strip().lower().startswith("please provide"):
+            transcription = None
+        if is_song_lyrics(transcription):
+            transcription = None
+
         prepared = {
             "account_id": values["account_id"],
             "platform_content_id": values["platform_content_id"],
             "content": values.get("content"),
-            "transcription": values.get("transcription"),
+            "transcription": transcription,
             "published_at": values.get("published_at", now),
             "views": values.get("views"),
             "reactions_count": values.get("reactions_count"),
@@ -63,7 +94,7 @@ async def bulk_upsert_content(
         constraint="uq_content_account_platform_id",
         set_=dict(
             content=stmt.excluded.content,
-            transcription=stmt.excluded.transcription,
+            transcription=func.coalesce(stmt.excluded.transcription, Content.transcription),
             views=stmt.excluded.views,
             reactions_count=stmt.excluded.reactions_count,
             comments_count=stmt.excluded.comments_count,

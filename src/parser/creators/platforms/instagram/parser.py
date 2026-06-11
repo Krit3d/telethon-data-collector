@@ -5,7 +5,7 @@ from typing import Any
 
 from sqlalchemy import select, update
 
-from src.db.models import Account
+from src.db.models import Account, Content
 from src.parser.creators.core.db.accounts_repo import (
     upsert_and_deduplicate_account,
     update_account_profile_metadata,
@@ -78,6 +78,20 @@ class InstagramParser(BasePlatformParser):
             )
             await session.execute(upd)
             await session.commit()
+
+    async def _fetch_raw_profile_payload(self, account_id: int) -> dict[str, Any] | None:
+        async with self.session_maker() as session:
+            stmt = select(Account.raw_metadata).where(Account.id == account_id)
+            result = await session.execute(stmt)
+            raw_metadata = result.scalar_one_or_none()
+            if not isinstance(raw_metadata, dict):
+                return None
+            payload = raw_metadata.get("raw_profile_payload")
+            if not isinstance(payload, dict) or not payload:
+                return None
+            if "username" not in payload and "id" not in payload:
+                return None
+            return payload
 
     async def parse_profile(self, handle: str) -> int | None:
         logger.info("Starting Instagram profile parse for handle: %s", handle)
@@ -439,7 +453,9 @@ class InstagramParser(BasePlatformParser):
 
         account_category = await self._fetch_account_category(account_id) or "unknown"
 
-        profile = await fetch_instagram_profile(self.client, platform_id)
+        profile = await self._fetch_raw_profile_payload(account_id)
+        if profile is None:
+            profile = await fetch_instagram_profile(self.client, platform_id)
         if not profile:
             raise RuntimeError(f"Could not retrieve profile metadata for {platform_id} during content parsing.")
 
@@ -467,6 +483,18 @@ class InstagramParser(BasePlatformParser):
         valid_items = await fetch_valid_instagram_videos(
             self.client, platform_id, max_items,
         )
+
+        def _published_at_key(item: dict[str, Any]) -> datetime:
+            try:
+                dt = extract_instagram_published_at(item)
+            except Exception:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+
+        valid_items.sort(key=_published_at_key, reverse=True)
+        valid_items = valid_items[:10]
 
         if not valid_items:
             logger.info(
@@ -590,14 +618,12 @@ class InstagramParser(BasePlatformParser):
 
             is_valid_video = bool(video_url) and duration > 0.0
 
-            if not is_valid_video:
-                needs_transcript = False
-            elif duration > 120.0:
-                needs_transcript = False
-            elif has_target_semantics:
-                needs_transcript = False
-            else:
-                needs_transcript = True
+            needs_transcript = not (
+                duration < 3.0
+                or duration > 120.0
+                or not is_valid_video
+                or has_target_semantics
+            )
 
             if needs_transcript and post_url:
                 items_needing_transcripts.append((item_id, post_url))
@@ -608,24 +634,56 @@ class InstagramParser(BasePlatformParser):
 
         transcript_map: dict[str, str | None] = {}
 
-        if items_needing_transcripts:
-            semaphore = asyncio.Semaphore(1)
+        candidate_item_ids = [item_id for item_id, _ in items_needing_transcripts]
 
-            for item_id, post_url in items_needing_transcripts:
+        already_transcribed: set[str] = set()
+        if candidate_item_ids:
+            async with self.session_maker() as session:
+                stmt = (
+                    select(Content.platform_content_id)
+                    .where(
+                        Content.platform_content_id.in_(candidate_item_ids),
+                        Content.transcription.isnot(None),
+                    )
+                )
+                result = await session.execute(stmt)
+                already_transcribed = {row[0] for row in result.all()}
+
+        items_needing_transcripts = [
+            (item_id, post_url)
+            for item_id, post_url in items_needing_transcripts
+            if item_id not in already_transcribed
+        ]
+
+        if items_needing_transcripts:
+
+            async def _fetch_one_transcript(
+                t_item_id: str, t_post_url: str,
+            ) -> tuple[str, str | None]:
                 try:
                     result = await fetch_video_transcript(
-                        self.client, semaphore, post_url,
+                        self.client, self.client.global_semaphore, t_post_url,
                     )
-                    if isinstance(result, str) or result is None:
-                        transcript_map[item_id] = result
-                    else:
-                        transcript_map[item_id] = None
+                    if isinstance(result, str):
+                        cleaned = result.strip()
+                        if cleaned.lower().startswith("please provide"):
+                            return t_item_id, None
+                        return t_item_id, cleaned
+                    return t_item_id, None
                 except Exception as e:
                     logger.error(
-                        "Transcript fetch failed for %s: %s", item_id, e,
+                        "Transcript fetch failed for %s: %s", t_item_id, e,
                     )
-                    transcript_map[item_id] = None
-                await asyncio.sleep(1.5)
+                    return t_item_id, None
+
+            tasks = [
+                _fetch_one_transcript(item_id, post_url)
+                for item_id, post_url in items_needing_transcripts
+            ]
+            results = await asyncio.gather(*tasks)
+
+            for t_item_id, t_transcript in results:
+                transcript_map[t_item_id] = t_transcript
 
             for item_data in items_data:
                 item_id = item_data["item_id"]

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import select
@@ -67,8 +68,11 @@ async def queue_discovered_accounts(
         }
 
         for platform_slug, platform_name in platform_mapping.items():
-            handle = getattr(external_platforms, platform_slug, None)
-            if handle:
+            if isinstance(external_platforms, Mapping):
+                handle = external_platforms.get(platform_slug)
+            else:
+                handle = getattr(external_platforms, platform_slug, None)
+            if isinstance(handle, str) and handle:
                 await _queue_if_new(platform_name, handle)
 
     urls_to_scan: list[str] = []
