@@ -66,7 +66,7 @@ async def fetch_video_transcript(
             response = await client.get(
                 endpoint="/v2/instagram/media/transcript",
                 params={"url": post_url},
-                max_retries=3,
+                max_retries=2,
             )
             transcripts = response.get("transcripts")
             if isinstance(transcripts, list) and len(transcripts) > 0:
@@ -98,8 +98,24 @@ async def fetch_video_transcript(
             logger.debug("No transcript: %s", post_url[:50])
             return None
 
+        except ClientResponseError as e:
+            if e.status >= 500:
+                logger.warning(
+                    "Transcript failed for %s (HTTP %d: video might exceed 2 minutes, contain no speech, or be unavailable on Scrape Creators side).",
+                    post_url,
+                    e.status,
+                )
+            else:
+                logger.warning(
+                    "Transcript request error for %s (HTTP %d): %s",
+                    post_url,
+                    e.status,
+                    e,
+                )
+            return None
+
         except Exception as e:
             logger.warning(
-                "Transcript permanently failed for %s: %s", post_url, e
+                "Transcript failed for %s: %s", post_url, e
             )
             return None

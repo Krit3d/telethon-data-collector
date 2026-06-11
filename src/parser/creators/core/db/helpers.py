@@ -10,7 +10,6 @@ from src.parser.creators.core.schemas import (
     AccountMetadata,
     ContentMetadata,
     Contacts,
-    ExternalPlatforms,
 )
 
 logger = logging.getLogger(__name__)
@@ -249,12 +248,9 @@ def convert_dict_to_account_metadata(contacts_dict: dict[str, Any]) -> AccountMe
         telegram_channels.append(username)
     telegram_personal: list[str] = []
 
-    external_platforms = ExternalPlatforms(
-        vk=external_platforms_dict.get("vk"),
-        youtube=external_platforms_dict.get("youtube"),
-        threads=external_platforms_dict.get("threads"),
-        tiktok=external_platforms_dict.get("tiktok"),
-    )
+    external_platforms: dict[str, str | None] = {
+        k: v for k, v in external_platforms_dict.items() if isinstance(v, str | type(None))
+    } if external_platforms_dict else {}
 
     contacts = Contacts(
         emails=[e for e in emails if e],

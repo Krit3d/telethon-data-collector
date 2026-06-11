@@ -6,7 +6,6 @@ from typing import Any
 from src.parser.creators.core.schemas import (
     AccountMetadata,
     Contacts,
-    ExternalPlatforms,
     GeoData
 )
 
@@ -79,6 +78,9 @@ EXTERNAL_PLATFORM_DOMAINS: dict[str, list[str]] = {
     "youtube": ["youtube.com", "youtu.be"],
     "threads": ["threads.net", "threads.com"],
     "tiktok": ["tiktok.com"],
+    "rutube": ["rutube.ru"],
+    "yandex_dzen": ["dzen.ru", "zen.yandex.ru", "zen.yandex.com"],
+    "ok": ["ok.ru", "odnoklassniki.ru"],
 }
 
 TELEGRAM_PERSONAL_KEYWORDS: frozenset[str] = frozenset({
@@ -172,6 +174,55 @@ def extract_external_platforms(
                 match = re.search(rf"{re.escape(domain)}/@([^/?#]+)", url_lower)
                 if match:
                     external_platforms["tiktok"] = match.group(1)
+                break
+
+        for domain in EXTERNAL_PLATFORM_DOMAINS["rutube"]:
+            if domain in url_lower:
+                match = re.search(rf"{re.escape(domain)}/channel/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["rutube"] = match.group(1)
+                    break
+                match = re.search(rf"{re.escape(domain)}/u/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["rutube"] = match.group(1)
+                    break
+                match = re.search(rf"{re.escape(domain)}/video/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["rutube"] = match.group(1)
+                    break
+                match = re.search(rf"{re.escape(domain)}/plp/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["rutube"] = match.group(1)
+                    break
+                match = re.search(rf"{re.escape(domain)}/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["rutube"] = match.group(1)
+                break
+
+        for domain in EXTERNAL_PLATFORM_DOMAINS["yandex_dzen"]:
+            if domain in url_lower:
+                match = re.search(rf"{re.escape(domain)}/suite/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["yandex_dzen"] = match.group(1)
+                    break
+                match = re.search(rf"{re.escape(domain)}/@([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["yandex_dzen"] = match.group(1)
+                    break
+                match = re.search(rf"{re.escape(domain)}/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["yandex_dzen"] = match.group(1)
+                break
+
+        for domain in EXTERNAL_PLATFORM_DOMAINS["ok"]:
+            if domain in url_lower:
+                match = re.search(rf"{re.escape(domain)}/profile/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["ok"] = match.group(1)
+                    break
+                match = re.search(rf"{re.escape(domain)}/([^/?#]+)", url_lower)
+                if match:
+                    external_platforms["ok"] = match.group(1)
                 break
 
     return external_platforms
@@ -497,12 +548,9 @@ def compile_author_metadata(
     if not isinstance(external_platforms_dict, dict):
         external_platforms_dict = {}
 
-    external_platforms = ExternalPlatforms(
-        vk=external_platforms_dict.get("vk"),
-        youtube=external_platforms_dict.get("youtube"),
-        threads=external_platforms_dict.get("threads"),
-        tiktok=external_platforms_dict.get("tiktok"),
-    )
+    external_platforms: dict[str, str | None] = {
+        k: v for k, v in external_platforms_dict.items() if isinstance(v, str | type(None))
+    } if external_platforms_dict else {}
 
     contacts = Contacts(
         emails=[email.lower().strip() for email in emails if email and isinstance(email, str)],
@@ -530,6 +578,7 @@ def compile_author_metadata(
         link_in_bio=link_in_bio,
         website=website,
         geo_data=geo_data_model,
+        external_links=remaining_external_links,
         metrics_history=[],
         raw_profile_payload=raw_profile_payload,
         extracted_at=datetime.now(timezone.utc).isoformat(),

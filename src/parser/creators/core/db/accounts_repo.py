@@ -167,6 +167,7 @@ async def update_account_profile_metadata(
     category: str | None = None,
     raw_profile_payload: dict[str, Any] | None = None,
     subscribers_count: int | None = None,
+    posts_count: int | None = None,
 ) -> dict[str, Any]:
     contacts: dict[str, Any] = {}
     if biography or external_url:
@@ -202,11 +203,11 @@ async def update_account_profile_metadata(
         raw_profile_payload=raw_profile_payload,
     )
 
-    if subscribers_count is not None:
+    if subscribers_count is not None or posts_count is not None:
         metrics_entry = MetricsEntry(
             timestamp=datetime.now(timezone.utc).isoformat(),
             subscribers_count=subscribers_count,
-            posts_count=None,
+            posts_count=posts_count,
         )
         compiled_metadata.metrics_history.append(metrics_entry)
 

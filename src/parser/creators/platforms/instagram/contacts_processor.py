@@ -18,6 +18,7 @@ async def process_and_queue_discovered_contacts(
     profile_external_url: str | None,
     items_data: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    parent_lower = parent_username.lower()
     aggregated_emails: list[str] = []
     aggregated_telegram_handles: list[str] = []
     aggregated_external_links: list[str] = []
@@ -29,7 +30,11 @@ async def process_and_queue_discovered_contacts(
         if email and email not in aggregated_emails:
             aggregated_emails.append(email)
     for handle in bio_contacts.get("telegram_handles", []):
-        if handle and handle not in aggregated_telegram_handles:
+        if (
+            handle
+            and handle.lower() != parent_lower
+            and handle not in aggregated_telegram_handles
+        ):
             aggregated_telegram_handles.append(handle)
     for link in bio_contacts.get("external_links", []):
         if link and link not in aggregated_external_links:
@@ -51,7 +56,11 @@ async def process_and_queue_discovered_contacts(
                 aggregated_emails.append(email)
 
         for handle in contacts_dict.get("telegram_handles", []):
-            if handle and handle not in aggregated_telegram_handles:
+            if (
+                handle
+                and handle.lower() != parent_lower
+                and handle not in aggregated_telegram_handles
+            ):
                 aggregated_telegram_handles.append(handle)
 
         for link in contacts_dict.get("external_links", []):
@@ -62,7 +71,9 @@ async def process_and_queue_discovered_contacts(
             if handle and platform_slug not in aggregated_external_platforms:
                 aggregated_external_platforms[platform_slug] = handle
 
-        aggregated_mentions.update(mentions)
+        for mention in mentions:
+            if mention.lower() != parent_lower:
+                aggregated_mentions.add(mention)
 
     aggregated_contacts: dict[str, Any] = {
         "emails": aggregated_emails,

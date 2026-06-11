@@ -2,7 +2,8 @@ import logging
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import DatabaseError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account
@@ -49,6 +50,8 @@ async def queue_discovered_accounts(
     for handle in telegram_channels:
         if not handle:
             continue
+        if handle.startswith("+"):
+            continue
         clean_handle = handle.lstrip("@")
         await _queue_if_new("TELEGRAM", clean_handle)
 
@@ -58,6 +61,9 @@ async def queue_discovered_accounts(
             "youtube": "YOUTUBE",
             "threads": "THREADS",
             "tiktok": "TIKTOK",
+            "rutube": "RUTUBE",
+            "yandex_dzen": "YANDEX_DZEN",
+            "ok": "OK",
         }
 
         for platform_slug, platform_name in platform_mapping.items():
@@ -109,6 +115,8 @@ async def queue_discovered_mentions(
     for username in mentions:
         if not username or len(username) < 3:
             continue
+        if username.startswith("+"):
+            continue
         await queue_single_account(session, platform, username, parent_handle, status, category)
 
 
@@ -129,19 +137,21 @@ async def queue_single_account(
 
     if not existing:
         generated_id = generate_deterministic_id(platform, platform_id)
-        try:
-            raw_metadata = {"category": category} if category else None
+        raw_metadata = {"category": category} if category else None
 
-            new_account = Account(
-                id=generated_id,
-                platform=platform,
-                platform_id=platform_id,
-                username=platform_id,
-                title=platform_id,
-                status=status,
-                raw_metadata=raw_metadata,
-            )
-            session.add(new_account)
+        insert_stmt = insert(Account).values(
+            id=generated_id,
+            platform=platform,
+            platform_id=platform_id,
+            username=platform_id,
+            title=platform_id,
+            status=status,
+            raw_metadata=raw_metadata,
+        )
+        insert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=["id"])
+
+        try:
+            await session.execute(insert_stmt)
             await session.flush()
             logger.info(
                 "[SPIDER] Queued discovered %s account: %s from bio of parent account %s (category: %s).",
@@ -150,9 +160,10 @@ async def queue_single_account(
                 parent_handle,
                 category or "none",
             )
-        except IntegrityError as e:
-            logger.debug(
-                "Integrity error while queuing %s account %s (likely duplicate): %s",
+        except DatabaseError as e:
+            await session.rollback()
+            logger.warning(
+                "Database error while queuing %s account %s: %s",
                 platform,
                 platform_id,
                 e,

@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -20,6 +21,7 @@ _KEYS_TO_KEEP = {
     "video_view_count",
     "comment_count",
     "like_count",
+    "video_url",
 }
 
 
@@ -99,28 +101,17 @@ def extract_instagram_published_at(node_dict: dict[str, Any]) -> datetime:
 
 
 def extract_instagram_video_url(node_dict: dict[str, Any]) -> str | None:
-    video_url: str | None = node_dict.get("video_url")
-    if video_url and isinstance(video_url, str):
+    video_url = node_dict.get("video_url")
+    if isinstance(video_url, str) and video_url:
         return video_url
 
-    display_url: str | None = node_dict.get("display_url")
-    if (
-        display_url
-        and isinstance(display_url, str)
-        and "cdninstagram" in display_url
-    ):
-        return display_url
-
-    video_resources = node_dict.get("video_resources")
-    if isinstance(video_resources, list) and video_resources:
-        sorted_resources = sorted(
-            video_resources,
-            key=lambda r: r.get("profile", 0) if isinstance(r, dict) else 0,
-            reverse=True,
-        )
-        best_resource = sorted_resources[0]
-        if isinstance(best_resource, dict):
-            return best_resource.get("src")
+    video_versions = node_dict.get("video_versions")
+    if isinstance(video_versions, list) and video_versions:
+        first = video_versions[0]
+        if isinstance(first, dict):
+            url = first.get("url")
+            if isinstance(url, str) and url:
+                return url
 
     return None
 
@@ -208,3 +199,82 @@ def prune_instagram_payload(item: dict[str, Any]) -> dict[str, Any]:
             pruned["caption"] = caption
 
     return pruned
+
+
+def extract_instagram_geo_data(
+    profile: dict[str, Any],
+    biography: str | None,
+    full_name: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    location_str: str | None = None
+    geo_data: dict[str, Any] | None = None
+
+    try:
+        business_address_raw = profile.get("business_address_json")
+        if business_address_raw is not None:
+            address_dict: dict[str, Any] | None = None
+            if isinstance(business_address_raw, str):
+                try:
+                    parsed = json.loads(business_address_raw)
+                    if isinstance(parsed, dict):
+                        address_dict = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif isinstance(business_address_raw, dict):
+                address_dict = business_address_raw
+
+            if address_dict is not None:
+                city_name = address_dict.get("city_name")
+                if city_name and isinstance(city_name, str):
+                    location_str = city_name
+                    parts = [p.strip() for p in city_name.split(",") if p.strip()]
+                    city = parts[0] if parts else city_name
+                    country = parts[1] if len(parts) > 1 else "Russia"
+                    geo_data = {"city": city, "country": country}
+
+        if geo_data is None:
+            fallback_name = profile.get("city_name") or profile.get("location")
+            if fallback_name and isinstance(fallback_name, str):
+                location_str = fallback_name
+                parts = [p.strip() for p in fallback_name.split(",") if p.strip()]
+                city = parts[0] if parts else fallback_name
+                country = parts[1] if len(parts) > 1 else "Russia"
+                geo_data = {"city": city, "country": country}
+
+        if geo_data is None:
+            city_aliases: dict[str, tuple[str, str]] = {
+                "москва": ("Moscow", "Russia"),
+                "москве": ("Moscow", "Russia"),
+                "мск": ("Moscow", "Russia"),
+                "санкт-петербург": ("Saint Petersburg", "Russia"),
+                "спб": ("Saint Petersburg", "Russia"),
+                "питер": ("Saint Petersburg", "Russia"),
+                "ташкент": ("Tashkent", "Uzbekistan"),
+                "алматы": ("Almaty", "Kazakhstan"),
+                "алмата": ("Almaty", "Kazakhstan"),
+                "астана": ("Astana", "Kazakhstan"),
+                "караганда": ("Karaganda", "Kazakhstan"),
+                "минск": ("Minsk", "Belarus"),
+                "киев": ("Kyiv", "Ukraine"),
+                "новосибирск": ("Novosibirsk", "Russia"),
+                "екатеринбург": ("Yekaterinburg", "Russia"),
+                "казань": ("Kazan", "Russia"),
+                "краснодар": ("Krasnodar", "Russia"),
+                "ростов": ("Rostov-on-Don", "Russia"),
+                "самара": ("Samara", "Russia"),
+                "уфа": ("Ufa", "Russia"),
+                "челябинск": ("Chelyabinsk", "Russia"),
+            }
+            bio_lower = (biography or "").lower()
+            fn_lower = (full_name or "").lower()
+            search_text = f"{fn_lower} {bio_lower}"
+            for alias, (city, country) in city_aliases.items():
+                if alias in search_text:
+                    location_str = f"{city}, {country}"
+                    geo_data = {"city": city, "country": country}
+                    break
+
+    except Exception:
+        pass
+
+    return (location_str, geo_data)

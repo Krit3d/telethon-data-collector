@@ -3,6 +3,7 @@ import asyncio
 import logging
 import signal
 import sys
+from collections import defaultdict
 from typing import Any
 
 from sqlalchemy import select
@@ -51,7 +52,8 @@ class CreatorsCoordinator:
         self.poll_interval_s: int = settings.creators_poll_interval_s
 
         self._queries_manager = SearchQueriesManager(settings.search_queries_path)
-        self._current_query_index: int = 0
+        self._current_category_index: int = 0
+        self._category_query_indices: dict[str, int] = {}
 
         logger.info(
             f"CreatorsCoordinator initialized with min_subscribers={self.min_subscribers}, "
@@ -66,13 +68,27 @@ class CreatorsCoordinator:
         if not balanced_queries:
             return []
 
-        total_queries = len(balanced_queries)
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for query, category in balanced_queries:
+            grouped[category].append(query)
+
+        sorted_categories: list[str] = sorted(grouped.keys())
+
+        self._current_category_index = getattr(self, "_current_category_index", 0)
+        self._category_query_indices = getattr(self, "_category_query_indices", {})
 
         selected_queries: list[tuple[str, str]] = []
 
         for _ in range(count):
-            selected_queries.append(balanced_queries[self._current_query_index])
-            self._current_query_index = (self._current_query_index + 1) % total_queries
+            category = sorted_categories[self._current_category_index % len(sorted_categories)]
+            local_index = self._category_query_indices.get(category, 0)
+            queries_in_cat = grouped[category]
+            query = queries_in_cat[local_index % len(queries_in_cat)]
+
+            selected_queries.append((query, category))
+
+            self._category_query_indices[category] = local_index + 1
+            self._current_category_index = (self._current_category_index + 1) % len(sorted_categories)
 
         return selected_queries
 
@@ -82,62 +98,59 @@ class CreatorsCoordinator:
         client: ScrapeCreatorsClient,
     ) -> None:
         active_platform = self.platform_filter if self.platform_filter else platform
-
-        pending_count = await self.db.count_pending_creator_accounts(active_platform)
-
-        logger.debug(
-            f"Pending accounts for platform '{active_platform}': {pending_count}"
-        )
-
         threshold = self.settings.creators_batch_size * 2
 
-        if pending_count < threshold:
+        balanced_queries = self._queries_manager.get_balanced_queries()
+        max_attempts = len(balanced_queries)
+        attempts = 0
+
+        parser = get_platform_parser(
+            platform=active_platform,
+            session_maker=self.db.async_session,
+            client=client,
+            settings=self.settings,
+        )
+
+        while attempts < max_attempts and not self.is_shutdown_requested():
+            pending_count = await self.db.count_pending_creator_accounts(active_platform)
+
+            if pending_count >= threshold:
+                logger.info(
+                    f"Pending queue sufficiently populated ({pending_count} >= {threshold}). "
+                    f"Stopping discovery loop."
+                )
+                break
+
+            next_queries = self._get_next_queries(count=1)
+            if not next_queries:
+                logger.warning("No more queries available for discovery.")
+                break
+
+            query, category = next_queries[0]
+
             logger.info(
                 f"Pending queue running low ({pending_count} < {threshold}). "
-                f"Running Stage 1 (Discovery) to populate candidates..."
+                f"Starting discovery attempt {attempts + 1}/{max_attempts}..."
             )
 
-            next_queries = self._get_next_queries(count=3)
+            try:
+                logger.info(
+                    f"Discovering candidates for query='{query}', "
+                    f"category='{category}' on platform={active_platform}"
+                )
+                discovered_count = await parser.discover_candidates(query, category)
+                logger.info(
+                    f"Discovered {discovered_count} accounts for query='{query}', "
+                    f"category='{category}' on platform={active_platform}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to discover candidates for query='{query}', "
+                    f"category='{category}' on platform={active_platform}: {e!r}",
+                    exc_info=e,
+                )
 
-            if not next_queries:
-                logger.warning("No queries available for discovery.")
-                return
-
-            parser = get_platform_parser(
-                platform=active_platform,
-                session_maker=self.db.async_session,
-                client=client,
-                settings=self.settings,
-            )
-
-            for query, category in next_queries:
-                if self.is_shutdown_requested():
-                    logger.info("Shutdown requested during discovery. Aborting.")
-                    return
-
-                try:
-                    logger.info(
-                        f"Discovering candidates for query='{query}', "
-                        f"category='{category}' on platform={active_platform}"
-                    )
-                    discovered_count = await parser.discover_candidates(query, category)
-                    logger.info(
-                        f"Discovered {discovered_count} accounts for query='{query}', "
-                        f"category='{category}' on platform={active_platform}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to discover candidates for query='{query}', "
-                        f"category='{category}' on platform={active_platform}: {e!r}",
-                        exc_info=e,
-                    )
-
-            logger.info("Stage 1 (Discovery) completed for this cycle.")
-        else:
-            logger.debug(
-                f"Pending queue has sufficient accounts ({pending_count} >= {threshold}). "
-                f"Skipping discovery."
-            )
+            attempts += 1
 
     def is_shutdown_requested(self) -> bool:
         if self._shutdown_event is None:

@@ -29,8 +29,7 @@ from src.parser.creators.platforms.base import BasePlatformParser
 from .client import fetch_instagram_profile, fetch_video_transcript
 from .contacts_processor import process_and_queue_discovered_contacts
 from .fetcher import fetch_valid_instagram_videos
-from .helpers import extract_instagram_video_url, prune_instagram_payload
-from .semantics import has_sufficient_semantics
+from .helpers import extract_instagram_geo_data, extract_instagram_video_url, prune_instagram_payload
 from .validators import (
     check_cyrillic_stage1,
     check_cyrillic_stage2,
@@ -51,7 +50,7 @@ class InstagramParser(BasePlatformParser):
         settings,
     ) -> None:
         super().__init__(session_maker, client, settings)
-        self._queries_manager = SearchQueriesManager(settings.search_queries_path)
+        self.queries_manager = SearchQueriesManager(settings.search_queries_path)
 
     async def _fetch_account_category(self, account_id: int) -> str | None:
         async with self.session_maker() as session:
@@ -63,6 +62,22 @@ class InstagramParser(BasePlatformParser):
                 if category and isinstance(category, str):
                     return category
         return None
+
+    async def _persist_fallback_category(self, account_id: int, category: str) -> None:
+        async with self.session_maker() as session:
+            stmt = select(Account.raw_metadata).where(Account.id == account_id)
+            result = await session.execute(stmt)
+            raw_meta = result.scalar_one_or_none()
+            if not isinstance(raw_meta, dict):
+                raw_meta = {}
+            raw_meta["category"] = category
+            upd = (
+                update(Account)
+                .where(Account.id == account_id)
+                .values(raw_metadata=raw_meta, updated_at=datetime.now(timezone.utc))
+            )
+            await session.execute(upd)
+            await session.commit()
 
     async def parse_profile(self, handle: str) -> int | None:
         logger.info("Starting Instagram profile parse for handle: %s", handle)
@@ -146,6 +161,19 @@ class InstagramParser(BasePlatformParser):
 
                 existing_category = await self._fetch_account_category(account_id)
 
+                if not existing_category or existing_category == "unknown":
+                    fallback = self.queries_manager.classify_text(f"{full_name} {biography or ''}")
+                    if fallback:
+                        logger.info(
+                            "Fallback category '%s' resolved for handle %s via keyword matching",
+                            fallback,
+                            handle,
+                        )
+                        existing_category = fallback
+                        await self._persist_fallback_category(account_id, fallback)
+
+                location_str, geo_data_dict = extract_instagram_geo_data(profile, biography, full_name)
+
                 await update_account_profile_metadata(
                     session=session,
                     account_id=account_id,
@@ -154,6 +182,11 @@ class InstagramParser(BasePlatformParser):
                     external_url=profile.get("external_url"),
                     category=existing_category,
                     subscribers_count=subscribers,
+                    raw_profile_payload=profile,
+                    posts_count=profile.get("media_count") or profile.get("posts_count"),
+                    language="ru",
+                    location=location_str,
+                    geo_data=geo_data_dict,
                 )
 
                 await session.commit()
@@ -205,6 +238,19 @@ class InstagramParser(BasePlatformParser):
 
             existing_category = await self._fetch_account_category(account_id)
 
+            if not existing_category or existing_category == "unknown":
+                fallback = self.queries_manager.classify_text(f"{full_name} {biography or ''}")
+                if fallback:
+                    logger.info(
+                        "Fallback category '%s' resolved for handle %s via keyword matching",
+                        fallback,
+                        handle,
+                    )
+                    existing_category = fallback
+                    await self._persist_fallback_category(account_id, fallback)
+
+            location_str, geo_data_dict = extract_instagram_geo_data(profile, biography, full_name)
+
             await update_account_profile_metadata(
                 session=session,
                 account_id=account_id,
@@ -213,6 +259,11 @@ class InstagramParser(BasePlatformParser):
                 external_url=profile.get("external_url"),
                 category=existing_category,
                 subscribers_count=subscribers,
+                raw_profile_payload=profile,
+                posts_count=profile.get("media_count") or profile.get("posts_count"),
+                language="ru",
+                location=location_str,
+                geo_data=geo_data_dict,
             )
 
             await session.commit()
@@ -400,6 +451,19 @@ class InstagramParser(BasePlatformParser):
             title=profile.get("full_name") or profile.get("username", ""),
         )
 
+        if not account_category or account_category == "unknown":
+            fallback = self.queries_manager.classify_text(
+                f"{author_profile_snapshot.title or ''} {profile_biography or ''}"
+            )
+            if fallback:
+                logger.info(
+                    "Fallback category '%s' resolved for account_id %d via keyword matching",
+                    fallback,
+                    account_id,
+                )
+                account_category = fallback
+                await self._persist_fallback_category(account_id, fallback)
+
         valid_items = await fetch_valid_instagram_videos(
             self.client, platform_id, max_items,
         )
@@ -491,7 +555,7 @@ class InstagramParser(BasePlatformParser):
                 ]
 
             combined_text = description + " " + " ".join(hashtags)
-            keywords_pattern = self._queries_manager.get_compiled_keywords_pattern()
+            keywords_pattern = self.queries_manager.get_compiled_keywords_pattern()
             has_target_semantics = (
                 keywords_pattern.search(combined_text) is not None
             )
@@ -507,6 +571,9 @@ class InstagramParser(BasePlatformParser):
 
             views = item.get("video_view_count") or item.get("play_count")
 
+            shortcode = item.get("code") or item.get("shortcode")
+            post_url = f"https://instagram.com/p/{shortcode}" if shortcode else None
+
             item_data: dict[str, Any] = {
                 "item": item,
                 "item_id": item_id,
@@ -517,50 +584,48 @@ class InstagramParser(BasePlatformParser):
                 "views": views,
                 "video_url": video_url,
                 "post_type": post_type,
+                "post_url": post_url,
                 "transcript": None,
             }
 
-            needs_transcript = not has_sufficient_semantics(
-                bio=profile_biography,
-                external_url=profile_external_url,
-                caption=description,
-                hashtags=hashtags,
-                has_target_semantics=has_target_semantics,
-            ) and post_type == "reel"
+            is_valid_video = bool(video_url) and duration > 0.0
 
-            if needs_transcript:
-                shortcode = item.get("code") or item.get("shortcode")
-                if shortcode:
-                    post_url = f"https://instagram.com/p/{shortcode}"
-                    items_needing_transcripts.append((item_id, post_url))
+            if not is_valid_video:
+                needs_transcript = False
+            elif duration > 120.0:
+                needs_transcript = False
+            elif has_target_semantics:
+                needs_transcript = False
+            else:
+                needs_transcript = True
+
+            if needs_transcript and post_url:
+                items_needing_transcripts.append((item_id, post_url))
 
             items_data.append(item_data)
+
+        items_needing_transcripts = items_needing_transcripts[:10]
 
         transcript_map: dict[str, str | None] = {}
 
         if items_needing_transcripts:
-            semaphore = asyncio.Semaphore(5)
-            transcript_fetch_tasks = [
-                fetch_video_transcript(self.client, semaphore, post_url)
-                for _, post_url in items_needing_transcripts
-            ]
+            semaphore = asyncio.Semaphore(1)
 
-            results = await asyncio.gather(
-                *transcript_fetch_tasks, return_exceptions=True
-            )
-
-            for (item_id, _), result in zip(
-                items_needing_transcripts, results, strict=False
-            ):
-                if isinstance(result, Exception):
+            for item_id, post_url in items_needing_transcripts:
+                try:
+                    result = await fetch_video_transcript(
+                        self.client, semaphore, post_url,
+                    )
+                    if isinstance(result, str) or result is None:
+                        transcript_map[item_id] = result
+                    else:
+                        transcript_map[item_id] = None
+                except Exception as e:
                     logger.error(
-                        "Transcript fetch failed for %s: %s", item_id, result
+                        "Transcript fetch failed for %s: %s", item_id, e,
                     )
                     transcript_map[item_id] = None
-                elif isinstance(result, str) or result is None:
-                    transcript_map[item_id] = result
-                else:
-                    transcript_map[item_id] = None
+                await asyncio.sleep(1.5)
 
             for item_data in items_data:
                 item_id = item_data["item_id"]
@@ -606,6 +671,9 @@ class InstagramParser(BasePlatformParser):
                 is_reel=post_type == "reel",
             )
 
+            raw_meta_dict = content_metadata.model_dump(mode="json", exclude_none=False)
+            raw_meta_dict["post_url"] = item_data["post_url"]
+
             final_content_values.append(
                 {
                     "account_id": account_id,
@@ -620,7 +688,7 @@ class InstagramParser(BasePlatformParser):
                     "has_media": True,
                     "is_embedded": False,
                     "is_graph_extracted": False,
-                    "raw_metadata": content_metadata.model_dump(mode="json", exclude_none=False),
+                    "raw_metadata": raw_meta_dict,
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
@@ -631,6 +699,25 @@ class InstagramParser(BasePlatformParser):
                     session=session,
                     content_values=final_content_values,
                 )
+
+                location_str, geo_data_dict = extract_instagram_geo_data(
+                    profile, profile_biography, author_profile_snapshot.title or "",
+                )
+
+                await update_account_profile_metadata(
+                    session=session,
+                    account_id=account_id,
+                    platform="INSTAGRAM",
+                    biography=profile_biography or "",
+                    external_url=profile_external_url,
+                    category=account_category,
+                    raw_profile_payload=profile,
+                    posts_count=profile.get("media_count") or profile.get("posts_count"),
+                    language="ru",
+                    location=location_str,
+                    geo_data=geo_data_dict,
+                )
+
                 await session.commit()
                 logger.info(
                     "Bulk upserted %d Instagram content items for account_id: %d",
