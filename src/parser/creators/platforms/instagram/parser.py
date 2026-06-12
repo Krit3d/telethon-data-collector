@@ -337,52 +337,52 @@ class InstagramParser(BasePlatformParser):
 
             discovered_count = 0
 
-            for profile in profiles:
-                if not isinstance(profile, dict):
-                    continue
+            async with self.session_maker() as session:
+                for profile in profiles:
+                    if not isinstance(profile, dict):
+                        continue
 
-                username = profile.get("username") or profile.get("handle")
-                if not username or not isinstance(username, str):
-                    logger.debug(
-                        "Skipping profile with missing username in search results: %s",
-                        profile.get("id", "unknown"),
-                    )
-                    continue
+                    username = profile.get("username") or profile.get("handle")
+                    if not username or not isinstance(username, str):
+                        logger.debug(
+                            "Skipping profile with missing username in search results: %s",
+                            profile.get("id", "unknown"),
+                        )
+                        continue
 
-                followers = profile.get("follower_count") or profile.get("followers")
-                if followers is None:
-                    followers = (
-                        profile.get("stats", {}).get("followers")
-                        or profile.get("user", {}).get("follower_count")
-                    )
+                    followers = profile.get("follower_count") or profile.get("followers")
+                    if followers is None:
+                        followers = (
+                            profile.get("stats", {}).get("followers")
+                            or profile.get("user", {}).get("follower_count")
+                        )
 
-                try:
-                    followers = int(followers) if followers is not None else 0
-                except (ValueError, TypeError):
-                    followers = 0
+                    try:
+                        followers = int(followers) if followers is not None else 0
+                    except (ValueError, TypeError):
+                        followers = 0
 
-                if followers == 0:
-                    logger.debug(
-                        "Skipping Instagram profile %s: follower count is 0",
-                        username,
-                    )
-                    continue
+                    if followers == 0:
+                        logger.debug(
+                            "Skipping Instagram profile %s: follower count is 0",
+                            username,
+                        )
+                        continue
 
-                if not validate_follower_count(followers):
-                    logger.debug(
-                        "Skipping Instagram profile %s: follower count %d outside range [%d, %d]",
-                        username,
-                        followers,
-                        MIN_SUBSCRIBERS,
-                        MAX_SUBSCRIBERS,
-                    )
-                    continue
+                    if not validate_follower_count(followers):
+                        logger.debug(
+                            "Skipping Instagram profile %s: follower count %d outside range [%d, %d]",
+                            username,
+                            followers,
+                            MIN_SUBSCRIBERS,
+                            MAX_SUBSCRIBERS,
+                        )
+                        continue
 
-                profile_id = profile.get("id")
-                full_name = profile.get("full_name", "")
-                biography = profile.get("biography", "") or ""
+                    profile_id = profile.get("id")
+                    full_name = profile.get("full_name", "")
+                    biography = profile.get("biography", "") or ""
 
-                async with self.session_maker() as session:
                     try:
                         account_id = await upsert_and_deduplicate_account(
                             session=session,
@@ -407,7 +407,6 @@ class InstagramParser(BasePlatformParser):
                             .values(raw_metadata=meta, updated_at=datetime.now(timezone.utc))
                         )
                         await session.execute(stmt)
-                        await session.commit()
 
                         discovered_count += 1
                         logger.debug(
@@ -424,6 +423,8 @@ class InstagramParser(BasePlatformParser):
                             exc_info=True,
                         )
                         continue
+
+                await session.commit()
 
             logger.info(
                 "Instagram candidate discovery completed for query: '%s'. "
@@ -484,14 +485,17 @@ class InstagramParser(BasePlatformParser):
             self.client, platform_id, max_items,
         )
 
+        def _to_utc_aware(dt: datetime) -> datetime:
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
         def _published_at_key(item: dict[str, Any]) -> datetime:
             try:
                 dt = extract_instagram_published_at(item)
             except Exception:
                 return datetime.min.replace(tzinfo=timezone.utc)
-            if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc)
-            return dt
+            return _to_utc_aware(dt)
 
         valid_items.sort(key=_published_at_key, reverse=True)
         valid_items = valid_items[:10]
@@ -634,7 +638,7 @@ class InstagramParser(BasePlatformParser):
 
         transcript_map: dict[str, str | None] = {}
 
-        candidate_item_ids = [item_id for item_id, _ in items_needing_transcripts]
+        candidate_item_ids = [d["item_id"] for d in items_data]
 
         already_transcribed: set[str] = set()
         if candidate_item_ids:
@@ -737,7 +741,7 @@ class InstagramParser(BasePlatformParser):
                     "account_id": account_id,
                     "platform_content_id": item_id,
                     "content": item_data["content_text"],
-                    "published_at": extract_instagram_published_at(item),
+                    "published_at": _to_utc_aware(extract_instagram_published_at(item)),
                     "transcription": item_data["transcript"],
                     "views": views,
                     "reactions_count": likes,

@@ -3,7 +3,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -99,6 +99,14 @@ async def bulk_upsert_content(
             reactions_count=stmt.excluded.reactions_count,
             comments_count=stmt.excluded.comments_count,
             raw_metadata=stmt.excluded.raw_metadata,
+            is_embedded=case(
+                (Content.transcription.is_(None) & stmt.excluded.transcription.isnot(None), False),
+                else_=Content.is_embedded,
+            ),
+            is_graph_extracted=case(
+                (Content.transcription.is_(None) & stmt.excluded.transcription.isnot(None), False),
+                else_=Content.is_graph_extracted,
+            ),
             updated_at=stmt.excluded.updated_at,
         ),
     )

@@ -3,6 +3,19 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+HEAVY_PROFILE_KEYS: list[str] = [
+    "chaining_results",
+    "facebook_pages",
+    "linked_facebook_page",
+    "mutual_followers_data",
+    "eligible_promotions",
+    "ad_metadata",
+    "hd_profile_pic_versions",
+    "hd_profile_pic_url_info",
+    "bio_links",
+    "about_your_account_blurb",
+]
+
 
 class GeoData(BaseModel):
     city: str | None = None
@@ -38,6 +51,31 @@ class AccountMetadata(BaseModel):
     external_links: list[str] = Field(default_factory=list)
     raw_profile_payload: dict[str, Any] | None = None
     extracted_at: str
+    is_verified: bool = False
+    is_business: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def prune_raw_payload(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        raw_payload = data.get("raw_profile_payload")
+        if not isinstance(raw_payload, dict):
+            return data
+
+        if "is_verified" not in data:
+            data["is_verified"] = raw_payload.get("is_verified", False)
+
+        if "is_business" not in data:
+            data["is_business"] = raw_payload.get(
+                "is_business_account", raw_payload.get("is_professional_account", False)
+            )
+
+        for key in HEAVY_PROFILE_KEYS:
+            raw_payload.pop(key, None)
+
+        return data
 
     @classmethod
     def create_with_timestamp(cls, **kwargs) -> "AccountMetadata":
@@ -76,6 +114,15 @@ class ContentMetadata(BaseModel):
     author_profile_snapshot: AuthorProfileSnapshot | None = None
     raw_item_payload: dict[str, Any] | None = None
     extracted_at: str
+    local_clip_path: str | None = None
+    video_processing_status: str = "pending"
+    transcription_status: str = "pending"
+    hashtags: list[str] = Field(default_factory=list)
+    coauthors: list[str] = Field(default_factory=list)
+    tagged_users: list[str] = Field(default_factory=list)
+    music_title: str | None = None
+    music_author: str | None = None
+    accessibility_caption: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -86,6 +133,37 @@ class ContentMetadata(BaseModel):
         raw_payload = data.get("raw_item_payload")
         if not isinstance(raw_payload, dict):
             return data
+
+        if "accessibility_caption" not in data:
+            data["accessibility_caption"] = raw_payload.get("accessibility_caption")
+
+        coauthor_producers = raw_payload.get("coauthor_producers")
+        if isinstance(coauthor_producers, list) and not data.get("coauthors"):
+            data["coauthors"] = [
+                u.get("username", "")
+                for u in coauthor_producers
+                if isinstance(u, dict) and u.get("username")
+            ]
+
+        tagged_edges = raw_payload.get("edge_media_to_tagged_user")
+        if isinstance(tagged_edges, dict) and not data.get("tagged_users"):
+            edges = tagged_edges.get("edges")
+            if isinstance(edges, list):
+                data["tagged_users"] = [
+                    e.get("node", {}).get("user", {}).get("username", "")
+                    for e in edges
+                    if isinstance(e, dict)
+                    and isinstance(e.get("node"), dict)
+                    and isinstance(e["node"].get("user"), dict)
+                    and e["node"]["user"].get("username")
+                ]
+
+        clips_meta = raw_payload.get("clips_metadata")
+        if isinstance(clips_meta, dict) and not data.get("music_title"):
+            music_info = clips_meta.get("clips_music_attribution_info")
+            if isinstance(music_info, dict):
+                data["music_title"] = music_info.get("song_name")
+                data["music_author"] = music_info.get("artist_name")
 
         heavy_fields = [
             "video_dash_manifest",

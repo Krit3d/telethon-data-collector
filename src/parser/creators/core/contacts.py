@@ -518,6 +518,19 @@ def compile_author_metadata(
     if extra_links:
         external_links.extend(extra_links)
 
+    bio_link_urls: list[str] = []
+    if isinstance(raw_profile_payload, dict):
+        raw_bio_links = raw_profile_payload.get("bio_links")
+        if isinstance(raw_bio_links, list):
+            for item in raw_bio_links:
+                if isinstance(item, dict):
+                    url_val = item.get("url")
+                    if isinstance(url_val, str) and url_val.strip():
+                        bio_link_urls.append(url_val.strip())
+
+    if bio_link_urls:
+        external_links.extend(bio_link_urls)
+
     seen: set[str] = set()
     unique_external: list[str] = []
     for link in external_links:
@@ -551,6 +564,13 @@ def compile_author_metadata(
     external_platforms: dict[str, str | None] = {
         k: v for k, v in external_platforms_dict.items() if isinstance(v, str | type(None))
     } if external_platforms_dict else {}
+
+    if bio_link_urls:
+        for bl_url in bio_link_urls:
+            bl_platforms = extract_external_platforms(bl_url)
+            for pl_key, pl_val in bl_platforms.items():
+                if pl_key not in external_platforms or external_platforms[pl_key] is None:
+                    external_platforms[pl_key] = pl_val
 
     contacts = Contacts(
         emails=[email.lower().strip() for email in emails if email and isinstance(email, str)],
