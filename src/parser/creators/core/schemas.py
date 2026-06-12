@@ -42,6 +42,7 @@ class MetricsEntry(BaseModel):
 class Contacts(BaseModel):
     emails: list[str] = Field(default_factory=list)
     phones: list[str] = Field(default_factory=list)
+    telegram_handles: list[str] = Field(default_factory=list)
     telegram_channels: list[str] = Field(default_factory=list)
     telegram_personal: list[str] = Field(default_factory=list)
     advertising_emails: list[str] = Field(default_factory=list)

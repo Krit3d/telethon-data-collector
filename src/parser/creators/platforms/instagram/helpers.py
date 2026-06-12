@@ -270,6 +270,18 @@ def extract_instagram_geo_data(
                 "самара": ("Samara", "Russia"),
                 "уфа": ("Ufa", "Russia"),
                 "челябинск": ("Chelyabinsk", "Russia"),
+                "павлодар": ("Pavlodar", "Kazakhstan"),
+                "шымкент": ("Shymkent", "Kazakhstan"),
+                "актобе": ("Aktobe", "Kazakhstan"),
+                "тараз": ("Taraz", "Kazakhstan"),
+                "усть-каменогорск": ("Ust-Kamenogorsk", "Kazakhstan"),
+                "семей": ("Semey", "Kazakhstan"),
+                "уральск": ("Uralsk", "Kazakhstan"),
+                "костанай": ("Kostanay", "Kazakhstan"),
+                "кызылорда": ("Kyzylorda", "Kazakhstan"),
+                "атырау": ("Atyrau", "Kazakhstan"),
+                "актау": ("Aktau", "Kazakhstan"),
+                "петропавловск": ("Petropavl", "Kazakhstan"),
             }
             bio_lower = (biography or "").lower()
             fn_lower = (full_name or "").lower()

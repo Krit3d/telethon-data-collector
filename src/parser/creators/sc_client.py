@@ -32,6 +32,7 @@ class ScrapeCreatorsClient:
         self._session_lock = asyncio.Lock()
         self.global_semaphore = asyncio.Semaphore(settings.creators_concurrency)
         self.last_credits_remaining: int | None = None
+        self.background_tasks: set[asyncio.Task[Any]] = set()
 
     async def __aenter__(self) -> ScrapeCreatorsClient:
         await self._ensure_session()
@@ -221,7 +222,10 @@ class ScrapeCreatorsClient:
                     str(e),
                 )
                 if attempt < actual_max_retries:
-                    wait_time = fixed_delay
+                    if "transcript" in endpoint:
+                        wait_time = 4.0 * (attempt + 1)
+                    else:
+                        wait_time = fixed_delay
                     logger.warning("Retrying after %.2f seconds...", wait_time)
                     await asyncio.sleep(wait_time)
                 else:

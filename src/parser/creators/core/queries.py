@@ -106,8 +106,13 @@ class SearchQueriesManager:
             if not category.queries:
                 continue
             escaped = [re.escape(q) for q in category.queries]
-            joined = "(?:" + "|".join(escaped) + ")"
-            self._category_patterns[category.name] = re.compile(joined, re.IGNORECASE)
+            joined = "|".join(escaped)
+            boundary_pattern = (
+                rf"(?<![a-zA-Zа-яА-ЯёЁ0-9])(?:{joined})(?![a-zA-Zа-яА-ЯёЁ0-9])"
+            )
+            self._category_patterns[category.name] = re.compile(
+                boundary_pattern, re.IGNORECASE
+            )
 
         return self._category_patterns
 

@@ -12,7 +12,7 @@ CURSORS_FILE = "src/config/search_cursors.json"
 
 class InstagramSearchPaginator:
 
-    def __init__(self, query: str, max_depth: int = 10, expiration_hours: int = 24) -> None:
+    def __init__(self, query: str, max_depth: int = 2, expiration_hours: int = 24) -> None:
         self.query: str = query
         self.max_depth: int = max_depth
         self.depth: int = 0
@@ -155,5 +155,5 @@ class InstagramSearchPaginator:
                 self.query,
                 self.max_depth,
             )
-            self._save_cursor("1")
+            self._save_cursor(self._cursor)
             self.is_finished = True

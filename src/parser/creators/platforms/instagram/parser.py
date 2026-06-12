@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -34,6 +35,7 @@ from .search_cursor import InstagramSearchPaginator
 from .validators import (
     check_cyrillic_stage1,
     check_cyrillic_stage2,
+    has_commercial_music,
     validate_follower_count,
     MIN_SUBSCRIBERS,
     MAX_SUBSCRIBERS,
@@ -99,6 +101,22 @@ class InstagramParser(BasePlatformParser):
 
         profile = await fetch_instagram_profile(self.client, handle)
         if not profile:
+            logger.warning(
+                "Instagram handle %s: profile fetch returned None (deleted or not found). Marking as rejected.",
+                handle,
+            )
+            async with self.session_maker() as session:
+                account_id = await upsert_and_deduplicate_account(
+                    session=session,
+                    platform="INSTAGRAM",
+                    platform_id=handle,
+                    username=handle,
+                    title=handle,
+                    description="",
+                    subscribers_count=0,
+                    status="rejected",
+                )
+                await session.commit()
             return None
 
         username = profile.get("username", "")
@@ -287,7 +305,7 @@ class InstagramParser(BasePlatformParser):
             category,
         )
 
-        paginator = InstagramSearchPaginator(query, max_depth=10)
+        paginator = InstagramSearchPaginator(query, max_depth=2)
         total_discovered = 0
 
         while paginator.should_continue():
@@ -385,12 +403,13 @@ class InstagramParser(BasePlatformParser):
                                 "search_metadata": profile,
                             }
 
-                            stmt = (
-                                update(Account)
-                                .where(Account.id == account_id)
-                                .values(raw_metadata=meta, updated_at=datetime.now(timezone.utc))
-                            )
-                            await session.execute(stmt)
+                            if not already_exists:
+                                stmt = (
+                                    update(Account)
+                                    .where(Account.id == account_id)
+                                    .values(raw_metadata=meta, updated_at=datetime.now(timezone.utc))
+                                )
+                                await session.execute(stmt)
 
                             discovered_count += 1
                             if not already_exists:
@@ -453,22 +472,26 @@ class InstagramParser(BasePlatformParser):
             title=profile.get("full_name") or profile.get("username", ""),
         )
 
-        if not account_category or account_category == "unknown":
-            fallback = self.queries_manager.classify_text(
-                f"{author_profile_snapshot.title or ''} {profile_biography or ''}"
+        try:
+            valid_items = await fetch_valid_instagram_videos(
+                self.client, platform_id, max_items,
             )
-            if fallback:
-                logger.info(
-                    "Fallback category '%s' resolved for account_id %d via keyword matching",
-                    fallback,
-                    account_id,
+        except Exception as e:
+            if getattr(e, "status", None) == 404 or "404" in str(e):
+                logger.warning(
+                    "Instagram account %s returned 404 when fetching posts. Marking as rejected.",
+                    platform_id,
                 )
-                account_category = fallback
-                await self._persist_fallback_category(account_id, fallback)
-
-        valid_items = await fetch_valid_instagram_videos(
-            self.client, platform_id, max_items,
-        )
+                async with self.session_maker() as session:
+                    stmt = (
+                        update(Account)
+                        .where(Account.id == account_id)
+                        .values(status="rejected", updated_at=datetime.now(timezone.utc))
+                    )
+                    await session.execute(stmt)
+                    await session.commit()
+                return
+            raise
 
         def _to_utc_aware(dt: datetime) -> datetime:
             if dt.tzinfo is None:
@@ -517,14 +540,39 @@ class InstagramParser(BasePlatformParser):
 
             hashtags = item.get("hashtags") or []
             if not hashtags and description:
-                hashtags = [
-                    tag.strip("#") for tag in description.split()
-                    if tag.startswith("#")
-                ]
+                hashtags = re.findall(r"#(\w+)", description)
 
             aggregated_text += " " + description + " " + " ".join(hashtags)
 
-        has_cyrillic = check_cyrillic_stage2(aggregated_text)
+        if not account_category or account_category == "unknown":
+            rich_text = f"{author_profile_snapshot.title or ''} {profile_biography or ''} {aggregated_text}"
+            fallback = self.queries_manager.classify_text(rich_text)
+            if fallback:
+                account_category = fallback
+                await self._persist_fallback_category(account_id, fallback)
+
+        if not account_category or account_category == "unknown":
+            discovery_query_text = None
+            async with self.session_maker() as session:
+                stmt = select(Account.raw_metadata).where(Account.id == account_id)
+                result = await session.execute(stmt)
+                raw_meta = result.scalar_one_or_none()
+                if isinstance(raw_meta, dict):
+                    discovery_query_text = raw_meta.get("discovery_query")
+            if discovery_query_text and isinstance(discovery_query_text, str):
+                fallback = self.queries_manager.classify_text(discovery_query_text)
+                if fallback:
+                    account_category = fallback
+                    await self._persist_fallback_category(account_id, fallback)
+
+        if not account_category or account_category == "unknown":
+            account_category = "lifestyle"
+            await self._persist_fallback_category(account_id, "lifestyle")
+
+        has_cyrillic = (
+            check_cyrillic_stage1(profile_biography, author_profile_snapshot.title)
+            or check_cyrillic_stage2(aggregated_text)
+        )
 
         if not has_cyrillic:
             logger.warning(
@@ -566,10 +614,7 @@ class InstagramParser(BasePlatformParser):
 
             hashtags = item.get("hashtags") or []
             if not hashtags and description:
-                hashtags = [
-                    tag.strip("#") for tag in description.split()
-                    if tag.startswith("#")
-                ]
+                hashtags = re.findall(r"#(\w+)", description)
 
             combined_text = description + " " + " ".join(hashtags)
             keywords_pattern = self.queries_manager.get_compiled_keywords_pattern()
@@ -583,7 +628,10 @@ class InstagramParser(BasePlatformParser):
 
             video_url = extract_instagram_video_url(item)
 
-            duration = item.get("video_duration") or item.get("duration", 0.0)
+            try:
+                duration = float(item.get("video_duration") or item.get("duration") or 0.0)
+            except (ValueError, TypeError):
+                duration = 0.0
             post_type = "reel" if duration <= 120.0 else "post"
 
             views = item.get("video_view_count") or item.get("play_count")
@@ -604,6 +652,7 @@ class InstagramParser(BasePlatformParser):
                 "post_url": post_url,
                 "transcript": None,
                 "hashtags": hashtags,
+                "combined_text": combined_text,
             }
 
             is_valid_video = bool(video_url) and duration > 0.0
@@ -613,6 +662,7 @@ class InstagramParser(BasePlatformParser):
                 or duration > 120.0
                 or not is_valid_video
                 or has_target_semantics
+                or has_commercial_music(item)
             )
 
             if needs_transcript and post_url:
@@ -621,8 +671,6 @@ class InstagramParser(BasePlatformParser):
             items_data.append(item_data)
 
         items_needing_transcripts = items_needing_transcripts[:10]
-
-        transcript_map: dict[str, str | None] = {}
 
         candidate_item_ids = [d["item_id"] for d in items_data]
 
@@ -645,40 +693,45 @@ class InstagramParser(BasePlatformParser):
             if item_id not in already_transcribed
         ]
 
-        if items_needing_transcripts:
+        for t_item_id, t_post_url in items_needing_transcripts:
 
-            async def _fetch_one_transcript(
-                t_item_id: str, t_post_url: str,
-            ) -> tuple[str, str | None]:
+            async def _background_transcribe_and_update(
+                item_id: str = t_item_id, post_url: str = t_post_url,
+            ) -> None:
                 try:
                     result = await fetch_video_transcript(
-                        self.client, self.client.global_semaphore, t_post_url,
+                        self.client, self.client.global_semaphore, post_url,
                     )
                     if isinstance(result, str):
                         cleaned = result.strip()
-                        if cleaned.lower().startswith("please provide"):
-                            return t_item_id, None
-                        return t_item_id, cleaned
-                    return t_item_id, None
+                        if not cleaned.lower().startswith("please provide") and cleaned:
+                            async with self.session_maker() as session:
+                                stmt = (
+                                    update(Content)
+                                    .where(Content.platform_content_id == item_id)
+                                    .values(
+                                        transcription=cleaned,
+                                        updated_at=datetime.now(timezone.utc),
+                                    )
+                                )
+                                await session.execute(stmt)
+                                await session.commit()
+                            logger.info(
+                                "Background transcript updated for item %s",
+                                item_id,
+                            )
                 except Exception as e:
                     logger.error(
-                        "Transcript fetch failed for %s: %s", t_item_id, e,
+                        "Background transcript fetch/update failed for %s: %s",
+                        item_id,
+                        e,
                     )
-                    return t_item_id, None
 
-            tasks = [
-                _fetch_one_transcript(item_id, post_url)
-                for item_id, post_url in items_needing_transcripts
-            ]
-            results = await asyncio.gather(*tasks)
-
-            for t_item_id, t_transcript in results:
-                transcript_map[t_item_id] = t_transcript
-
-            for item_data in items_data:
-                item_id = item_data["item_id"]
-                if item_id in transcript_map:
-                    item_data["transcript"] = transcript_map[item_id]
+            task: asyncio.Task[None] = asyncio.create_task(
+                _background_transcribe_and_update()
+            )
+            self.client.background_tasks.add(task)
+            task.add_done_callback(self.client.background_tasks.discard)
 
         await process_and_queue_discovered_contacts(
             session_maker=self.session_maker,
@@ -709,9 +762,13 @@ class InstagramParser(BasePlatformParser):
                 plays=views,
             )
 
+            post_category = self.queries_manager.classify_text(item_data.get("combined_text", ""))
+            if not post_category or post_category == "unknown":
+                post_category = account_category
+
             content_metadata = InstagramContentMetadata.create_with_timestamp(
                 video_url=video_url,
-                category=account_category,
+                category=post_category,
                 language="ru",
                 post_type=post_type,
                 platform_metrics=platform_metrics,

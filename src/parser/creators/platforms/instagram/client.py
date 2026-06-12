@@ -17,11 +17,36 @@ async def fetch_instagram_profile(
         )
         data = response.get("data")
         if not data:
-            logger.error(
-                "Missing 'data' in API response for Instagram handle %s",
-                handle,
+            error_msg = (
+                response.get("error")
+                or response.get("message")
+                or str(response)
+            ).lower()
+
+            permanent_phrases = (
+                "not_found",
+                "notfound",
+                "profile_not_found",
+                "user_not_found",
+                "not found",
+                "private",
+                "invalid handle",
+                "does not exist",
+                "suspended",
             )
-            return None
+
+            if any(phrase in error_msg for phrase in permanent_phrases):
+                logger.warning(
+                    "Instagram profile %s rejected: %s",
+                    handle,
+                    error_msg,
+                )
+                return None
+
+            raise RuntimeError(
+                f"Transient error fetching Instagram profile {handle}: "
+                f"{error_msg}"
+            )
 
         user = data.get("user") or data
         if not user:

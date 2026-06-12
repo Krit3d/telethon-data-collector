@@ -27,7 +27,7 @@ CREATOR_PLATFORMS = ["INSTAGRAM", "THREADS", "TIKTOK", "YOUTUBE"]
 
 DEFAULT_STATUS_UPDATE_THRESHOLD_HOURS = 24
 
-MIN_SUBSCRIBERS_THRESHOLD = 3000
+MIN_SUBSCRIBERS_THRESHOLD = 5000
 
 DEFAULT_CREATORS_POLL_INTERVAL_S = 300
 
@@ -236,6 +236,13 @@ class CreatorsCoordinator:
                     logger.error(
                         f"Unexpected error in task {i}: {result!r}", exc_info=result
                     )
+
+            if client.background_tasks:
+                logger.info(
+                    f"Waiting for {len(client.background_tasks)} background transcript tasks to complete..."
+                )
+                await asyncio.gather(*client.background_tasks, return_exceptions=True)
+                client.background_tasks.clear()
 
             final_credits: int | None = client.last_credits_remaining
 

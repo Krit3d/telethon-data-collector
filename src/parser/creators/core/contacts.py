@@ -32,12 +32,14 @@ TELEGRAM_CONTEXTUAL_PATTERN = re.compile(
 )
 
 TELEGRAM_INVITE_PATTERN = re.compile(
-    r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_\-]{6,})",
+    r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_\-]{6,})",
     re.IGNORECASE,
 )
 
 URL_PATTERN = re.compile(
-    r"https?://[^\s<>\"{}|\\^`\[\]]+",
+    r"\b(?:https?://|www\.)[^\s<>\"{}|\\^`\[\]]+\b"
+    r"|\b[a-zA-Z0-9][-a-zA-Z0-9]{0,62}\.[a-zA-Z]{2,10}"
+    r"(?:/[^\s<>\"{}|\\^`\[\]]*)?\b",
     re.IGNORECASE,
 )
 
@@ -123,6 +125,12 @@ COMMERCIAL_CONTEXT_KEYWORDS: frozenset[str] = frozenset({
 })
 
 
+def _normalize_url(url: str) -> str:
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return f"https://{url}"
+
+
 def _has_advertising_context(text: str, match_start: int, match_end: int, window: int = 40) -> bool:
     ctx_start = max(0, match_start - window)
     ctx_end = min(len(text), match_end + window)
@@ -192,7 +200,8 @@ def extract_external_platforms(
         return {}
 
     external_platforms: dict[str, str] = {}
-    urls = URL_PATTERN.findall(text)
+    raw_urls = URL_PATTERN.findall(text)
+    urls = [_normalize_url(u) for u in raw_urls]
 
     for url in urls:
         url_lower = url.lower()
@@ -320,12 +329,6 @@ def extract_telegram_handles(text: str | None) -> list[str]:
             continue
         handles.add(normalized)
 
-    for plus_match in re.finditer(r"t\.me/\+([A-Za-z0-9_\-]{6,})", text, re.IGNORECASE):
-        handles.add("+" + plus_match.group(1))
-
-    for joinchat_match in re.finditer(r"t\.me/joinchat/([A-Za-z0-9_\-]{6,})", text, re.IGNORECASE):
-        handles.add("joinchat/" + joinchat_match.group(1))
-
     return list(handles)
 
 
@@ -365,7 +368,8 @@ def extract_external_links(
     if exclude_domains:
         extended_excludes = extended_excludes.union(exclude_domains)
 
-    urls = URL_PATTERN.findall(text)
+    raw_urls = URL_PATTERN.findall(text)
+    urls = [_normalize_url(u) for u in raw_urls]
 
     external_links: list[str] = []
     for url in urls:
@@ -402,6 +406,17 @@ def parse_profile_contacts(
     phones = extract_phones(combined_text)
     external_platforms = extract_external_platforms(combined_text)
     external_links = extract_external_links(combined_text)
+
+    invite_links_seen: set[str] = set()
+    for link in external_links:
+        invite_links_seen.add(link.lower())
+
+    for invite_match in TELEGRAM_INVITE_PATTERN.finditer(combined_text):
+        path_part = invite_match.group(0).split("/", 1)[1]
+        normalized_invite = f"https://t.me/{path_part}"
+        if normalized_invite.lower() not in invite_links_seen:
+            invite_links_seen.add(normalized_invite.lower())
+            external_links.append(normalized_invite)
 
     if external_url and external_url not in external_links:
         domain_match = re.search(r"https?://(?:www\.)?([^/]+)", external_url)
@@ -684,6 +699,7 @@ def compile_author_metadata(
             [email.lower().strip() for email in advertising_emails if email and isinstance(email, str)]
         ),
         advertising_telegrams=advertising_telegrams,
+        telegram_handles=_deduplicate_preserve_order(telegram_channels + telegram_personal + advertising_telegrams),
     )
 
     geo_data_model: GeoData | None = None
