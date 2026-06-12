@@ -14,6 +14,16 @@ HEAVY_PROFILE_KEYS: list[str] = [
     "hd_profile_pic_url_info",
     "bio_links",
     "about_your_account_blurb",
+    "edge_owner_to_timeline_media",
+    "edge_felix_video_timeline",
+    "edge_saved_media",
+    "edge_media_collections",
+    "edge_mutual_followed_by",
+    "edge_related_profiles",
+    "biography_with_entities",
+    "fb_profile_biolink",
+    "profile_pic_url",
+    "profile_pic_url_hd",
 ]
 
 
@@ -34,6 +44,8 @@ class Contacts(BaseModel):
     phones: list[str] = Field(default_factory=list)
     telegram_channels: list[str] = Field(default_factory=list)
     telegram_personal: list[str] = Field(default_factory=list)
+    advertising_emails: list[str] = Field(default_factory=list)
+    advertising_telegrams: list[str] = Field(default_factory=list)
 
 
 class AccountMetadata(BaseModel):
@@ -109,6 +121,7 @@ class ContentMetadata(BaseModel):
     category: str | None = None
     language: str | None = None
     post_type: str
+    post_url: str | None = None
     platform_metrics: PlatformMetrics | None = None
     geo_data: PostGeoData | None = None
     author_profile_snapshot: AuthorProfileSnapshot | None = None
@@ -134,7 +147,7 @@ class ContentMetadata(BaseModel):
         if not isinstance(raw_payload, dict):
             return data
 
-        if "accessibility_caption" not in data:
+        if not data.get("accessibility_caption"):
             data["accessibility_caption"] = raw_payload.get("accessibility_caption")
 
         coauthor_producers = raw_payload.get("coauthor_producers")
@@ -163,7 +176,18 @@ class ContentMetadata(BaseModel):
             music_info = clips_meta.get("clips_music_attribution_info")
             if isinstance(music_info, dict):
                 data["music_title"] = music_info.get("song_name")
+            if isinstance(music_info, dict) and not data.get("music_author"):
                 data["music_author"] = music_info.get("artist_name")
+
+        location = raw_payload.get("location")
+        if isinstance(location, dict) and not data.get("geo_data"):
+            location_id = location.get("pk") or location.get("id")
+            data["geo_data"] = {
+                "location_id": str(location_id) if location_id is not None else None,
+                "name": location.get("name"),
+                "lat": location.get("lat") or location.get("latitude"),
+                "lng": location.get("lng") or location.get("longitude"),
+            }
 
         heavy_fields = [
             "video_dash_manifest",

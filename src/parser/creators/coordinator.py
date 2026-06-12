@@ -133,6 +133,8 @@ class CreatorsCoordinator:
                 f"Starting discovery attempt {attempts + 1}/{max_attempts}..."
             )
 
+            prev_pending_count = pending_count
+
             try:
                 logger.info(
                     f"Discovering candidates for query='{query}', "
@@ -149,6 +151,17 @@ class CreatorsCoordinator:
                     f"category='{category}' on platform={active_platform}: {e!r}",
                     exc_info=e,
                 )
+
+            new_pending_count = await self.db.count_pending_creator_accounts(active_platform)
+
+            if new_pending_count <= prev_pending_count:
+                logger.info(
+                    f"Discovery loop broken early after {attempts + 1}/{max_attempts} "
+                    f"attempts: no new pending accounts added "
+                    f"(pending_count={new_pending_count}). "
+                    f"Saving API credits."
+                )
+                break
 
             attempts += 1
 
@@ -173,6 +186,16 @@ class CreatorsCoordinator:
             platform = self.platform_filter if self.platform_filter else "INSTAGRAM"
 
             await self._ensure_pending_queue(platform, client)
+
+            final_pending_count = await self.db.count_pending_creator_accounts(platform)
+
+            if final_pending_count < batch_size:
+                logger.info(
+                    f"Not enough pending accounts to run a full batch: "
+                    f"{final_pending_count} < {batch_size}. "
+                    f"Skipping ingestion cycle."
+                )
+                return
 
             accounts = await self.db.claim_creator_accounts(
                 platforms=[self.platform_filter] if self.platform_filter else CREATOR_PLATFORMS,

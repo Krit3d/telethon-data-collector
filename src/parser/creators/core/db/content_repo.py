@@ -18,28 +18,61 @@ from src.parser.creators.core.db.helpers import (
 logger = logging.getLogger(__name__)
 
 
-def is_song_lyrics(text: str | None) -> bool:
+IGNORE_TAGS: frozenset[str] = frozenset({
+    "(music)", "[music]", "(laughter)", "[laughter]",
+    "[applause]", "(applause)", "[no speech]", "(silence)",
+    "music", "[sound]", "(sound)",
+})
+
+SYSTEM_ERROR_PATTERNS: tuple[str, ...] = (
+    "hi guys, i'm sorry",
+    "there is no recording",
+    "please provide",
+    "no speech detected",
+    "transcription failed",
+)
+
+WHISPER_NOISE_RE = re.compile(r"^[\(\[][^\]\)]+[\)\]]$")
+
+
+def clean_and_validate_transcription(text: str | None) -> str | None:
     if not text:
-        return False
+        return None
 
     text = text.strip()
     if not text:
-        return False
+        return None
+
+    if WHISPER_NOISE_RE.match(text):
+        return None
+
+    lower_text = text.lower()
+    if lower_text in IGNORE_TAGS:
+        return None
+
+    for pattern in SYSTEM_ERROR_PATTERNS:
+        if pattern in lower_text:
+            return None
+
+    words = lower_text.split()
+    if len(words) > 8:
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < 0.30:
+            return None
 
     lines = [line for line in text.splitlines() if line.strip()]
     if len(lines) > 4:
-        unique_lines = set(lines)
-        duplicate_ratio = 1 - len(unique_lines) / len(lines)
+        duplicate_ratio = 1 - len(set(lines)) / len(lines)
         if duplicate_ratio > 0.35:
-            return True
+            return None
 
-    words = re.findall(r'\b[a-zA-Zа-яА-ЯёЁ]{3,}\b', text)
-    if len(words) > 15:
-        unique_words = set(w.lower() for w in words)
-        if len(unique_words) / len(words) < 0.48:
-            return True
+    all_words = re.findall(r'\b[a-zA-Zа-яА-ЯёЁ]{3,}\b', text)
+    if len(all_words) > 15:
+        unique_words = set(w.lower() for w in all_words)
+        if len(unique_words) / len(all_words) < 0.48:
+            return None
 
-    return False
+    return text
 
 
 async def bulk_upsert_content(
@@ -61,11 +94,7 @@ async def bulk_upsert_content(
         if raw_metadata is not None:
             raw_metadata = clean_content_raw_metadata(raw_metadata)
 
-        transcription = values.get("transcription")
-        if isinstance(transcription, str) and transcription.strip().lower().startswith("please provide"):
-            transcription = None
-        if is_song_lyrics(transcription):
-            transcription = None
+        transcription = clean_and_validate_transcription(values.get("transcription"))
 
         prepared = {
             "account_id": values["account_id"],

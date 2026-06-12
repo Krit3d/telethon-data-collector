@@ -83,6 +83,14 @@ EXTERNAL_PLATFORM_DOMAINS: dict[str, list[str]] = {
     "ok": ["ok.ru", "odnoklassniki.ru"],
 }
 
+ADVERTISING_KEYWORDS: frozenset[str] = frozenset({
+    "pr", "ads", "reklama", "сотрудничество", "cooperation",
+    "collab", "sales", "реклама", "manager", "коммерция",
+    "рекламе", "рекламный", "рекламному", "рекламными",
+    "advertising", "commercial", "biz", "business",
+    "маркетинг", "marketing", "продвижение", "promotion",
+})
+
 TELEGRAM_PERSONAL_KEYWORDS: frozenset[str] = frozenset({
     "manager", "pr", "admin", "sales", "cooperation",
     "reklama", "advertising", "write", "contact",
@@ -108,6 +116,44 @@ _EMAIL_OBFUSCATION_RE = re.compile(
 )
 
 
+COMMERCIAL_CONTEXT_KEYWORDS: frozenset[str] = frozenset({
+    "pr", "ads", "reklama", "сотрудничество", "cooperation",
+    "collab", "sales", "реклама", "manager", "коммерция",
+    "пишите", "связь", "контакты", "collabs", "coop",
+})
+
+
+def _has_advertising_context(text: str, match_start: int, match_end: int, window: int = 40) -> bool:
+    ctx_start = max(0, match_start - window)
+    ctx_end = min(len(text), match_end + window)
+    context = text[ctx_start:ctx_end].lower()
+    return any(kw in context for kw in ADVERTISING_KEYWORDS)
+
+
+def is_commercial_context(biography: str | None, target: str) -> bool:
+    if not biography or not target:
+        return False
+    bio_lower = biography.lower()
+    target_lower = target.lower()
+    idx = bio_lower.find(target_lower)
+    if idx < 0:
+        return False
+    window_start = max(0, idx - 40)
+    window_end = min(len(bio_lower), idx + len(target_lower) + 40)
+    window = bio_lower[window_start:window_end]
+    return any(kw in window for kw in COMMERCIAL_CONTEXT_KEYWORDS)
+
+
+def _deduplicate_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
 def extract_emails(text: str | None) -> list[str]:
     if not text:
         return []
@@ -115,6 +161,28 @@ def extract_emails(text: str | None) -> list[str]:
     normalized = _EMAIL_OBFUSCATION_RE.sub("@", text)
     emails = EMAIL_PATTERN.findall(normalized)
     return list(set(email.lower() for email in emails))
+
+
+def extract_emails_classified(text: str | None) -> tuple[list[str], list[str]]:
+    if not text:
+        return ([], [])
+
+    normalized = _EMAIL_OBFUSCATION_RE.sub("@", text)
+    advertising: list[str] = []
+    general: list[str] = []
+    seen: set[str] = set()
+
+    for match in EMAIL_PATTERN.finditer(normalized):
+        email = match.group(0).lower()
+        if email in seen:
+            continue
+        seen.add(email)
+        if _has_advertising_context(normalized, match.start(), match.end()):
+            advertising.append(email)
+        else:
+            general.append(email)
+
+    return (_deduplicate_preserve_order(general), _deduplicate_preserve_order(advertising))
 
 
 def extract_external_platforms(
@@ -329,7 +397,7 @@ def parse_profile_contacts(
         else:
             combined_text = external_url
 
-    emails = extract_emails(combined_text)
+    emails, advertising_emails = extract_emails_classified(combined_text)
     telegram_handles = extract_telegram_handles(combined_text)
     phones = extract_phones(combined_text)
     external_platforms = extract_external_platforms(combined_text)
@@ -347,6 +415,7 @@ def parse_profile_contacts(
 
     return {
         "emails": emails,
+        "advertising_emails": advertising_emails,
         "phones": phones,
         "telegram_handles": telegram_handles,
         "external_links": external_links,
@@ -396,13 +465,15 @@ def is_valid_telegram_handle(handle: str) -> bool:
 def classify_telegram_handles(
     biography: str | None,
     handles: list[str],
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     if not handles:
-        return ([], [])
+        return ([], [], [])
 
     bio_lower = biography.lower() if biography else ""
+    combined_text = biography or ""
     telegram_channels: list[str] = []
     telegram_personal: list[str] = []
+    advertising_telegrams: list[str] = []
 
     for handle in handles:
         if not handle:
@@ -439,14 +510,21 @@ def classify_telegram_handles(
             is_channel = True
 
         if is_personal:
-            telegram_personal.append(normalized_handle)
+            handle_pos = combined_text.lower().find(handle_lower)
+            if handle_pos >= 0 and _has_advertising_context(
+                combined_text, handle_pos, handle_pos + len(handle)
+            ):
+                advertising_telegrams.append(normalized_handle)
+            else:
+                telegram_personal.append(normalized_handle)
         else:
             telegram_channels.append(normalized_handle)
 
-    telegram_channels = list(dict.fromkeys(telegram_channels))
-    telegram_personal = list(dict.fromkeys(telegram_personal))
-
-    return (telegram_channels, telegram_personal)
+    return (
+        _deduplicate_preserve_order(telegram_channels),
+        _deduplicate_preserve_order(telegram_personal),
+        _deduplicate_preserve_order(advertising_telegrams),
+    )
 
 
 PLATFORM_PROFILE_LINKS: dict[str, str] = {
@@ -497,15 +575,36 @@ def compile_author_metadata(
     telegram_handles = contacts_dict.get("telegram_handles", []) if contacts_dict else []
     telegram_channels: list[str] = []
     telegram_personal: list[str] = []
+    advertising_telegrams: list[str] = []
 
     if telegram_handles:
-        telegram_channels, telegram_personal = classify_telegram_handles(
+        telegram_channels, telegram_personal, advertising_telegrams = classify_telegram_handles(
             biography, telegram_handles
         )
+
+    reclassified_personal: list[str] = []
+    for handle in telegram_personal:
+        if is_commercial_context(biography, handle):
+            advertising_telegrams.append(handle)
+        else:
+            reclassified_personal.append(handle)
+    telegram_personal = reclassified_personal
 
     emails = contacts_dict.get("emails", []) if contacts_dict else []
     if not isinstance(emails, list):
         emails = []
+
+    advertising_emails = contacts_dict.get("advertising_emails", []) if contacts_dict else []
+    if not isinstance(advertising_emails, list):
+        advertising_emails = []
+
+    reclassified_emails: list[str] = []
+    for email in emails:
+        if is_commercial_context(biography, email):
+            advertising_emails.append(email)
+        else:
+            reclassified_emails.append(email)
+    emails = reclassified_emails
 
     phones = contacts_dict.get("phones", []) if contacts_dict else []
     if not isinstance(phones, list):
@@ -573,10 +672,18 @@ def compile_author_metadata(
                     external_platforms[pl_key] = pl_val
 
     contacts = Contacts(
-        emails=[email.lower().strip() for email in emails if email and isinstance(email, str)],
-        phones=[p for p in phones if p and isinstance(p, str)],
+        emails=_deduplicate_preserve_order(
+            [email.lower().strip() for email in emails if email and isinstance(email, str)]
+        ),
+        phones=_deduplicate_preserve_order(
+            [p for p in phones if p and isinstance(p, str)]
+        ),
         telegram_channels=telegram_channels,
         telegram_personal=telegram_personal,
+        advertising_emails=_deduplicate_preserve_order(
+            [email.lower().strip() for email in advertising_emails if email and isinstance(email, str)]
+        ),
+        advertising_telegrams=advertising_telegrams,
     )
 
     geo_data_model: GeoData | None = None

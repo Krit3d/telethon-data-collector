@@ -16,6 +16,9 @@ from src.parser.creators.core.schemas import MetricsEntry
 
 logger = logging.getLogger(__name__)
 
+FINALIZED_STATUSES: frozenset[str] = frozenset({"parsed", "rejected"})
+NON_FINALIZED_STATUSES: frozenset[str] = frozenset({"pending", "processing"})
+
 
 async def upsert_and_deduplicate_account(
     session: AsyncSession,
@@ -95,7 +98,8 @@ async def upsert_and_deduplicate_account(
         account.subscribers_count = (
             subscribers_count if subscribers_count is not None else account.subscribers_count
         )
-        account.status = status
+        if account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
+            account.status = status
         await session.flush()
         logger.info(
             "Updated existing account: platform=%s, platform_id=%s, id=%d",
@@ -123,7 +127,8 @@ async def upsert_and_deduplicate_account(
     primary_account.subscribers_count = (
         subscribers_count if subscribers_count is not None else primary_account.subscribers_count
     )
-    primary_account.status = status
+    if primary_account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
+        primary_account.status = status
 
     duplicate_ids = [acc.id for acc in existing_accounts if acc.id != primary_id]
     if duplicate_ids:

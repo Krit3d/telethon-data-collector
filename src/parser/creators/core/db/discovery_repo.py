@@ -155,8 +155,9 @@ async def queue_single_account(
         insert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=["id"])
 
         try:
-            await session.execute(insert_stmt)
-            await session.flush()
+            async with session.begin_nested():
+                await session.execute(insert_stmt)
+                await session.flush()
             logger.info(
                 "[SPIDER] Queued discovered %s account: %s from bio of parent account %s (category: %s).",
                 platform,
@@ -165,7 +166,6 @@ async def queue_single_account(
                 category or "none",
             )
         except DatabaseError as e:
-            await session.rollback()
             logger.warning(
                 "Database error while queuing %s account %s: %s",
                 platform,

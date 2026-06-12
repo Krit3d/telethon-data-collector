@@ -143,6 +143,12 @@ class ScrapeCreatorsClient:
                         await asyncio.sleep(wait_time)
                         continue
 
+                    if response.status == 404 and "search" in endpoint:
+                        logger.info(
+                            "Search returned 404 (no results). Returning empty dataset gracefully."
+                        )
+                        return {"profiles": [], "data": [], "items": []}
+
                     if 400 <= response.status < 500:
                         error_detail = None
                         try:

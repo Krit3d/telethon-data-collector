@@ -22,6 +22,12 @@ _KEYS_TO_KEEP = {
     "comment_count",
     "like_count",
     "video_url",
+    "coauthor_producers",
+    "edge_media_to_tagged_user",
+    "clips_metadata",
+    "location",
+    "accessibility_caption",
+    "hashtags",
 }
 
 
