@@ -35,7 +35,6 @@ from .search_cursor import InstagramSearchPaginator
 from .validators import (
     check_cyrillic_stage1,
     check_cyrillic_stage2,
-    has_commercial_music,
     validate_follower_count,
     MIN_SUBSCRIBERS,
     MAX_SUBSCRIBERS,
@@ -652,7 +651,6 @@ class InstagramParser(BasePlatformParser):
                 or duration > 120.0
                 or not is_valid_video
                 or has_target_semantics
-                or has_commercial_music(item)
             )
 
             if needs_transcript and post_url:

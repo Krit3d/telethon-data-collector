@@ -35,6 +35,7 @@ async def process_and_queue_discovered_contacts(
 ) -> dict[str, Any]:
     parent_lower = parent_username.lower()
     aggregated_emails: list[str] = []
+    aggregated_advertising_emails: list[str] = []
     aggregated_telegram_handles: list[str] = []
     aggregated_external_links: list[str] = []
     aggregated_external_platforms: dict[str, str] = {}
@@ -44,6 +45,9 @@ async def process_and_queue_discovered_contacts(
     for email in bio_contacts.get("emails", []):
         if email and email not in aggregated_emails:
             aggregated_emails.append(email)
+    for email in bio_contacts.get("advertising_emails", []):
+        if email and email not in aggregated_advertising_emails:
+            aggregated_advertising_emails.append(email)
     for handle in bio_contacts.get("telegram_handles", []):
         if (
             handle
@@ -74,6 +78,10 @@ async def process_and_queue_discovered_contacts(
             for email in contacts_dict.get("emails", []):
                 if email and email not in aggregated_emails:
                     aggregated_emails.append(email)
+
+            for email in contacts_dict.get("advertising_emails", []):
+                if email and email not in aggregated_advertising_emails:
+                    aggregated_advertising_emails.append(email)
 
             for handle in contacts_dict.get("telegram_handles", []):
                 if (
@@ -109,8 +117,18 @@ async def process_and_queue_discovered_contacts(
                 if username and username.lower() != parent_lower:
                     aggregated_mentions.add(username.lower())
 
+    context_parts: list[str] = []
+    if profile_biography:
+        context_parts.append(profile_biography)
+    for item_data in items_data:
+        item_content = item_data.get("content_text")
+        if item_content:
+            context_parts.append(item_content)
+    context_text: str | None = "\n".join(context_parts) if context_parts else None
+
     aggregated_contacts: dict[str, Any] = {
         "emails": aggregated_emails,
+        "advertising_emails": aggregated_advertising_emails,
         "telegram_handles": aggregated_telegram_handles,
         "external_links": aggregated_external_links,
         "external_platforms": aggregated_external_platforms,
@@ -134,6 +152,7 @@ async def process_and_queue_discovered_contacts(
                         biography=profile_biography,
                         contacts_dict=aggregated_contacts,
                         category=account_category,
+                        context_text=context_text,
                     )
                     await queue_discovered_accounts(
                         session=session,
