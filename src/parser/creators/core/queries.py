@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import re
@@ -6,6 +8,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+_queries_cache: dict[str, SearchQueriesSchema] = {}
 
 
 class CategoryQuery(BaseModel):
@@ -32,10 +36,17 @@ class SearchQueriesManager:
         self._load_and_validate()
 
     def _load_and_validate(self) -> None:
+        cache_key = str(self.json_path.resolve())
+
+        if cache_key in _queries_cache:
+            self._schema = _queries_cache[cache_key]
+            return
+
         try:
             with open(self.json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self._schema = SearchQueriesSchema.model_validate(data)
+            _queries_cache[cache_key] = self._schema
             logger.info(
                 f"Successfully loaded search queries from {self.json_path}. "
                 f"Found {len(self._schema.queries)} general queries, "

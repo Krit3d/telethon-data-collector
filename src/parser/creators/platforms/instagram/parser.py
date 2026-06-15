@@ -29,7 +29,7 @@ from src.parser.creators.platforms.base import BasePlatformParser
 
 from .client import fetch_instagram_profile, fetch_video_transcript
 from .contacts_processor import process_and_queue_discovered_contacts
-from .fetcher import fetch_valid_instagram_videos
+from .fetcher import fetch_recent_instagram_posts
 from .helpers import extract_instagram_geo_data, extract_instagram_video_url, prune_instagram_payload
 from .search_cursor import InstagramSearchPaginator
 from .validators import (
@@ -124,7 +124,28 @@ class InstagramParser(BasePlatformParser):
 
         subscribers = extract_instagram_subscribers(profile)
 
-        if subscribers == 0:
+        if not subscribers:
+            edge_followed_by = profile.get("edge_followed_by")
+            if isinstance(edge_followed_by, dict):
+                fallback_val = edge_followed_by.get("count")
+                if fallback_val is not None:
+                    try:
+                        subscribers = int(fallback_val)
+                    except (ValueError, TypeError):
+                        pass
+
+        if not subscribers:
+            for key in ("follower_count", "followers", "followers_count"):
+                raw_val = profile.get(key)
+                if raw_val is not None:
+                    try:
+                        subscribers = int(raw_val)
+                    except (ValueError, TypeError):
+                        continue
+                    if subscribers:
+                        break
+
+        if not subscribers:
             logger.warning(
                 "Instagram handle %s parsed 0 subscribers. Profile dict keys: %s",
                 handle,
@@ -447,7 +468,7 @@ class InstagramParser(BasePlatformParser):
         return total_discovered
 
     async def parse_content(
-        self, account_id: int, platform_id: str, max_items: int = 10
+        self, account_id: int, platform_id: str, max_items: int = 12
     ) -> None:
         logger.info(
             "Starting Instagram content parse for account_id: %d, platform_id: %s",
@@ -472,7 +493,7 @@ class InstagramParser(BasePlatformParser):
         )
 
         try:
-            valid_items = await fetch_valid_instagram_videos(
+            recent_items = await fetch_recent_instagram_posts(
                 self.client, platform_id, max_items,
             )
         except Exception as e:
@@ -497,17 +518,7 @@ class InstagramParser(BasePlatformParser):
                 return dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
 
-        def _published_at_key(item: dict[str, Any]) -> datetime:
-            try:
-                dt = extract_instagram_published_at(item)
-            except Exception:
-                return datetime.min.replace(tzinfo=timezone.utc)
-            return _to_utc_aware(dt)
-
-        valid_items.sort(key=_published_at_key, reverse=True)
-        valid_items = valid_items[:10]
-
-        if not valid_items:
+        if not recent_items:
             logger.info(
                 "No valid Instagram content found for account_id: %d. Rejecting account.",
                 account_id,
@@ -523,13 +534,13 @@ class InstagramParser(BasePlatformParser):
             return
 
         logger.info(
-            "Fetched %d valid video items for account_id: %d",
-            len(valid_items),
+            "Fetched %d recent posts for account_id: %d",
+            len(recent_items),
             account_id,
         )
 
         aggregated_text = ""
-        for item in valid_items:
+        for item in recent_items:
             description = extract_instagram_content_text(item) or ""
 
             hashtags = item.get("hashtags") or []
@@ -574,7 +585,7 @@ class InstagramParser(BasePlatformParser):
                 "Rejecting without writing content to database.",
                 platform_id,
                 account_id,
-                len(valid_items),
+                len(recent_items),
             )
             async with self.session_maker() as session:
                 stmt = (
@@ -594,7 +605,10 @@ class InstagramParser(BasePlatformParser):
         items_data: list[dict[str, Any]] = []
         items_needing_transcripts: list[tuple[str, str]] = []
 
-        for item in valid_items:
+        max_post_age_days = self.settings.max_post_age_days
+        now_utc = datetime.now(timezone.utc)
+
+        for item in recent_items:
             item_id = item.get("id") or item.get("media_id") or item.get("pk")
             if not item_id:
                 continue
@@ -606,32 +620,73 @@ class InstagramParser(BasePlatformParser):
                 hashtags = re.findall(r"#(\w+)", description)
 
             combined_text = description + " " + " ".join(hashtags)
-            keywords_pattern = self.queries_manager.get_compiled_keywords_pattern()
-            has_target_semantics = (
-                keywords_pattern.search(combined_text) is not None
-            )
 
             likes, comments = extract_instagram_metrics(item)
 
             content_text: str | None = extract_instagram_content_text(item)
 
-            video_url = extract_instagram_video_url(item)
+            is_video = (
+                item.get("media_type") == 2
+                or item.get("is_video") is True
+                or (
+                    isinstance(item.get("video_versions"), list)
+                    and bool(item.get("video_versions"))
+                )
+            )
 
-            try:
-                duration = float(item.get("video_duration") or item.get("duration") or 0.0)
-            except (ValueError, TypeError):
-                duration = 0.0
-            post_type = "reel" if duration <= 120.0 else "post"
+            if is_video:
+                video_url = extract_instagram_video_url(item)
+                raw_duration = item.get("video_duration") or item.get("duration")
+                if raw_duration is not None:
+                    try:
+                        duration: float | None = float(raw_duration)
+                    except (ValueError, TypeError):
+                        duration = None
+                else:
+                    duration = None
+                post_type = "reel" if duration is None or duration <= 120.0 else "post"
+            else:
+                video_url = None
+                duration = None
+                post_type = "post"
 
             views = item.get("video_view_count") or item.get("play_count")
 
             shortcode = item.get("code") or item.get("shortcode")
             post_url = f"https://instagram.com/p/{shortcode}" if shortcode else None
 
+            try:
+                published_dt = _to_utc_aware(extract_instagram_published_at(item))
+            except Exception:
+                published_dt = now_utc
+
+            post_age_days = (now_utc - published_dt).days
+            is_stale = post_age_days > max_post_age_days
+
+            duration_eligible = duration is None or (3.0 <= duration <= 120.0)
+
+            needs_transcript = (
+                is_video
+                and duration_eligible
+                and not is_stale
+            )
+
+            if is_video:
+                transcription_status = "pending"
+                if not needs_transcript:
+                    if is_stale:
+                        transcription_status = "skipped_stale"
+                    else:
+                        transcription_status = "skipped"
+            else:
+                transcription_status = "skipped"
+
+            if needs_transcript and post_url:
+                items_needing_transcripts.append((item_id, post_url))
+
             item_data: dict[str, Any] = {
                 "item": item,
                 "item_id": item_id,
-                "has_target_semantics": has_target_semantics,
                 "content_text": content_text,
                 "likes": likes,
                 "comments": comments,
@@ -642,38 +697,26 @@ class InstagramParser(BasePlatformParser):
                 "transcript": None,
                 "hashtags": hashtags,
                 "combined_text": combined_text,
+                "transcription_status": transcription_status,
+                "published_at": published_dt,
             }
-
-            is_valid_video = bool(video_url) and duration > 0.0
-
-            needs_transcript = not (
-                duration < 3.0
-                or duration > 120.0
-                or not is_valid_video
-                or has_target_semantics
-            )
-
-            if needs_transcript and post_url:
-                items_needing_transcripts.append((item_id, post_url))
 
             items_data.append(item_data)
 
-        items_needing_transcripts = items_needing_transcripts[:10]
-
         candidate_item_ids = [d["item_id"] for d in items_data]
 
-        already_transcribed: set[str] = set()
+        already_transcribed: dict[str, str] = {}
         if candidate_item_ids:
             async with self.session_maker() as session:
                 stmt = (
-                    select(Content.platform_content_id)
+                    select(Content.platform_content_id, Content.transcription)
                     .where(
                         Content.platform_content_id.in_(candidate_item_ids),
                         Content.transcription.isnot(None),
                     )
                 )
                 result = await session.execute(stmt)
-                already_transcribed = {row[0] for row in result.all()}
+                already_transcribed = {row[0]: row[1] for row in result.all()}
 
         items_needing_transcripts = [
             (item_id, post_url)
@@ -754,6 +797,8 @@ class InstagramParser(BasePlatformParser):
             if not post_category or post_category == "unknown":
                 post_category = account_category
 
+            tx_status = "completed" if item_id in already_transcribed else item_data.get("transcription_status", "pending")
+
             content_metadata = InstagramContentMetadata.create_with_timestamp(
                 video_url=video_url,
                 category=post_category,
@@ -765,6 +810,7 @@ class InstagramParser(BasePlatformParser):
                 is_reel=post_type == "reel",
                 hashtags=hashtags,
                 post_url=item_data["post_url"],
+                transcription_status=tx_status,
             )
 
             raw_meta_dict = content_metadata.model_dump(mode="json", exclude_none=False)
@@ -774,8 +820,8 @@ class InstagramParser(BasePlatformParser):
                     "account_id": account_id,
                     "platform_content_id": item_id,
                     "content": item_data["content_text"],
-                    "published_at": _to_utc_aware(extract_instagram_published_at(item)),
-                    "transcription": item_data["transcript"],
+                    "published_at": item_data["published_at"],
+                    "transcription": already_transcribed.get(item_id),
                     "views": views,
                     "reactions_count": likes,
                     "comments_count": comments,

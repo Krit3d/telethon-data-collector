@@ -211,6 +211,10 @@ class Settings(BaseSettings):
         default=24,
         description="Hours before a failed creator account can be re-processed",
     )
+    max_post_age_days: int = Field(
+        default=15,
+        description="Maximum age of a post in days to be eligible for video transcription",
+    )
 
     # ---- Embedding worker settings ----
     embedding_priority_mode: bool = Field(
