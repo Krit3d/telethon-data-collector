@@ -531,12 +531,7 @@ class InstagramParser(BasePlatformParser):
 
         aggregated_text = ""
         for item in valid_items:
-            caption_data = item.get("caption", {})
-            description = ""
-            if isinstance(caption_data, dict):
-                description = caption_data.get("text", "")
-            elif isinstance(caption_data, str):
-                description = caption_data
+            description = extract_instagram_content_text(item) or ""
 
             hashtags = item.get("hashtags") or []
             if not hashtags and description:
@@ -605,12 +600,7 @@ class InstagramParser(BasePlatformParser):
             if not item_id:
                 continue
 
-            caption_data = item.get("caption", {})
-            description = ""
-            if isinstance(caption_data, dict):
-                description = caption_data.get("text", "")
-            elif isinstance(caption_data, str):
-                description = caption_data
+            description = extract_instagram_content_text(item) or ""
 
             hashtags = item.get("hashtags") or []
             if not hashtags and description:
