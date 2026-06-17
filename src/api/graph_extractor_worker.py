@@ -194,6 +194,7 @@ class GraphExtractionWorker:
                 raw_metadata=raw_metadata,
                 graph_repo=self.graph_repo,
                 qdrant=self.qdrant,
+                platform=post.account.platform if post.account else None,
             )
         except Exception as e:
             # Log the full traceback for unrecoverable errors (validation, JSON parsing, API failures)
@@ -272,7 +273,7 @@ async def run_graph_extractor() -> None:
     extractor = KnowledgeExtractor(settings)
 
     # Create GraphRepository sharing the same async sessionmaker as Database
-    graph_repo = GraphRepository(db.async_session)
+    graph_repo = GraphRepository(db.async_session, settings)
 
     # Create and run worker with optimized settings
     worker = GraphExtractionWorker(

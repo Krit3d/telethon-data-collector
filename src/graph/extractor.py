@@ -18,7 +18,6 @@ from src.graph.schema import (
 )
 from src.graph.utils import (
     _repair_json,
-    _sanitize_key,
     _convert_to_dict,
     _merge_metadata_into_properties,
 )
@@ -44,21 +43,8 @@ class KnowledgeExtractor:
         author_id: int,
         post_id: int,
         metadata: dict | None = None,
+        platform: str | None = None,
     ) -> OpenSPGExtractionResult | None:
-        """Call the LLM API to extract knowledge triples from text with retry logic.
-
-        Args:
-            text: Input text to analyze.
-            author_id: Telegram user ID of the post author (used for author node).
-            post_id: Database ID of the post (used for logging and context).
-            metadata: Optional pre-collected metadata to pass to the LLM prompt.
-                      Fields like 'language', 'location', 'geo' in this metadata
-                      will be excluded from LLM extraction via prompt instructions.
-
-        Returns:
-            OpenSPGExtractionResult containing extracted entities and relations.
-            Returns None on complete failure (all retries exhausted).
-        """
         if not self.settings.llm_api_key:
             logger.warning("LLM API key not configured, skipping extraction")
             return None
@@ -67,9 +53,7 @@ class KnowledgeExtractor:
         if self._session is None:
             self._session = aiohttp.ClientSession()
 
-        # Construct the OpenSPG prompt with optional metadata
-        # The prompt now includes explicit instructions to skip pre-extracted fields
-        prompt = get_open_spg_llm_prompt(text, author_id, metadata)
+        prompt = get_open_spg_llm_prompt(text, author_id, platform, metadata)
 
         max_retries = 2
         last_error = None
@@ -177,9 +161,8 @@ class KnowledgeExtractor:
                                     else content
                                 ),
                             )
-                            # Modify prompt for retry
                             prompt = (
-                                get_open_spg_llm_prompt(text, author_id, metadata)
+                                get_open_spg_llm_prompt(text, author_id, platform, metadata)
                                 + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
                             )
                             continue
@@ -226,9 +209,8 @@ class KnowledgeExtractor:
                                     else content
                                 ),
                             )
-                            # Modify prompt for retry
                             prompt = (
-                                get_open_spg_llm_prompt(text, author_id, metadata)
+                                get_open_spg_llm_prompt(text, author_id, platform, metadata)
                                 + "\n\nIMPORTANT: Your previous response was truncated or invalid. Ensure you return ONLY valid JSON with the exact structure specified in the prompt. Limit to 5-7 most important entities."
                             )
                             continue
@@ -303,24 +285,10 @@ class KnowledgeExtractor:
         author_id: int,
         post_id: int,
         metadata: dict | None = None,
+        platform: str | None = None,
     ) -> OpenSPGExtractionResult | None:
-        """
-        Extract knowledge triplets from the given text using LLM.
-
-        Args:
-            text: Input text to analyze.
-            author_id: Telegram user ID of the post author.
-            post_id: Database ID of the post (for logging).
-            metadata: Optional pre-collected metadata to pass to the LLM.
-                      Fields in metadata (language, location, geo) will be
-                      excluded from LLM extraction via prompt instructions.
-
-        Returns:
-            OpenSPGExtractionResult containing extracted entities and relations.
-            Returns None if extraction failed completely.
-        """
         logger.debug("Extracting triplets from text: %s", text[:100])
-        return await self._call_llm(text, author_id, post_id, metadata)
+        return await self._call_llm(text, author_id, post_id, metadata, platform)
 
     async def close(self) -> None:
         """Close the aiohttp session and clean up resources."""
@@ -338,29 +306,8 @@ class KnowledgeExtractor:
         qdrant: QdrantService | None = None,
         post_metrics: dict | BaseModel | None = None,
         raw_metadata: dict | BaseModel | None = None,
+        platform: str | None = None,
     ) -> None:
-        """
-        Process a single post: extract knowledge triples and persist to AGE graph.
-
-        This method handles the complete pipeline:
-        1. Upsert Content node with merged metrics and raw_metadata
-        2. Upsert Actor node for the author
-        3. Create POSTED relationship
-        4. Extract knowledge via LLM (excluding pre-extracted fields)
-        5. Upsert extracted entities and relations to graph
-        6. Sync to Qdrant for vector search
-
-        Args:
-            post_id: Database ID of the content.
-            text: Text content of the content.
-            author_id: Telegram user ID of the content author.
-            graph_repo: GraphRepository instance for AGE graph persistence operations.
-            qdrant: Optional QdrantService for syncing entities to vector store.
-            post_metrics: Optional dictionary or Pydantic model containing content metrics (views, reactions, etc.).
-            raw_metadata: Optional dictionary or Pydantic model containing pre-extracted metadata
-                         (language, geo, location, etc.). This metadata will be merged into the Content node
-                         and excluded from LLM extraction.
-        """
         logger.info("Processing post id=%s for knowledge extraction", post_id)
 
         # Step A: Standardize the Content node ID
@@ -400,14 +347,16 @@ class KnowledgeExtractor:
             raise
 
         # Step C: Create/Upsert the Actor node for the channel/author
-        actor_node_id = f"actor_{author_id}"
+        platform_slug = platform.lower() if platform else "unknown"
+        actor_node_id = f"actor_{platform_slug}_{author_id}"
         try:
             await graph_repo.upsert_graph_node(
                 label="Actor",
                 properties={
                     "id": actor_node_id,
-                    "name": f"Channel {author_id}",  # Baseline fallback name
-                    "author_id": author_id,
+                    "name": f"Author {author_id}",
+                    "platform": platform or "unknown",
+                    "platform_id": str(author_id),
                 },
                 merge_key="id",
             )
@@ -447,11 +396,8 @@ class KnowledgeExtractor:
             )
             # Do not raise - continue with extraction
 
-        # Step E: Call LLM extraction with raw_metadata
-        # The LLM prompt will instruct the model to skip pre-extracted fields
-        # Convert raw_metadata to dict if it's a Pydantic model
         raw_metadata_dict = _convert_to_dict(raw_metadata) if raw_metadata else None
-        result = await self.extract_triplets(text, author_id, post_id, raw_metadata_dict)
+        result = await self.extract_triplets(text, author_id, post_id, raw_metadata_dict, platform)
 
         if result is None or (not result.entities and not result.relations):
             logger.warning(

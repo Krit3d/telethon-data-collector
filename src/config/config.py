@@ -13,12 +13,6 @@ from src.utils.logger import setup_logging
 
 
 class Settings(BaseSettings):
-    """Immutable runtime configuration for the parser.
-
-    All values can be supplied via environment variables or an ``.env`` file.
-    CLI arguments are handled by the surrounding ``load_settings()`` function
-    and are passed as keyword overrides.
-    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -47,7 +41,7 @@ class Settings(BaseSettings):
         description="Qdrant gRPC URL (optional, for faster operations)",
     )
     qdrant_collection_name: str | None = Field(
-        default=None,
+        default="social_posts",
         description="Qdrant collection name for post embeddings",
     )
     qdrant_api_key: str | None = Field(
@@ -224,6 +218,11 @@ class Settings(BaseSettings):
     embedding_batch_size: int = Field(
         default=64,
         description="Number of unembedded posts to fetch per poll in the embedding worker",
+    )
+
+    graph_name: str = Field(
+        default="social_graph",
+        description="The Apache AGE graph name",
     )
 
     # ---- API server settings ----

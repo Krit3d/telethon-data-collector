@@ -485,28 +485,18 @@ def open_spg_result_to_extraction_result(
 
 
 def get_open_spg_llm_prompt(
-    text: str, author_id: int | None = None, metadata: dict | None = None
+    text: str,
+    author_id: str | int | None = None,
+    platform: str | None = None,
+    metadata: dict | None = None,
 ) -> str:
-    """Generate the OpenSPG extraction prompt for LLM.
-
-    This prompt instructs the LLM to output structured OpenSPG data with
-    typed properties for dynamic attribute accumulation.
-
-    Args:
-        text: The input text to extract from.
-        author_id: Optional Telegram user ID to assign to an Author entity.
-        metadata: Optional pre-collected metadata dictionary (e.g., language, geo, location).
-                  If provided, the LLM will be instructed not to re-extract these fields.
-
-    Returns:
-        Formatted prompt string for the LLM.
-    """
     author_instruction = ""
     if author_id is not None:
-        author_instruction = f"""5. If the text EXPLICITLY mentions or references the author by name (Telegram user ID: {author_id}), OR if the author performs specific actions described in the text, create an Actor node with id "actor_{author_id}" and name based on the author's displayed name (if available) or "Author {author_id}". Include a property {{'key': 'telegram_id', 'value': {author_id}, 'type': 'numeric'}}. If the author is only implied or not directly mentioned, DO NOT create an author node.
+        platform_slug = platform.lower() if platform else "unknown"
+        actor_id = f"actor_{platform_slug}_{author_id}"
+        author_instruction = f"""5. If the text EXPLICITLY mentions or references the author by name (platform ID: {author_id}), OR if the author performs specific actions described in the text, create an Actor node with id "{actor_id}" and name based on the author's displayed name (if available) or "Author {author_id}". The Actor node MUST always include the following properties: {{'key': 'platform', 'value': '{platform or 'unknown'}', 'type': 'text'}} and {{'key': 'platform_id', 'value': '{author_id}', 'type': 'text'}}. If the author is only implied or not directly mentioned, DO NOT create an author node.
 6. """
 
-    # Build metadata instruction section if metadata is provided
     metadata_instruction = ""
     metadata_json_str = ""
     if metadata is not None and len(metadata) > 0:
@@ -543,7 +533,7 @@ CRITICAL OpenSPG DOCTRINE:
 - You are building a KNOWLEDGE GRAPH that accumulates facts over time.
 - If a post mentions that a blogger has a second child, you must extract a property {{'key': 'children_count', 'value': 2, 'type': 'numeric'}} for that Actor node, so the graph updates its state incrementally.
 - Every entity may have multiple properties added across different texts. Do not replace existing properties; only add new ones or update numeric/text values when new information is provided.
-- Use ONLY the four core universal labels: Actor (persons, organizations, any named individual/group), Entity (abstract concepts, products, technologies, objects), Event (occurrences, meetings, incidents), Place (geographic locations, cities, coordinates).
+- Use ONLY the four core universal labels: Actor (persons, organizations, groups, social media accounts, channels — the universal node type for ALL social profiles across Telegram, Instagram, YouTube, TikTok, and Threads), Entity (abstract concepts, products, technologies, objects), Event (occurrences, meetings, incidents), Place (geographic locations, cities, coordinates).
 
 OpenSPG Principles:
 - Build a connected subgraph of entities and relationships.
@@ -557,7 +547,10 @@ Text to analyze:
 Extraction Instructions:
 
 1. UNIVERSAL ENTITY TYPES (use EXACTLY these four labels):
-   - Actor: People, organizations, groups, or any named entity that can act or be referenced (e.g., "Pavel Durov", "Telegram", "UN Security Council")
+   - Actor: People, organizations, groups, social media accounts, channels, and any named entity that can act or be referenced. Actor is the UNIVERSAL node type for ALL social profiles — every social media account or channel (Telegram, Instagram, YouTube, TikTok, Threads) MUST be extracted as an Actor node (e.g., "Pavel Durov", "TechCrunch Telegram channel", "UN Security Council").
+     CRITICAL MANDATE: ALL social media accounts and channels across platforms (Telegram, Instagram, YouTube, TikTok, Threads) MUST include at minimum these two MANDATORY properties:
+       * {{"key": "platform", "value": "<platform_name>", "type": "text"}} (one of: "telegram", "instagram", "youtube", "tiktok", "threads")
+       * {{"key": "platform_id", "value": "<account_or_channel_identifier>", "type": "text"}}
    - Entity: Concepts, objects, products, technologies, ideas, or any non-place, non-event thing (e.g., "Python programming language", "Quantum Computing", "iPhone 15")
    - Event: Occurrences, meetings, incidents, or time-bound activities (e.g., "WWDC 2024", "Russian invasion of Ukraine", "product launch")
    - Place: Geographic locations, cities, countries, coordinates, or physical places (e.g., "Moscow", "Silicon Valley", "[55.7558, 37.6173]")
@@ -584,7 +577,7 @@ Extraction Instructions:
    CRITICAL: Property keys MUST be in strict snake_case (e.g., 'birth_date', 'co_founder' -> 'co_founder'). No hyphens or spaces allowed in keys.
    
    EXAMPLES OF PROPERTIES:
-   - Actor: [{{'key': 'telegram_id', 'value': 123456, 'type': 'numeric'}}, {{'key': 'nationality', 'value': 'Russian', 'type': 'text'}}]
+   - Actor: [{{'key': 'platform', 'value': 'telegram', 'type': 'text'}}, {{'key': 'platform_id', 'value': '123456', 'type': 'text'}}, {{'key': 'nationality', 'value': 'Russian', 'type': 'text'}}]
    - Entity: [{{'key': 'category', 'value': 'programming_language', 'type': 'text'}}, {{'key': 'release_year', 'value': 1991, 'type': 'numeric'}}]
    - Event: [{{'key': 'timestamp', 'value': 1712345678, 'type': 'numeric'}}, {{'key': 'location', 'value': 'San Francisco', 'type': 'location'}}]
    - Place: [{{'key': 'coordinates', 'value': [55.7558, 37.6173], 'type': 'geo'}}, {{'key': 'country', 'value': 'Russia', 'type': 'text'}}]
@@ -640,7 +633,8 @@ Example for a tech blog post:
       "label": "Actor",
       "name": "John Doe",
       "properties": [
-        {{"key": "telegram_id", "value": 987654321, "type": "numeric"}},
+        {{"key": "platform", "value": "telegram", "type": "text"}},
+        {{"key": "platform_id", "value": "987654321", "type": "text"}},
         {{"key": "role", "value": "software_engineer", "type": "text"}}
       ]
     }},

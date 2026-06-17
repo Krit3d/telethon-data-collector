@@ -33,6 +33,7 @@ async def lifespan(app: FastAPI):
 
     app.state.db = db
     app.state.qdrant = qdrant
+    app.state.settings = settings
 
     logger.info("FastAPI application started successfully.")
     yield

@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 EMBEDDING_DIM: Final[int] = 1024
 EMBEDDING_METRIC: Final[Distance] = Distance.COSINE
 
-POSTS_COLLECTION: Final[str] = "posts"
-ENTITIES_COLLECTION: Final[str] = "telegram_entities"
+POSTS_COLLECTION: Final[str] = "social_posts"
+ENTITIES_COLLECTION: Final[str] = "social_entities"
 
 
 class QdrantService:
@@ -496,5 +496,10 @@ class QdrantService:
         await self.initialize()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
         await self.close()
