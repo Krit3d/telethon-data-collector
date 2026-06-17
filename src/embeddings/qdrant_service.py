@@ -1,8 +1,7 @@
-"""Async Qdrant service for storing and searching post embeddings."""
-
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from typing import Final
 
@@ -24,33 +23,28 @@ logger = logging.getLogger(__name__)
 EMBEDDING_DIM: Final[int] = 1024
 EMBEDDING_METRIC: Final[Distance] = Distance.COSINE
 
-# Collection names
 POSTS_COLLECTION: Final[str] = "posts"
 ENTITIES_COLLECTION: Final[str] = "telegram_entities"
 
 
 class QdrantService:
-    """Service for managing post and entity embeddings in Qdrant using local fastembed."""
 
     def __init__(self, settings: Settings) -> None:
-        """Initialize Qdrant client and ensure collection exists.
-
-        Args:
-            settings: Application settings containing Qdrant and embedding configuration.
-
-        Raises:
-            ValueError: If required settings are missing.
-            RuntimeError: If Qdrant connection or collection creation fails.
-        """
-
         self.settings = settings
         self.collection_name = settings.qdrant_collection_name or POSTS_COLLECTION
 
-        # Initialize fastembed model with limited threads to control CPU usage
-        self.model = TextEmbedding(
-            model_name=settings.embedding_model_name,
-            threads=settings.embedding_threads,
-        )
+        onnx_provider = os.environ.get("ONNXRUNTIME_PROVIDER")
+        if onnx_provider == "CUDAExecutionProvider":
+            self.model = TextEmbedding(
+                model_name=settings.embedding_model_name,
+                threads=settings.embedding_threads,
+                providers=["CUDAExecutionProvider"],
+            )
+        else:
+            self.model = TextEmbedding(
+                model_name=settings.embedding_model_name,
+                threads=settings.embedding_threads,
+            )
 
         self.client = AsyncQdrantClient(
             url=settings.qdrant_url,
@@ -60,11 +54,6 @@ class QdrantService:
         self._initialized = False
 
     async def initialize(self) -> None:
-        """Initialize the service and ensure collection exists.
-
-        This method should be called after creating the service instance.
-        """
-
         if self._initialized:
             return
 
@@ -92,8 +81,6 @@ class QdrantService:
             raise RuntimeError(f"Qdrant initialization failed: {e}") from e
 
     async def _ensure_collection(self) -> None:
-        """Check if collections exist and create them if missing."""
-
         if not self.collection_name:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
 
@@ -101,7 +88,6 @@ class QdrantService:
             collections = await self.client.get_collections()
             collection_names = [c.name for c in collections.collections]
 
-            # Ensure posts collection (default collection for post embeddings)
             posts_collection = self.collection_name
             if posts_collection not in collection_names:
                 logger.info(
@@ -132,7 +118,6 @@ class QdrantService:
                     extra={"collection": posts_collection},
                 )
 
-            # Ensure telegram_entities collection (for graph nodes)
             entities_collection = ENTITIES_COLLECTION
             if entities_collection not in collection_names:
                 logger.info(
@@ -148,7 +133,6 @@ class QdrantService:
                         size=EMBEDDING_DIM, distance=EMBEDDING_METRIC
                     ),
                 )
-                # Create payload indexes for entities collection
                 await self.client.create_payload_index(
                     collection_name=entities_collection,
                     field_name="label",
@@ -176,24 +160,10 @@ class QdrantService:
         self,
         texts: list[str],
     ) -> np.ndarray:
-        """Generate embeddings for a list of texts using local fastembed model.
-
-        Args:
-            texts: List of text strings to generate embeddings for.
-
-        Returns:
-            numpy.ndarray: Array of embeddings with shape (len(texts), EMBEDDING_DIM).
-
-        Raises:
-            ValueError: If texts list is empty or contains invalid entries.
-            RuntimeError: If embedding generation fails.
-        """
-
         if not texts:
             logger.warning("Empty texts list provided for embedding generation")
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
-        # Validate texts
         valid_texts = [text for text in texts if text and text.strip()]
         if len(valid_texts) != len(texts):
             logger.warning(
@@ -206,10 +176,7 @@ class QdrantService:
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
         try:
-            # Generate embeddings using fastembed
             embeddings = self.model.embed(valid_texts)
-
-            # Convert generator to numpy array
             result = np.array(list(embeddings), dtype=np.float32)
 
             logger.debug(
@@ -235,12 +202,6 @@ class QdrantService:
             raise RuntimeError(f"Embedding generation failed: {e}") from e
 
     async def upsert_batch(self, points: list[tuple[int, str, int]]) -> None:
-        """Upsert multiple post embeddings in a single batch.
-
-        Args:
-            points: List of (post_id, text, account_id) tuples.
-        """
-
         if not points:
             return
 
@@ -248,7 +209,6 @@ class QdrantService:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
 
         try:
-            # Generate embeddings in parallel
             texts = [p[1] for p in points]
             embeddings = await self._generate_embeddings_batch(texts)
 
@@ -263,10 +223,10 @@ class QdrantService:
                 )
             ]
 
-            await self.client.upsert(  # type: ignore[attr-defined]
+            await self.client.upsert(
                 collection_name=self.collection_name,
                 points=point_structs,
-                wait=True,  # Wait for indexing
+                wait=True,
             )
 
             logger.debug(
@@ -283,15 +243,6 @@ class QdrantService:
             raise
 
     async def upsert_entities(self, nodes: list[ExtractedEntity]) -> None:
-        """Upsert graph entity nodes into the telegram_entities collection.
-
-        Args:
-            nodes: List of ExtractedEntity objects to upsert.
-
-        Raises:
-            RuntimeError: If service is not initialized or upsert fails.
-        """
-
         if not nodes:
             logger.debug("No entities to upsert")
             return
@@ -301,14 +252,12 @@ class QdrantService:
             return
 
         try:
-            # Construct textual representations for embedding generation
-            texts = []
-            node_ids = []
-            labels = []
-            original_ids = []
+            texts: list[str] = []
+            node_ids: list[ExtractedEntity] = []
+            labels: list[str] = []
+            original_ids: list[str] = []
 
             for node in nodes:
-                # node.id is directly available
                 node_id = node.id
                 if not node_id:
                     logger.warning(
@@ -317,11 +266,8 @@ class QdrantService:
                     )
                     continue
 
-                # Build text representation: "Label: name"
-                # Optionally append properties of type TEXT or LOCATION
                 text_parts = [f"{node.label}: {node.name}"]
 
-                # Append relevant properties
                 for prop in node.properties:
                     if prop.type in (PropertyType.TEXT, PropertyType.LOCATION):
                         text_parts.append(f", {prop.key}: {prop.value}")
@@ -344,15 +290,12 @@ class QdrantService:
                 logger.debug("No valid entities to upsert after filtering")
                 return
 
-            # Generate embeddings
             embeddings = await self._generate_embeddings_batch(texts)
 
-            # Create point structs with deterministic UUIDs
             point_structs = []
             for node, embedding, label, orig_id in zip(
                 node_ids, embeddings, labels, original_ids
             ):
-                # Convert string ID to deterministic UUID
                 point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, orig_id))
 
                 point_structs.append(
@@ -368,8 +311,7 @@ class QdrantService:
                     )
                 )
 
-            # Upsert to telegram_entities collection
-            await self.client.upsert(  # type: ignore[attr-defined]
+            await self.client.upsert(
                 collection_name=ENTITIES_COLLECTION,
                 points=point_structs,
                 wait=True,
@@ -392,18 +334,6 @@ class QdrantService:
     async def upsert_post_embedding(
         self, post_id: int, text: str, account_id: int
     ) -> None:
-        """Generate embedding for content text and upsert it into Qdrant.
-
-        Args:
-            post_id: PostgreSQL content ID (used as Qdrant point ID).
-            text: Content text to generate embedding for.
-            account_id: Telegram account ID stored in payload.
-
-        Raises:
-            ValueError: If text is empty or invalid.
-            RuntimeError: If embedding generation or Qdrant operation fails.
-        """
-
         if not text or not text.strip():
             logger.warning(
                 "Empty text provided for embedding", extra={"post_id": post_id}
@@ -428,7 +358,7 @@ class QdrantService:
                 payload={"account_id": account_id, "text": text},
             )
 
-            await self.client.upsert(  # type: ignore[attr-defined]
+            await self.client.upsert(
                 collection_name=self.collection_name, points=[point]
             )
 
@@ -450,21 +380,6 @@ class QdrantService:
     async def search_entities(
         self, query: str, limit: int = 5, score_threshold: float = 0.35
     ) -> list[dict]:
-        """Search for semantic entities in the telegram_entities collection.
-
-        Args:
-            query: Search query text.
-            limit: Maximum number of results to return.
-            score_threshold: Minimum similarity score threshold (0-1).
-
-        Returns:
-            List of dictionaries containing entity_id, score, and payload data.
-            Each dict has keys: 'entity_id' (original_id), 'score', 'payload' (dict).
-
-        Raises:
-            RuntimeError: If service is not initialized or search fails.
-        """
-
         if not self._initialized:
             await self.initialize()
 
@@ -475,11 +390,9 @@ class QdrantService:
             return []
 
         try:
-            # Generate embedding for the query
             embedding_array = await self._generate_embeddings_batch([query])
             query_embedding = embedding_array[0]
 
-            # Query the entities collection
             response = await self.client.query_points(
                 collection_name=collection_name,
                 query=query_embedding.tolist(),
@@ -488,8 +401,7 @@ class QdrantService:
                 with_payload=True,
             )
 
-            # Extract entity data with scores and full payload
-            entities = []
+            entities: list[dict] = []
             for hit in response.points:
                 if hit.payload and "original_id" in hit.payload:
                     entities.append({
@@ -521,20 +433,6 @@ class QdrantService:
     async def search_posts(
         self, query: str, limit: int = 10, score_threshold: float = 0.35
     ) -> list[dict]:
-        """Search for posts using the unified query API.
-
-        Args:
-            query: Search query text.
-            limit: Maximum number of results to return.
-            score_threshold: Minimum similarity score threshold (0-1).
-
-        Returns:
-            List of dictionaries containing post_id, score, text, and account_id.
-
-        Raises:
-            RuntimeError: If service is not initialized or search fails.
-        """
-
         if not self._initialized:
             await self.initialize()
 
@@ -546,11 +444,9 @@ class QdrantService:
             return []
 
         try:
-            # Generate embedding for the query
             embedding_array = await self._generate_embeddings_batch([query])
             query_embedding = embedding_array[0]
 
-            # Use modern query_points instead of deprecated search
             response = await self.client.query_points(
                 collection_name=self.collection_name,
                 query=query_embedding.tolist(),
@@ -559,7 +455,6 @@ class QdrantService:
                 with_payload=True,
             )
 
-            # Transform results
             results = [
                 {
                     "post_id": hit.id,
@@ -591,21 +486,15 @@ class QdrantService:
             raise RuntimeError(f"Search failed: {e}") from e
 
     async def close(self) -> None:
-        """Close the Qdrant client connection."""
-
         try:
             await self.client.close()
             logger.debug("Qdrant client closed")
         except Exception as e:
             logger.warning("Error closing Qdrant client", exc_info=e)
 
-    async def __aenter__(self) -> "QdrantService":
-        """Async context manager entry."""
-
+    async def __aenter__(self) -> QdrantService:
         await self.initialize()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Async context manager exit."""
-
         await self.close()

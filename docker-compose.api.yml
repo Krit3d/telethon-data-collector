@@ -1,7 +1,22 @@
 services:
+  nginx_llm:
+    image: nginx:alpine
+    container_name: nginx_llm
+    restart: always
+    ports:
+      - "8080:80"
+    volumes:
+      - ./docker/nginx-llm.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - api_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: tg_parser_qdrant
+    container_name: qdrant
     restart: always
     ports:
       - "6333:6333"
@@ -9,6 +24,13 @@ services:
       - qdrant_data:/qdrant/storage
     environment:
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+      QDRANT__TELEMETRY_DISABLED: "true"
+      QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: "2"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
     networks:
       - api_network
     logging:
@@ -20,7 +42,8 @@ services:
     build:
       context: .
       dockerfile: docker/api/Dockerfile
-    container_name: tg_parser_api
+      target: gpu-runner
+    container_name: api
     restart: always
     env_file:
       - .env
@@ -38,8 +61,17 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
+      ONNXRUNTIME_PROVIDER: CUDAExecutionProvider
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     depends_on:
       - qdrant
+      - nginx_llm
     networks:
       - api_network
     logging:
@@ -47,11 +79,53 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-  extractor:
+  embedding_worker:
     build:
       context: .
       dockerfile: docker/api/Dockerfile
-    container_name: tg_parser_extractor
+      target: gpu-runner
+    container_name: embedding_worker
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - fastembed_cache:/app/model_cache
+    environment:
+      DB_URL: ${DB_URL}
+      QDRANT_URL: ${QDRANT_URL}
+      QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME}
+      QDRANT_BATCH_SIZE: ${QDRANT_BATCH_SIZE}
+      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT}
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      FASTEMBED_CACHE_PATH: /app/model_cache
+      ONNXRUNTIME_PROVIDER: CUDAExecutionProvider
+      EXTRACTOR_CONCURRENCY: ${EXTRACTOR_CONCURRENCY:-5}
+      EXTRACTOR_BATCH_SIZE: ${EXTRACTOR_BATCH_SIZE:-20}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      - qdrant
+    networks:
+      - api_network
+    command: python -m src.api.embedding_worker
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+  graph_worker:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+      target: cpu-runner
+    container_name: graph_worker
     restart: always
     env_file:
       - .env
@@ -71,9 +145,10 @@ services:
       EXTRACTOR_BATCH_SIZE: ${EXTRACTOR_BATCH_SIZE:-20}
     depends_on:
       - qdrant
+      - nginx_llm
     networks:
       - api_network
-    command: python -m src.api.extractor_worker
+    command: python -m src.api.graph_extractor_worker
     logging:
       driver: json-file
       options:
