@@ -1,5 +1,3 @@
-"""Knowledge graph extractor for OpenSPG-based extraction pipeline."""
-
 import asyncio
 import json
 import logging
@@ -7,60 +5,97 @@ import time
 from typing import Any
 
 import aiohttp
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from src.config.config import Settings
-from src.db.graph_repo import GraphRepository
-from src.embeddings.qdrant_service import QdrantService
 from src.graph.schema import (
+    ExtractedEntity,
     OpenSPGExtractionResult,
     get_open_spg_llm_prompt,
 )
-from src.graph.utils import (
-    _repair_json,
-    _convert_to_dict,
-    _merge_metadata_into_properties,
-)
+from src.graph.utils import _repair_json
 
 logger = logging.getLogger(__name__)
 
+_DOMAIN_ENTITY_MAPPING = (
+    "\n\nADDITIONAL DOMAIN ENTITY CLASSIFICATION RULES:\n"
+    "You MUST classify each extracted entity using a 'type' marker property in its properties list.\n"
+    "This property tells the system what domain-specific category the entity belongs to.\n\n"
+    "Classification mapping (domain concept -> OpenSPG label + type marker property):\n"
+    "  - Author (person, blogger, content creator, journalist) -> label: Actor, "
+    'add property: {"key": "type", "value": "author", "type": "text"}\n'
+    "  - Brand (company, product line, trademark, startup) -> label: Actor, "
+    'add property: {"key": "type", "value": "brand", "type": "text"}\n'
+    "  - Product (specific product, gadget, software, app) -> label: Entity, "
+    'add property: {"key": "type", "value": "product", "type": "text"}\n'
+    "  - Topic (subject, theme, discussion point, trend) -> label: Entity, "
+    'add property: {"key": "type", "value": "topic", "type": "text"}\n'
+    "  - Hashtag (trending tag, keyword tag, campaign tag) -> label: Entity, "
+    'add property: {"key": "type", "value": "hashtag", "type": "text"}\n'
+    "  - Publication (article, post, news piece, announcement, report) -> label: Event, "
+    'add property: {"key": "type", "value": "publication", "type": "text"}\n'
+    "  - Region (geographic area, country, city, district, state) -> label: Place, "
+    'add property: {"key": "type", "value": "region", "type": "text"}\n\n'
+    "Every extracted entity MUST include the 'type' marker property. "
+    "If an entity does not fit any of the above categories, use the most appropriate "
+    "OpenSPG label (Actor/Entity/Event/Place) and set type to 'other'."
+)
+
+_MAX_RETRIES = 5
+_RETRY_BASE_DELAY = 2.0
+_RATE_LIMIT_COOLDOWN = 60.0
+_REQUEST_TIMEOUT = 120
+
 
 class KnowledgeExtractor:
-    """Extracts knowledge triples (nodes and edges) from text content using LLM."""
 
     def __init__(self, settings: Settings) -> None:
-        """Initialize the extractor with configuration settings.
-
-        Args:
-            settings: Application settings containing LLM configuration.
-        """
         self.settings = settings
         self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT),
+            )
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None
+            logger.debug("KnowledgeExtractor: aiohttp session closed")
+
+    def _build_prompt(
+        self,
+        text: str,
+        author_id: int,
+        platform: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        base = get_open_spg_llm_prompt(text, author_id, platform, metadata)
+        return f"{base}{_DOMAIN_ENTITY_MAPPING}"
 
     async def _call_llm(
         self,
         text: str,
         author_id: int,
         post_id: int,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
         platform: str | None = None,
-    ) -> OpenSPGExtractionResult | None:
+    ) -> OpenSPGExtractionResult:
         if not self.settings.llm_api_key:
-            logger.warning("LLM API key not configured, skipping extraction")
-            return None
+            raise RuntimeError("LLM API key is not configured")
 
-        # Lazy initialization of HTTP session
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
+        session = await self._get_session()
+        prompt = self._build_prompt(text, author_id, platform, metadata)
+        schema = OpenSPGExtractionResult.model_json_schema()
 
-        prompt = get_open_spg_llm_prompt(text, author_id, platform, metadata)
+        last_error: BaseException | None = None
 
-        max_retries = 2
-        last_error = None
-
-        for attempt in range(max_retries + 1):
+        for attempt in range(_MAX_RETRIES):
             try:
-                async with self._session.post(
+                async with session.post(
                     f"{self.settings.llm_base_url}/chat/completions",
                     headers={
                         "Authorization": f"Bearer {self.settings.llm_api_key}",
@@ -71,47 +106,63 @@ class KnowledgeExtractor:
                         "messages": [
                             {
                                 "role": "system",
-                                "content": "You are a highly meticulous OpenSPG knowledge extraction engine. Even for short texts, identify at least the author and any mentioned concepts, locations, or dates. Never skip entities if they are present.",
+                                "content": (
+                                    "You are a highly meticulous OpenSPG knowledge extraction engine. "
+                                    "Extract entities and relations from the provided text following the "
+                                    "schema and classification rules strictly. "
+                                    "Every entity MUST include a 'type' marker property indicating its "
+                                    "domain classification (author, brand, product, topic, hashtag, "
+                                    "publication, region, or other)."
+                                ),
                             },
                             {"role": "user", "content": prompt},
                         ],
                         "temperature": 0.3,
                         "max_tokens": 4096,
-                        "response_format": {"type": "json_object"},
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "OpenSPGExtractionResult",
+                                "strict": True,
+                                "schema": schema,
+                            },
+                        },
                     },
-                    timeout=aiohttp.ClientTimeout(total=120),
                 ) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(
-                            "LLM API request failed: status=%d, response=%s",
-                            response.status,
-                            error_text,
+                    if response.status == 429:
+                        delay = (
+                            _RATE_LIMIT_COOLDOWN
+                            if attempt < _MAX_RETRIES - 1
+                            else _RETRY_BASE_DELAY * (2 ** attempt)
                         )
-                        # Specific handling for rate limit (429) errors
-                        if response.status == 429:
-                            if attempt < max_retries:
-                                cooldown = (
-                                    60  # 60-second cooldown for rate limits
-                                )
-                                logger.warning(
-                                    "Rate limit hit (429). Cooling down for %d seconds before retry %d/%d...",
-                                    cooldown,
-                                    attempt + 1,
-                                    max_retries,
-                                )
-                                await asyncio.sleep(cooldown)
-                                continue
-                            else:
-                                logger.error(
-                                    "Rate limit error persisted after %d retries for post_id=%s",
-                                    max_retries,
-                                    post_id,
-                                )
-                                return None
-                        if attempt < max_retries:
+                        logger.warning(
+                            "Rate limit (429) on attempt %d/%d for post_id=%d, "
+                            "retrying in %.1fs",
+                            attempt + 1,
+                            _MAX_RETRIES,
+                            post_id,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    if response.status != 200:
+                        error_body = await response.text()
+                        logger.error(
+                            "LLM API error: status=%d, body=%s (post_id=%d)",
+                            response.status,
+                            error_body[:500],
+                            post_id,
+                        )
+                        last_error = RuntimeError(
+                            f"LLM API returned HTTP {response.status}"
+                        )
+                        if attempt < _MAX_RETRIES - 1:
+                            await asyncio.sleep(
+                                _RETRY_BASE_DELAY * (2 ** attempt)
+                            )
                             continue
-                        return None
+                        break
 
                     data = await response.json()
                     content = (
@@ -120,423 +171,273 @@ class KnowledgeExtractor:
                         .get("content", "")
                     )
 
-                    # Log raw content length for debugging truncation issues
-                    logger.debug(
-                        "LLM response received for post_id=%s: content_length=%d chars",
-                        post_id,
-                        len(content),
-                    )
-
                     if not content:
-                        logger.warning("LLM returned empty content")
-                        if attempt < max_retries:
+                        logger.warning(
+                            "Empty LLM response on attempt %d/%d for post_id=%d",
+                            attempt + 1,
+                            _MAX_RETRIES,
+                            post_id,
+                        )
+                        last_error = RuntimeError("LLM returned empty content")
+                        if attempt < _MAX_RETRIES - 1:
                             continue
-                        return None
+                        break
 
-                    # Try to repair JSON if malformed
-                    repaired_content = _repair_json(content)
-                    if repaired_content != content:
+                    repaired = _repair_json(content)
+                    if repaired != content:
                         logger.info(
-                            "Applied JSON repair for post_id=%s", post_id
+                            "JSON repair applied for post_id=%d", post_id
                         )
-                        content = repaired_content
+                        content = repaired
 
-                    # Parse the JSON response
                     try:
-                        parsed_json = json.loads(content)
-                    except json.JSONDecodeError as e:
-                        if attempt < max_retries:
-                            logger.warning(
-                                "Failed to decode LLM response as JSON (attempt %d/%d) for post_id=%s: %s\n"
-                                "First 500 chars: %s\n"
-                                "Last 500 chars: %s",
-                                attempt + 1,
-                                max_retries,
-                                post_id,
-                                e,
-                                content[:500],
-                                (
-                                    content[-500:]
-                                    if len(content) > 500
-                                    else content
-                                ),
-                            )
-                            prompt = (
-                                get_open_spg_llm_prompt(text, author_id, platform, metadata)
-                                + "\n\nIMPORTANT: Your previous response was truncated. Please provide a more concise JSON, focusing only on the most important entities."
-                            )
-                            continue
-                        else:
-                            logger.error(
-                                "Failed to decode LLM response as JSON after %d retries for post_id=%s: %s\n"
-                                "First 500 chars: %s\n"
-                                "Last 500 chars: %s",
-                                max_retries,
-                                post_id,
-                                e,
-                                content[:500],
-                                (
-                                    content[-500:]
-                                    if len(content) > 500
-                                    else content
-                                ),
-                            )
-                            # Raise exception to skip post and retry later
-                            raise Exception(
-                                f"Failed to decode LLM response as JSON after {max_retries} retries for post_id={post_id}"
-                            ) from e
-
-                    # Parse and validate the JSON response directly
-                    try:
-                        parsed_json = json.loads(content)
-                        open_spg_result = (
-                            OpenSPGExtractionResult.model_validate(parsed_json)
+                        parsed = json.loads(content)
+                    except json.JSONDecodeError as json_err:
+                        logger.error(
+                            "JSON decode failed for post_id=%d: %s "
+                            "(content[:300]=%s)",
+                            post_id,
+                            json_err,
+                            content[:300],
                         )
-                    except (json.JSONDecodeError, ValidationError) as e:
-                        if attempt < max_retries:
-                            logger.warning(
-                                "Failed to parse/validate LLM response (attempt %d/%d) for post_id=%s: %s\n"
-                                "First 500 chars: %s\n"
-                                "Last 500 chars: %s",
-                                attempt + 1,
-                                max_retries,
-                                post_id,
-                                e,
-                                content[:500],
-                                (
-                                    content[-500:]
-                                    if len(content) > 500
-                                    else content
-                                ),
-                            )
-                            prompt = (
-                                get_open_spg_llm_prompt(text, author_id, platform, metadata)
-                                + "\n\nIMPORTANT: Your previous response was truncated or invalid. Ensure you return ONLY valid JSON with the exact structure specified in the prompt. Limit to 5-7 most important entities."
-                            )
+                        last_error = RuntimeError(
+                            f"JSON decode failed: {json_err}"
+                        )
+                        last_error.__cause__ = json_err
+                        if attempt < _MAX_RETRIES - 1:
                             continue
-                        else:
-                            logger.error(
-                                "Failed to parse/validate LLM response after %d retries for post_id=%s: %s\n"
-                                "First 500 chars: %s\n"
-                                "Last 500 chars: %s",
-                                max_retries,
-                                post_id,
-                                e,
-                                content[:500],
-                                (
-                                    content[-500:]
-                                    if len(content) > 500
-                                    else content
-                                ),
-                            )
-                            # Raise exception to skip post and retry later
-                            raise Exception(
-                                f"Failed to parse/validate LLM response after {max_retries} retries for post_id={post_id}"
-                            ) from e
+                        break
+
+                    try:
+                        result = OpenSPGExtractionResult.model_validate(parsed)
+                    except ValidationError as val_err:
+                        logger.error(
+                            "Pydantic validation failed for post_id=%d: %s",
+                            post_id,
+                            val_err,
+                        )
+                        last_error = RuntimeError(
+                            f"Validation failed: {val_err}"
+                        )
+                        last_error.__cause__ = val_err
+                        if attempt < _MAX_RETRIES - 1:
+                            continue
+                        break
 
                     logger.info(
-                        "LLM extraction successful: %d entities, %d relations",
-                        len(open_spg_result.entities),
-                        len(open_spg_result.relations),
+                        "LLM extraction succeeded for post_id=%d: "
+                        "%d entities, %d relations",
+                        post_id,
+                        len(result.entities),
+                        len(result.relations),
                     )
-                    return open_spg_result
+                    return result
 
-            except aiohttp.ClientError as e:
-                last_error = e
-                logger.error(
-                    "LLM API request failed with network error (attempt %d/%d) for post_id=%s: %s",
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                last_error = exc
+                logger.warning(
+                    "Network error on attempt %d/%d for post_id=%d: %s",
                     attempt + 1,
-                    max_retries + 1,
+                    _MAX_RETRIES,
                     post_id,
-                    e,
+                    exc,
                 )
-                if attempt < max_retries:
-                    continue
-            except TimeoutError as e:
-                last_error = e
-                logger.error(
-                    "LLM API request timed out (attempt %d/%d) for post_id=%s: %s",
-                    attempt + 1,
-                    max_retries + 1,
-                    post_id,
-                    e,
-                )
-                if attempt < max_retries:
-                    continue
-            except Exception as e:
-                last_error = e
-                logger.error(
-                    "Unexpected error during LLM extraction (attempt %d/%d) for post_id=%s: %s",
-                    attempt + 1,
-                    max_retries + 1,
-                    post_id,
-                    e,
-                    exc_info=True,
-                )
-                if attempt < max_retries:
+                if attempt < _MAX_RETRIES - 1:
+                    await asyncio.sleep(
+                        _RETRY_BASE_DELAY * (2 ** attempt)
+                    )
                     continue
 
-        # If we exhausted all retries, return None
-        return None
+        raise RuntimeError(
+            f"LLM extraction failed after {_MAX_RETRIES} attempts "
+            f"for post_id={post_id}"
+        ) from last_error
 
-    async def extract_triplets(
-        self,
-        text: str,
-        author_id: int,
-        post_id: int,
-        metadata: dict | None = None,
-        platform: str | None = None,
-    ) -> OpenSPGExtractionResult | None:
-        logger.debug("Extracting triplets from text: %s", text[:100])
-        return await self._call_llm(text, author_id, post_id, metadata, platform)
+    @staticmethod
+    def _find_or_create_entity(
+        entities: list[ExtractedEntity],
+        entity_id: str,
+        label: str,
+        name: str,
+    ) -> ExtractedEntity:
+        for entity in entities:
+            if entity.id == entity_id:
+                return entity
+        created = ExtractedEntity(
+            id=entity_id,
+            label=label,
+            name=name,
+            properties=[],
+        )
+        entities.append(created)
+        return created
 
-    async def close(self) -> None:
-        """Close the aiohttp session and clean up resources."""
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
-            logger.debug("KnowledgeExtractor: aiohttp session closed")
+    @staticmethod
+    def _enrich_author_node(
+        author: ExtractedEntity,
+        account_metadata: dict[str, Any],
+    ) -> None:
+        field_map: dict[str, tuple[str, str]] = {
+            "follower_count": ("numeric", "follower_count"),
+            "subscribers_count": ("numeric", "follower_count"),
+            "engagement_rate": ("numeric", "engagement_rate"),
+            "region": ("location", "region"),
+            "handle": ("text", "handle"),
+            "username": ("text", "handle"),
+            "title": ("text", "display_name"),
+        }
+
+        existing = {p.key for p in author.properties}
+
+        for src_key, (prop_type, target_key) in field_map.items():
+            value = account_metadata.get(src_key)
+            if value is not None and target_key not in existing:
+                try:
+                    author.add_property(target_key, value, prop_type)
+                except (ValidationError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to enrich property %s for entity %s: %s",
+                        target_key,
+                        author.id,
+                        exc,
+                    )
+
+    @staticmethod
+    def _enrich_publication_node(
+        pub: ExtractedEntity,
+        post_metrics: dict[str, int | None],
+        raw_metadata: dict[str, Any],
+    ) -> None:
+        existing = {p.key for p in pub.properties}
+
+        for key in ("views", "reactions_count", "comments_count", "shares_count"):
+            value = post_metrics.get(key)
+            if value is not None and key not in existing:
+                try:
+                    pub.add_property(key, value, "numeric")
+                except (ValidationError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to enrich property %s for entity %s: %s",
+                        key,
+                        pub.id,
+                        exc,
+                    )
+
+        if "video_url" in raw_metadata and "video_url" not in existing:
+            try:
+                pub.add_property("video_url", raw_metadata["video_url"], "text")
+            except (ValidationError, ValueError) as exc:
+                logger.warning(
+                    "Failed to enrich property %s for entity %s: %s",
+                    "video_url",
+                    pub.id,
+                    exc,
+                )
+
+        if "published_at" in raw_metadata and "published_at" not in existing:
+            try:
+                pub.add_property(
+                    "published_at", str(raw_metadata["published_at"]), "text"
+                )
+            except (ValidationError, ValueError) as exc:
+                logger.warning(
+                    "Failed to enrich property %s for entity %s: %s",
+                    "published_at",
+                    pub.id,
+                    exc,
+                )
+
+        transcription = raw_metadata.get("transcription")
+        if transcription and "transcript" not in existing:
+            try:
+                pub.add_property("transcript", transcription, "text")
+            except (ValidationError, ValueError) as exc:
+                logger.warning(
+                    "Failed to enrich property %s for entity %s: %s",
+                    "transcript",
+                    pub.id,
+                    exc,
+                )
 
     async def process_post(
         self,
         post_id: int,
         text: str,
         author_id: int,
-        graph_repo: GraphRepository,
-        qdrant: QdrantService | None = None,
-        post_metrics: dict | BaseModel | None = None,
-        raw_metadata: dict | BaseModel | None = None,
+        post_metrics: dict[str, int | None],
+        raw_metadata: dict[str, Any],
+        graph_repo: Any,
+        qdrant: Any | None = None,
         platform: str | None = None,
+        account_metadata: dict[str, Any] | None = None,
     ) -> None:
-        logger.info("Processing post id=%s for knowledge extraction", post_id)
+        logger.info("Processing post_id=%d for knowledge extraction", post_id)
 
-        # Step A: Standardize the Content node ID
-        content_node_id = f"content_{post_id}"
-
-        # Step B: Create/Upsert the Content node with merged metrics and metadata
-        try:
-            # Start with base properties
-            content_properties: dict[str, Any] = {
-                "id": content_node_id,
-                "post_id": post_id,
-                "author_id": author_id,
-            }
-
-            # Merge post_metrics (views, comments, reactions) into properties
-            # Handle both dict and Pydantic model inputs
-            content_properties = _merge_metadata_into_properties(content_properties, post_metrics)
-
-            # Merge raw_metadata into properties
-            # This ensures all pre-extracted metadata is stored in the Content node
-            content_properties = _merge_metadata_into_properties(content_properties, raw_metadata)
-
-            # Upsert the Content node with all properties
-            await graph_repo.upsert_graph_node(
-                label="Content",
-                properties=content_properties,
-                merge_key="id",
-            )
-            logger.debug("Upserted Content node: id=%s", content_node_id)
-        except Exception as e:
-            logger.error(
-                "Failed to upsert Content node (post_id=%s): %s",
-                post_id,
-                e,
-                exc_info=True,
-            )
-            raise
-
-        # Step C: Create/Upsert the Actor node for the channel/author
-        platform_slug = platform.lower() if platform else "unknown"
-        actor_node_id = f"actor_{platform_slug}_{author_id}"
-        try:
-            await graph_repo.upsert_graph_node(
-                label="Actor",
-                properties={
-                    "id": actor_node_id,
-                    "name": f"Author {author_id}",
-                    "platform": platform or "unknown",
-                    "platform_id": str(author_id),
-                },
-                merge_key="id",
-            )
-            logger.debug("Upserted Actor node: id=%s", actor_node_id)
-        except Exception as e:
-            logger.error(
-                "Failed to upsert Actor node (author_id=%s): %s",
-                author_id,
-                e,
-                exc_info=True,
-            )
-            raise
-
-        # Step D: Create/Upsert the POSTED relationship
-        try:
-            await graph_repo.upsert_graph_edge(
-                start_label="Actor",
-                start_merge_key="id",
-                start_merge_val=actor_node_id,
-                edge_label="POSTED",
-                end_label="Content",
-                end_merge_key="id",
-                end_merge_val=content_node_id,
-                edge_properties={},
-            )
-            logger.debug(
-                "Created POSTED relationship: Actor(%s)-[:POSTED]->Content(%s)",
-                actor_node_id,
-                content_node_id,
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to create POSTED relationship (author_id=%s, post_id=%s): %s",
-                author_id,
-                post_id,
-                e,
-            )
-            # Do not raise - continue with extraction
-
-        raw_metadata_dict = _convert_to_dict(raw_metadata) if raw_metadata else None
-        result = await self.extract_triplets(text, author_id, post_id, raw_metadata_dict, platform)
-
-        if result is None or (not result.entities and not result.relations):
-            logger.warning(
-                "Empty extraction for content id=%s. Text snippet: %s. Core Content skeleton is saved.",
-                post_id,
-                text[:100],
-            )
-            return
-
-        # Step F: Process extracted entities and relations
-        # Detailed logging after extraction (before upserting)
-        logger.info(
-            "Extracted %d entities and %d relations from content %d",
-            len(result.entities),
-            len(result.relations),
-            post_id,
+        result = await self._call_llm(
+            text=text,
+            author_id=author_id,
+            post_id=post_id,
+            metadata=raw_metadata if raw_metadata else None,
+            platform=platform,
         )
 
-        # Add last_modified_at timestamp to all entities (for incremental updates tracking)
-        current_timestamp = int(time.time())
-        for entity in result.entities:
-            entity.add_property(
-                "last_modified_at", current_timestamp, "numeric"
-            )
+        platform_slug = platform.lower() if platform else "unknown"
+        author_node_id = f"actor_{platform_slug}_{author_id}"
+        pub_node_id = f"event_publication_{platform_slug}_{post_id}"
 
-        # Add default confidence property to relations if not present
+        author_entity = self._find_or_create_entity(
+            result.entities,
+            entity_id=author_node_id,
+            label="Actor",
+            name=f"Author {author_id}",
+        )
+
+        author_prop_keys = {p.key for p in author_entity.properties}
+        if "platform" not in author_prop_keys:
+            author_entity.add_property(
+                "platform", platform or "unknown", "text"
+            )
+        if "platform_id" not in author_prop_keys:
+            author_entity.add_property("platform_id", str(author_id), "text")
+
+        if account_metadata:
+            self._enrich_author_node(author_entity, account_metadata)
+
+        pub_entity = self._find_or_create_entity(
+            result.entities,
+            entity_id=pub_node_id,
+            label="Event",
+            name=f"Publication {post_id}",
+        )
+
+        self._enrich_publication_node(pub_entity, post_metrics, raw_metadata)
+
+        current_ts = int(time.time())
+        for entity in result.entities:
+            entity_prop_keys = {p.key for p in entity.properties}
+            if "last_modified_at" not in entity_prop_keys:
+                entity.add_property("last_modified_at", current_ts, "numeric")
+
         for relation in result.relations:
-            props_dict = relation.get_property_dict()
-            if "confidence" not in props_dict:
+            rel_prop_keys = {p.key for p in relation.properties}
+            if "confidence" not in rel_prop_keys:
                 relation.add_property("confidence", 0.5, "numeric")
 
-        # Build entity ID -> label mapping for relation upserts
-        entity_id_to_label: dict[str, str] = {}
-        for entity in result.entities:
-            entity_id_to_label[entity.id] = entity.label
+        await graph_repo.save_extraction_result(post_id, result)
 
-        # Upsert entities to AGE graph
-        for entity in result.entities:
-            try:
-                props = {
-                    "id": entity.id,
-                    "name": entity.name,
-                    **entity.get_property_dict(),
-                }
-                await graph_repo.upsert_graph_node(
-                    label=entity.label,
-                    properties=props,
-                    merge_key="id",
-                )
-                logger.debug(
-                    "Upserted entity: label=%s, id=%s",
-                    entity.label,
-                    entity.id,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to upsert entity (post_id=%s, label=%s): %s",
-                    post_id,
-                    entity.label,
-                    e,
-                )
-                raise
-
-        # Create MENTIONS relationship: (Content)-[:MENTIONS]->(Entity) for each extracted entity
-        for entity in result.entities:
-            try:
-                await graph_repo.upsert_graph_edge(
-                    start_label="Content",
-                    start_merge_key="id",
-                    start_merge_val=content_node_id,  # Use standardized Content node ID
-                    edge_label="MENTIONS",
-                    end_label=entity.label,
-                    end_merge_key="id",
-                    end_merge_val=entity.id,
-                    edge_properties={},
-                )
-                logger.debug(
-                    "Created MENTIONS relationship: Content(%s)-[:MENTIONS]->%s(%s)",
-                    content_node_id,
-                    entity.label,
-                    entity.id,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to create MENTIONS relationship (post_id=%s, entity_id=%s): %s",
-                    post_id,
-                    entity.id,
-                    e,
-                )
-                # Do not raise - continue with other operations
-
-        # Upsert relations to AGE graph
-        for relation in result.relations:
-            start_label = entity_id_to_label.get(relation.source_id, "Entity")
-            end_label = entity_id_to_label.get(relation.target_id, "Entity")
-            try:
-                edge_props = relation.get_property_dict()
-                await graph_repo.upsert_graph_edge(
-                    start_label=start_label,
-                    start_merge_key="id",
-                    start_merge_val=relation.source_id,
-                    edge_label=relation.relation_type,
-                    end_label=end_label,
-                    end_merge_key="id",
-                    end_merge_val=relation.target_id,
-                    edge_properties=edge_props,
-                )
-                logger.debug(
-                    "Upserted relation: %s(%s)-%s->%s(%s)",
-                    start_label,
-                    relation.source_id,
-                    relation.relation_type,
-                    end_label,
-                    relation.target_id,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to upsert relation (post_id=%s, relation=%s): %s",
-                    post_id,
-                    relation.relation_type,
-                    e,
-                )
-                raise
-
-        # Sync entities to Qdrant (if service is available)
         if qdrant is not None:
             try:
                 await qdrant.upsert_entities(result.entities)
-            except Exception as e:
+            except Exception as exc:
                 logger.error(
-                    "Failed to sync entities to Qdrant (post_id=%s): %s",
+                    "Qdrant sync failed for post_id=%d: %s",
                     post_id,
-                    e,
+                    exc,
                     exc_info=True,
                 )
-                # Do not raise - Qdrant failure should not crash the pipeline
 
         logger.info(
-            "Completed processing content id=%s: %d entities, %d relations",
+            "Completed extraction for post_id=%d: %d entities, %d relations",
             post_id,
             len(result.entities),
             len(result.relations),

@@ -1,39 +1,105 @@
-"""Background worker for generating and storing content embeddings.
-
-This worker runs independently from the scraper and extractor services. It polls
-the database for content where is_embedded=False, generates vector embeddings
-using fastembed, stores them in Qdrant for semantic search, and marks the
-content as embedded in PostgreSQL.
-"""
+from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import signal
+from typing import Any
 
 from sqlalchemy.exc import OperationalError
-from sqlalchemy import text
 
 try:
     import asyncpg.exceptions
 
     PostgresError = asyncpg.exceptions.PostgresError
 except ImportError:
-    PostgresError = Exception  # Fallback to base Exception
+    PostgresError = Exception
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
 from src.db.models import Content
 from src.embeddings.qdrant_service import QdrantService
+from src.parser.creators.core.schemas import AccountMetadata, ContentMetadata
 
 logger = logging.getLogger(__name__)
 
-# Backoff settings for error recovery
-BASE_BACKOFF = 1.0
-MAX_BACKOFF = 60.0
+_BASE_BACKOFF: float = 1.0
+_MAX_BACKOFF: float = 60.0
+_MIN_TEXT_LENGTH: int = 15
+_MAX_SUB_BATCH: int = 32
+_AVG_LEN_TIER_1: int = 2000
+_TIER_1_BATCH: int = 16
+_AVG_LEN_TIER_2: int = 4000
+_TIER_2_BATCH: int = 8
+_AVG_LEN_TIER_3: int = 8000
+_TIER_3_BATCH: int = 4
+
+_NOISE_WORDS: frozenset[str] = frozenset({
+    "music", "музыка", "смех", "шум", "аплодисменты",
+    "laughter", "applause", "inaudible", "нрзб",
+    "background noise", "crowd", "cheering", "silence",
+    "static", "cough", "кашель", "звуковые эффекты",
+    "звук", "тишина", "шепот", "whisper", "breathing",
+    "дыхание", "грохот", "шипение", "свист", "scribble",
+})
+
+_BRACKET_NOISE_RE = re.compile(
+    r"\[([^\]]*)\]|\(([^)]*)\)",
+    re.IGNORECASE,
+)
+
+_HALLUCINATION_RE = re.compile(
+    r"(?:"
+    r"[Tt]hank(?:s)?\s+(?:you\s+)?for\s+(?:watching|listening|viewing|subscribing)"
+    r"|"
+    r"Спасибо\s+за\s+(?:просмотр|прослушивание|подписку|поддержку)"
+    r"|"
+    r"[Ss]ubtitles?\s+(?:by|created|made|translated)"
+    r"|"
+    r"Субтитры\s+(?:созданы|сделаны|переведены|созданы)"
+    r"|"
+    r"[Cc]ommunity|Сообщество"
+    r"|"
+    r"Пожалуйста,\s+(?:подпишитесь|ставьте\s+лайк|нажмите\s+колокольчик)"
+    r"|"
+    r"[Pp]lease\s+(?:subscribe|like|hit\s+the\s+bell)"
+    r")",
+)
+
+_WORD_TOKEN_RE = re.compile(r"\b(\w+(?:\s+\w+){0,4})\b", re.UNICODE)
+
+_WHITESPACE_RE = re.compile(r"[ \t]+")
+_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+_MULTI_SPACE_RE = re.compile(r" {2,}")
+
+_MAX_CONSECUTIVE_REPEATS: int = 3
+
+
+def _strip_consecutive_repeats(text: str) -> str:
+    tokens = _WORD_TOKEN_RE.findall(text)
+    if len(tokens) < _MAX_CONSECUTIVE_REPEATS:
+        return text
+    result: list[str] = []
+    i = 0
+    while i < len(tokens):
+        run_token = tokens[i].strip().lower()
+        run_len = 1
+        while (
+            i + run_len < len(tokens)
+            and tokens[i + run_len].strip().lower() == run_token
+        ):
+            run_len += 1
+        if run_len >= _MAX_CONSECUTIVE_REPEATS:
+            result.append(tokens[i])
+        else:
+            result.extend(tokens[i : i + run_len])
+        i += run_len
+    if len(result) == len(tokens):
+        return text
+    return " ".join(result)
 
 
 class EmbeddingWorker:
-    """Background worker that processes unembedded content."""
 
     def __init__(
         self,
@@ -43,15 +109,6 @@ class EmbeddingWorker:
         batch_size: int = 64,
         poll_interval: int = 5,
     ) -> None:
-        """Initialize the embedding worker.
-
-        Args:
-            db: Database instance for data access.
-            qdrant: QdrantService for storing embeddings.
-            settings: Application settings containing embedding configuration.
-            batch_size: Number of content items to fetch per poll.
-            poll_interval: Sleep interval in seconds when no content is found.
-        """
         self.db = db
         self.qdrant = qdrant
         self.settings = settings
@@ -61,12 +118,248 @@ class EmbeddingWorker:
         self._shutdown_event = asyncio.Event()
 
     def handle_shutdown(self, *args: object) -> None:
-        """Signal handler for graceful shutdown."""
-        logger.info("Shutdown signal received, stopping embedding worker...")
+        logger.info("Shutdown signal received, finishing current sub-batch before exit")
         self._shutdown_event.set()
 
+    def _clean_text(self, text: str) -> str:
+        def _strip_bracket_noise(m: re.Match[str]) -> str:
+            inner = (m.group(1) or m.group(2) or "").strip()
+            inner_lower = inner.lower()
+            if any(w in inner_lower for w in _NOISE_WORDS):
+                return ""
+            return m.group(0)
+
+        cleaned = _BRACKET_NOISE_RE.sub(_strip_bracket_noise, text)
+        cleaned = _HALLUCINATION_RE.sub("", cleaned)
+        cleaned = _strip_consecutive_repeats(cleaned)
+        cleaned = _WHITESPACE_RE.sub(" ", cleaned)
+        cleaned = _MULTI_NEWLINE_RE.sub("\n\n", cleaned)
+        return cleaned.strip()
+
+    def _safe_parse_account_metadata(
+        self, raw: dict[str, Any] | None
+    ) -> AccountMetadata | None:
+        if not raw:
+            return None
+        try:
+            return AccountMetadata(**raw)
+        except Exception:
+            return None
+
+    def _safe_parse_content_metadata(
+        self, raw: dict[str, Any] | None
+    ) -> ContentMetadata | None:
+        if not raw:
+            return None
+        try:
+            return ContentMetadata(**raw)
+        except Exception:
+            return None
+
+    def _assemble_embedding_text(self, post: Content) -> str:
+        parts: list[str] = []
+        account = post.account
+
+        if account:
+            if account.platform:
+                parts.append(f"Platform: {account.platform}")
+            if account.title:
+                parts.append(f"Account: {account.title}")
+            if account.username:
+                parts.append(f"Username: @{account.username}")
+            if account.description:
+                parts.append(f"Bio: {account.description}")
+
+            account_meta = self._safe_parse_account_metadata(account.raw_metadata)
+            if account_meta:
+                if (
+                    account_meta.biography
+                    and account_meta.biography != account.description
+                ):
+                    parts.append(f"Biography: {account_meta.biography}")
+                if account_meta.category:
+                    parts.append(f"Category: {account_meta.category}")
+                if account_meta.location:
+                    parts.append(f"Location: {account_meta.location}")
+                if account_meta.external_links:
+                    links = ", ".join(account_meta.external_links[:5])
+                    parts.append(f"External links: {links}")
+            elif account.raw_metadata:
+                bio = account.raw_metadata.get("biography") or account.raw_metadata.get(
+                    "bio"
+                )
+                if bio and bio != account.description:
+                    parts.append(f"Biography: {bio}")
+                category = account.raw_metadata.get("category")
+                if category:
+                    parts.append(f"Category: {category}")
+                location = account.raw_metadata.get("location")
+                if isinstance(location, dict):
+                    loc_name = location.get("name") or location.get("city")
+                    if loc_name:
+                        parts.append(f"Location: {loc_name}")
+                elif location:
+                    parts.append(f"Location: {location}")
+                ext_links = account.raw_metadata.get("external_links")
+                if isinstance(ext_links, list) and ext_links:
+                    links = ", ".join(str(link) for link in ext_links[:5])
+                    parts.append(f"External links: {links}")
+
+        if post.content:
+            cleaned = self._clean_text(post.content)
+            if cleaned:
+                parts.append(f"Post: {cleaned}")
+
+        if post.transcription:
+            cleaned_t = self._clean_text(post.transcription)
+            if cleaned_t:
+                parts.append(f"Transcription: {cleaned_t}")
+
+        content_meta = self._safe_parse_content_metadata(post.raw_metadata)
+        if content_meta:
+            if content_meta.hashtags:
+                parts.append(f"Hashtags: {', '.join(content_meta.hashtags)}")
+            if content_meta.geo_data and content_meta.geo_data.name:
+                parts.append(f"Location: {content_meta.geo_data.name}")
+            if content_meta.coauthors:
+                parts.append(f"Co-authors: {', '.join(content_meta.coauthors)}")
+            if content_meta.tagged_users:
+                parts.append(f"Tagged users: {', '.join(content_meta.tagged_users)}")
+            if content_meta.category:
+                parts.append(f"Post category: {content_meta.category}")
+            if content_meta.accessibility_caption:
+                caption = self._clean_text(content_meta.accessibility_caption)
+                if caption:
+                    parts.append(f"Caption: {caption}")
+        elif post.raw_metadata:
+            hashtags = post.raw_metadata.get("hashtags")
+            if isinstance(hashtags, list) and hashtags:
+                parts.append(f"Hashtags: {', '.join(str(h) for h in hashtags)}")
+            elif isinstance(hashtags, str) and hashtags:
+                parts.append(f"Hashtags: {hashtags}")
+            geo = post.raw_metadata.get("geo_data")
+            if isinstance(geo, dict) and geo.get("name"):
+                parts.append(f"Location: {geo['name']}")
+            elif isinstance(geo, str) and geo:
+                parts.append(f"Location: {geo}")
+            coauthors = post.raw_metadata.get("coauthors")
+            if isinstance(coauthors, list) and coauthors:
+                parts.append(f"Co-authors: {', '.join(str(c) for c in coauthors)}")
+            tagged = post.raw_metadata.get("tagged_users")
+            if isinstance(tagged, list) and tagged:
+                parts.append(f"Tagged users: {', '.join(str(t) for t in tagged)}")
+            category = post.raw_metadata.get("category")
+            if category:
+                parts.append(f"Post category: {category}")
+            caption = post.raw_metadata.get("accessibility_caption")
+            if isinstance(caption, str) and caption:
+                cleaned_cap = self._clean_text(caption)
+                if cleaned_cap:
+                    parts.append(f"Caption: {cleaned_cap}")
+            transcription = post.raw_metadata.get("transcription")
+            if isinstance(transcription, str) and transcription and not post.transcription:
+                cleaned_tr = self._clean_text(transcription)
+                if cleaned_tr:
+                    parts.append(f"Transcription: {cleaned_tr}")
+
+        return "\n".join(parts)
+
+    async def _process_visual_video_embedding(
+        self, post: Content
+    ) -> list[float] | None:
+        return None
+
+    def _compute_sub_batch_size(self, texts: list[str]) -> int:
+        if not texts:
+            return _MAX_SUB_BATCH
+        avg_len = sum(len(t) for t in texts) / len(texts)
+        if avg_len > _AVG_LEN_TIER_3:
+            return _TIER_3_BATCH
+        if avg_len > _AVG_LEN_TIER_2:
+            return _TIER_2_BATCH
+        if avg_len > _AVG_LEN_TIER_1:
+            return _TIER_1_BATCH
+        return _MAX_SUB_BATCH
+
+    async def _process_batch(self, posts: list[Content]) -> None:
+        points: list[tuple[int, str, int]] = []
+        skip_ids: list[int] = []
+
+        for post in posts:
+            text_to_embed = self._assemble_embedding_text(post)
+            stripped_text = text_to_embed.strip()
+
+            if len(stripped_text) < _MIN_TEXT_LENGTH:
+                logger.debug(
+                    "Content id=%s produced text shorter than %d chars after cleaning, skipping embedding",
+                    post.id,
+                    _MIN_TEXT_LENGTH,
+                )
+                skip_ids.append(post.id)
+                continue
+
+            points.append((post.id, stripped_text, post.account_id))
+
+        if skip_ids:
+            await self.db.mark_content_embedded(skip_ids)
+            logger.debug(
+                "Marked %d posts as embedded (skipped due to insufficient text)",
+                len(skip_ids),
+            )
+
+        if not points:
+            return
+
+        texts = [p[1] for p in points]
+        sub_batch_size = self._compute_sub_batch_size(texts)
+        total_embedded = 0
+
+        for i in range(0, len(points), sub_batch_size):
+            if self._shutdown_event.is_set():
+                logger.info(
+                    "Shutdown requested, stopping batch processing after %d/%d items",
+                    total_embedded,
+                    len(points),
+                )
+                break
+
+            sub_batch = points[i : i + sub_batch_size]
+            try:
+                await self.qdrant.upsert_batch(sub_batch)
+                sub_ids = [p[0] for p in sub_batch]
+                await self.db.mark_content_embedded(sub_ids)
+                total_embedded += len(sub_ids)
+                logger.debug(
+                    "Embedded sub-batch of %d items (%d/%d total)",
+                    len(sub_ids),
+                    total_embedded,
+                    len(points),
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to embed sub-batch of %d items: %s",
+                    len(sub_batch),
+                    e,
+                    exc_info=True,
+                )
+                raise
+
+        logger.info("Successfully embedded %d content items", total_embedded)
+
+    async def _backoff_wait(self, attempt: int) -> None:
+        backoff_time = min(
+            _BASE_BACKOFF * (2 ** (attempt - 1)),
+            _MAX_BACKOFF,
+        )
+        try:
+            await asyncio.wait_for(
+                self._shutdown_event.wait(),
+                timeout=backoff_time,
+            )
+        except asyncio.TimeoutError:
+            pass
+
     async def run(self) -> None:
-        """Main worker loop: continuously poll and process unembedded content."""
         logger.info(
             "Embedding worker started (batch_size=%d, poll_interval=%ds, priority_mode=%s)",
             self.batch_size,
@@ -78,54 +371,45 @@ class EmbeddingWorker:
 
         while not self._shutdown_event.is_set():
             try:
-                # Fetch batch of unembedded content
                 try:
                     posts = await self.db.get_unembedded_content(
                         limit=self.batch_size, priority_mode=self.priority_mode
                     )
                 except (OperationalError, PostgresError) as e:
-                    # Database connection error - log warning, back off, and retry
                     consecutive_errors += 1
-                    backoff_time = min(
-                        BASE_BACKOFF * (2 ** (consecutive_errors - 1)), MAX_BACKOFF
-                    )
                     logger.warning(
-                        "Database connection error while fetching content: %s. "
-                        "Retrying after backoff (%.1fs, attempt %d)...",
+                        "Database error while fetching content: %s. Backing off for %.1fs (attempt %d)",
                         e,
-                        backoff_time,
+                        min(
+                            _BASE_BACKOFF * (2 ** (consecutive_errors - 1)),
+                            _MAX_BACKOFF,
+                        ),
                         consecutive_errors,
                     )
-                    # Use wait_for to allow shutdown during sleep
-                    try:
-                        await asyncio.wait_for(
-                            self._shutdown_event.wait(),
-                            timeout=backoff_time,
-                        )
-                    except asyncio.TimeoutError:
-                        # Timeout is expected - continue to retry
-                        pass
+                    await self._backoff_wait(consecutive_errors)
                     continue
 
                 if not posts:
                     logger.debug(
-                        "No unembedded content found, sleeping %ds",
-                        self.poll_interval,
+                        "No unembedded content found, sleeping %ds", self.poll_interval
                     )
-                    consecutive_errors = 0  # Reset error counter on success
-                    await asyncio.sleep(self.poll_interval)
+                    consecutive_errors = 0
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown_event.wait(),
+                            timeout=self.poll_interval,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
                     continue
 
                 logger.info(
                     "Processing batch of %d unembedded content items", len(posts)
                 )
-                consecutive_errors = 0  # Reset error counter on success
+                consecutive_errors = 0
 
-                # Process the batch sequentially to avoid thread/memory contention on ONNX Runtime
-                # upsert_batch is already internally parallelized by FastEmbed
                 await self._process_batch(posts)
 
-                # Small delay between batches to avoid overwhelming the system
                 await asyncio.sleep(1)
 
             except asyncio.CancelledError:
@@ -134,145 +418,39 @@ class EmbeddingWorker:
             except Exception as e:
                 consecutive_errors += 1
                 backoff_time = min(
-                    BASE_BACKOFF * (2 ** (consecutive_errors - 1)), MAX_BACKOFF
+                    _BASE_BACKOFF * (2 ** (consecutive_errors - 1)),
+                    _MAX_BACKOFF,
                 )
                 logger.error(
-                    "Unexpected error in embedding worker loop: %s. "
-                    "Backing off for %.1fs (attempt %d)",
+                    "Unexpected error in embedding worker loop: %s. Backing off for %.1fs (attempt %d)",
                     e,
                     backoff_time,
                     consecutive_errors,
                     exc_info=True,
                 )
-                try:
-                    await asyncio.wait_for(
-                        self._shutdown_event.wait(),
-                        timeout=backoff_time,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                await self._backoff_wait(consecutive_errors)
 
         logger.info("Embedding worker stopped")
 
-    async def _process_batch(self, posts: list[Content]) -> None:
-        """Process a batch of content items: generate embeddings and store in Qdrant.
-
-        Args:
-            posts: List of Content objects to process.
-        """
-
-        # Filter out posts with empty content and build points list
-        points: list[tuple[int, str, int]] = []
-        failed_ids: list[int] = []
-
-        for post in posts:
-            # Build text to embed from content and/or transcription
-            text_to_embed = ""
-
-            # Get stripped values, handling None cases
-            content_text = post.content.strip() if post.content else ""
-            transcription_text = post.transcription.strip() if post.transcription else ""
-
-            has_content = bool(content_text)
-            has_transcription = bool(transcription_text)
-
-            if has_content and has_transcription:
-                text_to_embed = f"Description: {content_text}\nTranscription: {transcription_text}"
-            elif has_content:
-                text_to_embed = content_text
-            elif has_transcription:
-                text_to_embed = transcription_text
-
-            if not text_to_embed:
-                logger.debug(
-                    "Content id=%s has no valid text content or transcription, skipping embedding",
-                    post.id,
-                )
-                failed_ids.append(post.id)
-                continue
-
-            points.append((post.id, text_to_embed, post.account_id))
-
-        if not points:
-            logger.debug("No valid content to embed in this batch")
-            # Mark failed posts as embedded to avoid reprocessing empty content
-            if failed_ids:
-                await self.db.mark_content_embedded(failed_ids)
-            return
-
-        # Generate embeddings and upsert to Qdrant
-        try:
-            await self.qdrant.upsert_batch(points)
-
-            # Mark all successfully embedded content as embedded in PostgreSQL
-            embedded_ids = [p[0] for p in points]
-            await self.db.mark_content_embedded(embedded_ids)
-
-            logger.info(
-                "Successfully embedded %d content items",
-                len(embedded_ids),
-            )
-
-        except Exception as e:
-            logger.error(
-                "Failed to process embedding batch: %s",
-                e,
-                exc_info=True,
-            )
-
-            # Log individual failed items for debugging
-            for post_id, text, account_id in points:
-                logger.debug(
-                    "Failed to embed content id=%s (account_id=%s)",
-                    post_id,
-                    account_id,
-                )
-
-            # Still mark failed items to prevent infinite retry loops
-            # In production, you might want to implement a separate error queue
-            embedded_ids = [p[0] for p in points]
-            await self.db.mark_content_embedded(embedded_ids)
-
-            # Re-raise to trigger backoff in the main loop
-            raise
-
-        # Mark posts with empty content as embedded (to skip them in future)
-        if failed_ids:
-            await self.db.mark_content_embedded(failed_ids)
-            logger.debug(
-                "Marked %d posts with empty content as embedded (skipped)",
-                len(failed_ids),
-            )
-
 
 async def run_embedding_worker() -> None:
-    """Entry point for the embedding worker service.
-
-    Initializes all dependencies and starts the worker loop.
-    This function is intended to be called from the main() block.
-    """
     settings = load_settings()
 
     logger.info("Starting embedding worker")
 
-    # Initialize database
     db = Database(settings.db_url)
     await db.init_db()
 
-    # Initialize Qdrant service
     qdrant = QdrantService(settings)
     try:
         await qdrant.initialize()
         logger.info("Qdrant service initialized")
     except Exception as e:
         logger.error("Failed to initialize Qdrant: %s", e)
-        logger.warning(
-            "Embedding worker cannot function without Qdrant - exiting"
-        )
+        logger.warning("Embedding worker cannot function without Qdrant - exiting")
         await db.close()
         return
 
-    # Create and run worker with configured settings
     worker = EmbeddingWorker(
         db=db,
         qdrant=qdrant,
@@ -280,17 +458,18 @@ async def run_embedding_worker() -> None:
         batch_size=settings.embedding_batch_size,
         poll_interval=5,
     )
-    # Set priority mode from configuration (default: True for recent content first)
     worker.priority_mode = settings.embedding_priority_mode
 
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, worker.handle_shutdown)
-    signal.signal(signal.SIGTERM, worker.handle_shutdown)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, worker.handle_shutdown)
+        except NotImplementedError:
+            signal.signal(sig, worker.handle_shutdown)
 
     try:
         await worker.run()
     finally:
-        # Cleanup
         await qdrant.close()
         await db.close()
         logger.info("Resources cleaned up")

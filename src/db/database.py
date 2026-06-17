@@ -1,16 +1,14 @@
-"""
-Asynchronous CRUD operations for accounts and content using SQLAlchemy 2.0.
-"""
-
 import asyncio
 import functools
 import logging
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Sequence, TypeVar
+from typing import Any, Callable, Sequence, TypeVar, cast
 
 from sqlalchemy import case, func, select, update, text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.sql.expression import Select
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -23,7 +21,6 @@ from src.db.models import Base, Account, Content
 
 logger = logging.getLogger(__name__)
 
-# Type variable for generic async function signature
 T = TypeVar("T")
 
 
@@ -31,23 +28,6 @@ def with_retry_on_deadlock(
     max_retries: int = 3,
     base_delay: float = 0.5,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """
-    Decorator to retry database operations on deadlock or serialization failure.
-
-    Catches SQLAlchemy OperationalError and DBAPIError with specific PostgreSQL error codes:
-    - 40P01: deadlock detected
-    - 40001: serialization failure
-
-    Implements exponential backoff with jitter to avoid thundering herd.
-
-    Args:
-        max_retries: Maximum number of retry attempts (default: 3).
-        base_delay: Base delay in seconds for exponential backoff (default: 0.5).
-
-    Returns:
-        Decorated async function with retry logic.
-    """
-
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -58,17 +38,14 @@ def with_retry_on_deadlock(
                     return await func(*args, **kwargs)
                 except (OperationalError, DBAPIError) as e:
                     last_exception = e
-                    # Extract error message from exception or its orig attribute
                     error_msg = str(e).lower()
                     if hasattr(e, "orig") and e.orig is not None:
                         error_msg += " " + str(e.orig).lower()
 
-                    # Check for deadlock (40P01) or serialization failure (40001)
                     is_deadlock = "40p01" in error_msg or "deadlock detected" in error_msg
                     is_serialization = "40001" in error_msg or "serialization failure" in error_msg
 
                     if not (is_deadlock or is_serialization):
-                        # Not a retryable error, re-raise immediately
                         raise
 
                     if attempt == max_retries:
@@ -79,7 +56,6 @@ def with_retry_on_deadlock(
                         )
                         raise
 
-                    # Exponential backoff with jitter: 0.5 * (2 ** attempt) + random jitter
                     delay = base_delay * (2 ** attempt)
                     jitter = random.uniform(0, 0.1)
                     total_delay = delay + jitter
@@ -94,7 +70,6 @@ def with_retry_on_deadlock(
                     )
                     await asyncio.sleep(total_delay)
 
-            # This should never be reached, but satisfies type checker
             if last_exception is not None:
                 raise last_exception
 
@@ -104,21 +79,7 @@ def with_retry_on_deadlock(
 
 
 class Database:
-    """Asynchronous PostgreSQL connection manager."""
-
     def __init__(self, db_url: str, echo: bool = False) -> None:
-        """
-        Initialize the database manager.
-
-        Args:
-            db_url: Connection string in postgresql+asyncpg:// format.
-            echo: Enable SQL query logging (for debugging).
-        """
-
-        # command_timeout is reduced to 60s for more responsive query termination.
-        # pool_timeout prevents infinite blocking when the connection pool is exhausted.
-        # server_settings configure PostgreSQL-level timeouts to avoid silent hangs
-        # on locks or idle transactions over high-latency VPN tunnels (Tailscale).
         self.engine = create_async_engine(
             db_url,
             echo=echo,
@@ -146,64 +107,29 @@ class Database:
         base_delay: float = 1.0,
         timeout: float = 120.0,
     ) -> None:
-        """
-        Create all tables defined in the models (if they don't exist).
-
-        Implements retry with exponential backoff and jitter for resilience
-        against temporary network or database unavailability during startup.
-        Also enforces an overall timeout to prevent indefinite blocking.
-
-        Args:
-            max_retries: Maximum number of retry attempts (default: 5).
-            base_delay: Base delay in seconds for exponential backoff (default: 1.0).
-            timeout: Overall timeout in seconds for the entire initialization process (default: 120.0).
-
-        Raises:
-            RuntimeError: If initialization fails after all retries or times out.
-        """
-
         last_exception: Exception | None = None
         start_time = asyncio.get_event_loop().time()
 
         for attempt in range(1, max_retries + 1):
             try:
-                # ===================================================================
-                # STAGE 1: Core Setup (Transactional)
-                # ===================================================================
-                # Use engine.begin() for automatic transaction management
                 async with self.engine.begin() as conn:
-                    # Create SQLAlchemy-managed tables
                     await conn.run_sync(Base.metadata.create_all)
 
-                    # Initialize Apache AGE extension and graph
                     try:
-                        # Create extension if not exists
-                        await conn.execute(
-                            text("CREATE EXTENSION IF NOT EXISTS age;")
-                        )
-                        # Load AGE library
+                        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
                         await conn.execute(text("LOAD 'age';"))
-                        # Set search path for AGE
                         await conn.execute(
-                            text(
-                                'SET search_path = ag_catalog, "$user", public;'
-                            )
+                            text('SET search_path = ag_catalog, "$user", public;')
                         )
-                        # Create the base graph (ignore if already exists)
                         await conn.execute(
                             text(
-                                "SELECT create_graph('telegram_graph') WHERE NOT EXISTS (SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');"
+                                "SELECT create_graph('telegram_graph') WHERE NOT EXISTS "
+                                "(SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');"
                             )
                         )
 
-                        # Initialize vertex labels for the graph
                         vertex_labels = [
-                            "Actor",
-                            "Entity",
-                            "Event",
-                            "Place",
-                            "Account",
-                            "Content",
+                            "Actor", "Entity", "Event", "Place", "Account", "Content",
                         ]
                         for label in vertex_labels:
                             try:
@@ -220,74 +146,39 @@ class Database:
                                     END
                                     $$;
                                 """))
-                                logger.debug(
-                                    "Ensured vertex label exists: %s", label
-                                )
+                                logger.debug("Ensured vertex label exists: %s", label)
                             except Exception as e:
-                                logger.warning(
-                                    "Failed to create vertex label %s: %s",
-                                    label,
-                                    e,
-                                )
+                                logger.warning("Failed to create vertex label %s: %s", label, e)
 
-                        logger.info(
-                            "Apache AGE extension and graph initialized"
-                        )
+                        logger.info("Apache AGE extension and graph initialized")
                     except Exception as e:
                         logger.error("Failed to initialize Apache AGE: %s", e)
                         raise
-                # Transaction is automatically committed when the context exits
 
-                # ===================================================================
-                # STAGE 2: Graph Indexes (Non-transactional)
-                # ===================================================================
-                # Use connect() without begin() for manual transaction control
                 async with self.engine.connect() as conn:
-                    labels = [
-                        "Actor",
-                        "Entity",
-                        "Event",
-                        "Place",
-                        "Account",
-                        "Content",
-                    ]
+                    labels = ["Actor", "Entity", "Event", "Place", "Account", "Content"]
                     for label in labels:
                         try:
-                            # B-Tree index using agtype_access_operator for @> operator (optimal for id lookups)
                             await conn.execute(text(f"""
                                 CREATE INDEX IF NOT EXISTS idx_{label.lower()}_id
                                 ON telegram_graph."{label}"
                                 USING btree (agtype_access_operator(properties, '"id"'));
                             """))
                         except Exception as e:
-                            logger.debug(
-                                "Skipped index creation for %s: %s", label, e
-                            )
+                            logger.debug("Skipped index creation for %s: %s", label, e)
 
-                    # Explicitly commit the index creations (connection is not in autocommit mode)
                     await conn.commit()
 
-                # ===================================================================
-                # STAGE 3: Maintenance (Autocommit)
-                # ===================================================================
-                # Create a separate connection with AUTOCOMMIT isolation level
-                # VACUUM cannot run inside a transaction block
                 async with self.engine.connect() as conn:
-                    # Set autocommit BEFORE executing any statements
-                    conn = await conn.execution_options(
-                        isolation_level="AUTOCOMMIT"
-                    )
+                    conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
                     try:
                         await conn.execute(text("VACUUM ANALYZE;"))
                         logger.info("VACUUM ANALYZE completed successfully")
                     except Exception as e:
-                        # VACUUM failure should not crash the entire startup
-                        logger.warning(
-                            "VACUUM ANALYZE failed (non-critical): %s", e
-                        )
+                        logger.warning("VACUUM ANALYZE failed (non-critical): %s", e)
 
                 logger.info("Database initialization successful")
-                return  # Success, exit the retry loop
+                return
 
             except Exception as e:
                 last_exception = e
@@ -301,7 +192,6 @@ class Database:
                         f"Database initialization failed after {max_retries} attempts"
                     ) from e
 
-                # Check if we've exceeded the overall timeout
                 elapsed = asyncio.get_event_loop().time() - start_time
                 if elapsed >= timeout:
                     logger.error(
@@ -313,11 +203,8 @@ class Database:
                         f"Database initialization timed out after {elapsed:.1f} seconds"
                     ) from last_exception
 
-                # Exponential backoff with jitter to avoid thundering herd
-                delay = min(
-                    base_delay * (2 ** (attempt - 1)), 60
-                )  # Cap at 60 seconds
-                jitter = random.uniform(0, delay * 0.1)  # 10% jitter
+                delay = min(base_delay * (2 ** (attempt - 1)), 60)
+                jitter = random.uniform(0, delay * 0.1)
                 total_delay = delay + jitter
 
                 logger.warning(
@@ -330,11 +217,6 @@ class Database:
                 await asyncio.sleep(total_delay)
 
     async def reset_orphaned_processing_accounts(self) -> None:
-        """Reset all accounts with status='processing' back to 'pending'.
-
-        This recovers from crashes/restarts where accounts were left in processing state.
-        Only affects TELEGRAM platform accounts to prevent status leakage to other platforms.
-        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
@@ -343,8 +225,8 @@ class Database:
                     .where(Account.platform == "TELEGRAM")
                     .values(status="pending")
                 )
-                result = await session.execute(stmt)
-                count = result.rowcount  # type: ignore[attr-defined]
+                result = cast(CursorResult, await session.execute(stmt))
+                count = result.rowcount
 
                 if count > 0:
                     logger.info(
@@ -355,21 +237,11 @@ class Database:
                     logger.debug("No orphaned processing accounts found")
 
     async def close(self) -> None:
-        """Close all database connections."""
         await self.engine.dispose()
         logger.info("Database connections closed")
 
     @with_retry_on_deadlock()
     async def count_pending_creator_accounts(self, platform: str) -> int:
-        """
-        Count accounts with pending status for a specific platform.
-
-        Args:
-            platform: Platform name (e.g., 'INSTAGRAM', 'YOUTUBE').
-
-        Returns:
-            Number of pending accounts for the specified platform.
-        """
         async with self.async_session() as session:
             stmt = (
                 select(func.count(Account.id))
@@ -384,26 +256,10 @@ class Database:
     async def claim_creator_accounts(
         self, platforms: list[str], batch_size: int, status_threshold_hours: int
     ) -> list[Account]:
-        """
-        Atomically fetch and mark accounts as 'processing' using CTE with FOR UPDATE SKIP LOCKED.
-
-        This method implements a deadlock-resistant claiming mechanism for creator accounts
-        across multiple platforms. It uses a CTE subquery to select eligible accounts
-        and atomically updates their status to prevent race conditions.
-
-        Args:
-            platforms: List of platform names to claim accounts from.
-            batch_size: Maximum number of accounts to claim in one batch.
-            status_threshold_hours: Hours after which failed accounts can be retried.
-
-        Returns:
-            List of claimed Account objects with status set to 'processing'.
-        """
         threshold_time = datetime.now(timezone.utc) - timedelta(hours=status_threshold_hours)
 
         async with self.async_session() as session:
             async with session.begin():
-                # Build CTE subquery to select eligible accounts
                 subq = (
                     select(Account.id)
                     .where(Account.platform.in_(platforms))
@@ -420,7 +276,6 @@ class Database:
                     .cte("eligible_accounts")
                 )
 
-                # Atomically update selected accounts
                 stmt = (
                     update(Account)
                     .where(Account.id.in_(select(subq.c.id)))
@@ -445,13 +300,6 @@ class Database:
     async def update_creator_account_status(
         self, account_id: int, status: str
     ) -> None:
-        """
-        Update the status and updated_at timestamp for a specific account.
-
-        Args:
-            account_id: The database ID of the account to update.
-            status: New status value (e.g., 'pending', 'processing', 'completed', 'failed').
-        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
@@ -459,9 +307,9 @@ class Database:
                     .where(Account.id == account_id)
                     .values(status=status, updated_at=datetime.now(timezone.utc))
                 )
-                result = await session.execute(stmt)
+                result = cast(CursorResult, await session.execute(stmt))
 
-                if result.rowcount > 0:  # type: ignore[attr-defined]
+                if result.rowcount > 0:
                     logger.debug(
                         "Updated account id=%s status to '%s'",
                         account_id,
@@ -477,18 +325,6 @@ class Database:
     async def reset_orphaned_creator_accounts(
         self, platforms: list[str]
     ) -> int:
-        """
-        Reset accounts stuck in 'processing' status back to 'pending'.
-
-        This recovers from worker crashes or restarts where accounts were left
-        in processing state. Only affects accounts from the specified platforms.
-
-        Args:
-            platforms: List of platform names to reset accounts for.
-
-        Returns:
-            Number of accounts reset to 'pending' status.
-        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
@@ -497,8 +333,8 @@ class Database:
                     .where(Account.status == "processing")
                     .values(status="pending", updated_at=datetime.now(timezone.utc))
                 )
-                result = await session.execute(stmt)
-                reset_count = result.rowcount  # type: ignore[attr-defined]
+                result = cast(CursorResult, await session.execute(stmt))
+                reset_count = result.rowcount
 
                 if reset_count > 0:
                     logger.info(
@@ -512,20 +348,6 @@ class Database:
 
     @with_retry_on_deadlock()
     async def upsert_account(self, account_data: dict[str, Any]) -> Account:
-        """
-        Insert or update an account record.
-
-        Conflict is detected on the id field (Telegram channel_id).
-        On conflict, all mutable fields except the primary key are updated.
-        Status is preserved if it's already 'parsed' or 'ready_for_parsing'.
-
-        Args:
-            account_data: Dictionary with fields matching the Account model.
-
-        Returns:
-            The persisted Account object.
-        """
-
         stmt = insert(Account).values(**account_data)
         update_columns = {
             "username": stmt.excluded.username,
@@ -551,35 +373,18 @@ class Database:
         async with self.async_session() as session:
             async with session.begin():
                 await session.execute(stmt)
-                # Retrieve the current record (may have existed already)
                 account = await session.get(Account, account_data["id"])
 
                 if account is None:
-                    # Fallback manual creation (should not happen under normal circumstances)
                     account = Account(**account_data)
                     session.add(account)
                     await session.flush()
 
                 logger.debug("Upserted account: %s", account)
-
                 return account
 
     @with_retry_on_deadlock()
     async def upsert_content(self, content_data: dict[str, Any]) -> Content:
-        """
-        Insert or update a content record.
-
-        Conflict is detected on the composite unique key (account_id, platform_content_id).
-        On conflict, only metrics (views, comments, shares, reactions) are updated.
-        Content and published_at are preserved to avoid overwriting existing data.
-
-        Args:
-            content_data: Dictionary with fields matching the Content model.
-
-        Returns:
-            The persisted Content object.
-        """
-
         stmt = insert(Content).values(**content_data)
 
         update_columns = {
@@ -603,7 +408,6 @@ class Database:
             async with session.begin():
                 await session.execute(stmt)
 
-                # Retrieve the saved object
                 content = await self._get_content_by_unique(
                     session,
                     content_data["account_id"],
@@ -611,7 +415,6 @@ class Database:
                 )
 
                 if content is None:
-                    # Fallback manual creation if upsert failed unexpectedly
                     content = Content(**content_data)
                     session.add(content)
                     await session.flush()
@@ -622,7 +425,6 @@ class Database:
     async def _get_content_by_unique(
         self, session: AsyncSession, account_id: int, platform_content_id: str
     ) -> Content | None:
-        """Helper method to fetch a content by its composite natural key."""
         stmt = select(Content).where(
             Content.account_id == account_id,
             Content.platform_content_id == platform_content_id,
@@ -634,18 +436,6 @@ class Database:
     async def get_accounts_batch(
         self, account_ids: Sequence[int]
     ) -> dict[int, Account]:
-        """
-        Return a dictionary of existing accounts by a list of IDs.
-
-        Useful for checking which accounts are already in the DB before parsing.
-
-        Args:
-            account_ids: List of Telegram account IDs.
-
-        Returns:
-            Dictionary mapping account_id to Account object.
-        """
-
         if not account_ids:
             return {}
 
@@ -658,15 +448,6 @@ class Database:
     async def get_content_by_ids(
         self, content_ids: list[int]
     ) -> dict[int, Content]:
-        """
-        Fetch content by a list of content IDs with their associated accounts eagerly loaded.
-
-        Args:
-            content_ids: List of PostgreSQL content IDs (primary keys).
-
-        Returns:
-            Dictionary mapping content_id to Content object (with .account populated) for efficient lookup.
-        """
         if not content_ids:
             return {}
 
@@ -681,7 +462,6 @@ class Database:
             return {item.id: item for item in content_items}
 
     async def get_recent_content(self, limit: int = 100) -> list[Content]:
-        """Fetch recent content from the database for indexing."""
         async with self.async_session() as session:
             stmt = select(Content).order_by(Content.id.desc()).limit(limit)
             result = await session.execute(stmt)
@@ -690,35 +470,20 @@ class Database:
     async def get_unembedded_content(
         self, limit: int, priority_mode: bool
     ) -> list[Content]:
-        """
-        Fetch content that has not yet been embedded for vector search.
-
-        Queries the content table for records where is_embedded = False and
-        content is not NULL/empty.
-
-        Args:
-            limit: Maximum number of content items to return.
-            priority_mode: If True, sort by published_at DESC (most recent first).
-                           If False, sort by published_at ASC (oldest first).
-
-        Returns:
-            List of Content objects where is_embedded is False and content is not empty.
-        """
-
         async with self.async_session() as session:
-            # Build base query: is_embedded = False and content is not NULL/empty
-            stmt = select(Content).where(
-                Content.is_embedded == False,  # noqa: E712
-                Content.content.isnot(None),
-                Content.content != "",  # Filter out empty strings
+            stmt = (
+                select(Content)
+                .options(joinedload(Content.account))
+                .where(
+                    Content.is_embedded == False,
+                    Content.content.isnot(None),
+                    Content.content != "",
+                )
             )
 
-            # Apply sorting based on priority_mode
             if priority_mode:
-                # Priority mode: process most recent content first
                 stmt = stmt.order_by(Content.published_at.desc())
             else:
-                # Default: process oldest content first (FIFO)
                 stmt = stmt.order_by(Content.published_at.asc())
 
             stmt = stmt.limit(limit)
@@ -727,15 +492,6 @@ class Database:
 
     @with_retry_on_deadlock()
     async def mark_content_embedded(self, content_ids: list[int]) -> None:
-        """Mark multiple content items as embedded in a single batch update.
-
-        Updates multiple records at once, setting is_embedded = True and
-        updated_at = datetime.now(timezone.utc).
-
-        Args:
-            content_ids: List of content IDs to mark as embedded.
-        """
-
         if not content_ids:
             return
 
@@ -749,46 +505,49 @@ class Database:
                         updated_at=datetime.now(timezone.utc),
                     )
                 )
-                result = await session.execute(stmt)
+                result = cast(CursorResult, await session.execute(stmt))
 
-                if result.rowcount > 0:  # type: ignore[attr-defined]
+                if result.rowcount > 0:
                     logger.debug(
                         "Marked %d content items as embedded",
-                        result.rowcount,  # type: ignore[attr-defined]
+                        result.rowcount,
                     )
                 else:
                     logger.warning(
                         "No content items found to mark as embedded for IDs: %s",
-                        content_ids[:10],  # Log first 10 IDs to avoid huge logs
+                        content_ids[:10],
                     )
+
+    async def _build_ungraphed_query(
+        self,
+        require_content: bool,
+        priority_mode: bool,
+    ) -> Select[tuple[Content]]:
+        conditions = [Content.is_graph_extracted == False]
+
+        if require_content:
+            conditions.append(Content.content.isnot(None))
+            conditions.append(Content.content != "")
+
+        stmt = select(Content).where(*conditions)
+
+        if priority_mode:
+            stmt = stmt.order_by(Content.published_at.desc())
+        elif require_content:
+            stmt = stmt.order_by(Content.published_at.asc())
+        else:
+            stmt = stmt.order_by(Content.id.asc())
+
+        return stmt
 
     async def get_unextracted_content(
         self, limit: int = 50, priority_mode: bool = False
     ) -> list[Content]:
-        """
-        Fetch content that has not yet been extracted to knowledge graph.
-
-        Args:
-            limit: Maximum number of content to return.
-            priority_mode: If True, order by published_at DESC (most recent first).
-                          If False, order by id ASC (oldest first).
-
-        Returns:
-            List of Content objects where is_graph_extracted is False.
-        """
-
         async with self.async_session() as session:
-            stmt = select(Content).where(
-                Content.is_graph_extracted == False
-            )  # noqa: E712
-
-            if priority_mode:
-                # Priority mode: process most recent content first (for search relevance)
-                stmt = stmt.order_by(Content.published_at.desc())
-            else:
-                # Default: process oldest content first (FIFO)
-                stmt = stmt.order_by(Content.id.asc())
-
+            stmt = await self._build_ungraphed_query(
+                require_content=False,
+                priority_mode=priority_mode,
+            )
             stmt = stmt.limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
@@ -796,127 +555,56 @@ class Database:
     async def get_ungraphed_content(
         self, limit: int, priority_mode: bool
     ) -> list[Content]:
-        """
-        Fetch content that has not yet been processed for knowledge graph extraction.
-
-        Queries the content table for records where is_graph_extracted = False and
-        content is not NULL/empty.
-
-        Args:
-            limit: Maximum number of content items to return.
-            priority_mode: If True, sort by published_at DESC (most recent first).
-                           If False, sort by published_at ASC (oldest first).
-
-        Returns:
-            List of Content objects where is_graph_extracted is False and content is not empty.
-        """
-
         async with self.async_session() as session:
-            # Build base query: is_graph_extracted = False and content is not NULL/empty
-            stmt = select(Content).where(
-                Content.is_graph_extracted == False,  # noqa: E712
-                Content.content.isnot(None),
-                Content.content != "",  # Filter out empty strings
+            stmt = await self._build_ungraphed_query(
+                require_content=True,
+                priority_mode=priority_mode,
             )
-
-            # Apply sorting based on priority_mode
-            if priority_mode:
-                # Priority mode: process most recent content first
-                stmt = stmt.order_by(Content.published_at.desc())
-            else:
-                # Default: process oldest content first (FIFO)
-                stmt = stmt.order_by(Content.published_at.asc())
-
             stmt = stmt.limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
     @with_retry_on_deadlock()
-    async def mark_content_extracted(self, content_id: int) -> None:
-        """Mark a content as extracted (is_graph_extracted = True).
-
-        Uses a direct atomic UPDATE statement to avoid FOR UPDATE issues
-        with outer joins caused by lazy="joined" relationships.
-
-        Args:
-            content_id: The database ID of the content to mark as extracted.
-        """
+    async def _mark_content_graph_extracted(
+        self, content_id: int, update_updated_at: bool
+    ) -> None:
+        values: dict[str, Any] = {"is_graph_extracted": True}
+        if update_updated_at:
+            values["updated_at"] = datetime.now(timezone.utc)
 
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
                     update(Content)
                     .where(Content.id == content_id)
-                    .values(is_graph_extracted=True)
+                    .values(**values)
                 )
-                result = await session.execute(stmt)
+                result = cast(CursorResult, await session.execute(stmt))
 
-                if result.rowcount > 0:  # type: ignore[attr-defined]
+                if result.rowcount > 0:
                     logger.debug(
-                        "Marked content id=%s as extracted", content_id
+                        "Marked content id=%s as graph extracted", content_id
                     )
                 else:
                     logger.warning(
-                        "Content id=%s not found when marking as extracted",
+                        "Content id=%s not found when marking as graph extracted",
                         content_id,
                     )
 
     @with_retry_on_deadlock()
+    async def mark_content_extracted(self, content_id: int) -> None:
+        await self._mark_content_graph_extracted(content_id, update_updated_at=False)
+
+    @with_retry_on_deadlock()
     async def mark_content_graphed(self, content_id: int) -> None:
-        """Mark a content as processed for knowledge graph (is_graph_extracted = True).
-
-        Updates a single record setting is_graph_extracted = True and
-        updated_at = datetime.now(timezone.utc).
-
-        Args:
-            content_id: The database ID of the content to mark as graphed.
-        """
-
-        async with self.async_session() as session:
-            async with session.begin():
-                stmt = (
-                    update(Content)
-                    .where(Content.id == content_id)
-                    .values(
-                        is_graph_extracted=True,
-                        updated_at=datetime.now(timezone.utc),
-                    )
-                )
-                result = await session.execute(stmt)
-
-                if result.rowcount > 0:  # type: ignore[attr-defined]
-                    logger.debug("Marked content id=%s as graphed", content_id)
-                else:
-                    logger.warning(
-                        "Content id=%s not found when marking as graphed",
-                        content_id,
-                    )
+        await self._mark_content_graph_extracted(content_id, update_updated_at=True)
 
     @with_retry_on_deadlock()
     async def get_random_pending_account(
         self, require_hash: bool = False
     ) -> Account | None:
-        """
-        Fetch a random account with status='pending' and mark it as 'processing'.
-
-        Uses FOR UPDATE SKIP LOCKED to avoid race conditions between workers.
-        After marking, the transaction is committed so the account is immediately
-        visible to other workers as 'processing'.
-
-        Args:
-            require_hash: If True, only return accounts with non-null access_hash.
-                This allows "weak" accounts to fetch only accounts that can be
-                accessed directly without global search.
-
-        Returns:
-            The selected Account entity, or None if no pending accounts exist.
-        """
-
         async with self.async_session() as session:
-            # Start transaction with row-level lock
             async with session.begin():
-                # Build query with optional hash requirement
-                # Always filter by TELEGRAM platform to prevent status leakage
                 stmt = select(Account).where(
                     Account.status == "pending",
                     Account.platform == "TELEGRAM",
@@ -924,7 +612,6 @@ class Database:
                 if require_hash:
                     stmt = stmt.where(Account.access_hash.is_not(None))
 
-                # Get random pending account and lock it
                 stmt = (
                     stmt.order_by(func.random())
                     .limit(1)
@@ -945,49 +632,45 @@ class Database:
 
                 return account
 
-    @with_retry_on_deadlock()
-    async def mark_account_processed(self, account_id: int) -> None:
-        """Mark an account as successfully processed (status='ready_for_parsing').
-
-        Only affects TELEGRAM platform accounts to prevent status leakage.
-        """
+    async def _set_telegram_account_status(
+        self, account_id: int, status: str
+    ) -> None:
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    select(Account)
+                    update(Account)
                     .where(Account.id == account_id)
                     .where(Account.platform == "TELEGRAM")
-                    .with_for_update()
+                    .values(status=status, updated_at=datetime.now(timezone.utc))
                 )
-                result = await session.execute(stmt)
-                account = result.scalar_one_or_none()
+                result = cast(CursorResult, await session.execute(stmt))
 
-                if account is not None:
-                    account.status = "ready_for_parsing"
+                if result.rowcount > 0:
                     logger.debug(
-                        "Marked account id=%s as processed", account_id
+                        "Marked account id=%s as %s", account_id, status
+                    )
+                else:
+                    logger.debug(
+                        "Account id=%s not found when setting status to %s",
+                        account_id,
+                        status,
                     )
 
     @with_retry_on_deadlock()
+    async def mark_account_processed(self, account_id: int) -> None:
+        await self._set_telegram_account_status(account_id, "ready_for_parsing")
+
+    @with_retry_on_deadlock()
     async def mark_account_rejected(self, account_id: int) -> None:
-        """Mark an account as rejected (status='rejected').
+        await self._set_telegram_account_status(account_id, "rejected")
 
-        Only affects TELEGRAM platform accounts to prevent status leakage.
-        """
-        async with self.async_session() as session:
-            async with session.begin():
-                stmt = (
-                    select(Account)
-                    .where(Account.id == account_id)
-                    .where(Account.platform == "TELEGRAM")
-                    .with_for_update()
-                )
-                result = await session.execute(stmt)
-                account = result.scalar_one_or_none()
+    @with_retry_on_deadlock()
+    async def mark_account_parsed(self, account_id: int) -> None:
+        await self._set_telegram_account_status(account_id, "parsed")
 
-                if account is not None:
-                    account.status = "rejected"
-                    logger.debug("Marked account id=%s as rejected", account_id)
+    @with_retry_on_deadlock()
+    async def mark_account_pending(self, account_id: int) -> None:
+        await self._set_telegram_account_status(account_id, "pending")
 
     @with_retry_on_deadlock()
     async def get_account_for_parsing(
@@ -995,24 +678,10 @@ class Database:
         session_index: int | None = None,
         total_sessions: int | None = None,
     ) -> Account | None:
-        """Fetch an account ready for CONTENT PARSING and mark as processing.
-
-        Implements session-account sharding to reuse Telethon's local SQLite cache
-        and avoid FloodWait on username resolution. Each session claims accounts
-        from its shard first, then falls back to any available account.
-
-        Args:
-            session_index: Optional zero-based index of the current session (0 to total_sessions-1).
-            total_sessions: Optional total number of sessions for sharding.
-
-        Returns:
-            The claimed Account entity, or None if no accounts are available.
-        """
         async with self.async_session() as session:
             async with session.begin():
                 account = None
 
-                # Stage 1: Try to claim an account from this session's shard
                 if (
                     session_index is not None
                     and total_sessions is not None
@@ -1022,9 +691,8 @@ class Database:
                         select(Account)
                         .where(Account.status == "ready_for_parsing")
                         .where(Account.platform == "TELEGRAM")
-                        .where(Account.is_author_blog == True)  # noqa: E712
+                        .where(Account.is_author_blog == True)
                         .where(Account.access_hash.is_not(None))
-                        # Shard condition: Account.id % total_sessions == session_index
                         .where(
                             func.mod(Account.id, total_sessions)
                             == session_index
@@ -1053,14 +721,11 @@ class Database:
                         total_sessions,
                     )
 
-                # Stage 2: Fallback - claim ANY available account
-                # This prevents idle workers when some sessions are in cooldown
-                # Always filter by TELEGRAM platform to prevent status leakage
                 fallback_stmt = (
                     select(Account)
                     .where(Account.status == "ready_for_parsing")
                     .where(Account.platform == "TELEGRAM")
-                    .where(Account.is_author_blog == True)  # noqa: E712
+                    .where(Account.is_author_blog == True)
                     .where(Account.access_hash.is_not(None))
                     .order_by(func.random())
                     .limit(1)
@@ -1082,97 +747,30 @@ class Database:
                 return account
 
     @with_retry_on_deadlock()
-    async def mark_account_parsed(self, account_id: int) -> None:
-        """Mark an account as completely parsed (content are saved).
-
-        Only affects TELEGRAM platform accounts to prevent status leakage.
-        """
-        async with self.async_session() as session:
-            async with session.begin():
-                stmt = (
-                    select(Account)
-                    .where(Account.id == account_id)
-                    .where(Account.platform == "TELEGRAM")
-                    .with_for_update()
-                )
-                result = await session.execute(stmt)
-                account = result.scalar_one_or_none()
-
-                if account is not None:
-                    account.status = "parsed"
-                    logger.debug(
-                        "Marked account id=%s as COMPLETELY PARSED", account_id
-                    )
-
-    @with_retry_on_deadlock()
-    async def mark_account_pending(self, account_id: int) -> None:
-        """Return an account to pending status (e.g., if a worker failed due to a shadowban).
-
-        Only affects TELEGRAM platform accounts to prevent status leakage.
-        """
-        async with self.async_session() as session:
-            async with session.begin():
-                stmt = (
-                    select(Account)
-                    .where(Account.id == account_id)
-                    .where(Account.platform == "TELEGRAM")
-                    .with_for_update()
-                )
-                result = await session.execute(stmt)
-                account = result.scalar_one_or_none()
-
-                if account is not None:
-                    account.status = "pending"
-                    logger.debug(
-                        "Returned account id=%s to pending state", account_id
-                    )
-
-    @with_retry_on_deadlock()
     async def update_account_access_hash(
         self, account_id: int, access_hash: int
     ) -> None:
-        """Update the access_hash for an account.
-
-        This is used to store the session-local correct access_hash after
-        successful resolution by username.
-
-        Only affects TELEGRAM platform accounts to prevent status leakage.
-
-        Args:
-            account_id: Telegram account ID.
-            access_hash: The resolved access_hash for this session.
-        """
         async with self.async_session() as session:
             async with session.begin():
                 stmt = (
-                    select(Account)
+                    update(Account)
                     .where(Account.id == account_id)
                     .where(Account.platform == "TELEGRAM")
-                    .with_for_update()
+                    .values(access_hash=access_hash, updated_at=datetime.now(timezone.utc))
                 )
-                result = await session.execute(stmt)
-                account = result.scalar_one_or_none()
+                result = cast(CursorResult, await session.execute(stmt))
 
-                if account is not None:
-                    account.access_hash = access_hash
+                if result.rowcount > 0:
                     logger.debug(
                         "Updated access_hash for account id=%s", account_id
                     )
+                else:
+                    logger.debug(
+                        "Account id=%s not found when updating access_hash",
+                        account_id,
+                    )
 
     async def get_latest_message_id(self, account_id: int) -> int | None:
-        """Fetch the latest (highest) message ID for a given account.
-
-        This is used to implement smart skip logic in the parser,
-        allowing us to avoid re-fetching messages we already have.
-        Only considers rows where message_id is not NULL.
-
-        Args:
-            account_id: Telegram account ID.
-
-        Returns:
-            The highest message_id for the account, or None if no content exist
-            or all message_id values are NULL.
-        """
         async with self.async_session() as session:
             stmt = (
                 select(func.max(Content.message_id))
@@ -1182,4 +780,4 @@ class Database:
                 )
             )
             result = await session.execute(stmt)
-            return result.scalar()  # Returns None if no rows exist
+            return result.scalar()

@@ -26,6 +26,8 @@ ID_PREFIX_TO_LABEL: dict[str, str] = {
     "product_": "Entity",
     "topic_": "Entity",
     "hashtag_": "Entity",
+    "entity_": "Entity",
+    "event_": "Event",
     "publication_": "Event",
     "collaboration_": "Event",
     "place_": "Place",
@@ -621,6 +623,105 @@ class GraphRepository:
         )
 
         return all_edges
+
+    async def save_extraction_result(
+        self, post_id: int, result: Any
+    ) -> None:
+        entity_id_to_label: dict[str, str] = {}
+        for entity in result.entities:
+            entity_id_to_label[entity.id] = entity.label
+            try:
+                props: dict[str, Any] = {
+                    "id": entity.id,
+                    "name": entity.name,
+                    **entity.get_property_dict(),
+                }
+                await self.upsert_graph_node(
+                    label=entity.label,
+                    properties=props,
+                    merge_key="id",
+                )
+                logger.debug(
+                    "Upserted entity: label=%s, id=%s",
+                    entity.label,
+                    entity.id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to upsert entity (post_id=%d, label=%s, id=%s): %s",
+                    post_id,
+                    entity.label,
+                    entity.id,
+                    exc,
+                )
+                raise
+
+        pub_node_id: str | None = None
+        for entity in result.entities:
+            if entity.id.startswith("event_publication_"):
+                pub_node_id = entity.id
+                break
+
+        if pub_node_id is not None:
+            pub_label = entity_id_to_label.get(pub_node_id, "Event")
+            for entity in result.entities:
+                if entity.id == pub_node_id:
+                    continue
+                try:
+                    await self.upsert_graph_edge(
+                        start_label=pub_label,
+                        start_merge_key="id",
+                        start_merge_val=pub_node_id,
+                        edge_label="MENTIONS",
+                        end_label=entity.label,
+                        end_merge_key="id",
+                        end_merge_val=entity.id,
+                        edge_properties={},
+                    )
+                    logger.debug(
+                        "Created MENTIONS edge: %s -[:MENTIONS]-> %s(%s)",
+                        pub_node_id,
+                        entity.label,
+                        entity.id,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed MENTIONS edge (post_id=%d, entity_id=%s): %s",
+                        post_id,
+                        entity.id,
+                        exc,
+                    )
+
+        for relation in result.relations:
+            start_label = entity_id_to_label.get(relation.source_id, "Entity")
+            end_label = entity_id_to_label.get(relation.target_id, "Entity")
+            try:
+                await self.upsert_graph_edge(
+                    start_label=start_label,
+                    start_merge_key="id",
+                    start_merge_val=relation.source_id,
+                    edge_label=relation.relation_type,
+                    end_label=end_label,
+                    end_merge_key="id",
+                    end_merge_val=relation.target_id,
+                    edge_properties=relation.get_property_dict(),
+                )
+                logger.debug(
+                    "Upserted relation: %s(%s)-[%s]->%s(%s)",
+                    start_label,
+                    relation.source_id,
+                    relation.relation_type,
+                    end_label,
+                    relation.target_id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed relation upsert (post_id=%d, type=%s): %s",
+                    post_id,
+                    relation.relation_type,
+                    exc,
+                )
+                raise
 
     async def execute_cypher(self, query: str) -> Any:
         result = await self._execute_in_transaction(text(query))

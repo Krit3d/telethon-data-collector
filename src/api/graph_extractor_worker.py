@@ -184,6 +184,17 @@ class GraphExtractionWorker:
         raw_metadata: dict = (
             post.raw_metadata if post.raw_metadata is not None else {}
         )
+        if post.transcription:
+            raw_metadata = {**raw_metadata, "transcription": post.transcription}
+
+        account_metadata: dict | None = None
+        if post.account:
+            account_metadata = (
+                post.account.raw_metadata.copy() if post.account.raw_metadata else {}
+            )
+            account_metadata["username"] = post.account.username
+            account_metadata["title"] = post.account.title
+            account_metadata["subscribers_count"] = post.account.subscribers_count
 
         try:
             await self.extractor.process_post(
@@ -195,6 +206,7 @@ class GraphExtractionWorker:
                 graph_repo=self.graph_repo,
                 qdrant=self.qdrant,
                 platform=post.account.platform if post.account else None,
+                account_metadata=account_metadata,
             )
         except Exception as e:
             # Log the full traceback for unrecoverable errors (validation, JSON parsing, API failures)
