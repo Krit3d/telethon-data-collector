@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 from src.config.config import Settings
 from src.graph.schema import (
     ExtractedEntity,
+    ExtractedRelation,
     OpenSPGExtractionResult,
     get_open_spg_llm_prompt,
 )
@@ -34,6 +36,8 @@ _DOMAIN_ENTITY_MAPPING = (
     'add property: {"key": "type", "value": "hashtag", "type": "text"}\n'
     "  - Publication (article, post, news piece, announcement, report) -> label: Event, "
     'add property: {"key": "type", "value": "publication", "type": "text"}\n'
+    "  - Collaboration (joint venture, co-authored post, advertising partnership, brand collaboration) -> label: Event, "
+    'add property: {"key": "type", "value": "collaboration", "type": "text"}\n'
     "  - Region (geographic area, country, city, district, state) -> label: Place, "
     'add property: {"key": "type", "value": "region", "type": "text"}\n\n'
     "Every extracted entity MUST include the 'type' marker property. "
@@ -112,7 +116,7 @@ class KnowledgeExtractor:
                                     "schema and classification rules strictly. "
                                     "Every entity MUST include a 'type' marker property indicating its "
                                     "domain classification (author, brand, product, topic, hashtag, "
-                                    "publication, region, or other)."
+                                    "publication, collaboration, region, or other)."
                                 ),
                             },
                             {"role": "user", "content": prompt},
@@ -277,7 +281,9 @@ class KnowledgeExtractor:
         author: ExtractedEntity,
         account_metadata: dict[str, Any],
     ) -> None:
-        field_map: dict[str, tuple[str, str]] = {
+        existing = {p.key for p in author.properties}
+
+        base_field_map: dict[str, tuple[str, str]] = {
             "follower_count": ("numeric", "follower_count"),
             "subscribers_count": ("numeric", "follower_count"),
             "engagement_rate": ("numeric", "engagement_rate"),
@@ -287,20 +293,126 @@ class KnowledgeExtractor:
             "title": ("text", "display_name"),
         }
 
-        existing = {p.key for p in author.properties}
-
-        for src_key, (prop_type, target_key) in field_map.items():
+        for src_key, (prop_type, target_key) in base_field_map.items():
             value = account_metadata.get(src_key)
             if value is not None and target_key not in existing:
                 try:
                     author.add_property(target_key, value, prop_type)
                 except (ValidationError, ValueError) as exc:
                     logger.warning(
-                        "Failed to enrich property %s for entity %s: %s",
+                        "Failed to enrich base property %s for entity %s: %s",
                         target_key,
                         author.id,
                         exc,
                     )
+
+        profile_field_map: dict[str, str] = {
+            "biography": "biography",
+            "category": "category",
+            "website": "website",
+            "link_in_bio": "link_in_bio",
+            "profile_url": "profile_url",
+        }
+
+        for src_key, target_key in profile_field_map.items():
+            value = account_metadata.get(src_key)
+            if value is not None and target_key not in existing:
+                try:
+                    author.add_property(target_key, str(value), "text")
+                except (ValidationError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to enrich profile property %s for entity %s: %s",
+                        target_key,
+                        author.id,
+                        exc,
+                    )
+
+        contacts = account_metadata.get("contacts")
+        if isinstance(contacts, dict):
+            contact_list_keys = (
+                "emails",
+                "phones",
+                "telegram_handles",
+                "telegram_channels",
+                "telegram_personal",
+                "advertising_emails",
+                "advertising_telegrams",
+            )
+            for ckey in contact_list_keys:
+                cval = contacts.get(ckey)
+                if isinstance(cval, list) and cval and ckey not in existing:
+                    joined = ", ".join(str(item) for item in cval)
+                    try:
+                        author.add_property(ckey, joined, "text")
+                    except (ValidationError, ValueError) as exc:
+                        logger.warning(
+                            "Failed to enrich contact property %s for entity %s: %s",
+                            ckey,
+                            author.id,
+                            exc,
+                        )
+
+        geo_data = account_metadata.get("geo_data")
+        if isinstance(geo_data, dict):
+            coords = geo_data.get("coordinates")
+            if (
+                isinstance(coords, list)
+                and len(coords) == 2
+                and all(isinstance(c, float) for c in coords)
+                and "coordinates" not in existing
+            ):
+                try:
+                    author.add_property("coordinates", coords, "geo")
+                except (ValidationError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to enrich geo property coordinates for entity %s: %s",
+                        author.id,
+                        exc,
+                    )
+
+            geo_text_keys: dict[str, str] = {
+                "city": "city",
+                "country": "country",
+            }
+            for gkey, gprop in geo_text_keys.items():
+                gval = geo_data.get(gkey)
+                if isinstance(gval, str) and gval and gprop not in existing:
+                    try:
+                        author.add_property(gprop, gval, "text")
+                    except (ValidationError, ValueError) as exc:
+                        logger.warning(
+                            "Failed to enrich geo property %s for entity %s: %s",
+                            gprop,
+                            author.id,
+                            exc,
+                        )
+
+        ext_links = account_metadata.get("external_links")
+        if isinstance(ext_links, list) and ext_links and "external_links" not in existing:
+            joined = ", ".join(str(link) for link in ext_links)
+            try:
+                author.add_property("external_links", joined, "text")
+            except (ValidationError, ValueError) as exc:
+                logger.warning(
+                    "Failed to enrich external_links for entity %s: %s",
+                    author.id,
+                    exc,
+                )
+
+        ext_platforms = account_metadata.get("external_platforms")
+        if isinstance(ext_platforms, dict) and ext_platforms and "external_platforms" not in existing:
+            try:
+                author.add_property(
+                    "external_platforms",
+                    json.dumps(ext_platforms, ensure_ascii=False),
+                    "text",
+                )
+            except (ValidationError, ValueError) as exc:
+                logger.warning(
+                    "Failed to enrich external_platforms for entity %s: %s",
+                    author.id,
+                    exc,
+                )
 
     @staticmethod
     def _enrich_publication_node(
@@ -359,6 +471,67 @@ class KnowledgeExtractor:
                     exc,
                 )
 
+        text_field_map: dict[str, str] = {
+            "music_title": "music_title",
+            "music_author": "music_author",
+            "accessibility_caption": "accessibility_caption",
+        }
+        for src_key, target_key in text_field_map.items():
+            value = raw_metadata.get(src_key)
+            if value is not None and target_key not in existing:
+                try:
+                    pub.add_property(target_key, str(value), "text")
+                except (ValidationError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to enrich property %s for entity %s: %s",
+                        target_key,
+                        pub.id,
+                        exc,
+                    )
+
+        hashtags = raw_metadata.get("hashtags")
+        if isinstance(hashtags, list) and hashtags and "hashtags" not in existing:
+            joined = ", ".join(str(tag) for tag in hashtags)
+            try:
+                pub.add_property("hashtags", joined, "text")
+            except (ValidationError, ValueError) as exc:
+                logger.warning(
+                    "Failed to enrich hashtags for entity %s: %s",
+                    pub.id,
+                    exc,
+                )
+
+        geo_data = raw_metadata.get("geo_data")
+        if isinstance(geo_data, dict):
+            loc_name = geo_data.get("name")
+            if isinstance(loc_name, str) and loc_name and "location_name" not in existing:
+                try:
+                    pub.add_property("location_name", loc_name, "text")
+                except (ValidationError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to enrich location_name for entity %s: %s",
+                        pub.id,
+                        exc,
+                    )
+
+            lat = geo_data.get("lat") or geo_data.get("latitude")
+            lng = geo_data.get("lng") or geo_data.get("longitude")
+            if (
+                lat is not None
+                and lng is not None
+                and isinstance(lat, (int, float))
+                and isinstance(lng, (int, float))
+                and "coordinates" not in existing
+            ):
+                try:
+                    pub.add_property("coordinates", [float(lat), float(lng)], "geo")
+                except (ValidationError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to enrich geo coordinates for entity %s: %s",
+                        pub.id,
+                        exc,
+                    )
+
     async def process_post(
         self,
         post_id: int,
@@ -370,6 +543,7 @@ class KnowledgeExtractor:
         qdrant: Any | None = None,
         platform: str | None = None,
         account_metadata: dict[str, Any] | None = None,
+        platform_content_id: str = "",
     ) -> None:
         logger.info("Processing post_id=%d for knowledge extraction", post_id)
 
@@ -383,7 +557,16 @@ class KnowledgeExtractor:
 
         platform_slug = platform.lower() if platform else "unknown"
         author_node_id = f"actor_{platform_slug}_{author_id}"
-        pub_node_id = f"event_publication_{platform_slug}_{post_id}"
+        clean_content_id = re.sub(r"[^a-z0-9_]", "_", str(platform_content_id).strip().lower())
+        if clean_content_id:
+            if platform_slug == "telegram":
+                pub_node_id = f"event_publication_{platform_slug}_{author_id}_{clean_content_id}"
+            else:
+                pub_node_id = f"event_publication_{platform_slug}_{clean_content_id}"
+            pub_display_name = f"Publication {platform_content_id}"
+        else:
+            pub_node_id = f"event_publication_{platform_slug}_{post_id}"
+            pub_display_name = f"Publication {post_id}"
 
         author_entity = self._find_or_create_entity(
             result.entities,
@@ -407,10 +590,68 @@ class KnowledgeExtractor:
             result.entities,
             entity_id=pub_node_id,
             label="Event",
-            name=f"Publication {post_id}",
+            name=pub_display_name,
         )
 
         self._enrich_publication_node(pub_entity, post_metrics, raw_metadata)
+
+        coauthors = raw_metadata.get("coauthors")
+        if isinstance(coauthors, list):
+            for coauthor in coauthors:
+                coauthor_name = str(coauthor).strip()
+                if not coauthor_name:
+                    continue
+                coauthor_slug = re.sub(r"[^a-z0-9_]", "_", coauthor_name.lower())
+                coauthor_node_id = f"actor_{platform_slug}_{coauthor_slug}"
+                coauthor_entity = self._find_or_create_entity(
+                    result.entities,
+                    entity_id=coauthor_node_id,
+                    label="Actor",
+                    name=coauthor_name,
+                )
+                coauthor_prop_keys = {p.key for p in coauthor_entity.properties}
+                if "platform" not in coauthor_prop_keys:
+                    coauthor_entity.add_property(
+                        "platform", platform or "unknown", "text"
+                    )
+                if "platform_id" not in coauthor_prop_keys:
+                    coauthor_entity.add_property("platform_id", coauthor_slug, "text")
+                result.relations.append(
+                    ExtractedRelation(
+                        source_id=pub_node_id,
+                        relation_type="COAUTHOR",
+                        target_id=coauthor_node_id,
+                    )
+                )
+
+        tagged_users = raw_metadata.get("tagged_users")
+        if isinstance(tagged_users, list):
+            for tagged_user in tagged_users:
+                tagged_name = str(tagged_user).strip()
+                if not tagged_name:
+                    continue
+                tagged_slug = re.sub(r"[^a-z0-9_]", "_", tagged_name.lower())
+                tagged_node_id = f"actor_{platform_slug}_{tagged_slug}"
+                tagged_entity = self._find_or_create_entity(
+                    result.entities,
+                    entity_id=tagged_node_id,
+                    label="Actor",
+                    name=tagged_name,
+                )
+                tagged_prop_keys = {p.key for p in tagged_entity.properties}
+                if "platform" not in tagged_prop_keys:
+                    tagged_entity.add_property(
+                        "platform", platform or "unknown", "text"
+                    )
+                if "platform_id" not in tagged_prop_keys:
+                    tagged_entity.add_property("platform_id", tagged_slug, "text")
+                result.relations.append(
+                    ExtractedRelation(
+                        source_id=pub_node_id,
+                        relation_type="TAGGED",
+                        target_id=tagged_node_id,
+                    )
+                )
 
         current_ts = int(time.time())
         for entity in result.entities:

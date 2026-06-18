@@ -2,13 +2,14 @@ import asyncio
 import functools
 import logging
 import random
+import re
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Sequence, TypeVar, cast
+from typing import Any, cast
 
-from sqlalchemy import case, func, select, update, text
+from sqlalchemy import and_, case, func, or_, select, update, text
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.sql.expression import Select
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -21,8 +22,6 @@ from src.db.models import Base, Account, Content
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
-
 
 def with_retry_on_deadlock(
     max_retries: int = 3,
@@ -31,7 +30,7 @@ def with_retry_on_deadlock(
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            last_exception: OperationalError | DBAPIError | Exception | None = None
+            last_exception: Exception | None = None
 
             for attempt in range(1, max_retries + 1):
                 try:
@@ -61,8 +60,7 @@ def with_retry_on_deadlock(
                     total_delay = delay + jitter
 
                     logger.warning(
-                        "Attempt %d/%d failed with retryable error: %s. "
-                        "Retrying in %.2f seconds...",
+                        "Attempt %d/%d failed with retryable error: %s. Retrying in %.2f s...",
                         attempt,
                         max_retries,
                         e,
@@ -96,7 +94,6 @@ class Database:
                 },
             },
         )
-
         self.async_session = async_sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
         )
@@ -106,74 +103,70 @@ class Database:
         max_retries: int = 5,
         base_delay: float = 1.0,
         timeout: float = 120.0,
+        graph_name: str = "social_graph",
     ) -> None:
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", graph_name):
+            raise ValueError(
+                f"Invalid graph name: '{graph_name}'. "
+                "Must be a valid SQL identifier matching ^[a-zA-Z_][a-zA-Z0-9_]*$"
+            )
+
         last_exception: Exception | None = None
         start_time = asyncio.get_event_loop().time()
+
+        vertex_labels = ["Actor", "Entity", "Event", "Place", "Account", "Content"]
 
         for attempt in range(1, max_retries + 1):
             try:
                 async with self.engine.begin() as conn:
                     await conn.run_sync(Base.metadata.create_all)
-
-                    try:
-                        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
-                        await conn.execute(text("LOAD 'age';"))
-                        await conn.execute(
-                            text('SET search_path = ag_catalog, "$user", public;')
+                    await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
+                    await conn.execute(text("LOAD 'age';"))
+                    await conn.execute(
+                        text('SET search_path = ag_catalog, "$user", public;')
+                    )
+                    await conn.execute(
+                        text(
+                            f"SELECT create_graph('{graph_name}') WHERE NOT EXISTS "
+                            f"(SELECT 1 FROM ag_graph WHERE name = '{graph_name}');"
                         )
-                        await conn.execute(
-                            text(
-                                "SELECT create_graph('telegram_graph') WHERE NOT EXISTS "
-                                "(SELECT 1 FROM ag_graph WHERE name = 'telegram_graph');"
-                            )
-                        )
+                    )
 
-                        vertex_labels = [
-                            "Actor", "Entity", "Event", "Place", "Account", "Content",
-                        ]
-                        for label in vertex_labels:
-                            try:
-                                await conn.execute(text(f"""
-                                    DO $$
-                                    BEGIN
-                                        IF NOT EXISTS (
-                                            SELECT 1 FROM information_schema.tables
-                                            WHERE table_schema = 'telegram_graph'
-                                            AND table_name = '{label}'
-                                        ) THEN
-                                            PERFORM create_vlabel('telegram_graph', '{label}');
-                                        END IF;
-                                    END
-                                    $$;
-                                """))
-                                logger.debug("Ensured vertex label exists: %s", label)
-                            except Exception as e:
-                                logger.warning("Failed to create vertex label %s: %s", label, e)
-
-                        logger.info("Apache AGE extension and graph initialized")
-                    except Exception as e:
-                        logger.error("Failed to initialize Apache AGE: %s", e)
-                        raise
+                    for label in vertex_labels:
+                        try:
+                            await conn.execute(text(f"""
+                                DO $$
+                                BEGIN
+                                    IF NOT EXISTS (
+                                        SELECT 1 FROM information_schema.tables
+                                        WHERE table_schema = '{graph_name}'
+                                        AND table_name = '{label}'
+                                    ) THEN
+                                        PERFORM create_vlabel('{graph_name}', '{label}');
+                                    END IF;
+                                END
+                                $$;
+                            """))
+                        except Exception as e:
+                            logger.warning("Failed to create vertex label %s: %s", label, e)
 
                 async with self.engine.connect() as conn:
-                    labels = ["Actor", "Entity", "Event", "Place", "Account", "Content"]
-                    for label in labels:
+                    for label in vertex_labels:
                         try:
                             await conn.execute(text(f"""
                                 CREATE INDEX IF NOT EXISTS idx_{label.lower()}_id
-                                ON telegram_graph."{label}"
+                                ON {graph_name}."{label}"
                                 USING btree (agtype_access_operator(properties, '"id"'));
                             """))
                         except Exception as e:
                             logger.debug("Skipped index creation for %s: %s", label, e)
-
                     await conn.commit()
 
                 async with self.engine.connect() as conn:
                     conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
                     try:
                         await conn.execute(text("VACUUM ANALYZE;"))
-                        logger.info("VACUUM ANALYZE completed successfully")
+                        logger.info("VACUUM ANALYZE completed")
                     except Exception as e:
                         logger.warning("VACUUM ANALYZE failed (non-critical): %s", e)
 
@@ -195,7 +188,7 @@ class Database:
                 elapsed = asyncio.get_event_loop().time() - start_time
                 if elapsed >= timeout:
                     logger.error(
-                        "Database initialization exceeded timeout of %.1f seconds after %d attempts",
+                        "Database initialization exceeded timeout of %.1f s after %d attempts",
                         timeout,
                         attempt,
                     )
@@ -208,7 +201,7 @@ class Database:
                 total_delay = delay + jitter
 
                 logger.warning(
-                    "Database initialization attempt %d/%d failed: %s. Retrying in %.2f seconds...",
+                    "Database init attempt %d/%d failed: %s. Retrying in %.2f s...",
                     attempt,
                     max_retries,
                     e,
@@ -226,12 +219,11 @@ class Database:
                     .values(status="pending")
                 )
                 result = cast(CursorResult, await session.execute(stmt))
-                count = result.rowcount
 
-                if count > 0:
+                if result.rowcount > 0:
                     logger.info(
-                        "Reset orphaned processing accounts back to pending: %d accounts",
-                        count,
+                        "Reset %d orphaned processing accounts back to pending",
+                        result.rowcount,
                     )
                 else:
                     logger.debug("No orphaned processing accounts found")
@@ -296,9 +288,11 @@ class Database:
 
                 return claimed_accounts
 
-    @with_retry_on_deadlock()
-    async def update_creator_account_status(
-        self, account_id: int, status: str
+    async def _update_account_status(
+        self,
+        account_id: int,
+        status: str,
+        platform: str | list[str] | None = None,
     ) -> None:
         async with self.async_session() as session:
             async with session.begin():
@@ -307,19 +301,30 @@ class Database:
                     .where(Account.id == account_id)
                     .values(status=status, updated_at=datetime.now(timezone.utc))
                 )
+                if platform is not None:
+                    if isinstance(platform, list):
+                        stmt = stmt.where(Account.platform.in_(platform))
+                    else:
+                        stmt = stmt.where(Account.platform == platform)
+
                 result = cast(CursorResult, await session.execute(stmt))
 
                 if result.rowcount > 0:
                     logger.debug(
-                        "Updated account id=%s status to '%s'",
-                        account_id,
-                        status,
+                        "Updated account id=%d status to '%s'", account_id, status
                     )
                 else:
                     logger.warning(
-                        "Account id=%s not found when updating status",
+                        "Account id=%d not found when updating status to '%s'",
                         account_id,
+                        status,
                     )
+
+    @with_retry_on_deadlock()
+    async def update_creator_account_status(
+        self, account_id: int, status: str
+    ) -> None:
+        await self._update_account_status(account_id, status)
 
     @with_retry_on_deadlock()
     async def reset_orphaned_creator_accounts(
@@ -368,17 +373,12 @@ class Database:
         stmt = stmt.on_conflict_do_update(
             index_elements=["id"],
             set_=update_columns,
-        )
+        ).returning(Account)
 
         async with self.async_session() as session:
             async with session.begin():
-                await session.execute(stmt)
-                account = await session.get(Account, account_data["id"])
-
-                if account is None:
-                    account = Account(**account_data)
-                    session.add(account)
-                    await session.flush()
+                result = await session.execute(stmt)
+                account = result.scalar_one()
 
                 logger.debug("Upserted account: %s", account)
                 return account
@@ -386,7 +386,6 @@ class Database:
     @with_retry_on_deadlock()
     async def upsert_content(self, content_data: dict[str, Any]) -> Content:
         stmt = insert(Content).values(**content_data)
-
         update_columns = {
             "views": stmt.excluded.views,
             "comments_count": stmt.excluded.comments_count,
@@ -398,39 +397,18 @@ class Database:
             "raw_metadata": stmt.excluded.raw_metadata,
             "updated_at": stmt.excluded.updated_at,
         }
-
         stmt = stmt.on_conflict_do_update(
             constraint="uq_content_account_platform_id",
             set_=update_columns,
-        )
+        ).returning(Content)
 
         async with self.async_session() as session:
             async with session.begin():
-                await session.execute(stmt)
-
-                content = await self._get_content_by_unique(
-                    session,
-                    content_data["account_id"],
-                    content_data["platform_content_id"],
-                )
-
-                if content is None:
-                    content = Content(**content_data)
-                    session.add(content)
-                    await session.flush()
+                result = await session.execute(stmt)
+                content = result.scalar_one()
 
                 logger.debug("Upserted content: %s", content)
                 return content
-
-    async def _get_content_by_unique(
-        self, session: AsyncSession, account_id: int, platform_content_id: str
-    ) -> Content | None:
-        stmt = select(Content).where(
-            Content.account_id == account_id,
-            Content.platform_content_id == platform_content_id,
-        )
-        result = await session.execute(stmt)
-        return result.scalar_one_or_none()
 
     @with_retry_on_deadlock()
     async def get_accounts_batch(
@@ -447,7 +425,7 @@ class Database:
 
     async def get_content_by_ids(
         self, content_ids: list[int]
-    ) -> dict[int, Content]:
+    ) -> dict[int, Any]:
         if not content_ids:
             return {}
 
@@ -522,12 +500,17 @@ class Database:
         self,
         require_content: bool,
         priority_mode: bool,
-    ) -> Select[tuple[Content]]:
-        conditions = [Content.is_graph_extracted == False]
+    ) -> Any:
+        conditions: list[Any] = [Content.is_graph_extracted == False]
 
         if require_content:
-            conditions.append(Content.content.isnot(None))
-            conditions.append(Content.content != "")
+            conditions.append(
+                or_(
+                    and_(Content.content.isnot(None), Content.content != ""),
+                    and_(Content.transcription.isnot(None), Content.transcription != ""),
+                    and_(Content.raw_metadata.isnot(None), Content.raw_metadata != ""),
+                )
+            )
 
         stmt = select(Content).where(*conditions)
 
@@ -583,11 +566,11 @@ class Database:
 
                 if result.rowcount > 0:
                     logger.debug(
-                        "Marked content id=%s as graph extracted", content_id
+                        "Marked content id=%d as graph extracted", content_id
                     )
                 else:
                     logger.warning(
-                        "Content id=%s not found when marking as graph extracted",
+                        "Content id=%d not found when marking as graph extracted",
                         content_id,
                     )
 
@@ -623,7 +606,7 @@ class Database:
                 if account is not None:
                     account.status = "processing"
                     logger.debug(
-                        "Claimed account id=%s username=%s for processing",
+                        "Claimed account id=%d username=%s for processing",
                         account.id,
                         account.username,
                     )
@@ -632,45 +615,21 @@ class Database:
 
                 return account
 
-    async def _set_telegram_account_status(
-        self, account_id: int, status: str
-    ) -> None:
-        async with self.async_session() as session:
-            async with session.begin():
-                stmt = (
-                    update(Account)
-                    .where(Account.id == account_id)
-                    .where(Account.platform == "TELEGRAM")
-                    .values(status=status, updated_at=datetime.now(timezone.utc))
-                )
-                result = cast(CursorResult, await session.execute(stmt))
-
-                if result.rowcount > 0:
-                    logger.debug(
-                        "Marked account id=%s as %s", account_id, status
-                    )
-                else:
-                    logger.debug(
-                        "Account id=%s not found when setting status to %s",
-                        account_id,
-                        status,
-                    )
-
     @with_retry_on_deadlock()
     async def mark_account_processed(self, account_id: int) -> None:
-        await self._set_telegram_account_status(account_id, "ready_for_parsing")
+        await self._update_account_status(account_id, "ready_for_parsing", "TELEGRAM")
 
     @with_retry_on_deadlock()
     async def mark_account_rejected(self, account_id: int) -> None:
-        await self._set_telegram_account_status(account_id, "rejected")
+        await self._update_account_status(account_id, "rejected", "TELEGRAM")
 
     @with_retry_on_deadlock()
     async def mark_account_parsed(self, account_id: int) -> None:
-        await self._set_telegram_account_status(account_id, "parsed")
+        await self._update_account_status(account_id, "parsed", "TELEGRAM")
 
     @with_retry_on_deadlock()
     async def mark_account_pending(self, account_id: int) -> None:
-        await self._set_telegram_account_status(account_id, "pending")
+        await self._update_account_status(account_id, "pending", "TELEGRAM")
 
     @with_retry_on_deadlock()
     async def get_account_for_parsing(
@@ -680,23 +639,26 @@ class Database:
     ) -> Account | None:
         async with self.async_session() as session:
             async with session.begin():
-                account = None
+                base_conditions = [
+                    Account.status == "ready_for_parsing",
+                    Account.platform == "TELEGRAM",
+                    Account.is_author_blog == True,
+                    Account.access_hash.is_not(None),
+                ]
 
-                if (
+                use_shard = (
                     session_index is not None
                     and total_sessions is not None
                     and total_sessions > 0
-                ):
+                )
+
+                if use_shard:
+                    shard_conditions = base_conditions + [
+                        func.mod(Account.id, total_sessions) == session_index
+                    ]
                     shard_stmt = (
                         select(Account)
-                        .where(Account.status == "ready_for_parsing")
-                        .where(Account.platform == "TELEGRAM")
-                        .where(Account.is_author_blog == True)
-                        .where(Account.access_hash.is_not(None))
-                        .where(
-                            func.mod(Account.id, total_sessions)
-                            == session_index
-                        )
+                        .where(*shard_conditions)
                         .order_by(func.random())
                         .limit(1)
                         .with_for_update(skip_locked=True)
@@ -704,10 +666,10 @@ class Database:
                     result = await session.execute(shard_stmt)
                     account = result.scalar_one_or_none()
 
-                    if account:
+                    if account is not None:
                         account.status = "processing"
                         logger.debug(
-                            "Parser claimed shard account id=%s username=%s (session_index=%s/%s)",
+                            "Claimed shard account id=%d username=%s (%d/%d)",
                             account.id,
                             account.username,
                             session_index,
@@ -716,17 +678,14 @@ class Database:
                         return account
 
                     logger.debug(
-                        "No accounts available in shard %s/%s, trying fallback",
+                        "No accounts in shard %d/%d, trying fallback",
                         session_index,
                         total_sessions,
                     )
 
                 fallback_stmt = (
                     select(Account)
-                    .where(Account.status == "ready_for_parsing")
-                    .where(Account.platform == "TELEGRAM")
-                    .where(Account.is_author_blog == True)
-                    .where(Account.access_hash.is_not(None))
+                    .where(*base_conditions)
                     .order_by(func.random())
                     .limit(1)
                     .with_for_update(skip_locked=True)
@@ -734,15 +693,15 @@ class Database:
                 result = await session.execute(fallback_stmt)
                 account = result.scalar_one_or_none()
 
-                if account:
+                if account is not None:
                     account.status = "processing"
                     logger.debug(
-                        "Parser claimed account (fallback) id=%s username=%s (has access_hash)",
+                        "Claimed account (fallback) id=%d username=%s",
                         account.id,
                         account.username,
                     )
                 else:
-                    logger.debug("No pending accounts available for parsing")
+                    logger.debug("No accounts available for parsing")
 
                 return account
 
@@ -762,11 +721,11 @@ class Database:
 
                 if result.rowcount > 0:
                     logger.debug(
-                        "Updated access_hash for account id=%s", account_id
+                        "Updated access_hash for account id=%d", account_id
                     )
                 else:
                     logger.debug(
-                        "Account id=%s not found when updating access_hash",
+                        "Account id=%d not found when updating access_hash",
                         account_id,
                     )
 

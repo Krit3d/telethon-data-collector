@@ -97,11 +97,17 @@ class QdrantService:
                         "dimension": EMBEDDING_DIM,
                     },
                 )
-                await self.client.create_collection(
-                    collection_name=posts_collection,
-                    vectors_config=VectorParams(
+                vectors_config: dict[str, VectorParams] = {
+                    "text": VectorParams(
                         size=EMBEDDING_DIM, distance=EMBEDDING_METRIC
                     ),
+                    "video_clip": VectorParams(
+                        size=512, distance=EMBEDDING_METRIC
+                    ),
+                }
+                await self.client.create_collection(
+                    collection_name=posts_collection,
+                    vectors_config=vectors_config,
                 )
                 await self.client.create_payload_index(
                     collection_name=posts_collection,
@@ -215,7 +221,7 @@ class QdrantService:
             point_structs = [
                 PointStruct(
                     id=post_id,
-                    vector=embedding.tolist(),
+                    vector={"text": embedding.tolist()},
                     payload={"account_id": channel_id, "text": text},
                 )
                 for (post_id, text, channel_id), embedding in zip(
@@ -354,7 +360,7 @@ class QdrantService:
 
             point = PointStruct(
                 id=post_id,
-                vector=embedding.tolist(),
+                vector={"text": embedding.tolist()},
                 payload={"account_id": account_id, "text": text},
             )
 
@@ -450,6 +456,7 @@ class QdrantService:
             response = await self.client.query_points(
                 collection_name=self.collection_name,
                 query=query_embedding.tolist(),
+                using="text",
                 limit=limit,
                 score_threshold=score_threshold,
                 with_payload=True,
