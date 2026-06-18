@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from typing import Final
+from typing import Any, Final
 
 import numpy as np
 from fastembed import TextEmbedding
@@ -102,7 +102,7 @@ class QdrantService:
                         size=EMBEDDING_DIM, distance=EMBEDDING_METRIC
                     ),
                     "video_clip": VectorParams(
-                        size=512, distance=EMBEDDING_METRIC
+                        size=self.settings.visual_embedding_dim, distance=EMBEDDING_METRIC
                     ),
                 }
                 await self.client.create_collection(
@@ -207,7 +207,11 @@ class QdrantService:
             )
             raise RuntimeError(f"Embedding generation failed: {e}") from e
 
-    async def upsert_batch(self, points: list[tuple[int, str, int]]) -> None:
+    async def upsert_batch(
+        self,
+        points: list[tuple[int, str, int]],
+        visual_embeddings: list[list[float] | None] | None = None,
+    ) -> None:
         if not points:
             return
 
@@ -215,19 +219,36 @@ class QdrantService:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
 
         try:
-            texts = [p[1] for p in points]
+            filtered_indices = [
+                i for i, (_, text, _) in enumerate(points)
+                if text and text.strip()
+            ]
+            if not filtered_indices:
+                logger.debug("No points with valid text to upsert")
+                return
+
+            filtered_points = [points[i] for i in filtered_indices]
+            texts = [p[1] for p in filtered_points]
             embeddings = await self._generate_embeddings_batch(texts)
 
-            point_structs = [
-                PointStruct(
-                    id=post_id,
-                    vector={"text": embedding.tolist()},
-                    payload={"account_id": channel_id, "text": text},
+            point_structs = []
+            for local_idx, (post_id, text, channel_id) in enumerate(filtered_points):
+                vis: list[float] | None = None
+                vectors: dict[str, Any] = {"text": embeddings[local_idx].tolist()}
+
+                if visual_embeddings is not None:
+                    orig_idx = filtered_indices[local_idx]
+                    vis = visual_embeddings[orig_idx] if orig_idx < len(visual_embeddings) else None
+                    if vis is not None:
+                        vectors["video_clip"] = vis
+
+                point_structs.append(
+                    PointStruct(
+                        id=post_id,
+                        vector=vectors,
+                        payload={"account_id": channel_id, "text": text},
+                    )
                 )
-                for (post_id, text, channel_id), embedding in zip(
-                    points, embeddings
-                )
-            ]
 
             await self.client.upsert(
                 collection_name=self.collection_name,
@@ -236,15 +257,15 @@ class QdrantService:
             )
 
             logger.debug(
-                "Batch upserted %d embeddings",
-                len(points),
-                extra={"collection": self.collection_name},
+                "Batch upserted %d embeddings to collection %s",
+                len(point_structs),
+                self.collection_name,
             )
         except Exception as e:
             logger.error(
-                "Failed to batch upsert embeddings",
-                exc_info=e,
-                extra={"batch_size": len(points)},
+                "Failed to batch upsert embeddings: %s",
+                e,
+                extra={"batch_size": len(points), "collection": self.collection_name},
             )
             raise
 
@@ -338,7 +359,11 @@ class QdrantService:
             raise RuntimeError(f"Entity upsert failed: {e}") from e
 
     async def upsert_post_embedding(
-        self, post_id: int, text: str, account_id: int
+        self,
+        post_id: int,
+        text: str,
+        account_id: int,
+        visual_embedding: list[float] | None = None,
     ) -> None:
         if not text or not text.strip():
             logger.warning(
@@ -358,9 +383,14 @@ class QdrantService:
             embedding_array = await self._generate_embeddings_batch([text])
             embedding = embedding_array[0]
 
+            vectors: dict[str, Any] = {"text": embedding.tolist()}
+
+            if visual_embedding is not None:
+                vectors["video_clip"] = visual_embedding
+
             point = PointStruct(
                 id=post_id,
-                vector={"text": embedding.tolist()},
+                vector=vectors,
                 payload={"account_id": account_id, "text": text},
             )
 
@@ -369,15 +399,17 @@ class QdrantService:
             )
 
             logger.debug(
-                "Content embedding upserted successfully",
-                extra={"post_id": post_id, "account_id": account_id},
+                "Content embedding upserted for post %d to collection %s",
+                post_id,
+                self.collection_name,
             )
 
         except Exception as e:
             logger.error(
-                "Failed to upsert post embedding",
-                exc_info=e,
-                extra={"post_id": post_id, "account_id": account_id},
+                "Failed to upsert post embedding for post %d: %s",
+                post_id,
+                e,
+                extra={"post_id": post_id, "account_id": account_id, "collection": self.collection_name},
             )
             raise RuntimeError(
                 f"Failed to upsert embedding for post {post_id}: {e}"

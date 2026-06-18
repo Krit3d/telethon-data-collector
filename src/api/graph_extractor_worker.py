@@ -15,7 +15,8 @@ except ImportError:
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
-from src.db.graph_repo import GraphRepository
+from src.graph.db.extractor_repo import ExtractorRepository
+from src.graph.db.graph_repo import GraphRepository
 from src.db.models import Content
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.extractor import KnowledgeExtractor
@@ -28,6 +29,7 @@ class GraphExtractionWorker:
     def __init__(
         self,
         db: Database,
+        extractor_repo: ExtractorRepository,
         graph_repo: GraphRepository,
         qdrant: QdrantService | None,
         extractor: KnowledgeExtractor,
@@ -36,6 +38,7 @@ class GraphExtractionWorker:
         poll_interval: int = 5,
     ) -> None:
         self.db = db
+        self.extractor_repo = extractor_repo
         self.graph_repo = graph_repo
         self.qdrant = qdrant
         self.extractor = extractor
@@ -60,7 +63,7 @@ class GraphExtractionWorker:
         while not self._shutdown_event.is_set():
             try:
                 try:
-                    posts = await self.db.get_ungraphed_content(
+                    posts = await self.extractor_repo.get_ungraphed_content(
                         limit=self.batch_size, priority_mode=self.priority_mode
                     )
                 except (OperationalError, PostgresError) as e:
@@ -136,7 +139,7 @@ class GraphExtractionWorker:
                 "Content id=%s has no content or transcription, skipping graph extraction",
                 post.id,
             )
-            await self.db.mark_content_graphed(post.id)
+            await self.extractor_repo.mark_content_graphed(post.id)
             return
 
         logger.debug("Extracting knowledge graph from content id=%s", post.id)
@@ -208,10 +211,10 @@ class GraphExtractionWorker:
                     exc_info=True,
                 )
 
-            await self.db.mark_content_graphed(post.id)
+            await self.extractor_repo.mark_content_graphed(post.id)
             return
 
-        await self.db.mark_content_graphed(post.id)
+        await self.extractor_repo.mark_content_graphed(post.id)
 
         logger.info("Completed graph extraction for content id=%s", post.id)
 
@@ -238,9 +241,11 @@ async def run_graph_extractor() -> None:
     extractor = KnowledgeExtractor(settings)
 
     graph_repo = GraphRepository(db.async_session, settings)
+    extractor_repo = ExtractorRepository(db.async_session, settings)
 
     worker = GraphExtractionWorker(
         db=db,
+        extractor_repo=extractor_repo,
         graph_repo=graph_repo,
         qdrant=qdrant,
         extractor=extractor,

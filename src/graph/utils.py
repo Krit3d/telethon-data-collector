@@ -1,5 +1,3 @@
-"""Utility functions for knowledge graph extraction and processing."""
-
 import json
 import logging
 import re
@@ -11,21 +9,6 @@ logger = logging.getLogger(__name__)
 
 
 def _repair_json(content: str) -> str:
-    """Attempt to repair malformed or truncated JSON.
-
-    Uses multiple strategies to fix common issues:
-    - Strip markdown code blocks (```json ... ```)
-    - Unclosed braces/brackets at root level
-    - Truncated objects inside entities/relations lists (discards partial objects)
-    - Trailing incomplete tokens
-    - Fallback: find last complete closing brace/bracket and close root
-
-    Args:
-        content: The potentially malformed JSON string.
-
-    Returns:
-        Repaired JSON string if successful, otherwise original content.
-    """
     original = content
 
     content = content.strip()
@@ -37,15 +20,12 @@ def _repair_json(content: str) -> str:
     if not content:
         return original
 
-    # First, try simple parsing to see if it is already valid
     try:
         json.loads(content)
         return content
     except json.JSONDecodeError:
-        pass  # Proceed with repair strategies
+        pass
 
-    # Pre-check: Detect if the last character is inside an unclosed string
-    # (common truncation pattern: "... "key": "value" <-- missing closing quote)
     in_string = False
     escape_next = False
     for i, char in enumerate(content):
@@ -58,7 +38,6 @@ def _repair_json(content: str) -> str:
         if char == '"':
             in_string = not in_string
 
-    # If we end inside a string, add a closing quote before further repairs
     if in_string:
         content = content + '"'
         logger.debug("Added closing quote for unclosed string in JSON")
@@ -66,9 +45,8 @@ def _repair_json(content: str) -> str:
             json.loads(content)
             return content
         except json.JSONDecodeError:
-            pass  # Continue with other strategies
+            pass
 
-    # Strategy 1: Simple brace/bracket matching for root-level truncation
     brace_count = 0
     bracket_count = 0
     in_string = False
@@ -110,17 +88,14 @@ def _repair_json(content: str) -> str:
                 logger.debug("JSON repaired using root-level brace closure")
                 return truncated
             except json.JSONDecodeError:
-                pass  # Fall through to array-level repair
+                pass
 
-    # Strategy 2: Handle truncation inside entities/relations arrays
-    # Find the start positions of entities and relations arrays
     entities_key_match = re.search(r'"entities"\s*:\s*\[', content)
     relations_key_match = re.search(r'"relations"\s*:\s*\[', content)
 
     if entities_key_match or relations_key_match:
         truncate_point = last_valid_pos if last_valid_pos > 0 else len(content)
 
-        # Find the last complete entity
         last_complete_entity_end = -1
         if entities_key_match:
             entities_array_start = entities_key_match.end()
@@ -157,7 +132,6 @@ def _repair_json(content: str) -> str:
                     i += 1
                 break
 
-        # Find the last complete relation
         last_complete_relation_end = -1
         if relations_key_match:
             relations_array_start = relations_key_match.end()
@@ -230,12 +204,8 @@ def _repair_json(content: str) -> str:
             except json.JSONDecodeError:
                 pass
 
-    # Strategy 3 (Fallback): Find the last complete closing brace or bracket
-    # that closes the root object/array and truncate there
     if last_valid_pos > 0:
-        # Try to close the root object with just a single }
         fallback = content[: last_valid_pos + 1]
-        # Count if we need to add closing brackets/braces
         if brace_count > 0:
             fallback += "}" * brace_count
         if bracket_count > 0:
@@ -252,69 +222,38 @@ def _repair_json(content: str) -> str:
     return original
 
 
-def _sanitize_key(key: Any) -> str:
-    """Sanitize dictionary keys to be Cypher-safe snake_case.
-
-    Converts the key to string, replaces spaces and hyphens with underscores,
-    removes special characters, and converts to lowercase.
-    Handles keys like 'geo_lat' or 'geo_long' to ensure they remain
-    as valid Cypher identifiers (alphanumeric and underscores only).
-
-    Args:
-        key: The original key value.
-
-    Returns:
-        Sanitized key string.
-    """
+def sanitize_key(key: Any) -> str:
     if not isinstance(key, str):
         key = str(key)
-    # Convert hyphens and spaces to underscores
     key = key.replace("-", "_").replace(" ", "_")
-    # Remove non-alphanumeric and non-underscore characters
     key = re.sub(r'[^A-Za-z0-9_]', '', key)
-    # Convert to lowercase
     key = key.lower()
     return key if key else "unknown_property"
 
 
 def _convert_to_dict(obj: Any) -> dict[str, Any]:
-    """Convert a Pydantic model or other object to a dictionary safely.
-
-    Handles Pydantic models (v1 and v2), dataclasses, and falls back
-    to dict conversion or empty dict if conversion fails.
-
-    Args:
-        obj: The object to convert.
-
-    Returns:
-        Dictionary representation of the object, or empty dict if conversion fails.
-    """
     if obj is None:
         return {}
-    
-    # Handle Pydantic models (v2 and v1 compatibility)
+
     if isinstance(obj, BaseModel):
         try:
             return obj.model_dump(exclude_none=True)
         except AttributeError:
-            # Fallback for Pydantic v1
             try:
                 return obj.dict(exclude_none=True)
             except AttributeError:
                 logger.warning("Failed to convert Pydantic model to dict")
                 return {}
-    
-    # Handle dictionaries directly
+
     if isinstance(obj, dict):
         return obj
-    
-    # Handle objects with __dict__ attribute (dataclasses, regular objects)
+
     if hasattr(obj, '__dict__'):
         try:
             return dict(obj.__dict__)
         except (TypeError, ValueError):
             pass
-    
+
     logger.warning("Cannot convert object of type %s to dict", type(obj).__name__)
     return {}
 
@@ -323,36 +262,19 @@ def _merge_metadata_into_properties(
     base_props: dict[str, Any],
     metadata: dict[str, Any] | BaseModel | None,
 ) -> dict[str, Any]:
-    """Merge metadata dictionary or Pydantic model into base properties with key sanitization.
-
-    This function handles both dictionary and Pydantic model inputs for metadata.
-    All keys are sanitized to be Cypher-safe snake_case identifiers.
-    Existing keys in base_props are overwritten by metadata values.
-
-    Args:
-        base_props: Base properties dictionary.
-        metadata: Metadata dictionary or Pydantic model to merge (keys will be sanitized).
-                  Can be None, in which case base_props is returned unchanged.
-
-    Returns:
-        Merged properties dictionary with sanitized keys.
-    """
     if metadata is None:
         return base_props
 
-    # Convert Pydantic models or other objects to dict
     metadata_dict = _convert_to_dict(metadata)
-    
+
     if not metadata_dict:
         return base_props
 
     merged = base_props.copy()
     for key, value in metadata_dict.items():
-        sanitized_key = _sanitize_key(key)
-        # Only merge if value is not None (skip None values to keep existing ones)
+        sanitized_key = sanitize_key(key)
         if value is not None:
             merged[sanitized_key] = value
         elif sanitized_key not in merged:
-            # Only set None if the key doesn't exist in merged
             merged[sanitized_key] = None
     return merged

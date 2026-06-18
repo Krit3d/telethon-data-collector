@@ -14,7 +14,7 @@ from src.api.schemas import (
 )
 from src.api.dependencies import get_db, get_graph_repo, get_qdrant
 from src.db.database import Database
-from src.db.graph_repo import GraphRepository
+from src.graph.db.graph_repo import GraphRepository
 from src.embeddings.qdrant_service import QdrantService
 
 logger = logging.getLogger(__name__)

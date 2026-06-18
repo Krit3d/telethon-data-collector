@@ -1,12 +1,7 @@
-"""Pydantic models for OpenSPG (Semantic Parsing Graph) schema elements.
-
-OpenSPG supports dynamic knowledge extraction with typed property accumulation
-for flexible entity and relationship attributes.
-"""
+from __future__ import annotations
 
 from enum import Enum
 import json
-import re
 from typing import Any
 
 from pydantic import (
@@ -17,14 +12,10 @@ from pydantic import (
     model_validator,
 )
 
+from src.graph.utils import sanitize_key
+
 
 class PropertyType(str, Enum):
-    """Enumeration of supported property types in OpenSPG.
-
-    All properties in the system must conform to one of these strict types
-    to ensure type safety and universal domain support (IT, politics, etc.).
-    """
-
     TEXT = "text"
     NUMERIC = "numeric"
     GEO = "geo"
@@ -33,13 +24,6 @@ class PropertyType(str, Enum):
 
 
 class Property(BaseModel):
-    """Represents a typed dynamic property with strict validation.
-
-    Properties are used to store attributes on entities and relations.
-    Each property has a key, a value, and a type from the PropertyType enum.
-    The value is validated against the type to ensure data integrity.
-    """
-
     key: str = Field(..., description="Property name/key")
     value: Any = Field(
         ..., description="Property value (validated based on type)"
@@ -53,53 +37,18 @@ class Property(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def convert_type_string(cls, data: dict[str, Any]) -> dict[str, Any]:
-        """Convert string type to PropertyType enum for backward compatibility.
-
-        This validator allows passing type as a string (e.g., "text") which
-        is automatically converted to the corresponding PropertyType enum value.
-        If the string is not a valid PropertyType member, falls back to
-        PropertyType.TEXT to prevent Pydantic ValidationError.
-
-        Args:
-            data: Raw input data before model validation.
-
-        Returns:
-            Modified data with type converted to PropertyType enum if it was a string,
-            or PropertyType.TEXT if the string was invalid.
-        """
         if isinstance(data, dict) and "type" in data:
             type_value = data["type"]
             if isinstance(type_value, str):
                 try:
                     data["type"] = PropertyType(type_value)
                 except ValueError:
-                    # Fallback to TEXT for invalid type strings to ensure resilience
                     data["type"] = PropertyType.TEXT
         return data
 
     @model_validator(mode="before")
     @classmethod
     def coerce_value_types(cls, data: dict[str, Any]) -> dict[str, Any]:
-        """Coerce value types to match PropertyType expectations for resilience.
-
-        This validator automatically converts common type mismatches caused by LLM output:
-        - Boolean values: handled based on prop_type:
-          - TEXT: converts to "true" or "false" strings
-          - NUMERIC: converts to 1 or 0 integers
-          - Other types: falls back to string conversion and sets type to TEXT
-        - TEXT: converts non-string values (int, float) to strings
-        - NUMERIC: converts numeric strings to int or float
-
-        This ensures the extractor does not crash on minor type mistakes while
-        maintaining strict validation for GEO and LANGUAGE types.
-
-        Args:
-            data: Raw input data before model validation.
-
-        Returns:
-            Modified data with coerced values where appropriate.
-        """
-
         if isinstance(data, dict):
             prop_type = data.get("type")
             value = data.get("value")
@@ -107,77 +56,41 @@ class Property(BaseModel):
             if prop_type is None or value is None:
                 return data
 
-            # Handle boolean values first to avoid misclassification as integers
             if isinstance(value, bool):
                 if prop_type == PropertyType.TEXT:
                     data["value"] = "true" if value else "false"
                 elif prop_type == PropertyType.NUMERIC:
                     data["value"] = 1 if value else 0
                 else:
-                    # Fallback: convert to string and set type to TEXT
                     data["value"] = str(value)
                     data["type"] = PropertyType.TEXT
                 return data
 
-            # Handle TEXT type: convert any non-string to string
             if prop_type == PropertyType.TEXT and not isinstance(value, str):
                 data["value"] = str(value)
                 return data
 
-            # Handle NUMERIC type: convert string numbers to numeric
             if prop_type == PropertyType.NUMERIC and isinstance(value, str):
                 stripped = value.strip()
                 try:
-                    # Try to convert to int first for whole numbers (including negative)
                     if stripped.isdigit() or (
                         stripped.startswith("-") and stripped[1:].isdigit()
                     ):
                         data["value"] = int(stripped)
                     else:
-                        # Try float for decimal numbers or scientific notation
                         data["value"] = float(stripped)
                 except (ValueError, TypeError):
-                    # If conversion fails, keep original and let validation handle error
                     pass
 
         return data
 
     @field_validator("key", mode="before")
     @classmethod
-    def sanitize_key(cls, v: Any) -> str:
-        """Sanitize property keys to ensure they are Cypher-safe snake_case.
-
-        Converts hyphens and spaces to underscores, and strips special characters.
-        """
-
-        if not isinstance(v, str):
-            v = str(v)
-        # Convert hyphens and spaces to underscores
-        v = v.replace("-", "_").replace(" ", "_")
-        # Remove non-alphanumeric and non-underscore characters
-        v = re.sub(r"[^A-Za-z0-9_]", "", v)
-        # Convert to lowercase
-        v = v.lower()
-        return v if v else "unknown_property"
+    def validate_and_sanitize_key(cls, v: Any) -> str:
+        return sanitize_key(v)
 
     @model_validator(mode="after")
-    def validate_value_against_type(self) -> "Property":
-        """Validate that the property value matches the expected type.
-
-        Enforces strict type constraints:
-        - NUMERIC: value must be int or float
-        - GEO: value must be a list of exactly two floats
-        - LANGUAGE: value must be a 2-letter string
-        - TEXT: any string value accepted
-        - LOCATION: any string value accepted (human-readable location)
-
-        Returns:
-            The validated Property instance.
-
-        Raises:
-            ValueError: If the value does not match the type constraints.
-        """
-
+    def validate_value_against_type(self) -> Property:
         prop_type = self.type
         value = self.value
 
@@ -221,12 +134,6 @@ class Property(BaseModel):
 
 
 class ExtractedEntity(BaseModel):
-    """Represents an extracted entity node in OpenSPG format.
-
-    Entities are the nodes in the knowledge graph. They have a unique standardized
-    ID, a type label, a display name, and a list of typed properties.
-    """
-
     id: str = Field(
         ...,
         description="Unique standardized identifier (e.g., 'person_pavel_durov')",
@@ -244,36 +151,17 @@ class ExtractedEntity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     def get_property_dict(self) -> dict[str, Any]:
-        """Convert properties list to a dictionary keyed by property key.
-
-        Returns:
-            Dictionary mapping property keys to their values.
-        """
         return {prop.key: prop.value for prop in self.properties}
 
     def add_property(
         self, key: str, value: Any, type: str | PropertyType
     ) -> None:
-        """Add a typed property to the entity.
-
-        Args:
-            key: Property name.
-            value: Property value (will be validated against type).
-            type: Property type - either a PropertyType enum member or its string value.
-        """
-        # Convert string to PropertyType enum for backward compatibility
         if isinstance(type, str):
             type = PropertyType(type)
         self.properties.append(Property(key=key, value=value, type=type))
 
 
 class ExtractedRelation(BaseModel):
-    """Represents an extracted relationship/edge in OpenSPG format.
-
-    Relations connect entities and can have their own typed properties
-    to provide context (e.g., 'since_year', 'confidence', 'role').
-    """
-
     source_id: str = Field(..., description="ID of the source entity")
     relation_type: str = Field(
         ...,
@@ -288,35 +176,17 @@ class ExtractedRelation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     def get_property_dict(self) -> dict[str, Any]:
-        """Convert properties list to a dictionary keyed by property key.
-
-        Returns:
-            Dictionary mapping property keys to their values.
-        """
         return {prop.key: prop.value for prop in self.properties}
 
     def add_property(
         self, key: str, value: Any, type: str | PropertyType
     ) -> None:
-        """Add a typed property to the relation.
-
-        Args:
-            key: Property name.
-            value: Property value (will be validated against type).
-            type: Property type - either a PropertyType enum member or its string value.
-        """
-        # Convert string to PropertyType enum for backward compatibility
         if isinstance(type, str):
             type = PropertyType(type)
         self.properties.append(Property(key=key, value=value, type=type))
 
 
 class OpenSPGExtractionResult(BaseModel):
-    """Container for the result of an OpenSPG knowledge extraction operation.
-
-    Holds all extracted entities and relations from a text extraction.
-    """
-
     entities: list[ExtractedEntity] = Field(
         default_factory=list, description="List of extracted entity nodes"
     )
@@ -327,21 +197,7 @@ class OpenSPGExtractionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-# ---------------------------------------------------------------------------
-# Backward Compatibility Layer
-# ---------------------------------------------------------------------------
-# The original SPGNode and SPGEdge classes are kept for backward compatibility
-# with existing code (database operations, Qdrant service). New code should use
-# ExtractedEntity and ExtractedRelation. Conversion functions are provided to
-# migrate between formats.
-
-
 class SPGNode(BaseModel):
-    """Represents a graph node in the knowledge graph.
-
-    DEPRECATED: Use ExtractedEntity for new code. Kept for backward compatibility.
-    """
-
     label: str
     properties: dict[str, Any]
 
@@ -349,11 +205,6 @@ class SPGNode(BaseModel):
 
 
 class SPGEdge(BaseModel):
-    """Represents a graph edge/relationship in the knowledge graph.
-
-    DEPRECATED: Use ExtractedRelation for new code. Kept for backward compatibility.
-    """
-
     start_node_id: str
     edge_label: str
     end_node_id: str
@@ -363,11 +214,6 @@ class SPGEdge(BaseModel):
 
 
 class ExtractionResult(BaseModel):
-    """Container for the result of a knowledge extraction operation.
-
-    DEPRECATED: Use OpenSPGExtractionResult for new code. Kept for backward compatibility.
-    """
-
     nodes: list[SPGNode]
     edges: list[SPGEdge]
 
@@ -375,11 +221,6 @@ class ExtractionResult(BaseModel):
 
 
 class LLMNode(BaseModel):
-    """Schema for nodes as returned by the LLM extraction.
-
-    DEPRECATED: Use ExtractedEntity for new code. Kept for backward compatibility.
-    """
-
     id: str
     label: str
     name: str
@@ -389,11 +230,6 @@ class LLMNode(BaseModel):
 
 
 class LLMEdge(BaseModel):
-    """Schema for edges as returned by the LLM extraction.
-
-    DEPRECATED: Use ExtractedRelation for new code. Kept for backward compatibility.
-    """
-
     source_id: str
     relation_type: str
     target_id: str
@@ -403,34 +239,13 @@ class LLMEdge(BaseModel):
 
 
 class LLMExtractionResult(BaseModel):
-    """Schema for the complete LLM extraction result.
-
-    DEPRECATED: Use OpenSPGExtractionResult for new code. Kept for backward compatibility.
-    """
-
     nodes: list[LLMNode]
     edges: list[LLMEdge]
 
     model_config = ConfigDict(extra="allow")
 
 
-# ---------------------------------------------------------------------------
-# Conversion Functions (Backward Compatibility)
-# ---------------------------------------------------------------------------
-
-
 def entity_to_spg_node(entity: ExtractedEntity) -> SPGNode:
-    """Convert an ExtractedEntity to a legacy SPGNode.
-
-    The SPGNode stores all entity data in the properties dict, including
-    the standardized ID, name, and label as metadata.
-
-    Args:
-        entity: The ExtractedEntity to convert.
-
-    Returns:
-        A new SPGNode instance with properties merged into a dictionary.
-    """
     prop_dict = entity.get_property_dict()
     spg_properties = {
         "id": entity.id,
@@ -441,14 +256,6 @@ def entity_to_spg_node(entity: ExtractedEntity) -> SPGNode:
 
 
 def relation_to_spg_edge(relation: ExtractedRelation) -> SPGEdge:
-    """Convert an ExtractedRelation to a legacy SPGEdge.
-
-    Args:
-        relation: The ExtractedRelation to convert.
-
-    Returns:
-        A new SPGEdge instance with properties merged into a dictionary.
-    """
     prop_dict = relation.get_property_dict()
     return SPGEdge(
         start_node_id=relation.source_id,
@@ -461,27 +268,11 @@ def relation_to_spg_edge(relation: ExtractedRelation) -> SPGEdge:
 def open_spg_result_to_extraction_result(
     open_spg_result: OpenSPGExtractionResult,
 ) -> ExtractionResult:
-    """Convert an OpenSPGExtractionResult to a legacy ExtractionResult.
-
-    This allows existing code that expects SPGNode/SPGEdge to work with
-    the new OpenSPG models.
-
-    Args:
-        open_spg_result: The OpenSPGExtractionResult to convert.
-
-    Returns:
-        A new ExtractionResult containing SPGNode and SPGEdge objects.
-    """
     nodes = [entity_to_spg_node(entity) for entity in open_spg_result.entities]
     edges = [
         relation_to_spg_edge(relation) for relation in open_spg_result.relations
     ]
     return ExtractionResult(nodes=nodes, edges=edges)
-
-
-# ---------------------------------------------------------------------------
-# LLM Prompt Helper
-# ---------------------------------------------------------------------------
 
 
 def get_open_spg_llm_prompt(
@@ -501,19 +292,17 @@ def get_open_spg_llm_prompt(
     metadata_json_str = ""
     if metadata is not None and len(metadata) > 0:
         metadata_json_str = json.dumps(metadata, ensure_ascii=False, indent=2)
-        
-        # Check which fields are present in metadata to customize instructions
+
         excluded_fields = []
         if "language" in metadata:
             excluded_fields.append("'language' (2-letter code)")
         if "location" in metadata:
             excluded_fields.append("'location' (human-readable location)")
-        # Handle both 'geo' (list) and separate 'geo_lat'/'geo_long' keys
         if "geo" in metadata or "geo_lat" in metadata or "geo_long" in metadata:
             excluded_fields.append("'geo'/'geo_lat'/'geo_long' (coordinates)")
-        
+
         excluded_text = ", ".join(excluded_fields) if excluded_fields else "none"
-        
+
         metadata_instruction = f"""
 PRE-EXTRACTED METADATA (DO NOT RE-EXTRACT):
 The following metadata has been pre-collected from the post and is already available in the database:

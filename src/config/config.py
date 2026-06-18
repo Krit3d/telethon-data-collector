@@ -219,6 +219,8 @@ class Settings(BaseSettings):
         default=64,
         description="Number of unembedded posts to fetch per poll in the embedding worker",
     )
+    enable_visual_embeddings: bool = Field(default=False, description="Enable or disable visual video embeddings extraction")
+    visual_embedding_dim: int = Field(default=512, description="Dimension of visual video embeddings")
 
     graph_name: str = Field(
         default="social_graph",

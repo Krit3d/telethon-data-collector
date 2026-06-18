@@ -17,8 +17,10 @@ except ImportError:
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
+from src.graph.db.extractor_repo import ExtractorRepository
 from src.db.models import Content
 from src.embeddings.qdrant_service import QdrantService
+from src.embeddings.visual_service import VisualEmbeddingService
 from src.parser.creators.core.schemas import AccountMetadata, ContentMetadata
 
 logger = logging.getLogger(__name__)
@@ -104,13 +106,17 @@ class EmbeddingWorker:
     def __init__(
         self,
         db: Database,
+        extractor_repo: ExtractorRepository,
         qdrant: QdrantService,
+        visual_service: VisualEmbeddingService,
         settings: Settings,
         batch_size: int = 64,
         poll_interval: int = 5,
     ) -> None:
         self.db = db
+        self.extractor_repo = extractor_repo
         self.qdrant = qdrant
+        self.visual_service = visual_service
         self.settings = settings
         self.batch_size = batch_size
         self.poll_interval = poll_interval
@@ -264,11 +270,6 @@ class EmbeddingWorker:
 
         return "\n".join(parts)
 
-    async def _process_visual_video_embedding(
-        self, post: Content
-    ) -> list[float] | None:
-        return None
-
     def _compute_sub_batch_size(self, texts: list[str]) -> int:
         if not texts:
             return _MAX_SUB_BATCH
@@ -283,6 +284,7 @@ class EmbeddingWorker:
 
     async def _process_batch(self, posts: list[Content]) -> None:
         points: list[tuple[int, str, int]] = []
+        valid_posts: list[Content] = []
         skip_ids: list[int] = []
 
         for post in posts:
@@ -299,9 +301,10 @@ class EmbeddingWorker:
                 continue
 
             points.append((post.id, stripped_text, post.account_id))
+            valid_posts.append(post)
 
         if skip_ids:
-            await self.db.mark_content_embedded(skip_ids)
+            await self.extractor_repo.mark_content_embedded(skip_ids)
             logger.debug(
                 "Marked %d posts as embedded (skipped due to insufficient text)",
                 len(skip_ids),
@@ -324,10 +327,21 @@ class EmbeddingWorker:
                 break
 
             sub_batch = points[i : i + sub_batch_size]
+            sub_posts = valid_posts[i : i + sub_batch_size]
             try:
-                await self.qdrant.upsert_batch(sub_batch)
+                visual_tasks: list[asyncio.Task[list[float] | None]] = []
+                for post in sub_posts:
+                    content_meta = self._safe_parse_content_metadata(post.raw_metadata)
+                    video_url = content_meta.video_url if content_meta else None
+                    visual_tasks.append(
+                        asyncio.ensure_future(
+                            self.visual_service.extract_visual_embedding(video_url)
+                        )
+                    )
+                visual_embeddings = await asyncio.gather(*visual_tasks)
+                await self.qdrant.upsert_batch(sub_batch, list(visual_embeddings))
                 sub_ids = [p[0] for p in sub_batch]
-                await self.db.mark_content_embedded(sub_ids)
+                await self.extractor_repo.mark_content_embedded(sub_ids)
                 total_embedded += len(sub_ids)
                 logger.debug(
                     "Embedded sub-batch of %d items (%d/%d total)",
@@ -372,7 +386,7 @@ class EmbeddingWorker:
         while not self._shutdown_event.is_set():
             try:
                 try:
-                    posts = await self.db.get_unembedded_content(
+                    posts = await self.extractor_repo.get_unembedded_content(
                         limit=self.batch_size, priority_mode=self.priority_mode
                     )
                 except (OperationalError, PostgresError) as e:
@@ -451,9 +465,15 @@ async def run_embedding_worker() -> None:
         await db.close()
         return
 
+    extractor_repo = ExtractorRepository(db.async_session, settings)
+
+    visual_service = VisualEmbeddingService(settings)
+
     worker = EmbeddingWorker(
         db=db,
+        extractor_repo=extractor_repo,
         qdrant=qdrant,
+        visual_service=visual_service,
         settings=settings,
         batch_size=settings.embedding_batch_size,
         poll_interval=5,

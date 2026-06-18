@@ -1,6 +1,6 @@
 from fastapi import Request
 from src.db.database import Database
-from src.db.graph_repo import GraphRepository
+from src.graph.db.graph_repo import GraphRepository
 from src.embeddings.qdrant_service import QdrantService
 
 

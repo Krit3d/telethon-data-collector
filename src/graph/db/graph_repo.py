@@ -1,109 +1,17 @@
 import asyncio
-import functools
 import json
 import logging
 import re
 import time
-from collections.abc import Callable, Coroutine
-from typing import Any, TypeVar, cast
+from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from src.config.config import Settings
-
-try:
-    import asyncpg.exceptions as _asyncpg_exc
-except ImportError:
-    _asyncpg_exc = None
+from src.graph.db.helpers import ID_PREFIX_TO_LABEL, parse_agtype, connection_retry
 
 logger = logging.getLogger(__name__)
-
-ID_PREFIX_TO_LABEL: dict[str, str] = {
-    "actor_": "Actor",
-    "brand_": "Actor",
-    "product_": "Entity",
-    "topic_": "Entity",
-    "hashtag_": "Entity",
-    "entity_": "Entity",
-    "event_": "Event",
-    "publication_": "Event",
-    "collaboration_": "Event",
-    "place_": "Place",
-    "region_": "Place",
-    "content_": "Content",
-}
-
-F = TypeVar("F", bound=Callable[..., Coroutine[Any, Any, Any]])
-
-_MAX_RETRIES = 5
-_RETRY_BASE_DELAY = 0.5
-
-
-def _is_retryable_db_error(exc: BaseException) -> bool:
-    if _asyncpg_exc is not None:
-        if isinstance(exc, (_asyncpg_exc.SerializationError, _asyncpg_exc.DeadlockDetectedError)):
-            return True
-    if isinstance(exc, DBAPIError) and exc.orig is not None and _asyncpg_exc is not None:
-        if isinstance(exc.orig, (_asyncpg_exc.SerializationError, _asyncpg_exc.DeadlockDetectedError)):
-            return True
-    return False
-
-
-def connection_retry(func: F) -> F:
-    @functools.wraps(func)
-    async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        last_exc: BaseException | None = None
-        for attempt in range(1, _MAX_RETRIES + 1):
-            try:
-                return await func(*args, **kwargs)
-            except Exception as exc:
-                if not _is_retryable_db_error(exc) or attempt == _MAX_RETRIES:
-                    raise
-                last_exc = exc
-                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(
-                    "Retryable DB error on %s (attempt %d/%d): %s. "
-                    "Retrying in %.2fs",
-                    func.__qualname__,
-                    attempt,
-                    _MAX_RETRIES,
-                    exc,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-        assert last_exc is not None
-        raise last_exc
-
-    return cast(F, wrapper)
-
-
-def _parse_agtype(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        text_val = value.strip()
-        if len(text_val) >= 2 and (
-            (text_val[0] == '"' and text_val[-1] == '"')
-            or (text_val[0] == "'" and text_val[-1] == "'")
-        ):
-            text_val = text_val[1:-1]
-        try:
-            return json.loads(text_val)
-        except (json.JSONDecodeError, TypeError):
-            return text_val
-    text_val = str(value).strip()
-    if (text_val.startswith('"') and text_val.endswith('"')) or (
-        text_val.startswith("'") and text_val.endswith("'")
-    ):
-        text_val = text_val[1:-1]
-    try:
-        return json.loads(text_val)
-    except (json.JSONDecodeError, TypeError):
-        return text_val
 
 
 class GraphRepository:
@@ -160,22 +68,19 @@ class GraphRepository:
         try:
             query = text(
                 f"SELECT * FROM ag_catalog.cypher('{graph_name}',"
-                " $$ MATCH ()-[r]->() RETURN count(r) LIMIT 1 $$"
-                ") AS (cnt agtype)"
+                " $$ MATCH ()-[r]->() RETURN r LIMIT 1 $$"
+                ") AS (r agtype)"
             )
             result = await asyncio.wait_for(
                 self._execute_in_transaction(query),
                 timeout=5.0,
             )
             row = result.first()
-            if row is None:
-                return False
-            count_val = _parse_agtype(row[0])
-            edge_count = int(count_val) if count_val is not None else 0
+            has_edges = row is not None
             logger.debug(
-                "Graph edge existence check: %d total edges", edge_count
+                "Graph edge existence check: edges_present=%s", has_edges
             )
-            return edge_count > 0
+            return has_edges
         except asyncio.TimeoutError:
             logger.warning(
                 "Graph edge existence check timed out, assuming edges exist"
@@ -375,10 +280,10 @@ class GraphRepository:
 
             nodes: list[dict] = []
             for row in rows:
-                node_id = _parse_agtype(row[0])
-                node_label = _parse_agtype(row[1])
-                node_name = _parse_agtype(row[2])
-                node_data = _parse_agtype(row[3])
+                node_id = parse_agtype(row[0])
+                node_label = parse_agtype(row[1])
+                node_name = parse_agtype(row[2])
+                node_data = parse_agtype(row[3])
 
                 properties: dict[str, Any] = {}
                 if isinstance(node_data, dict):
@@ -500,9 +405,9 @@ class GraphRepository:
                        LIMIT {limit_val}
                        UNION
                        UNWIND $ids_list AS hid
-                       MATCH (a:{label})
-                       WHERE a.id = hid
-                       MATCH (a)<-[r]-(b)
+                       MATCH (b:{label})
+                       WHERE b.id = hid
+                       MATCH (a)-[r]->(b)
                        RETURN a.id AS a_id, label(a) AS a_label, a.name AS a_name,
                               type(r) AS rel_type, b.id AS b_id, label(b) AS b_label, b.name AS b_name
                        LIMIT {limit_val} $$,
@@ -532,13 +437,13 @@ class GraphRepository:
                 for row in rows:
                     edges.append(
                         {
-                            "source_id": _parse_agtype(row[0]),
-                            "source_label": _parse_agtype(row[1]),
-                            "source_name": _parse_agtype(row[2]),
-                            "relation_type": _parse_agtype(row[3]),
-                            "target_id": _parse_agtype(row[4]),
-                            "target_label": _parse_agtype(row[5]),
-                            "target_name": _parse_agtype(row[6]),
+                            "source_id": parse_agtype(row[0]),
+                            "source_label": parse_agtype(row[1]),
+                            "source_name": parse_agtype(row[2]),
+                            "relation_type": parse_agtype(row[3]),
+                            "target_id": parse_agtype(row[4]),
+                            "target_label": parse_agtype(row[5]),
+                            "target_name": parse_agtype(row[6]),
                         }
                     )
 
@@ -563,7 +468,7 @@ class GraphRepository:
                         )
                         sample_rows = sample_result.all()
                         sample_ids = [
-                            str(_parse_agtype(row[0]))
+                            str(parse_agtype(row[0]))
                             for row in sample_rows
                         ]
                         logger.warning(
