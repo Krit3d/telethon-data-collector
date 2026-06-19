@@ -221,6 +221,10 @@ class Settings(BaseSettings):
     )
     enable_visual_embeddings: bool = Field(default=False, description="Enable or disable visual video embeddings extraction")
     visual_embedding_dim: int = Field(default=512, description="Dimension of visual video embeddings")
+    onnxruntime_provider: str = Field(
+        default="CPUExecutionProvider",
+        description="Execution provider for ONNX Runtime models (e.g., CUDAExecutionProvider or CPUExecutionProvider)",
+    )
 
     graph_name: str = Field(
         default="social_graph",

@@ -164,6 +164,7 @@ class EmbeddingWorker:
 
     def _assemble_embedding_text(self, post: Content) -> str:
         parts: list[str] = []
+        category_placeholder: str | None = None
         account = post.account
 
         if account:
@@ -183,8 +184,6 @@ class EmbeddingWorker:
                     and account_meta.biography != account.description
                 ):
                     parts.append(f"Biography: {account_meta.biography}")
-                if account_meta.category:
-                    parts.append(f"Category: {account_meta.category}")
                 if account_meta.location:
                     parts.append(f"Location: {account_meta.location}")
                 if account_meta.external_links:
@@ -196,9 +195,6 @@ class EmbeddingWorker:
                 )
                 if bio and bio != account.description:
                     parts.append(f"Biography: {bio}")
-                category = account.raw_metadata.get("category")
-                if category:
-                    parts.append(f"Category: {category}")
                 location = account.raw_metadata.get("location")
                 if isinstance(location, dict):
                     loc_name = location.get("name") or location.get("city")
@@ -210,6 +206,9 @@ class EmbeddingWorker:
                 if isinstance(ext_links, list) and ext_links:
                     links = ", ".join(str(link) for link in ext_links[:5])
                     parts.append(f"External links: {links}")
+
+        if category_placeholder:
+            parts.append(f"Category: {category_placeholder}")
 
         if post.content:
             cleaned = self._clean_text(post.content)
@@ -231,8 +230,6 @@ class EmbeddingWorker:
                 parts.append(f"Co-authors: {', '.join(content_meta.coauthors)}")
             if content_meta.tagged_users:
                 parts.append(f"Tagged users: {', '.join(content_meta.tagged_users)}")
-            if content_meta.category:
-                parts.append(f"Post category: {content_meta.category}")
             if content_meta.accessibility_caption:
                 caption = self._clean_text(content_meta.accessibility_caption)
                 if caption:
@@ -254,9 +251,6 @@ class EmbeddingWorker:
             tagged = post.raw_metadata.get("tagged_users")
             if isinstance(tagged, list) and tagged:
                 parts.append(f"Tagged users: {', '.join(str(t) for t in tagged)}")
-            category = post.raw_metadata.get("category")
-            if category:
-                parts.append(f"Post category: {category}")
             caption = post.raw_metadata.get("accessibility_caption")
             if isinstance(caption, str) and caption:
                 cleaned_cap = self._clean_text(caption)
@@ -267,6 +261,9 @@ class EmbeddingWorker:
                 cleaned_tr = self._clean_text(transcription)
                 if cleaned_tr:
                     parts.append(f"Transcription: {cleaned_tr}")
+
+        if category_placeholder:
+            parts.append(f"Post category: {category_placeholder}")
 
         return "\n".join(parts)
 
@@ -478,7 +475,7 @@ async def run_embedding_worker() -> None:
         batch_size=settings.embedding_batch_size,
         poll_interval=5,
     )
-    worker.priority_mode = settings.embedding_priority_mode
+    worker.priority_mode = getattr(settings, "embedding_priority_mode", False)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

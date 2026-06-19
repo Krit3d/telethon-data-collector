@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from typing import Any, Final
 
@@ -33,8 +32,7 @@ class QdrantService:
         self.settings = settings
         self.collection_name = settings.qdrant_collection_name or POSTS_COLLECTION
 
-        onnx_provider = os.environ.get("ONNXRUNTIME_PROVIDER")
-        if onnx_provider == "CUDAExecutionProvider":
+        if settings.onnxruntime_provider == "CUDAExecutionProvider":
             self.model = TextEmbedding(
                 model_name=settings.embedding_model_name,
                 threads=settings.embedding_threads,

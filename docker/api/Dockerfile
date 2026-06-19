@@ -17,7 +17,7 @@ COPY . .
 
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-FROM nvidia/cuda:12.4.1-cudnn9-runtime-ubuntu22.04 AS gpu-runner
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS gpu-runner
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONPATH=/app

@@ -152,8 +152,9 @@ class GraphExtractionWorker:
         }
 
         raw_metadata: dict = (
-            post.raw_metadata if post.raw_metadata is not None else {}
+            post.raw_metadata.copy() if post.raw_metadata is not None else {}
         )
+        raw_metadata.pop("category", None)
         if post.transcription:
             raw_metadata = {**raw_metadata, "transcription": post.transcription}
 
@@ -162,6 +163,7 @@ class GraphExtractionWorker:
             account_metadata = (
                 post.account.raw_metadata.copy() if post.account.raw_metadata else {}
             )
+            account_metadata.pop("category", None)
             account_metadata["username"] = post.account.username
             account_metadata["title"] = post.account.title
             account_metadata["subscribers_count"] = post.account.subscribers_count
@@ -253,7 +255,7 @@ async def run_graph_extractor() -> None:
         batch_size=settings.extractor_batch_size,
         poll_interval=5,
     )
-    worker.priority_mode = settings.extraction_priority_mode
+    worker.priority_mode = getattr(settings, "extraction_priority_mode", False)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

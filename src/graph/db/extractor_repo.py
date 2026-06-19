@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 class ExtractorRepository:
 
+    TARGET_PLATFORM_STATUSES: dict[str, list[str]] = {
+        "INSTAGRAM": ["verified"],
+    }
+
     def __init__(
         self,
         async_session: async_sessionmaker[AsyncSession],
@@ -23,6 +27,21 @@ class ExtractorRepository:
     ) -> None:
         self.async_session = async_session
         self.settings = settings
+
+    def _apply_account_filters(self, stmt: Any) -> Any:
+        mapping: dict[str, list[str]] = getattr(
+            self.settings, "extractor_target_mapping", None
+        ) or self.TARGET_PLATFORM_STATUSES
+
+        platform_filters = [
+            and_(
+                Account.platform == platform,
+                Account.status.in_(statuses),
+            )
+            for platform, statuses in mapping.items()
+        ]
+
+        return stmt.where(or_(*platform_filters))
 
     async def get_unembedded_content(
         self, limit: int, priority_mode: bool
@@ -36,9 +55,9 @@ class ExtractorRepository:
                     Content.is_embedded == False,
                     Content.content.isnot(None),
                     Content.content != "",
-                    Account.status == "parsed",
                 )
             )
+            stmt = self._apply_account_filters(stmt)
 
             if priority_mode:
                 stmt = stmt.order_by(Content.published_at.desc())
@@ -97,8 +116,9 @@ class ExtractorRepository:
             select(Content)
             .join(Account, Content.account_id == Account.id)
             .options(joinedload(Content.account))
-            .where(*conditions, Account.status == "parsed")
+            .where(*conditions)
         )
+        stmt = self._apply_account_filters(stmt)
 
         if priority_mode:
             stmt = stmt.order_by(Content.published_at.desc())
