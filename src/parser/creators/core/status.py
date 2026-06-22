@@ -32,6 +32,7 @@ CREATOR_STATUSES: Final[frozenset[str]] = frozenset({
     "parsed",
     "rejected",
     "failed",
+    "verified",
 })
 
 # All valid statuses across all platforms
@@ -50,6 +51,7 @@ class AccountStatus(str, Enum):
     PARSED = "parsed"
     REJECTED = "rejected"
     FAILED = "failed"
+    VERIFIED = "verified"
     READY_FOR_PARSING = "ready_for_parsing"
 
     def is_valid_for_platform(self, platform: str) -> bool:
@@ -85,10 +87,11 @@ class StatusTransitionError(ValueError):
 VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     "pending": frozenset({"processing", "rejected"}),
     "processing": frozenset({"parsed", "rejected", "failed", "pending"}),
-    "parsed": frozenset({"processing"}),  # Allow re-processing
-    "rejected": frozenset({"pending", "processing"}),  # Allow re-queuing
-    "failed": frozenset({"pending", "processing"}),  # Allow retry
-    "ready_for_parsing": frozenset({"processing", "rejected"}),  # Telegram only
+    "parsed": frozenset({"processing", "verified"}),
+    "rejected": frozenset({"pending", "processing"}),
+    "failed": frozenset({"pending", "processing"}),
+    "ready_for_parsing": frozenset({"processing", "rejected"}),
+    "verified": frozenset(),
 }
 
 

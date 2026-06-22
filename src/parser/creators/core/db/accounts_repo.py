@@ -16,7 +16,7 @@ from src.parser.creators.core.schemas import MetricsEntry
 
 logger = logging.getLogger(__name__)
 
-FINALIZED_STATUSES: frozenset[str] = frozenset({"parsed", "rejected"})
+FINALIZED_STATUSES: frozenset[str] = frozenset({"parsed", "rejected", "verified"})
 NON_FINALIZED_STATUSES: frozenset[str] = frozenset({"pending", "processing"})
 
 
@@ -91,6 +91,12 @@ async def upsert_and_deduplicate_account(
 
     if len(existing_accounts) == 1:
         account = existing_accounts[0]
+        if account.status == "verified":
+            logger.info(
+                "Skipping update for verified account: id=%d",
+                account.id,
+            )
+            return account.id
         account.platform_id = platform_id or account.platform_id
         account.username = username or account.username
         account.title = title
@@ -109,26 +115,31 @@ async def upsert_and_deduplicate_account(
         )
         return account.id
 
-    primary_account = None
+    primary_account: Account | None = None
     for account in existing_accounts:
-        if account.platform_id and account.platform_id.isdigit():
+        if account.status == "verified":
             primary_account = account
             break
-
+    if primary_account is None:
+        for account in existing_accounts:
+            if account.platform_id and account.platform_id.isdigit():
+                primary_account = account
+                break
     if primary_account is None:
         primary_account = existing_accounts[0]
 
     primary_id = primary_account.id
 
-    primary_account.platform_id = platform_id or primary_account.platform_id
-    primary_account.username = username or primary_account.username
-    primary_account.title = title
-    primary_account.description = description if description is not None else primary_account.description
-    primary_account.subscribers_count = (
-        subscribers_count if subscribers_count is not None else primary_account.subscribers_count
-    )
-    if primary_account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
-        primary_account.status = status
+    if primary_account.status != "verified":
+        primary_account.platform_id = platform_id or primary_account.platform_id
+        primary_account.username = username or primary_account.username
+        primary_account.title = title
+        primary_account.description = description if description is not None else primary_account.description
+        primary_account.subscribers_count = (
+            subscribers_count if subscribers_count is not None else primary_account.subscribers_count
+        )
+        if primary_account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
+            primary_account.status = status
 
     duplicate_ids = [acc.id for acc in existing_accounts if acc.id != primary_id]
     if duplicate_ids:
@@ -344,6 +355,13 @@ async def update_account_profile_metadata(
     if not account:
         logger.warning("Account with id %d not found for metadata update", account_id)
         return {}
+
+    if account.status == "verified":
+        logger.info(
+            "Skipping metadata update for verified account: id=%d",
+            account_id,
+        )
+        return account.raw_metadata if isinstance(account.raw_metadata, dict) else {}
 
     raw_metadata_dict: dict[str, Any] = {}
     if account.raw_metadata and isinstance(account.raw_metadata, dict):

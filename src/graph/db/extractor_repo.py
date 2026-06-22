@@ -55,6 +55,8 @@ class ExtractorRepository:
                     Content.is_embedded == False,
                     Content.content.isnot(None),
                     Content.content != "",
+                    Content.raw_metadata.isnot(None),
+                    Account.raw_metadata.isnot(None),
                 )
             )
             stmt = self._apply_account_filters(stmt)
@@ -101,7 +103,11 @@ class ExtractorRepository:
         require_content: bool,
         priority_mode: bool,
     ) -> Any:
-        conditions: list[Any] = [Content.is_graph_extracted == False]
+        conditions: list[Any] = [
+            Content.is_graph_extracted == False,
+            Content.raw_metadata.isnot(None),
+            Account.raw_metadata.isnot(None),
+        ]
 
         if require_content:
             conditions.append(

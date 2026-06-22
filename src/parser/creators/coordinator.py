@@ -189,13 +189,15 @@ class CreatorsCoordinator:
 
             final_pending_count = await self.db.count_pending_creator_accounts(platform)
 
+            if final_pending_count == 0:
+                logger.info("No pending accounts available. Skipping ingestion cycle.")
+                return
+
             if final_pending_count < batch_size:
                 logger.info(
-                    f"Not enough pending accounts to run a full batch: "
-                    f"{final_pending_count} < {batch_size}. "
-                    f"Skipping ingestion cycle."
+                    f"Processing partial batch of {final_pending_count} pending accounts "
+                    f"(batch_size={batch_size})."
                 )
-                return
 
             accounts = await self.db.claim_creator_accounts(
                 platforms=[self.platform_filter] if self.platform_filter else CREATOR_PLATFORMS,

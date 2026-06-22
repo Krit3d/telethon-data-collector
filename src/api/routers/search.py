@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -28,20 +29,7 @@ _SEMANTIC_RELATIONS: frozenset[str] = frozenset(
 _DIRECT_CONNECT_WEIGHT: float = 1.0
 _SEMANTIC_TRAVERSAL_WEIGHT: float = 0.6
 _BRAND_TRAVERSAL_WEIGHT: float = 0.5
-
-
-def _clean_content_id(node_id: Any) -> int | None:
-    if node_id is None:
-        return None
-    s = str(node_id)
-    if s.startswith("content_"):
-        s = s[8:]
-    elif s.startswith("event_publication_"):
-        s = s[18:]
-    try:
-        return int(s)
-    except (ValueError, TypeError):
-        return None
+_ER_BOOST_WEIGHT: float = 0.1
 
 
 def _strip_surrounding_quotes(val: Any) -> Any:
@@ -64,10 +52,59 @@ def _build_content_url(content: Any) -> str:
     )
 
 
+def _build_node_id_to_post_id(
+    nodes_data: list[dict[str, Any]],
+) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for node in nodes_data:
+        label = (node.get("label") or "").lower()
+        if label not in _CONTENT_LABELS:
+            continue
+        node_id = node.get("id", "")
+        props = node.get("properties", {})
+        raw_db_post_id = props.get("db_post_id")
+        post_id: int | None = None
+        if raw_db_post_id is not None:
+            try:
+                post_id = int(raw_db_post_id)
+            except (ValueError, TypeError):
+                post_id = None
+        if post_id is None:
+            match = re.search(r"(\d+)$", str(node_id))
+            if match:
+                try:
+                    post_id = int(match.group(1))
+                except (ValueError, TypeError):
+                    post_id = None
+        if post_id is not None:
+            result[node_id] = post_id
+    return result
+
+
+def _build_post_id_to_er(
+    nodes_data: list[dict[str, Any]],
+    node_id_to_post_id: dict[str, int],
+) -> dict[int, float]:
+    result: dict[int, float] = {}
+    for node in nodes_data:
+        node_id = node.get("id", "")
+        if node_id not in node_id_to_post_id:
+            continue
+        post_id = node_id_to_post_id[node_id]
+        props = node.get("properties", {})
+        raw_er = props.get("engagement_rate", 0.0)
+        try:
+            result[post_id] = float(raw_er)
+        except (ValueError, TypeError):
+            result[post_id] = 0.0
+    return result
+
+
 def _traverse_graph_for_posts(
     edges_data: list[dict[str, Any]],
     entity_ids: set[str],
     entity_id_to_score: dict[str, float],
+    node_id_to_post_id: dict[str, int],
 ) -> tuple[dict[int, float], dict[str, set[int]]]:
     graph_post_scores: dict[int, float] = {}
     entity_connected: dict[str, set[int]] = defaultdict(set)
@@ -99,12 +136,12 @@ def _traverse_graph_for_posts(
         tgt_label = (edge["target_label"] or "").lower()
 
         if src_label in _CONTENT_LABELS and tgt_id in entity_ids:
-            cid = _clean_content_id(src_id)
+            cid = node_id_to_post_id.get(src_id)
             _update(cid, entity_id_to_score.get(tgt_id, 0.0) * _DIRECT_CONNECT_WEIGHT)
             if cid is not None:
                 entity_connected[tgt_id].add(cid)
         elif tgt_label in _CONTENT_LABELS and src_id in entity_ids:
-            cid = _clean_content_id(tgt_id)
+            cid = node_id_to_post_id.get(tgt_id)
             _update(cid, entity_id_to_score.get(src_id, 0.0) * _DIRECT_CONNECT_WEIGHT)
             if cid is not None:
                 entity_connected[src_id].add(cid)
@@ -125,9 +162,9 @@ def _traverse_graph_for_posts(
                 nsl = (edge["source_label"] or "").lower()
                 ntl = (edge["target_label"] or "").lower()
                 if nsl in _CONTENT_LABELS and nt == nb:
-                    _update(_clean_content_id(ns), weighted)
+                    _update(node_id_to_post_id.get(ns), weighted)
                 elif ntl in _CONTENT_LABELS and ns == nb:
-                    _update(_clean_content_id(nt), weighted)
+                    _update(node_id_to_post_id.get(nt), weighted)
 
     avg_entity_score = (
         sum(entity_id_to_score.values()) / len(entity_id_to_score)
@@ -142,9 +179,9 @@ def _traverse_graph_for_posts(
             btl = (edge["target_label"] or "").lower()
             cid: int | None = None
             if bsl in _CONTENT_LABELS and bt == brand_id:
-                cid = _clean_content_id(bs)
+                cid = node_id_to_post_id.get(bs)
             elif btl in _CONTENT_LABELS and bs == brand_id:
-                cid = _clean_content_id(bt)
+                cid = node_id_to_post_id.get(bt)
             if cid is not None and cid not in graph_post_scores:
                 graph_post_scores[cid] = brand_weighted
 
@@ -206,6 +243,8 @@ async def search_content(
 
         graph_post_scores: dict[int, float] = {}
         edges_data: list[dict[str, Any]] = []
+        node_id_to_post_id: dict[str, int] = {}
+        post_id_to_er: dict[int, float] = {}
 
         if entity_ids:
             try:
@@ -222,8 +261,26 @@ async def search_content(
                 ]
                 logger.info("Graph subgraph returned %d edges", len(edges_data))
 
+                node_ids: set[str] = set()
+                for edge in edges_data:
+                    node_ids.add(edge["source_id"])
+                    node_ids.add(edge["target_id"])
+
+                if node_ids:
+                    nodes_data = await graph_repo.get_nodes_by_ids(list(node_ids))
+                    node_id_to_post_id = _build_node_id_to_post_id(nodes_data)
+                    post_id_to_er = _build_post_id_to_er(
+                        nodes_data, node_id_to_post_id
+                    )
+                    logger.info(
+                        "Built ID mapping for %d content nodes, "
+                        "ER data for %d posts",
+                        len(node_id_to_post_id),
+                        len(post_id_to_er),
+                    )
+
                 graph_post_scores, _ = _traverse_graph_for_posts(
-                    edges_data, entity_ids, entity_id_to_score
+                    edges_data, entity_ids, entity_id_to_score, node_id_to_post_id
                 )
             except Exception:
                 logger.warning("Graph traversal failed", exc_info=True)
@@ -258,17 +315,19 @@ async def search_content(
                     "Content ID %d not found in PostgreSQL", cid
                 )
                 continue
+            er_boost = post_id_to_er.get(cid, 0.0)
+            final_score = rrf_scores[cid] * (1.0 + (er_boost * _ER_BOOST_WEIGHT))
             merged.append(
                 {
                     "content": content,
-                    "rrf_score": rrf_scores[cid],
+                    "final_score": final_score,
                     "url": _build_content_url(content),
                     "in_graph": cid in graph_post_scores,
                     "in_vector": cid in vector_set,
                 }
             )
 
-        merged.sort(key=lambda x: x["rrf_score"], reverse=True)
+        merged.sort(key=lambda x: x["final_score"], reverse=True)
         merged = merged[: payload.limit]
 
         results: list[SearchResultItem] = []
@@ -290,7 +349,7 @@ async def search_content(
                     post_id=content.id,
                     account_id=content.account_id,
                     text=content.content or "",
-                    score=item["rrf_score"],
+                    score=item["final_score"],
                     created_at=content.created_at,
                     url=item["url"],
                     author_id=author_id,
@@ -302,15 +361,17 @@ async def search_content(
         graph_entities: list[GraphEntity] = []
         if entity_ids and edges_data:
             try:
-                node_ids: set[str] = set()
+                all_node_ids: set[str] = set()
                 for edge in edges_data:
-                    node_ids.add(edge["source_id"])
-                    node_ids.add(edge["target_id"])
+                    all_node_ids.add(edge["source_id"])
+                    all_node_ids.add(edge["target_id"])
 
-                if node_ids:
-                    nodes_data = await graph_repo.get_nodes_by_ids(list(node_ids))
+                if all_node_ids:
+                    nodes_data_full = await graph_repo.get_nodes_by_ids(
+                        list(all_node_ids)
+                    )
                     node_lookup: dict[str, dict[str, Any]] = {
-                        n["id"]: n for n in nodes_data
+                        n["id"]: n for n in nodes_data_full
                     }
                     entity_lookup: dict[str, GraphEntity] = {}
 

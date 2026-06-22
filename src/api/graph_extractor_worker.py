@@ -129,9 +129,14 @@ class GraphExtractionWorker:
     async def _process_single_post(self, post: Content) -> None:
         text_for_processing: str | None = None
 
-        if post.content and post.content.strip():
+        has_content = post.content is not None and post.content.strip()
+        has_transcription = post.transcription is not None and post.transcription.strip()
+
+        if has_content and has_transcription:
+            text_for_processing = f"{post.content}\n\nTranscription:\n{post.transcription}"
+        elif has_content:
             text_for_processing = post.content
-        elif post.transcription and post.transcription.strip():
+        elif has_transcription:
             text_for_processing = post.transcription
 
         if text_for_processing is None:
@@ -155,6 +160,8 @@ class GraphExtractionWorker:
             post.raw_metadata.copy() if post.raw_metadata is not None else {}
         )
         raw_metadata.pop("category", None)
+        if not getattr(self.settings, "process_language_data", False):
+            raw_metadata.pop("language", None)
         if post.transcription:
             raw_metadata = {**raw_metadata, "transcription": post.transcription}
 
@@ -164,6 +171,8 @@ class GraphExtractionWorker:
                 post.account.raw_metadata.copy() if post.account.raw_metadata else {}
             )
             account_metadata.pop("category", None)
+            if not getattr(self.settings, "process_language_data", False):
+                account_metadata.pop("language", None)
             account_metadata["username"] = post.account.username
             account_metadata["title"] = post.account.title
             account_metadata["subscribers_count"] = post.account.subscribers_count

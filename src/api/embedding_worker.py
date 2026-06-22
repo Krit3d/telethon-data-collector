@@ -142,6 +142,18 @@ class EmbeddingWorker:
         cleaned = _MULTI_NEWLINE_RE.sub("\n\n", cleaned)
         return cleaned.strip()
 
+    def _extract_domain(self, url: str) -> str | None:
+        url = url.strip()
+        if not url:
+            return None
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        if url.startswith("www."):
+            url = url[4:]
+        url = url.split("/", 1)[0]
+        url = url.split("?", 1)[0]
+        return url.lower() if url else None
+
     def _safe_parse_account_metadata(
         self, raw: dict[str, Any] | None
     ) -> AccountMetadata | None:
@@ -164,51 +176,123 @@ class EmbeddingWorker:
 
     def _assemble_embedding_text(self, post: Content) -> str:
         parts: list[str] = []
-        category_placeholder: str | None = None
         account = post.account
 
         if account:
             if account.platform:
                 parts.append(f"Platform: {account.platform}")
-            if account.title:
-                parts.append(f"Account: {account.title}")
+
+            title = account.title or None
+            if not title and account.raw_metadata:
+                title = account.raw_metadata.get("full_name")
+            if title:
+                parts.append(f"Account: {title}")
+
             if account.username:
                 parts.append(f"Username: @{account.username}")
-            if account.description:
-                parts.append(f"Bio: {account.description}")
+
+            description = account.description or None
+            if not description and account.raw_metadata:
+                description = (
+                    account.raw_metadata.get("biography")
+                    or account.raw_metadata.get("bio")
+                )
+            if description:
+                parts.append(f"Bio: {description}")
 
             account_meta = self._safe_parse_account_metadata(account.raw_metadata)
+            location = None
             if account_meta:
-                if (
-                    account_meta.biography
-                    and account_meta.biography != account.description
-                ):
-                    parts.append(f"Biography: {account_meta.biography}")
                 if account_meta.location:
-                    parts.append(f"Location: {account_meta.location}")
-                if account_meta.external_links:
-                    links = ", ".join(account_meta.external_links[:5])
-                    parts.append(f"External links: {links}")
+                    location = account_meta.location
+                elif account_meta.geo_data:
+                    geo_parts = [
+                        p
+                        for p in (account_meta.geo_data.city, account_meta.geo_data.country)
+                        if p
+                    ]
+                    if geo_parts:
+                        location = ", ".join(geo_parts)
             elif account.raw_metadata:
-                bio = account.raw_metadata.get("biography") or account.raw_metadata.get(
-                    "bio"
-                )
-                if bio and bio != account.description:
-                    parts.append(f"Biography: {bio}")
-                location = account.raw_metadata.get("location")
-                if isinstance(location, dict):
-                    loc_name = location.get("name") or location.get("city")
-                    if loc_name:
-                        parts.append(f"Location: {loc_name}")
-                elif location:
-                    parts.append(f"Location: {location}")
-                ext_links = account.raw_metadata.get("external_links")
-                if isinstance(ext_links, list) and ext_links:
-                    links = ", ".join(str(link) for link in ext_links[:5])
-                    parts.append(f"External links: {links}")
+                raw_loc = account.raw_metadata.get("location")
+                if isinstance(raw_loc, str) and raw_loc:
+                    location = raw_loc
+                elif isinstance(raw_loc, dict):
+                    geo_parts = [
+                        p
+                        for p in (raw_loc.get("city"), raw_loc.get("country"))
+                        if p
+                    ]
+                    if geo_parts:
+                        location = ", ".join(geo_parts)
+            if location:
+                parts.append(f"Location: {location}")
 
-        if category_placeholder:
-            parts.append(f"Category: {category_placeholder}")
+            urls: list[str] = []
+            if account_meta:
+                if account_meta.external_links:
+                    urls.extend(account_meta.external_links[:5])
+                if account_meta.website:
+                    urls.append(account_meta.website)
+                if account_meta.link_in_bio:
+                    urls.append(account_meta.link_in_bio)
+            elif account.raw_metadata:
+                ext_links = account.raw_metadata.get("external_links")
+                if isinstance(ext_links, list):
+                    urls.extend(str(link) for link in ext_links[:5])
+                website = account.raw_metadata.get("website")
+                if isinstance(website, str) and website:
+                    urls.append(website)
+                link_in_bio = account.raw_metadata.get("link_in_bio")
+                if isinstance(link_in_bio, str) and link_in_bio:
+                    urls.append(link_in_bio)
+            if urls:
+                domains: list[str] = []
+                for u in urls:
+                    domain = self._extract_domain(u)
+                    if domain:
+                        domains.append(domain)
+                if domains:
+                    unique_domains = list(dict.fromkeys(domains))
+                    parts.append(f"Domains: {', '.join(unique_domains)}")
+
+            if getattr(self.settings, "process_language_data", False):
+                lang = None
+                if account_meta:
+                    lang = account_meta.language
+                elif account.raw_metadata:
+                    lang = account.raw_metadata.get("language")
+                if lang:
+                    parts.append(f"Language: {lang}")
+
+        content_meta = self._safe_parse_content_metadata(post.raw_metadata)
+
+        post_type = None
+        if content_meta:
+            post_type = content_meta.post_type
+        elif post.raw_metadata:
+            pt = post.raw_metadata.get("post_type")
+            if pt:
+                post_type = str(pt)
+        if post_type:
+            parts.append(f"Post type: {post_type}")
+
+        author_parts: list[str] = []
+        if content_meta and content_meta.author_profile_snapshot:
+            snapshot = content_meta.author_profile_snapshot
+            if snapshot.title:
+                author_parts.append(snapshot.title)
+            if snapshot.username:
+                author_parts.append(f"@{snapshot.username}")
+        elif post.raw_metadata:
+            author = post.raw_metadata.get("author_profile_snapshot")
+            if isinstance(author, dict):
+                if author.get("title"):
+                    author_parts.append(str(author["title"]))
+                if author.get("username"):
+                    author_parts.append(f"@{author['username']}")
+        if author_parts:
+            parts.append(f"Author: {' '.join(author_parts)}")
 
         if post.content:
             cleaned = self._clean_text(post.content)
@@ -220,50 +304,56 @@ class EmbeddingWorker:
             if cleaned_t:
                 parts.append(f"Transcription: {cleaned_t}")
 
-        content_meta = self._safe_parse_content_metadata(post.raw_metadata)
-        if content_meta:
-            if content_meta.hashtags:
-                parts.append(f"Hashtags: {', '.join(content_meta.hashtags)}")
-            if content_meta.geo_data and content_meta.geo_data.name:
-                parts.append(f"Location: {content_meta.geo_data.name}")
-            if content_meta.coauthors:
-                parts.append(f"Co-authors: {', '.join(content_meta.coauthors)}")
-            if content_meta.tagged_users:
-                parts.append(f"Tagged users: {', '.join(content_meta.tagged_users)}")
-            if content_meta.accessibility_caption:
-                caption = self._clean_text(content_meta.accessibility_caption)
-                if caption:
-                    parts.append(f"Caption: {caption}")
+        accessibility = None
+        if content_meta and content_meta.accessibility_caption:
+            accessibility = content_meta.accessibility_caption
         elif post.raw_metadata:
-            hashtags = post.raw_metadata.get("hashtags")
-            if isinstance(hashtags, list) and hashtags:
-                parts.append(f"Hashtags: {', '.join(str(h) for h in hashtags)}")
-            elif isinstance(hashtags, str) and hashtags:
-                parts.append(f"Hashtags: {hashtags}")
-            geo = post.raw_metadata.get("geo_data")
-            if isinstance(geo, dict) and geo.get("name"):
-                parts.append(f"Location: {geo['name']}")
-            elif isinstance(geo, str) and geo:
-                parts.append(f"Location: {geo}")
-            coauthors = post.raw_metadata.get("coauthors")
-            if isinstance(coauthors, list) and coauthors:
-                parts.append(f"Co-authors: {', '.join(str(c) for c in coauthors)}")
-            tagged = post.raw_metadata.get("tagged_users")
-            if isinstance(tagged, list) and tagged:
-                parts.append(f"Tagged users: {', '.join(str(t) for t in tagged)}")
-            caption = post.raw_metadata.get("accessibility_caption")
-            if isinstance(caption, str) and caption:
-                cleaned_cap = self._clean_text(caption)
-                if cleaned_cap:
-                    parts.append(f"Caption: {cleaned_cap}")
-            transcription = post.raw_metadata.get("transcription")
-            if isinstance(transcription, str) and transcription and not post.transcription:
-                cleaned_tr = self._clean_text(transcription)
-                if cleaned_tr:
-                    parts.append(f"Transcription: {cleaned_tr}")
+            cap = post.raw_metadata.get("accessibility_caption")
+            if isinstance(cap, str) and cap:
+                accessibility = cap
+        if accessibility:
+            cleaned_cap = self._clean_text(accessibility)
+            if cleaned_cap:
+                parts.append(f"Caption: {cleaned_cap}")
 
-        if category_placeholder:
-            parts.append(f"Post category: {category_placeholder}")
+        hashtags = None
+        if content_meta and content_meta.hashtags:
+            hashtags = content_meta.hashtags
+        elif post.raw_metadata:
+            h = post.raw_metadata.get("hashtags")
+            if isinstance(h, list) and h:
+                hashtags = [str(x) for x in h]
+            elif isinstance(h, str) and h:
+                hashtags = [h]
+        if hashtags:
+            parts.append(f"Hashtags: {', '.join(hashtags)}")
+
+        music_title = None
+        music_author = None
+        if content_meta:
+            music_title = content_meta.music_title
+            music_author = content_meta.music_author
+        elif post.raw_metadata:
+            clips = post.raw_metadata.get("clips_metadata")
+            if isinstance(clips, dict):
+                music_info = clips.get("clips_music_attribution_info")
+                if isinstance(music_info, dict):
+                    music_title = music_info.get("song_name")
+                    music_author = music_info.get("artist_name")
+        if music_title:
+            audio = music_title
+            if music_author:
+                audio = f"{music_title} - {music_author}"
+            parts.append(f"Audio: {audio}")
+
+        if getattr(self.settings, "process_language_data", False):
+            lang = None
+            if content_meta:
+                lang = content_meta.language
+            elif post.raw_metadata:
+                lang = post.raw_metadata.get("language")
+            if lang:
+                parts.append(f"Language: {lang}")
 
         return "\n".join(parts)
 

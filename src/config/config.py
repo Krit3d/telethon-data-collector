@@ -231,6 +231,11 @@ class Settings(BaseSettings):
         description="The Apache AGE graph name",
     )
 
+    process_language_data: bool = Field(
+        default=False,
+        description="Enable processing and storage of language metadata in the knowledge graph",
+    )
+
     # ---- API server settings ----
     api_host: str = Field(
         default="0.0.0.0",
