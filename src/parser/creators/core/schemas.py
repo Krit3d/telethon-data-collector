@@ -3,6 +3,20 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+
+def _safe_int(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 HEAVY_PROFILE_KEYS: list[str] = [
     "chaining_results",
     "facebook_pages",
@@ -188,6 +202,52 @@ class ContentMetadata(BaseModel):
                 "name": location.get("name"),
                 "lat": location.get("lat") or location.get("latitude"),
                 "lng": location.get("lng") or location.get("longitude"),
+            }
+
+        if "platform_metrics" not in data:
+            likes = (
+                _safe_int(raw_payload.get("like_count"))
+                or _safe_int(raw_payload.get("likes"))
+                or None
+            )
+            if likes is None:
+                edge_like = raw_payload.get("edge_media_preview_like")
+                if isinstance(edge_like, dict):
+                    likes = _safe_int(edge_like.get("count"))
+
+            comments_count = (
+                _safe_int(raw_payload.get("comment_count"))
+                or _safe_int(raw_payload.get("comments"))
+                or None
+            )
+            if comments_count is None:
+                edge_comment = raw_payload.get("edge_media_to_parent_comment")
+                if isinstance(edge_comment, dict):
+                    comments_count = _safe_int(edge_comment.get("count"))
+
+            plays = _safe_int(raw_payload.get("play_count")) or _safe_int(raw_payload.get("plays")) or None
+
+            views = (
+                _safe_int(raw_payload.get("view_count"))
+                or _safe_int(raw_payload.get("video_view_count"))
+                or None
+            )
+            is_video = (
+                raw_payload.get("media_type") == 2
+                or raw_payload.get("product_type") in ("video", "clips", "reels")
+                or data.get("post_type") in ("video", "reel")
+            )
+            if views is None and is_video:
+                views = plays
+
+            shares = _safe_int(raw_payload.get("share_count")) or _safe_int(raw_payload.get("shares")) or None
+
+            data["platform_metrics"] = {
+                "likes": likes,
+                "comments_count": comments_count,
+                "views": views,
+                "shares": shares,
+                "plays": plays,
             }
 
         heavy_fields = [

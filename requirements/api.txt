@@ -2,4 +2,4 @@
 fastapi==0.136.1
 uvicorn[standard]==0.46.0
 qdrant-client==1.17.1
-fastembed==0.8.0
+openai==2.43.0

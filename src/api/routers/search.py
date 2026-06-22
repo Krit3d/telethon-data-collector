@@ -28,6 +28,7 @@ _SEMANTIC_RELATIONS: frozenset[str] = frozenset(
 )
 _DIRECT_CONNECT_WEIGHT: float = 1.0
 _SEMANTIC_TRAVERSAL_WEIGHT: float = 0.6
+_AUTHOR_NODE_PREFIX: str = "actor_"
 _BRAND_TRAVERSAL_WEIGHT: float = 0.5
 _ER_BOOST_WEIGHT: float = 0.1
 
@@ -98,6 +99,38 @@ def _build_post_id_to_er(
         except (ValueError, TypeError):
             result[post_id] = 0.0
     return result
+
+
+def _author_matches_location(
+    content: Any,
+    edges_data: list[dict[str, Any]],
+    location: str,
+) -> bool:
+    account = getattr(content, "account", None)
+    if account is not None:
+        raw_meta = getattr(account, "raw_metadata", None) or {}
+        if isinstance(raw_meta, dict):
+            for key in ("geo_data", "location"):
+                geo_obj = raw_meta.get(key)
+                if isinstance(geo_obj, dict):
+                    for field in ("country", "city", "name", "region"):
+                        val = geo_obj.get(field)
+                        if isinstance(val, str) and location.lower() in val.lower():
+                            return True
+    if account is not None:
+        platform = getattr(account, "platform", None) or "TELEGRAM"
+        author_node_id = f"{_AUTHOR_NODE_PREFIX}{platform.lower()}_{content.account_id}"
+        loc_lower = location.lower()
+        for edge in edges_data:
+            if edge.get("relation_type") != "BASED_IN":
+                continue
+            if edge.get("source_id") != author_node_id:
+                continue
+            target_name = edge.get("target_name") or ""
+            target_id = edge.get("target_id") or ""
+            if loc_lower in target_name.lower() or loc_lower in target_id.lower():
+                return True
+    return False
 
 
 def _traverse_graph_for_posts(
@@ -215,6 +248,9 @@ async def search_content(
                 query=payload.query,
                 limit=fetch_limit,
                 score_threshold=payload.score_threshold,
+                min_followers=payload.min_followers,
+                min_engagement_rate=payload.min_engagement_rate,
+                platform=getattr(payload, "platform", None),
             ),
             qdrant.search_entities(
                 query=payload.query,
@@ -241,10 +277,14 @@ async def search_content(
         vector_ranked: list[int] = [item["post_id"] for item in posts_data]
         vector_set: set[int] = set(vector_ranked)
 
+        post_id_to_er: dict[int, float] = {
+            item["post_id"]: float(item.get("engagement_rate", 0.0))
+            for item in posts_data
+        }
+
         graph_post_scores: dict[int, float] = {}
         edges_data: list[dict[str, Any]] = []
         node_id_to_post_id: dict[str, int] = {}
-        post_id_to_er: dict[int, float] = {}
 
         if entity_ids:
             try:
@@ -269,9 +309,9 @@ async def search_content(
                 if node_ids:
                     nodes_data = await graph_repo.get_nodes_by_ids(list(node_ids))
                     node_id_to_post_id = _build_node_id_to_post_id(nodes_data)
-                    post_id_to_er = _build_post_id_to_er(
+                    post_id_to_er.update(_build_post_id_to_er(
                         nodes_data, node_id_to_post_id
-                    )
+                    ))
                     logger.info(
                         "Built ID mapping for %d content nodes, "
                         "ER data for %d posts",
@@ -315,6 +355,11 @@ async def search_content(
                     "Content ID %d not found in PostgreSQL", cid
                 )
                 continue
+
+            if payload.location is not None:
+                if not _author_matches_location(content, edges_data, payload.location):
+                    continue
+
             er_boost = post_id_to_er.get(cid, 0.0)
             final_score = rrf_scores[cid] * (1.0 + (er_boost * _ER_BOOST_WEIGHT))
             merged.append(
@@ -348,7 +393,7 @@ async def search_content(
                 SearchResultItem(
                     post_id=content.id,
                     account_id=content.account_id,
-                    text=content.content or "",
+                    text=content.content or content.transcription or "",
                     score=item["final_score"],
                     created_at=content.created_at,
                     url=item["url"],

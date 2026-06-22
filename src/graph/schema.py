@@ -414,6 +414,9 @@ Return ONLY a valid JSON object with exactly this structure:
 
 Do not include any explanatory text, markdown formatting, or code block delimiters. The response must be pure JSON.
 
+TOPIC COVERAGE RULE (MANDATORY for Knowledge Augmented Generation):
+Any key concepts, technologies, products, or subjects discussed in the text MUST be represented as Entity nodes. The main subject or publication of the text MUST connect to these Entity nodes using the ABOUT relationship. For example, if a post discusses Python programming, you MUST create an Entity node for "Python" and connect the publication to it via ABOUT. The ABOUT relation is the PRIMARY connection between a post/publication and its core subjects — always prefer ABOUT over DISCUSSES for the main topic link.
+
 Example for a tech blog post:
 {{
   "entities": [
@@ -456,6 +459,11 @@ Example for a tech blog post:
     }}
   ],
   "relations": [
+    {{
+      "source_id": "event_pycon_2024",
+      "relation_type": "ABOUT",
+      "target_id": "entity_python"
+    }},
     {{
       "source_id": "actor_john_doe",
       "relation_type": "ATTENDED",

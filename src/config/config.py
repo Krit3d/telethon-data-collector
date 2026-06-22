@@ -48,20 +48,22 @@ class Settings(BaseSettings):
         default=None,
         description="API key for Qdrant authentication",
     )
-    embedding_model: str = Field(
-        default="bge-m3", description="Model name for the API payload"
+    # ---- Cloud.ru Evolution Foundation Models (Shared API) ----
+    cloud_ru_api_key: str = Field(
+        ...,
+        description="Access API Key for Cloud.ru Foundation Models",
     )
-    embedding_model_dense: str = Field(
+    cloud_ru_base_url: str = Field(
+        default="https://foundation-models.api.cloud.ru/v1",
+        description="Cloud.ru API base URL",
+    )
+    cloud_ru_embedding_model: str = Field(
         default="BAAI/bge-m3",
-        description="Name of the FastEmbed model used for dense semantic embeddings (semantic search)",
+        description="Model name for embeddings",
     )
-    embedding_model_sparse: str = Field(
-        default="prithivida/bge-m3-sparse",
-        description="Name of the FastEmbed model used for sparse lexical embeddings (exact keyword match)",
-    )
-    embedding_threads: int = Field(
-        default=3,
-        description="Number of threads to use for embedding generation",
+    cloud_ru_llm_model: str = Field(
+        default="deepseek-ai/DeepSeek-V4-Pro",
+        description="Model name for chat completions",
     )
     qdrant_batch_size: int | None = Field(
         default=None,
@@ -74,20 +76,6 @@ class Settings(BaseSettings):
     qdrant_retries: int | None = Field(
         default=None,
         description="Number of retries for failed Qdrant operations",
-    )
-
-    # ---- LLM settings ----
-    llm_api_key: str | None = Field(
-        default=None,
-        description="API key for OpenAI-compatible LLM service",
-    )
-    llm_base_url: str = Field(
-        default="https://api.openai.com/v1",
-        description="Base URL for OpenAI-compatible API endpoint",
-    )
-    llm_model_name: str = Field(
-        default="gpt-4o-mini",
-        description="Model name to use for LLM extraction",
     )
 
     # ---- Scrape Creators API settings ----
@@ -225,11 +213,6 @@ class Settings(BaseSettings):
     )
     enable_visual_embeddings: bool = Field(default=False, description="Enable or disable visual video embeddings extraction")
     visual_embedding_dim: int = Field(default=512, description="Dimension of visual video embeddings")
-    onnxruntime_provider: str = Field(
-        default="CPUExecutionProvider",
-        description="Execution provider for ONNX Runtime models (e.g., CUDAExecutionProvider or CPUExecutionProvider)",
-    )
-
     graph_name: str = Field(
         default="social_graph",
         description="The Apache AGE graph name",

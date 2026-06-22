@@ -237,13 +237,13 @@ class KnowledgeExtractor:
 
         topic_target_ids: set[str] = set()
         for relation in result.relations:
-            if relation.relation_type == "ABOUT":
+            if relation.relation_type in ("ABOUT", "DISCUSSES"):
                 target_entity = find_entity(
                     result.entities, relation.target_id
                 )
                 if (
                     target_entity is not None
-                    and target_entity.label == "Concept"
+                    and target_entity.label == "Entity"
                 ):
                     topic_target_ids.add(relation.target_id)
 

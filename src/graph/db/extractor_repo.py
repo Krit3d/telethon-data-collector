@@ -114,7 +114,7 @@ class ExtractorRepository:
                 or_(
                     and_(Content.content.isnot(None), Content.content != ""),
                     and_(Content.transcription.isnot(None), Content.transcription != ""),
-                    and_(Content.raw_metadata.isnot(None), Content.raw_metadata != ""),
+                    and_(Content.raw_metadata.isnot(None), Content.raw_metadata != {}),
                 )
             )
 

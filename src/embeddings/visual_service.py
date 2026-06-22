@@ -21,13 +21,13 @@ class VisualEmbeddingService(VideoProcessor):
             )
             return
 
-        if settings.onnxruntime_provider != "CUDAExecutionProvider":
+        if _cuda_available():
+            self._session = _build_cuda_session()
+        else:
             logger.info(
                 "CUDA provider not available; visual embedding service running on CPU"
             )
             self._session = _build_cpu_session()
-        else:
-            self._session = _build_cuda_session()
 
     async def extract_visual_embedding(
         self, video_url: str | None
@@ -49,6 +49,14 @@ class VisualEmbeddingService(VideoProcessor):
         logger.debug("Extracting visual embedding for video: %s", video_url)
 
         return [0.0] * self.settings.visual_embedding_dim
+
+
+def _cuda_available() -> bool:
+    try:
+        import onnxruntime as ort
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
 
 
 def _build_cpu_session():

@@ -13,6 +13,18 @@ class SearchRequest(BaseModel):
         default=False,
         description="Include author (Actor) node details for found posts",
     )
+    location: str | None = Field(
+        default=None,
+        description="Filter results by author location (country or city)",
+    )
+    min_followers: int | None = Field(
+        default=None,
+        description="Minimum subscriber count for the author account",
+    )
+    min_engagement_rate: float | None = Field(
+        default=None,
+        description="Minimum engagement rate for the post",
+    )
 
 
 class SearchResultItem(BaseModel):

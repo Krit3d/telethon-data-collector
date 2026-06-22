@@ -42,7 +42,7 @@ services:
     build:
       context: .
       dockerfile: docker/api/Dockerfile
-      target: gpu-runner
+      target: cpu-runner
     container_name: api
     restart: always
     env_file:
@@ -61,14 +61,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
-      ONNXRUNTIME_PROVIDER: CUDAExecutionProvider
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      ONNXRUNTIME_PROVIDER: ${ONNXRUNTIME_PROVIDER:-CPUExecutionProvider}
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
     depends_on:
       - qdrant
       - nginx_llm
@@ -83,7 +83,7 @@ services:
     build:
       context: .
       dockerfile: docker/api/Dockerfile
-      target: gpu-runner
+      target: cpu-runner
     container_name: embedding_worker
     restart: always
     env_file:
@@ -100,16 +100,16 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
-      ONNXRUNTIME_PROVIDER: CUDAExecutionProvider
+      ONNXRUNTIME_PROVIDER: ${ONNXRUNTIME_PROVIDER:-CPUExecutionProvider}
       EXTRACTOR_CONCURRENCY: ${EXTRACTOR_CONCURRENCY:-5}
       EXTRACTOR_BATCH_SIZE: ${EXTRACTOR_BATCH_SIZE:-20}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
     depends_on:
       - qdrant
     networks:

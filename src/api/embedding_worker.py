@@ -21,7 +21,7 @@ from src.graph.db.extractor_repo import ExtractorRepository
 from src.db.models import Content
 from src.embeddings.qdrant_service import QdrantService
 from src.embeddings.visual_service import VisualEmbeddingService
-from src.parser.creators.core.schemas import AccountMetadata, ContentMetadata
+from src.parser.creators.core.schemas import ContentMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,8 @@ _WHITESPACE_RE = re.compile(r"[ \t]+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _MULTI_SPACE_RE = re.compile(r" {2,}")
 
+_SENTENCE_REPEAT_RE = re.compile(r"\s+")
+
 _MAX_CONSECUTIVE_REPEATS: int = 3
 
 
@@ -99,6 +101,27 @@ def _strip_consecutive_repeats(text: str) -> str:
     if len(result) == len(tokens):
         return text
     return " ".join(result)
+
+
+def _strip_sentence_repeats(text: str) -> str:
+    tokens = _SENTENCE_REPEAT_RE.split(text.strip())
+    if len(tokens) < 2:
+        return text
+    changed = True
+    while changed:
+        changed = False
+        n = len(tokens)
+        for w in range(n // 2, 0, -1):
+            i = 0
+            while i + 2 * w <= n:
+                if tokens[i : i + w] == tokens[i + w : i + 2 * w]:
+                    tokens = tokens[: i + w] + tokens[i + 2 * w :]
+                    changed = True
+                    break
+                i += 1
+            if changed:
+                break
+    return " ".join(tokens)
 
 
 class EmbeddingWorker:
@@ -128,6 +151,8 @@ class EmbeddingWorker:
         self._shutdown_event.set()
 
     def _clean_text(self, text: str) -> str:
+        text = re.sub(r'(?<=[\w])([#@])', r' \1', text)
+
         def _strip_bracket_noise(m: re.Match[str]) -> str:
             inner = (m.group(1) or m.group(2) or "").strip()
             inner_lower = inner.lower()
@@ -138,31 +163,10 @@ class EmbeddingWorker:
         cleaned = _BRACKET_NOISE_RE.sub(_strip_bracket_noise, text)
         cleaned = _HALLUCINATION_RE.sub("", cleaned)
         cleaned = _strip_consecutive_repeats(cleaned)
+        cleaned = _strip_sentence_repeats(cleaned)
         cleaned = _WHITESPACE_RE.sub(" ", cleaned)
         cleaned = _MULTI_NEWLINE_RE.sub("\n\n", cleaned)
         return cleaned.strip()
-
-    def _extract_domain(self, url: str) -> str | None:
-        url = url.strip()
-        if not url:
-            return None
-        if "://" in url:
-            url = url.split("://", 1)[1]
-        if url.startswith("www."):
-            url = url[4:]
-        url = url.split("/", 1)[0]
-        url = url.split("?", 1)[0]
-        return url.lower() if url else None
-
-    def _safe_parse_account_metadata(
-        self, raw: dict[str, Any] | None
-    ) -> AccountMetadata | None:
-        if not raw:
-            return None
-        try:
-            return AccountMetadata(**raw)
-        except Exception:
-            return None
 
     def _safe_parse_content_metadata(
         self, raw: dict[str, Any] | None
@@ -176,143 +180,34 @@ class EmbeddingWorker:
 
     def _assemble_embedding_text(self, post: Content) -> str:
         parts: list[str] = []
-        account = post.account
-
-        if account:
-            if account.platform:
-                parts.append(f"Platform: {account.platform}")
-
-            title = account.title or None
-            if not title and account.raw_metadata:
-                title = account.raw_metadata.get("full_name")
-            if title:
-                parts.append(f"Account: {title}")
-
-            if account.username:
-                parts.append(f"Username: @{account.username}")
-
-            description = account.description or None
-            if not description and account.raw_metadata:
-                description = (
-                    account.raw_metadata.get("biography")
-                    or account.raw_metadata.get("bio")
-                )
-            if description:
-                parts.append(f"Bio: {description}")
-
-            account_meta = self._safe_parse_account_metadata(account.raw_metadata)
-            location = None
-            if account_meta:
-                if account_meta.location:
-                    location = account_meta.location
-                elif account_meta.geo_data:
-                    geo_parts = [
-                        p
-                        for p in (account_meta.geo_data.city, account_meta.geo_data.country)
-                        if p
-                    ]
-                    if geo_parts:
-                        location = ", ".join(geo_parts)
-            elif account.raw_metadata:
-                raw_loc = account.raw_metadata.get("location")
-                if isinstance(raw_loc, str) and raw_loc:
-                    location = raw_loc
-                elif isinstance(raw_loc, dict):
-                    geo_parts = [
-                        p
-                        for p in (raw_loc.get("city"), raw_loc.get("country"))
-                        if p
-                    ]
-                    if geo_parts:
-                        location = ", ".join(geo_parts)
-            if location:
-                parts.append(f"Location: {location}")
-
-            urls: list[str] = []
-            if account_meta:
-                if account_meta.external_links:
-                    urls.extend(account_meta.external_links[:5])
-                if account_meta.website:
-                    urls.append(account_meta.website)
-                if account_meta.link_in_bio:
-                    urls.append(account_meta.link_in_bio)
-            elif account.raw_metadata:
-                ext_links = account.raw_metadata.get("external_links")
-                if isinstance(ext_links, list):
-                    urls.extend(str(link) for link in ext_links[:5])
-                website = account.raw_metadata.get("website")
-                if isinstance(website, str) and website:
-                    urls.append(website)
-                link_in_bio = account.raw_metadata.get("link_in_bio")
-                if isinstance(link_in_bio, str) and link_in_bio:
-                    urls.append(link_in_bio)
-            if urls:
-                domains: list[str] = []
-                for u in urls:
-                    domain = self._extract_domain(u)
-                    if domain:
-                        domains.append(domain)
-                if domains:
-                    unique_domains = list(dict.fromkeys(domains))
-                    parts.append(f"Domains: {', '.join(unique_domains)}")
-
-            badges: list[str] = []
-            if account_meta:
-                if getattr(account_meta, "is_verified", False):
-                    badges.append("Verified")
-                if getattr(account_meta, "is_business", False):
-                    badges.append("Business")
-            elif isinstance(account.raw_metadata, dict):
-                if account.raw_metadata.get("is_verified"):
-                    badges.append("Verified")
-                if (
-                    account.raw_metadata.get("is_business_account")
-                    or account.raw_metadata.get("is_professional_account")
-                ):
-                    badges.append("Business")
-            if badges:
-                parts.append(f"Account Type: {' '.join(badges)}")
 
         content_meta = self._safe_parse_content_metadata(post.raw_metadata)
 
-        post_type = None
-        if content_meta:
-            post_type = content_meta.post_type
-        elif post.raw_metadata:
-            pt = post.raw_metadata.get("post_type")
-            if pt:
-                post_type = str(pt)
-        if post_type:
-            parts.append(f"Post type: {post_type}")
-
-        author_parts: list[str] = []
-        if content_meta and content_meta.author_profile_snapshot:
-            snapshot = content_meta.author_profile_snapshot
-            if snapshot.title:
-                author_parts.append(snapshot.title)
-            if snapshot.username:
-                author_parts.append(f"@{snapshot.username}")
-        elif post.raw_metadata:
-            author = post.raw_metadata.get("author_profile_snapshot")
-            if isinstance(author, dict):
-                if author.get("title"):
-                    author_parts.append(str(author["title"]))
-                if author.get("username"):
-                    author_parts.append(f"@{author['username']}")
-        if author_parts:
-            parts.append(f"Author: {' '.join(author_parts)}")
-
+        cleaned_content = ""
         if post.content:
-            cleaned = self._clean_text(post.content)
-            if cleaned:
-                parts.append(f"Post: {cleaned}")
+            cleaned_content = self._clean_text(post.content)
 
+        cleaned_transcription = ""
         if post.transcription:
-            cleaned_t = self._clean_text(post.transcription)
-            if cleaned_t:
-                parts.append(f"Transcription: {cleaned_t}")
+            cleaned_transcription = self._clean_text(post.transcription)
 
-        accessibility = None
+        if cleaned_content and cleaned_transcription:
+            if (
+                cleaned_content == cleaned_transcription
+                or cleaned_content in cleaned_transcription
+            ):
+                parts.append(cleaned_transcription)
+            elif cleaned_transcription in cleaned_content:
+                parts.append(cleaned_content)
+            else:
+                parts.append(cleaned_content)
+                parts.append(cleaned_transcription)
+        elif cleaned_content:
+            parts.append(cleaned_content)
+        elif cleaned_transcription:
+            parts.append(cleaned_transcription)
+
+        accessibility: str | None = None
         if content_meta and content_meta.accessibility_caption:
             accessibility = content_meta.accessibility_caption
         elif post.raw_metadata:
@@ -322,9 +217,9 @@ class EmbeddingWorker:
         if accessibility:
             cleaned_cap = self._clean_text(accessibility)
             if cleaned_cap:
-                parts.append(f"Caption: {cleaned_cap}")
+                parts.append(cleaned_cap)
 
-        hashtags = None
+        hashtags: list[str] | None = None
         if content_meta and content_meta.hashtags:
             hashtags = content_meta.hashtags
         elif post.raw_metadata:
@@ -334,25 +229,7 @@ class EmbeddingWorker:
             elif isinstance(h, str) and h:
                 hashtags = [h]
         if hashtags:
-            parts.append(f"Hashtags: {', '.join(hashtags)}")
-
-        music_title = None
-        music_author = None
-        if content_meta:
-            music_title = content_meta.music_title
-            music_author = content_meta.music_author
-        elif post.raw_metadata:
-            clips = post.raw_metadata.get("clips_metadata")
-            if isinstance(clips, dict):
-                music_info = clips.get("clips_music_attribution_info")
-                if isinstance(music_info, dict):
-                    music_title = music_info.get("song_name")
-                    music_author = music_info.get("artist_name")
-        if music_title:
-            audio = music_title
-            if music_author:
-                audio = f"{music_title} - {music_author}"
-            parts.append(f"Audio: {audio}")
+            parts.append(", ".join(hashtags))
 
         return "\n".join(parts)
 
@@ -369,7 +246,7 @@ class EmbeddingWorker:
         return _MAX_SUB_BATCH
 
     async def _process_batch(self, posts: list[Content]) -> None:
-        points: list[tuple[int, str, int]] = []
+        points: list[dict[str, Any]] = []
         valid_posts: list[Content] = []
         skip_ids: list[int] = []
 
@@ -386,7 +263,32 @@ class EmbeddingWorker:
                 skip_ids.append(post.id)
                 continue
 
-            points.append((post.id, stripped_text, post.account_id))
+            account = post.account
+            subscribers_count: int = account.subscribers_count if account and account.subscribers_count else 0
+            views: int = post.views or 0
+            comments_count: int = post.comments_count or 0
+            shares_count: int = post.shares_count or 0
+            reactions_count: int = post.reactions_count or 0
+
+            if subscribers_count > 0:
+                engagement_rate = round((reactions_count + comments_count) / subscribers_count, 4)
+            else:
+                engagement_rate = 0.0
+
+            payload: dict[str, Any] = {
+                "post_id": post.id,
+                "account_id": post.account_id,
+                "platform": account.platform if account else "UNKNOWN",
+                "subscribers_count": subscribers_count,
+                "views": views,
+                "comments_count": comments_count,
+                "shares_count": shares_count,
+                "reactions_count": reactions_count,
+                "engagement_rate": engagement_rate,
+                "text": stripped_text,
+            }
+
+            points.append(payload)
             valid_posts.append(post)
 
         if skip_ids:
@@ -399,7 +301,7 @@ class EmbeddingWorker:
         if not points:
             return
 
-        texts = [p[1] for p in points]
+        texts = [p["text"] for p in points]
         sub_batch_size = self._compute_sub_batch_size(texts)
         total_embedded = 0
 
@@ -426,7 +328,7 @@ class EmbeddingWorker:
                     )
                 visual_embeddings = await asyncio.gather(*visual_tasks)
                 await self.qdrant.upsert_batch(sub_batch, list(visual_embeddings))
-                sub_ids = [p[0] for p in sub_batch]
+                sub_ids = [p["post_id"] for p in sub_batch]
                 await self.extractor_repo.mark_content_embedded(sub_ids)
                 total_embedded += len(sub_ids)
                 logger.debug(

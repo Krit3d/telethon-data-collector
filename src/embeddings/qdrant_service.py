@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import asyncio
+import base64
+import hashlib
 import logging
+import struct
 import uuid
 from typing import Any, Final
 
-import numpy as np
-from fastembed import SparseTextEmbedding, TextEmbedding
+from openai import AsyncOpenAI
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
 
@@ -28,26 +29,10 @@ class QdrantService:
         self.settings = settings
         self.collection_name = settings.qdrant_collection_name or POSTS_COLLECTION
 
-        if settings.onnxruntime_provider == "CUDAExecutionProvider":
-            self.dense_model = TextEmbedding(
-                model_name=settings.embedding_model_dense,
-                threads=settings.embedding_threads,
-                providers=["CUDAExecutionProvider"],
-            )
-            self.sparse_model = SparseTextEmbedding(
-                model_name=settings.embedding_model_sparse,
-                threads=settings.embedding_threads,
-                providers=["CUDAExecutionProvider"],
-            )
-        else:
-            self.dense_model = TextEmbedding(
-                model_name=settings.embedding_model_dense,
-                threads=settings.embedding_threads,
-            )
-            self.sparse_model = SparseTextEmbedding(
-                model_name=settings.embedding_model_sparse,
-                threads=settings.embedding_threads,
-            )
+        self.openai_client = AsyncOpenAI(
+            api_key=settings.cloud_ru_api_key,
+            base_url=settings.cloud_ru_base_url,
+        )
 
         self.client = AsyncQdrantClient(
             url=settings.qdrant_url,
@@ -68,7 +53,7 @@ class QdrantService:
                 extra={
                     "collection": self.collection_name,
                     "url": self.settings.qdrant_url,
-                    "model": self.settings.embedding_model_dense,
+                    "model": self.settings.cloud_ru_embedding_model,
                 },
             )
 
@@ -125,6 +110,21 @@ class QdrantService:
                     field_name="account_id",
                     field_schema=models.PayloadSchemaType.INTEGER,
                 )
+                await self.client.create_payload_index(
+                    collection_name=posts_collection,
+                    field_name="subscribers_count",
+                    field_schema=models.PayloadSchemaType.INTEGER,
+                )
+                await self.client.create_payload_index(
+                    collection_name=posts_collection,
+                    field_name="engagement_rate",
+                    field_schema=models.PayloadSchemaType.FLOAT,
+                )
+                await self.client.create_payload_index(
+                    collection_name=posts_collection,
+                    field_name="platform",
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
                 logger.info(
                     "Qdrant posts collection created successfully",
                     extra={"collection": posts_collection},
@@ -177,51 +177,113 @@ class QdrantService:
             )
             raise
 
-    async def _generate_dense_batch(self, texts: list[str]) -> np.ndarray:
-        if not texts:
-            return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+    @staticmethod
+    def _make_fallback_sparse(text: str) -> models.SparseVector:
+        tokens = text.lower().split()
+        index_map: dict[int, float] = {}
+        for token in tokens:
+            token_hash = int(hashlib.md5(token.encode()).hexdigest(), 16)
+            idx = token_hash % 30_000
+            weight = index_map.get(idx, 0.0) + 1.0
+            index_map[idx] = weight
+        sorted_items = sorted(index_map.items())
+        if not sorted_items:
+            return models.SparseVector(indices=[0], values=[0.0])
+        return models.SparseVector(
+            indices=[k for k, _ in sorted_items],
+            values=[v for _, v in sorted_items],
+        )
 
-        valid_texts = [text for text in texts if text and text.strip()]
-        if not valid_texts:
-            return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+    async def _generate_cloud_embeddings_batch(
+        self,
+        texts: list[str],
+    ) -> tuple[list[list[float]], list[models.SparseVector]]:
+        if not texts:
+            return [], []
+
+        valid_indices = [i for i, t in enumerate(texts) if t and t.strip()]
+        if not valid_indices:
+            return [[] for _ in texts], [self._make_fallback_sparse("") for _ in texts]
+
+        valid_texts = [texts[i] for i in valid_indices]
 
         try:
-            embeddings = await asyncio.to_thread(
-                lambda: list(self.dense_model.embed(valid_texts)),
+            raw_response = await self.openai_client.embeddings.with_raw_response.create(
+                model=self.settings.cloud_ru_embedding_model,
+                input=valid_texts,
             )
-            return np.array(embeddings, dtype=np.float32)
+            payload = raw_response.http_response.json()
         except Exception as e:
             logger.error(
-                "Failed to generate dense embeddings",
+                "Cloud.ru embedding API call failed",
                 exc_info=e,
                 extra={"text_count": len(valid_texts)},
             )
-            raise RuntimeError(f"Dense embedding generation failed: {e}") from e
+            raise RuntimeError(f"Cloud embedding generation failed: {e}") from e
 
-    async def _generate_sparse_batch(self, texts: list[str]) -> list[Any]:
-        if not texts:
-            return []
+        dense_map: dict[int, list[float]] = {}
+        sparse_map: dict[int, models.SparseVector] = {}
 
-        valid_texts = [text for text in texts if text and text.strip()]
-        if not valid_texts:
-            return []
+        for local_idx, item in enumerate(payload.get("data", [])):
+            global_idx = valid_indices[local_idx]
 
-        try:
-            sparse_results = await asyncio.to_thread(
-                lambda: list(self.sparse_model.embed(valid_texts)),
+            dense_emb = item.get("embedding", [])
+            if isinstance(dense_emb, str):
+                try:
+                    decoded = base64.b64decode(dense_emb)
+                    dense_emb = list(struct.unpack(f"{len(decoded) // 4}f", decoded))
+                except Exception:
+                    dense_emb = [0.0] * EMBEDDING_DIM
+            dense_map[global_idx] = dense_emb
+
+            sparse_vector: models.SparseVector | None = None
+
+            for key in ("sparse", "sparse_embedding"):
+                raw_sparse = item.get(key)
+                if raw_sparse is not None:
+                    if isinstance(raw_sparse, dict):
+                        indices = raw_sparse.get("indices")
+                        values = raw_sparse.get("values")
+                        if (
+                            isinstance(indices, list)
+                            and isinstance(values, list)
+                            and indices
+                            and values
+                        ):
+                            sparse_vector = models.SparseVector(
+                                indices=[int(i) for i in indices],
+                                values=[float(v) for v in values],
+                            )
+                            break
+                        else:
+                            sorted_items = sorted(
+                                (int(k), float(v)) for k, v in raw_sparse.items()
+                            )
+                            if sorted_items:
+                                sparse_vector = models.SparseVector(
+                                    indices=[k for k, _ in sorted_items],
+                                    values=[v for _, v in sorted_items],
+                                )
+                                break
+
+            if sparse_vector is None:
+                sparse_vector = self._make_fallback_sparse(valid_texts[local_idx])
+
+            sparse_map[global_idx] = sparse_vector
+
+        result_dense: list[list[float]] = []
+        result_sparse: list[models.SparseVector] = []
+        for i in range(len(texts)):
+            result_dense.append(dense_map.get(i, [0.0] * EMBEDDING_DIM))
+            result_sparse.append(
+                sparse_map.get(i, self._make_fallback_sparse(texts[i]))
             )
-            return sparse_results
-        except Exception as e:
-            logger.error(
-                "Failed to generate sparse embeddings",
-                exc_info=e,
-                extra={"text_count": len(valid_texts)},
-            )
-            raise RuntimeError(f"Sparse embedding generation failed: {e}") from e
+
+        return result_dense, result_sparse
 
     async def upsert_batch(
         self,
-        points: list[tuple[int, str, int]],
+        points: list[dict[str, Any]],
         visual_embeddings: list[list[float] | None] | None = None,
     ) -> None:
         if not points:
@@ -232,27 +294,23 @@ class QdrantService:
 
         try:
             filtered_indices = [
-                i for i, (_, text, _) in enumerate(points)
-                if text and text.strip()
+                i for i, p in enumerate(points)
+                if p.get("text") and p["text"].strip()
             ]
             if not filtered_indices:
                 logger.debug("No points with valid text to upsert")
                 return
 
             filtered_points = [points[i] for i in filtered_indices]
-            texts = [p[1] for p in filtered_points]
+            texts = [p["text"] for p in filtered_points]
 
-            dense_embeddings = await self._generate_dense_batch(texts)
-            sparse_embeddings = await self._generate_sparse_batch(texts)
+            dense_list, sparse_list = await self._generate_cloud_embeddings_batch(texts)
 
             point_structs = []
-            for local_idx, (post_id, text, channel_id) in enumerate(filtered_points):
+            for local_idx, payload in enumerate(filtered_points):
                 vectors: dict[str, Any] = {
-                    "text": dense_embeddings[local_idx].tolist(),
-                    "text_sparse": models.SparseVector(
-                        indices=sparse_embeddings[local_idx].indices.tolist(),
-                        values=sparse_embeddings[local_idx].values.tolist(),
-                    ),
+                    "text": dense_list[local_idx],
+                    "text_sparse": sparse_list[local_idx],
                 }
 
                 if visual_embeddings is not None:
@@ -263,9 +321,9 @@ class QdrantService:
 
                 point_structs.append(
                     models.PointStruct(
-                        id=post_id,
+                        id=payload["post_id"],
                         vector=vectors,
-                        payload={"account_id": channel_id, "text": text},
+                        payload=payload,
                     )
                 )
 
@@ -336,12 +394,11 @@ class QdrantService:
                 logger.debug("No valid entities to upsert after filtering")
                 return
 
-            dense_embeddings = await self._generate_dense_batch(texts)
-            sparse_embeddings = await self._generate_sparse_batch(texts)
+            dense_list, sparse_list = await self._generate_cloud_embeddings_batch(texts)
 
             point_structs = []
             for node, dense_emb, sparse_emb, label, orig_id in zip(
-                node_ids, dense_embeddings, sparse_embeddings, labels, original_ids,
+                node_ids, dense_list, sparse_list, labels, original_ids,
             ):
                 point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, orig_id))
 
@@ -349,11 +406,8 @@ class QdrantService:
                     models.PointStruct(
                         id=point_id,
                         vector={
-                            "text": dense_emb.tolist(),
-                            "text_sparse": models.SparseVector(
-                                indices=sparse_emb.indices.tolist(),
-                                values=sparse_emb.values.tolist(),
-                            ),
+                            "text": dense_emb,
+                            "text_sparse": sparse_emb,
                         },
                         payload={
                             "original_id": orig_id,
@@ -386,11 +440,12 @@ class QdrantService:
 
     async def upsert_post_embedding(
         self,
-        post_id: int,
-        text: str,
-        account_id: int,
+        payload: dict[str, Any],
         visual_embedding: list[float] | None = None,
     ) -> None:
+        post_id: int = payload["post_id"]
+        text: str = payload.get("text", "")
+
         if not text or not text.strip():
             logger.warning(
                 "Empty text provided for embedding", extra={"post_id": post_id},
@@ -406,18 +461,11 @@ class QdrantService:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
 
         try:
-            dense_embeddings = await self._generate_dense_batch([text])
-            sparse_embeddings = await self._generate_sparse_batch([text])
-
-            dense_emb = dense_embeddings[0]
-            sparse_emb = sparse_embeddings[0]
+            dense_list, sparse_list = await self._generate_cloud_embeddings_batch([text])
 
             vectors: dict[str, Any] = {
-                "text": dense_emb.tolist(),
-                "text_sparse": models.SparseVector(
-                    indices=sparse_emb.indices.tolist(),
-                    values=sparse_emb.values.tolist(),
-                ),
+                "text": dense_list[0],
+                "text_sparse": sparse_list[0],
             }
 
             if visual_embedding is not None:
@@ -426,7 +474,7 @@ class QdrantService:
             point = models.PointStruct(
                 id=post_id,
                 vector=vectors,
-                payload={"account_id": account_id, "text": text},
+                payload=payload,
             )
 
             await self.client.upsert(
@@ -434,17 +482,17 @@ class QdrantService:
             )
 
             logger.debug(
-                "Content embedding upserted for post %d to collection %s",
+                "Content embedding upserted for post %s to collection %s",
                 post_id,
                 self.collection_name,
             )
 
         except Exception as e:
             logger.error(
-                "Failed to upsert post embedding for post %d: %s",
+                "Failed to upsert post embedding for post %s: %s",
                 post_id,
                 e,
-                extra={"post_id": post_id, "account_id": account_id, "collection": self.collection_name},
+                extra={"post_id": post_id, "collection": self.collection_name},
             )
             raise RuntimeError(
                 f"Failed to upsert embedding for post {post_id}: {e}",
@@ -463,24 +511,20 @@ class QdrantService:
             return []
 
         try:
-            dense_embeddings = await self._generate_dense_batch([query])
-            sparse_embeddings = await self._generate_sparse_batch([query])
+            dense_list, sparse_list = await self._generate_cloud_embeddings_batch([query])
 
-            dense_emb = dense_embeddings[0]
-            sparse_emb = sparse_embeddings[0]
+            dense_emb = dense_list[0]
+            sparse_emb = sparse_list[0]
 
             response = await self.client.query_points(
                 collection_name=collection_name,
                 prefetch=[
                     models.Prefetch(
-                        query=dense_emb.tolist(),
+                        query=dense_emb,
                         using="text",
                     ),
                     models.Prefetch(
-                        query=models.SparseVector(
-                            indices=sparse_emb.indices.tolist(),
-                            values=sparse_emb.values.tolist(),
-                        ),
+                        query=sparse_emb,
                         using="text_sparse",
                     ),
                 ],
@@ -520,7 +564,13 @@ class QdrantService:
             raise RuntimeError(f"Entity search failed: {e}") from e
 
     async def search_posts(
-        self, query: str, limit: int = 10, score_threshold: float = 0.35,
+        self,
+        query: str,
+        limit: int = 10,
+        score_threshold: float = 0.35,
+        min_followers: int | None = None,
+        min_engagement_rate: float | None = None,
+        platform: str | None = None,
     ) -> list[dict]:
         if not self._initialized:
             await self.initialize()
@@ -533,42 +583,73 @@ class QdrantService:
             return []
 
         try:
-            dense_embeddings = await self._generate_dense_batch([query])
-            sparse_embeddings = await self._generate_sparse_batch([query])
+            dense_list, sparse_list = await self._generate_cloud_embeddings_batch([query])
 
-            dense_emb = dense_embeddings[0]
-            sparse_emb = sparse_embeddings[0]
+            dense_emb = dense_list[0]
+            sparse_emb = sparse_list[0]
+
+            filter_conditions: list[models.Condition] = []
+            if min_followers is not None:
+                filter_conditions.append(
+                    models.FieldCondition(
+                        key="subscribers_count",
+                        range=models.Range(gte=min_followers),
+                    )
+                )
+            if min_engagement_rate is not None:
+                filter_conditions.append(
+                    models.FieldCondition(
+                        key="engagement_rate",
+                        range=models.Range(gte=min_engagement_rate),
+                    )
+                )
+            if platform is not None:
+                filter_conditions.append(
+                    models.FieldCondition(
+                        key="platform",
+                        match=models.MatchValue(value=platform.upper()),
+                    )
+                )
+
+            query_filter: models.Filter | None = (
+                models.Filter(must=filter_conditions)
+                if filter_conditions
+                else None
+            )
 
             response = await self.client.query_points(
                 collection_name=self.collection_name,
                 prefetch=[
                     models.Prefetch(
-                        query=dense_emb.tolist(),
+                        query=dense_emb,
                         using="text",
+                        filter=query_filter,
                     ),
                     models.Prefetch(
-                        query=models.SparseVector(
-                            indices=sparse_emb.indices.tolist(),
-                            values=sparse_emb.values.tolist(),
-                        ),
+                        query=sparse_emb,
                         using="text_sparse",
+                        filter=query_filter,
                     ),
                 ],
                 query=models.FusionQuery(fusion=models.Fusion.RRF),
                 limit=limit,
                 score_threshold=score_threshold,
+                query_filter=query_filter,
                 with_payload=True,
             )
 
-            results = [
-                {
+            results = []
+            for hit in response.points:
+                entry: dict[str, Any] = {
                     "post_id": hit.id,
                     "score": hit.score,
-                    "text": hit.payload.get("text", "") if hit.payload else "",
-                    "account_id": hit.payload.get("account_id", 0) if hit.payload else 0,
+                    "engagement_rate": hit.payload.get("engagement_rate", 0.0) if hit.payload else 0.0,
+                    "subscribers_count": hit.payload.get("subscribers_count", 0) if hit.payload else 0,
+                    "platform": hit.payload.get("platform", "") if hit.payload else "",
                 }
-                for hit in response.points
-            ]
+                if hit.payload:
+                    entry.update(hit.payload)
+                results.append(entry)
 
             logger.debug(
                 "Query successful",
@@ -593,6 +674,7 @@ class QdrantService:
     async def close(self) -> None:
         try:
             await self.client.close()
+            await self.openai_client.close()
             logger.debug("Qdrant client closed")
         except Exception as e:
             logger.warning("Error closing Qdrant client", exc_info=e)
