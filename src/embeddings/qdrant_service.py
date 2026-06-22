@@ -1,18 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, Final
 
 import numpy as np
-from fastembed import TextEmbedding
+from fastembed import SparseTextEmbedding, TextEmbedding
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.http.models import (
-    Distance,
-    PayloadSchemaType,
-    PointStruct,
-    VectorParams,
-)
+from qdrant_client.http import models
 
 from src.config.config import Settings
 from src.graph.schema import ExtractedEntity, PropertyType
@@ -20,7 +16,7 @@ from src.graph.schema import ExtractedEntity, PropertyType
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM: Final[int] = 1024
-EMBEDDING_METRIC: Final[Distance] = Distance.COSINE
+EMBEDDING_METRIC: Final[models.Distance] = models.Distance.COSINE
 
 POSTS_COLLECTION: Final[str] = "social_posts"
 ENTITIES_COLLECTION: Final[str] = "social_entities"
@@ -33,14 +29,23 @@ class QdrantService:
         self.collection_name = settings.qdrant_collection_name or POSTS_COLLECTION
 
         if settings.onnxruntime_provider == "CUDAExecutionProvider":
-            self.model = TextEmbedding(
-                model_name=settings.embedding_model_name,
+            self.dense_model = TextEmbedding(
+                model_name=settings.embedding_model_dense,
+                threads=settings.embedding_threads,
+                providers=["CUDAExecutionProvider"],
+            )
+            self.sparse_model = SparseTextEmbedding(
+                model_name=settings.embedding_model_sparse,
                 threads=settings.embedding_threads,
                 providers=["CUDAExecutionProvider"],
             )
         else:
-            self.model = TextEmbedding(
-                model_name=settings.embedding_model_name,
+            self.dense_model = TextEmbedding(
+                model_name=settings.embedding_model_dense,
+                threads=settings.embedding_threads,
+            )
+            self.sparse_model = SparseTextEmbedding(
+                model_name=settings.embedding_model_sparse,
                 threads=settings.embedding_threads,
             )
 
@@ -63,7 +68,7 @@ class QdrantService:
                 extra={
                     "collection": self.collection_name,
                     "url": self.settings.qdrant_url,
-                    "model": self.settings.embedding_model_name,
+                    "model": self.settings.embedding_model_dense,
                 },
             )
 
@@ -86,6 +91,12 @@ class QdrantService:
             collections = await self.client.get_collections()
             collection_names = [c.name for c in collections.collections]
 
+            sparse_config = {
+                "text_sparse": models.SparseVectorParams(
+                    modifier=models.Modifier.IDF,
+                ),
+            }
+
             posts_collection = self.collection_name
             if posts_collection not in collection_names:
                 logger.info(
@@ -95,22 +106,24 @@ class QdrantService:
                         "dimension": EMBEDDING_DIM,
                     },
                 )
-                vectors_config: dict[str, VectorParams] = {
-                    "text": VectorParams(
-                        size=EMBEDDING_DIM, distance=EMBEDDING_METRIC
+                vectors_config: dict[str, models.VectorParams] = {
+                    "text": models.VectorParams(
+                        size=EMBEDDING_DIM, distance=EMBEDDING_METRIC,
                     ),
-                    "video_clip": VectorParams(
-                        size=self.settings.visual_embedding_dim, distance=EMBEDDING_METRIC
+                    "video_clip": models.VectorParams(
+                        size=self.settings.visual_embedding_dim,
+                        distance=EMBEDDING_METRIC,
                     ),
                 }
                 await self.client.create_collection(
                     collection_name=posts_collection,
                     vectors_config=vectors_config,
+                    sparse_vectors_config=sparse_config,
                 )
                 await self.client.create_payload_index(
                     collection_name=posts_collection,
                     field_name="account_id",
-                    field_schema=PayloadSchemaType.INTEGER,
+                    field_schema=models.PayloadSchemaType.INTEGER,
                 )
                 logger.info(
                     "Qdrant posts collection created successfully",
@@ -131,16 +144,20 @@ class QdrantService:
                         "dimension": EMBEDDING_DIM,
                     },
                 )
+                entities_vectors_config: dict[str, models.VectorParams] = {
+                    "text": models.VectorParams(
+                        size=EMBEDDING_DIM, distance=EMBEDDING_METRIC,
+                    ),
+                }
                 await self.client.create_collection(
                     collection_name=entities_collection,
-                    vectors_config=VectorParams(
-                        size=EMBEDDING_DIM, distance=EMBEDDING_METRIC
-                    ),
+                    vectors_config=entities_vectors_config,
+                    sparse_vectors_config=sparse_config,
                 )
                 await self.client.create_payload_index(
                     collection_name=entities_collection,
                     field_name="label",
-                    field_schema=PayloadSchemaType.KEYWORD,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
                 )
                 logger.info(
                     "Qdrant entities collection created successfully",
@@ -160,50 +177,47 @@ class QdrantService:
             )
             raise
 
-    async def _generate_embeddings_batch(
-        self,
-        texts: list[str],
-    ) -> np.ndarray:
+    async def _generate_dense_batch(self, texts: list[str]) -> np.ndarray:
         if not texts:
-            logger.warning("Empty texts list provided for embedding generation")
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
         valid_texts = [text for text in texts if text and text.strip()]
-        if len(valid_texts) != len(texts):
-            logger.warning(
-                "Filtered out empty texts from embedding batch",
-                extra={"total": len(texts), "valid": len(valid_texts)},
-            )
-
         if not valid_texts:
-            logger.warning("No valid texts to generate embeddings for")
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
         try:
-            embeddings = self.model.embed(valid_texts)
-            result = np.array(list(embeddings), dtype=np.float32)
-
-            logger.debug(
-                "Generated embeddings batch",
-                extra={
-                    "requested": len(texts),
-                    "valid": len(valid_texts),
-                    "embedding_shape": result.shape,
-                },
+            embeddings = await asyncio.to_thread(
+                lambda: list(self.dense_model.embed(valid_texts)),
             )
-
-            return result
-
+            return np.array(embeddings, dtype=np.float32)
         except Exception as e:
             logger.error(
-                "Failed to generate embeddings batch",
+                "Failed to generate dense embeddings",
                 exc_info=e,
-                extra={
-                    "text_count": len(texts),
-                    "valid_count": len(valid_texts),
-                },
+                extra={"text_count": len(valid_texts)},
             )
-            raise RuntimeError(f"Embedding generation failed: {e}") from e
+            raise RuntimeError(f"Dense embedding generation failed: {e}") from e
+
+    async def _generate_sparse_batch(self, texts: list[str]) -> list[Any]:
+        if not texts:
+            return []
+
+        valid_texts = [text for text in texts if text and text.strip()]
+        if not valid_texts:
+            return []
+
+        try:
+            sparse_results = await asyncio.to_thread(
+                lambda: list(self.sparse_model.embed(valid_texts)),
+            )
+            return sparse_results
+        except Exception as e:
+            logger.error(
+                "Failed to generate sparse embeddings",
+                exc_info=e,
+                extra={"text_count": len(valid_texts)},
+            )
+            raise RuntimeError(f"Sparse embedding generation failed: {e}") from e
 
     async def upsert_batch(
         self,
@@ -227,12 +241,19 @@ class QdrantService:
 
             filtered_points = [points[i] for i in filtered_indices]
             texts = [p[1] for p in filtered_points]
-            embeddings = await self._generate_embeddings_batch(texts)
+
+            dense_embeddings = await self._generate_dense_batch(texts)
+            sparse_embeddings = await self._generate_sparse_batch(texts)
 
             point_structs = []
             for local_idx, (post_id, text, channel_id) in enumerate(filtered_points):
-                vis: list[float] | None = None
-                vectors: dict[str, Any] = {"text": embeddings[local_idx].tolist()}
+                vectors: dict[str, Any] = {
+                    "text": dense_embeddings[local_idx].tolist(),
+                    "text_sparse": models.SparseVector(
+                        indices=sparse_embeddings[local_idx].indices.tolist(),
+                        values=sparse_embeddings[local_idx].values.tolist(),
+                    ),
+                }
 
                 if visual_embeddings is not None:
                     orig_idx = filtered_indices[local_idx]
@@ -241,7 +262,7 @@ class QdrantService:
                         vectors["video_clip"] = vis
 
                 point_structs.append(
-                    PointStruct(
+                    models.PointStruct(
                         id=post_id,
                         vector=vectors,
                         payload={"account_id": channel_id, "text": text},
@@ -315,18 +336,25 @@ class QdrantService:
                 logger.debug("No valid entities to upsert after filtering")
                 return
 
-            embeddings = await self._generate_embeddings_batch(texts)
+            dense_embeddings = await self._generate_dense_batch(texts)
+            sparse_embeddings = await self._generate_sparse_batch(texts)
 
             point_structs = []
-            for node, embedding, label, orig_id in zip(
-                node_ids, embeddings, labels, original_ids
+            for node, dense_emb, sparse_emb, label, orig_id in zip(
+                node_ids, dense_embeddings, sparse_embeddings, labels, original_ids,
             ):
                 point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, orig_id))
 
                 point_structs.append(
-                    PointStruct(
+                    models.PointStruct(
                         id=point_id,
-                        vector=embedding.tolist(),
+                        vector={
+                            "text": dense_emb.tolist(),
+                            "text_sparse": models.SparseVector(
+                                indices=sparse_emb.indices.tolist(),
+                                values=sparse_emb.values.tolist(),
+                            ),
+                        },
                         payload={
                             "original_id": orig_id,
                             "label": label,
@@ -365,35 +393,44 @@ class QdrantService:
     ) -> None:
         if not text or not text.strip():
             logger.warning(
-                "Empty text provided for embedding", extra={"post_id": post_id}
+                "Empty text provided for embedding", extra={"post_id": post_id},
             )
             return
 
         if not self._initialized:
             raise RuntimeError(
-                "QdrantService not initialized. Call initialize() first."
+                "QdrantService not initialized. Call initialize() first.",
             )
 
         if not self.collection_name:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
 
         try:
-            embedding_array = await self._generate_embeddings_batch([text])
-            embedding = embedding_array[0]
+            dense_embeddings = await self._generate_dense_batch([text])
+            sparse_embeddings = await self._generate_sparse_batch([text])
 
-            vectors: dict[str, Any] = {"text": embedding.tolist()}
+            dense_emb = dense_embeddings[0]
+            sparse_emb = sparse_embeddings[0]
+
+            vectors: dict[str, Any] = {
+                "text": dense_emb.tolist(),
+                "text_sparse": models.SparseVector(
+                    indices=sparse_emb.indices.tolist(),
+                    values=sparse_emb.values.tolist(),
+                ),
+            }
 
             if visual_embedding is not None:
                 vectors["video_clip"] = visual_embedding
 
-            point = PointStruct(
+            point = models.PointStruct(
                 id=post_id,
                 vector=vectors,
                 payload={"account_id": account_id, "text": text},
             )
 
             await self.client.upsert(
-                collection_name=self.collection_name, points=[point]
+                collection_name=self.collection_name, points=[point],
             )
 
             logger.debug(
@@ -410,11 +447,11 @@ class QdrantService:
                 extra={"post_id": post_id, "account_id": account_id, "collection": self.collection_name},
             )
             raise RuntimeError(
-                f"Failed to upsert embedding for post {post_id}: {e}"
+                f"Failed to upsert embedding for post {post_id}: {e}",
             ) from e
 
     async def search_entities(
-        self, query: str, limit: int = 5, score_threshold: float = 0.35
+        self, query: str, limit: int = 5, score_threshold: float = 0.35,
     ) -> list[dict]:
         if not self._initialized:
             await self.initialize()
@@ -426,12 +463,28 @@ class QdrantService:
             return []
 
         try:
-            embedding_array = await self._generate_embeddings_batch([query])
-            query_embedding = embedding_array[0]
+            dense_embeddings = await self._generate_dense_batch([query])
+            sparse_embeddings = await self._generate_sparse_batch([query])
+
+            dense_emb = dense_embeddings[0]
+            sparse_emb = sparse_embeddings[0]
 
             response = await self.client.query_points(
                 collection_name=collection_name,
-                query=query_embedding.tolist(),
+                prefetch=[
+                    models.Prefetch(
+                        query=dense_emb.tolist(),
+                        using="text",
+                    ),
+                    models.Prefetch(
+                        query=models.SparseVector(
+                            indices=sparse_emb.indices.tolist(),
+                            values=sparse_emb.values.tolist(),
+                        ),
+                        using="text_sparse",
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
                 limit=limit,
                 score_threshold=score_threshold,
                 with_payload=True,
@@ -443,7 +496,7 @@ class QdrantService:
                     entities.append({
                         "entity_id": str(hit.payload["original_id"]),
                         "score": hit.score,
-                        "payload": hit.payload
+                        "payload": hit.payload,
                     })
 
             logger.debug(
@@ -467,7 +520,7 @@ class QdrantService:
             raise RuntimeError(f"Entity search failed: {e}") from e
 
     async def search_posts(
-        self, query: str, limit: int = 10, score_threshold: float = 0.35
+        self, query: str, limit: int = 10, score_threshold: float = 0.35,
     ) -> list[dict]:
         if not self._initialized:
             await self.initialize()
@@ -480,13 +533,28 @@ class QdrantService:
             return []
 
         try:
-            embedding_array = await self._generate_embeddings_batch([query])
-            query_embedding = embedding_array[0]
+            dense_embeddings = await self._generate_dense_batch([query])
+            sparse_embeddings = await self._generate_sparse_batch([query])
+
+            dense_emb = dense_embeddings[0]
+            sparse_emb = sparse_embeddings[0]
 
             response = await self.client.query_points(
                 collection_name=self.collection_name,
-                query=query_embedding.tolist(),
-                using="text",
+                prefetch=[
+                    models.Prefetch(
+                        query=dense_emb.tolist(),
+                        using="text",
+                    ),
+                    models.Prefetch(
+                        query=models.SparseVector(
+                            indices=sparse_emb.indices.tolist(),
+                            values=sparse_emb.values.tolist(),
+                        ),
+                        using="text_sparse",
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
                 limit=limit,
                 score_threshold=score_threshold,
                 with_payload=True,

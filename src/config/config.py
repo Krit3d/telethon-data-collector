@@ -48,12 +48,16 @@ class Settings(BaseSettings):
         default=None,
         description="API key for Qdrant authentication",
     )
-    embedding_model_name: str = Field(
-        default="intfloat/multilingual-e5-large",
-        description="Name of the fastembed model to use for local embeddings",
-    )
     embedding_model: str = Field(
         default="bge-m3", description="Model name for the API payload"
+    )
+    embedding_model_dense: str = Field(
+        default="BAAI/bge-m3",
+        description="Name of the FastEmbed model used for dense semantic embeddings (semantic search)",
+    )
+    embedding_model_sparse: str = Field(
+        default="prithivida/bge-m3-sparse",
+        description="Name of the FastEmbed model used for sparse lexical embeddings (exact keyword match)",
     )
     embedding_threads: int = Field(
         default=3,

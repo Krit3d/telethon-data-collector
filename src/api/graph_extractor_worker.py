@@ -159,9 +159,17 @@ class GraphExtractionWorker:
         raw_metadata: dict = (
             post.raw_metadata.copy() if post.raw_metadata is not None else {}
         )
-        raw_metadata.pop("category", None)
-        if not getattr(self.settings, "process_language_data", False):
-            raw_metadata.pop("language", None)
+        iab_enabled = getattr(self.settings, "enable_iab_taxonomy", False)
+        if not iab_enabled:
+            for key in (
+                "category",
+                "category_name",
+                "category_enum",
+                "overall_category_name",
+                "business_category_name",
+            ):
+                raw_metadata.pop(key, None)
+        raw_metadata.pop("language", None)
         if post.transcription:
             raw_metadata = {**raw_metadata, "transcription": post.transcription}
 
@@ -170,9 +178,16 @@ class GraphExtractionWorker:
             account_metadata = (
                 post.account.raw_metadata.copy() if post.account.raw_metadata else {}
             )
-            account_metadata.pop("category", None)
-            if not getattr(self.settings, "process_language_data", False):
-                account_metadata.pop("language", None)
+            if not iab_enabled:
+                for key in (
+                    "category",
+                    "category_name",
+                    "category_enum",
+                    "overall_category_name",
+                    "business_category_name",
+                ):
+                    account_metadata.pop(key, None)
+            account_metadata.pop("language", None)
             account_metadata["username"] = post.account.username
             account_metadata["title"] = post.account.title
             account_metadata["subscribers_count"] = post.account.subscribers_count

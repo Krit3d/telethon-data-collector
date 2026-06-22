@@ -256,14 +256,22 @@ class EmbeddingWorker:
                     unique_domains = list(dict.fromkeys(domains))
                     parts.append(f"Domains: {', '.join(unique_domains)}")
 
-            if getattr(self.settings, "process_language_data", False):
-                lang = None
-                if account_meta:
-                    lang = account_meta.language
-                elif account.raw_metadata:
-                    lang = account.raw_metadata.get("language")
-                if lang:
-                    parts.append(f"Language: {lang}")
+            badges: list[str] = []
+            if account_meta:
+                if getattr(account_meta, "is_verified", False):
+                    badges.append("Verified")
+                if getattr(account_meta, "is_business", False):
+                    badges.append("Business")
+            elif isinstance(account.raw_metadata, dict):
+                if account.raw_metadata.get("is_verified"):
+                    badges.append("Verified")
+                if (
+                    account.raw_metadata.get("is_business_account")
+                    or account.raw_metadata.get("is_professional_account")
+                ):
+                    badges.append("Business")
+            if badges:
+                parts.append(f"Account Type: {' '.join(badges)}")
 
         content_meta = self._safe_parse_content_metadata(post.raw_metadata)
 
@@ -345,15 +353,6 @@ class EmbeddingWorker:
             if music_author:
                 audio = f"{music_title} - {music_author}"
             parts.append(f"Audio: {audio}")
-
-        if getattr(self.settings, "process_language_data", False):
-            lang = None
-            if content_meta:
-                lang = content_meta.language
-            elif post.raw_metadata:
-                lang = post.raw_metadata.get("language")
-            if lang:
-                parts.append(f"Language: {lang}")
 
         return "\n".join(parts)
 
