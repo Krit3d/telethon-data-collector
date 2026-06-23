@@ -28,15 +28,13 @@ services:
     networks:
       - scraper_network
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
+        max-size: "10m"
         max-file: "3"
 
   crawler:
-    build:
-      context: .
-      dockerfile: docker/scraper/Dockerfile
+    image: tg_parser_crawler_base:latest
     container_name: tg_parser_crawler
     restart: always
     env_file:
@@ -59,15 +57,16 @@ services:
     networks:
       - scraper_network
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
+        max-size: "10m"
         max-file: "3"
 
   parser:
     build:
       context: .
       dockerfile: docker/scraper/Dockerfile
+    image: tg_parser_crawler_base:latest
     container_name: tg_parser_app
     restart: always
     env_file:
@@ -90,15 +89,13 @@ services:
     networks:
       - scraper_network
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
+        max-size: "10m"
         max-file: "3"
 
   creators_instagram:
-    build:
-      context: .
-      dockerfile: docker/scraper/Dockerfile
+    image: tg_parser_crawler_base:latest
     container_name: tg_parser_creators_instagram
     restart: always
     env_file:
@@ -119,15 +116,13 @@ services:
     networks:
       - scraper_network
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
+        max-size: "10m"
         max-file: "3"
 
   creators_tiktok:
-    build:
-      context: .
-      dockerfile: docker/scraper/Dockerfile
+    image: tg_parser_crawler_base:latest
     container_name: tg_parser_creators_tiktok
     restart: always
     env_file:
@@ -148,15 +143,13 @@ services:
     networks:
       - scraper_network
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
+        max-size: "10m"
         max-file: "3"
 
   creators_threads:
-    build:
-      context: .
-      dockerfile: docker/scraper/Dockerfile
+    image: tg_parser_crawler_base:latest
     container_name: tg_parser_creators_threads
     restart: always
     env_file:
@@ -177,15 +170,13 @@ services:
     networks:
       - scraper_network
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
+        max-size: "10m"
         max-file: "3"
 
   creators_youtube:
-    build:
-      context: .
-      dockerfile: docker/scraper/Dockerfile
+    image: tg_parser_crawler_base:latest
     container_name: tg_parser_creators_youtube
     restart: always
     env_file:
@@ -206,9 +197,9 @@ services:
     networks:
       - scraper_network
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
+        max-size: "10m"
         max-file: "3"
 
   llm_proxy:
@@ -224,9 +215,9 @@ services:
     networks:
       - scraper_network
     logging:
-      driver: json-file
+      driver: local
       options:
-        max-size: "50m"
+        max-size: "10m"
         max-file: "3"
 
 networks:
