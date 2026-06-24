@@ -1,9 +1,11 @@
 import asyncio
+import json
 import logging
+import random
 import signal
 from datetime import datetime, timezone
 
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import InternalError, OperationalError
 from sqlalchemy import text
 
 try:
@@ -13,15 +15,133 @@ try:
 except ImportError:
     PostgresError = Exception
 
+from openai import APIConnectionError, APIStatusError, RateLimitError
+
 from src.config.config import Settings, load_settings
 from src.db.database import Database
-from src.graph.db.extractor_repo import ExtractorRepository
-from src.graph.db.graph_repo import GraphRepository
 from src.db.models import Content
 from src.embeddings.qdrant_service import QdrantService
+from src.graph.db.extractor_repo import ExtractorRepository
+from src.graph.db.graph_repo import GraphRepository
 from src.graph.extractor import KnowledgeExtractor
 
 logger = logging.getLogger(__name__)
+
+RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
+    APIConnectionError,
+    RateLimitError,
+    APIStatusError,
+    OperationalError,
+    InternalError,
+    PostgresError,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+
+UNRECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
+    json.JSONDecodeError,
+    ValueError,
+    TypeError,
+    KeyError,
+    AttributeError,
+)
+
+_DB_BACKOFF_BASE = 2.0
+_DB_BACKOFF_MAX = 60.0
+_DB_MAX_BACKOFF_RETRIES = 5
+_DB_JITTER_MAX = 1.0
+
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_JITTER_MIN = 0.5
+_RETRY_JITTER_MAX = 2.0
+
+_STRIP_KEYS: tuple[str, ...] = (
+    "category",
+    "category_name",
+    "category_enum",
+    "overall_category_name",
+    "business_category_name",
+    "language",
+    "lang",
+    "language_code",
+    "primary_locale",
+)
+
+_HEAVY_KEYS: tuple[str, ...] = (
+    "chaining_results",
+    "facebook_pages",
+    "linked_facebook_page",
+    "mutual_followers_data",
+    "eligible_promotions",
+    "ad_metadata",
+    "hd_profile_pic_versions",
+    "hd_profile_pic_url_info",
+    "bio_links",
+    "about_your_account_blurb",
+    "edge_owner_to_timeline_media",
+    "edge_felix_video_timeline",
+    "edge_saved_media",
+    "edge_media_collections",
+    "edge_mutual_followed_by",
+    "edge_related_profiles",
+    "biography_with_entities",
+    "fb_profile_biolink",
+    "profile_pic_url",
+    "profile_pic_url_hd",
+    "video_dash_manifest",
+    "image_versions2",
+    "user",
+    "owner",
+    "clips_metadata",
+    "scrubber_spritesheet_info_candidates",
+    "organic_tracking_token",
+    "candidate_metadata",
+)
+
+_OMIT_KEYS: frozenset[str] = frozenset(_STRIP_KEYS) | frozenset(_HEAVY_KEYS)
+
+
+def _sanitize_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return str(value)
+    stripped = value.strip()
+    return stripped if stripped else None
+
+
+def _sanitize_metadata(raw: dict | None) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    sanitized: dict[str, object] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        if key in _OMIT_KEYS:
+            continue
+        if value is None:
+            sanitized[key] = None
+        elif isinstance(value, (str, int, float, bool)):
+            sanitized[key] = value
+        elif isinstance(value, dict):
+            sanitized[key] = _sanitize_metadata(value)
+        elif isinstance(value, list):
+            sanitized[key] = [
+                _sanitize_metadata(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        else:
+            sanitized[key] = str(value)
+    return sanitized
+
+
+def _db_backoff_delay(attempt: int) -> float:
+    exponential = min(_DB_BACKOFF_BASE * (2 ** attempt), _DB_BACKOFF_MAX)
+    jitter = random.uniform(0.0, _DB_JITTER_MAX)
+    return exponential + jitter
 
 
 class GraphExtractionWorker:
@@ -52,6 +172,52 @@ class GraphExtractionWorker:
         logger.info("Shutdown signal received, stopping graph extraction worker...")
         self._shutdown_event.set()
 
+    async def _sleep_with_shutdown_check(self, delay: float) -> bool:
+        try:
+            await asyncio.wait_for(
+                self._shutdown_event.wait(),
+                timeout=delay,
+            )
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _fetch_batch_with_backoff(self) -> list[Content]:
+        last_db_error: Exception | None = None
+
+        for attempt in range(_DB_MAX_BACKOFF_RETRIES):
+            if self._shutdown_event.is_set():
+                return []
+
+            try:
+                posts = await self.extractor_repo.get_ungraphed_content(
+                    limit=self.batch_size, priority_mode=self.priority_mode
+                )
+                return posts
+            except (OperationalError, InternalError, PostgresError, ConnectionError, OSError) as e:
+                last_db_error = e
+                delay = _db_backoff_delay(attempt)
+                logger.warning(
+                    "Database error while fetching content (attempt %d/%d): %s. "
+                    "Retrying after %.1fs backoff...",
+                    attempt + 1,
+                    _DB_MAX_BACKOFF_RETRIES,
+                    e,
+                    delay,
+                )
+                if await self._sleep_with_shutdown_check(delay):
+                    return []
+
+        logger.error(
+            "Database unavailable after %d backoff attempts: %s. "
+            "Sleeping default poll interval.",
+            _DB_MAX_BACKOFF_RETRIES,
+            last_db_error,
+        )
+        if await self._sleep_with_shutdown_check(float(self.poll_interval)):
+            return []
+        return []
+
     async def run(self) -> None:
         logger.info(
             "Graph extraction worker started (batch_size=%d, poll_interval=%ds, priority_mode=%s)",
@@ -62,67 +228,67 @@ class GraphExtractionWorker:
 
         while not self._shutdown_event.is_set():
             try:
-                try:
-                    posts = await self.extractor_repo.get_ungraphed_content(
-                        limit=self.batch_size, priority_mode=self.priority_mode
-                    )
-                except (OperationalError, PostgresError) as e:
-                    logger.warning(
-                        "Database connection error while fetching content: %s. "
-                        "Retrying after backoff (%.1fs)...",
-                        e,
-                        self.poll_interval * 2,
-                    )
-                    try:
-                        await asyncio.wait_for(
-                            self._shutdown_event.wait(),
-                            timeout=self.poll_interval * 2,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
-                    continue
+                posts = await self._fetch_batch_with_backoff()
+
+                if self._shutdown_event.is_set():
+                    break
 
                 if not posts:
                     logger.debug(
                         "No ungraphed content found, sleeping %ds",
                         self.poll_interval,
                     )
-                    await asyncio.sleep(self.poll_interval)
+                    if await self._sleep_with_shutdown_check(float(self.poll_interval)):
+                        break
                     continue
 
                 logger.info(
                     "Processing batch of %d ungraphed content items", len(posts)
                 )
 
-                semaphore = asyncio.Semaphore(self.settings.extractor_concurrency)
+                queue: asyncio.Queue[Content] = asyncio.Queue()
+                for post in posts:
+                    await queue.put(post)
 
-                async def process_with_semaphore(post: Content) -> None:
-                    async with semaphore:
-                        await self._process_single_post(post)
+                worker_count = min(
+                    self.settings.extractor_concurrency, len(posts)
+                )
 
-                tasks = [process_with_semaphore(post) for post in posts]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                async def _queue_worker() -> None:
+                    while not queue.empty():
+                        try:
+                            post = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        try:
+                            await self._process_single_post(post)
+                        except Exception as exc:
+                            logger.error(
+                                "Unhandled exception in queue worker for content id=%s: %s",
+                                post.id,
+                                exc,
+                                exc_info=exc,
+                            )
+                        finally:
+                            queue.task_done()
 
-                for idx, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        post = posts[idx]
-                        logger.error(
-                            "Unhandled exception processing content id=%s: %s",
-                            post.id,
-                            result,
-                            exc_info=result,
-                        )
+                workers = [_queue_worker() for _ in range(worker_count)]
+                await asyncio.gather(*workers)
 
-                await asyncio.sleep(1)
+                if await self._sleep_with_shutdown_check(1):
+                    break
 
             except asyncio.CancelledError:
                 logger.info("Graph extraction worker task cancelled")
                 break
             except Exception as e:
                 logger.error(
-                    "Unexpected error in graph extraction worker loop: %s", e, exc_info=True
+                    "Unexpected error in graph extraction worker loop: %s",
+                    e,
+                    exc_info=True,
                 )
-                await asyncio.sleep(5)
+                if await self._sleep_with_shutdown_check(5):
+                    break
 
         logger.info("Graph extraction worker stopped")
 
@@ -130,10 +296,14 @@ class GraphExtractionWorker:
         text_for_processing: str | None = None
 
         has_content = post.content is not None and post.content.strip()
-        has_transcription = post.transcription is not None and post.transcription.strip()
+        has_transcription = (
+            post.transcription is not None and post.transcription.strip()
+        )
 
         if has_content and has_transcription:
-            text_for_processing = f"{post.content}\n\nTranscription:\n{post.transcription}"
+            text_for_processing = (
+                f"{post.content}\n\nTranscription:\n{post.transcription}"
+            )
         elif has_content:
             text_for_processing = post.content
         elif has_transcription:
@@ -156,88 +326,110 @@ class GraphExtractionWorker:
             "shares_count": post.shares_count,
         }
 
-        raw_metadata: dict = (
-            post.raw_metadata.copy() if post.raw_metadata is not None else {}
+        raw_metadata = _sanitize_metadata(
+            post.raw_metadata if post.raw_metadata is not None else None
         )
-        iab_enabled = getattr(self.settings, "enable_iab_taxonomy", False)
-        if not iab_enabled:
-            for key in (
-                "category",
-                "category_name",
-                "category_enum",
-                "overall_category_name",
-                "business_category_name",
-            ):
-                raw_metadata.pop(key, None)
-        raw_metadata.pop("language", None)
+
         if post.transcription:
-            raw_metadata = {**raw_metadata, "transcription": post.transcription}
+            safe_transcription = _sanitize_string(post.transcription)
+            if safe_transcription:
+                raw_metadata["transcription"] = safe_transcription
 
         account_metadata: dict | None = None
         if post.account:
-            account_metadata = (
-                post.account.raw_metadata.copy() if post.account.raw_metadata else {}
+            account_metadata = _sanitize_metadata(
+                post.account.raw_metadata if post.account.raw_metadata else None
             )
-            if not iab_enabled:
-                for key in (
-                    "category",
-                    "category_name",
-                    "category_enum",
-                    "overall_category_name",
-                    "business_category_name",
-                ):
-                    account_metadata.pop(key, None)
-            account_metadata.pop("language", None)
-            account_metadata["username"] = post.account.username
-            account_metadata["title"] = post.account.title
-            account_metadata["subscribers_count"] = post.account.subscribers_count
-
-        try:
-            await self.extractor.process_post(
-                post_id=post.id,
-                text=text_for_processing,
-                author_id=post.account_id,
-                post_metrics=post_metrics,
-                raw_metadata=raw_metadata,
-                graph_repo=self.graph_repo,
-                qdrant=self.qdrant,
-                platform=post.account.platform if post.account else None,
-                account_metadata=account_metadata,
-                platform_content_id=post.platform_content_id,
-            )
-        except Exception as e:
-            logger.error(
-                "Unrecoverable error extracting knowledge graph for content id=%s: %s",
-                post.id,
-                e,
-                exc_info=True,
+            account_metadata["username"] = _sanitize_string(post.account.username) or "unknown"
+            account_metadata["title"] = _sanitize_string(post.account.title) or "Unknown"
+            raw_subscribers = post.account.subscribers_count
+            account_metadata["subscribers_count"] = (
+                int(raw_subscribers)
+                if isinstance(raw_subscribers, (int, float))
+                else None
             )
 
+            if not account_metadata.get("biography"):
+                fallback_bio = _sanitize_string(post.account.description)
+                if fallback_bio:
+                    account_metadata["biography"] = fallback_bio
+
+        last_recoverable_error: Exception | None = None
+
+        for attempt in range(_RETRY_MAX_ATTEMPTS):
             try:
-                async with self.db.async_session() as session:
-                    await session.execute(
-                        text("""
-                            UPDATE content
-                            SET raw_metadata = COALESCE(raw_metadata, '{}'::jsonb) ||
-                                jsonb_build_object('graph_extraction_error', :error_msg, 'graph_failed_at', :failed_at)
-                            WHERE id = :post_id
-                        """),
-                        {
-                            "post_id": post.id,
-                            "error_msg": str(e),
-                            "failed_at": datetime.now(timezone.utc).isoformat(),
-                        },
-                    )
-                    await session.commit()
-            except Exception as db_err:
+                await self.extractor.process_post(
+                    post_id=post.id,
+                    text=text_for_processing,
+                    author_id=post.account_id,
+                    post_metrics=post_metrics,
+                    raw_metadata=raw_metadata,
+                    graph_repo=self.graph_repo,
+                    qdrant=self.qdrant,
+                    platform=post.account.platform if post.account else None,
+                    account_metadata=account_metadata,
+                    platform_content_id=post.platform_content_id,
+                )
+                break
+            except UNRECOVERABLE_ERRORS as e:
                 logger.error(
-                    "Failed to update raw_metadata for content id=%s: %s",
+                    "Unrecoverable error extracting knowledge graph for content id=%s: %s",
                     post.id,
-                    db_err,
-                    exc_info=True,
+                    e,
                 )
 
-            await self.extractor_repo.mark_content_graphed(post.id)
+                try:
+                    async with self.db.async_session() as session:
+                        await session.execute(
+                            text("""
+                                UPDATE content
+                                SET raw_metadata = COALESCE(raw_metadata, '{}'::jsonb) ||
+                                    jsonb_build_object(
+                                        'graph_extraction_error', CAST(:error_msg AS text),
+                                        'graph_failed_at', CAST(:failed_at AS text)
+                                    )
+                                WHERE id = :post_id
+                            """),
+                            {
+                                "post_id": post.id,
+                                "error_msg": str(e)[:1000],
+                                "failed_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        await session.commit()
+                except Exception as db_err:
+                    logger.error(
+                        "Failed to update raw_metadata for content id=%s: %s",
+                        post.id,
+                        db_err,
+                        exc_info=db_err,
+                    )
+
+                await self.extractor_repo.mark_content_graphed(post.id)
+                return
+            except RECOVERABLE_ERRORS as e:
+                last_recoverable_error = e
+                if attempt < _RETRY_MAX_ATTEMPTS - 1:
+                    jitter = random.uniform(_RETRY_JITTER_MIN, _RETRY_JITTER_MAX)
+                    logger.warning(
+                        "Recoverable error extracting knowledge graph for content id=%s "
+                        "(attempt %d/%d): %s. Retrying after %.2fs jitter...",
+                        post.id,
+                        attempt + 1,
+                        _RETRY_MAX_ATTEMPTS,
+                        e,
+                        jitter,
+                    )
+                    await asyncio.sleep(jitter)
+                continue
+        else:
+            logger.warning(
+                "Recoverable error extracting knowledge graph for content id=%s "
+                "after %d attempts: %s. Post will be retried in a subsequent batch.",
+                post.id,
+                _RETRY_MAX_ATTEMPTS,
+                last_recoverable_error,
+            )
             return
 
         await self.extractor_repo.mark_content_graphed(post.id)

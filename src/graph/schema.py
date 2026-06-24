@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import uuid
 from enum import Enum
 import json
 from typing import Any
@@ -15,18 +17,34 @@ from pydantic import (
 from src.graph.utils import sanitize_key
 
 
+def decode_unicode_escapes(val: str) -> str:
+    try:
+        decoded = re.sub(
+            r"\\u([0-9a-fA-F]{4})",
+            lambda m: chr(int(m.group(1), 16)),
+            val,
+        )
+        return decoded.replace("\\", "/")
+    except Exception:
+        return val
+
+
+_CORRUPTED_VALUES = frozenset({"un", "unknown", "null", "none", "undefined", ""})
+
+
 class PropertyType(str, Enum):
     TEXT = "text"
     NUMERIC = "numeric"
     GEO = "geo"
     LANGUAGE = "language"
     LOCATION = "location"
+    CATEGORY = "category"
 
 
 class Property(BaseModel):
     key: str = Field(..., description="Property name/key")
-    value: Any = Field(
-        ..., description="Property value (validated based on type)"
+    value: Any | None = Field(
+        default=None, description="Property value (validated based on type)"
     )
     type: PropertyType = Field(
         ..., description="Property type category from PropertyType enum"
@@ -53,7 +71,10 @@ class Property(BaseModel):
             prop_type = data.get("type")
             value = data.get("value")
 
-            if prop_type is None or value is None:
+            if prop_type is None:
+                return data
+
+            if value is None:
                 return data
 
             if isinstance(value, bool):
@@ -64,6 +85,15 @@ class Property(BaseModel):
                 else:
                     data["value"] = str(value)
                     data["type"] = PropertyType.TEXT
+                return data
+
+            if prop_type == PropertyType.TEXT and isinstance(value, str):
+                if value.strip().lower() in _CORRUPTED_VALUES:
+                    data["value"] = None
+                    return data
+
+            if prop_type in (PropertyType.LANGUAGE, PropertyType.CATEGORY):
+                data["value"] = None
                 return data
 
             if prop_type == PropertyType.TEXT and not isinstance(value, str):
@@ -82,6 +112,10 @@ class Property(BaseModel):
                 except (ValueError, TypeError):
                     pass
 
+            value_after = data.get("value")
+            if isinstance(value_after, str):
+                data["value"] = decode_unicode_escapes(value_after)
+
         return data
 
     @field_validator("key", mode="before")
@@ -93,6 +127,16 @@ class Property(BaseModel):
     def validate_value_against_type(self) -> Property:
         prop_type = self.type
         value = self.value
+
+        if value is None:
+            return self
+
+        if prop_type == PropertyType.LANGUAGE:
+            if not (
+                isinstance(value, str) and len(value) == 2 and value.isalpha()
+            ):
+                self.value = None
+                return self
 
         if prop_type == PropertyType.NUMERIC:
             if not isinstance(value, (int, float)):
@@ -110,14 +154,6 @@ class Property(BaseModel):
                     f"Property '{self.key}' with type GEO must be a list of two floats, got {value!r}"
                 )
 
-        elif prop_type == PropertyType.LANGUAGE:
-            if not (
-                isinstance(value, str) and len(value) == 2 and value.isalpha()
-            ):
-                raise ValueError(
-                    f"Property '{self.key}' with type LANGUAGE must be a 2-letter alphabetic string, got {value!r}"
-                )
-
         elif prop_type == PropertyType.TEXT:
             if not isinstance(value, str):
                 raise ValueError(
@@ -129,6 +165,10 @@ class Property(BaseModel):
                 raise ValueError(
                     f"Property '{self.key}' with type LOCATION must be a string, got {type(value).__name__}"
                 )
+
+        elif prop_type == PropertyType.CATEGORY:
+            if not isinstance(value, str):
+                self.value = str(value)
 
         return self
 
@@ -150,8 +190,52 @@ class ExtractedEntity(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    @field_validator("id", mode="before")
+    @classmethod
+    def sanitize_id(cls, v: Any) -> str:
+        value = str(v).strip()
+        value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
+        value = re.sub(r"_+", "_", value).strip("_")
+        if not value:
+            value = f"entity_{uuid.uuid4().hex[:8]}"
+        if value[0].isdigit():
+            value = f"ent_{value}"
+        return value
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def sanitize_label(cls, v: Any) -> str:
+        value = str(v).strip()
+        value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
+        value = re.sub(r"_+", "_", value).strip("_")
+        if not value:
+            value = "Entity"
+        if value[0].isdigit():
+            value = f"Label_{value}"
+        else:
+            value = value[0].upper() + value[1:]
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_entity_name(cls, data: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(data, dict) and "name" in data and isinstance(data["name"], str):
+            name = data["name"]
+            name = decode_unicode_escapes(name)
+            name = re.sub(r"\[.*?\]", "", name)
+            name = re.sub(r"\s+", " ", name).strip()
+            data["name"] = name
+        return data
+
     def get_property_dict(self) -> dict[str, Any]:
-        return {prop.key: prop.value for prop in self.properties}
+        result: dict[str, Any] = {}
+        for prop in self.properties:
+            if prop.value is None:
+                continue
+            if str(prop.value).strip().lower() in _CORRUPTED_VALUES:
+                continue
+            result[prop.key] = prop.value
+        return result
 
     def add_property(
         self, key: str, value: Any, type: str | PropertyType
@@ -175,8 +259,39 @@ class ExtractedRelation(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    @field_validator("source_id", "target_id", mode="before")
+    @classmethod
+    def sanitize_relation_id(cls, v: Any) -> str:
+        value = str(v).strip()
+        value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
+        value = re.sub(r"_+", "_", value).strip("_")
+        if not value:
+            value = f"entity_{uuid.uuid4().hex[:8]}"
+        if value[0].isdigit():
+            value = f"ent_{value}"
+        return value
+
+    @field_validator("relation_type", mode="before")
+    @classmethod
+    def sanitize_relation_type(cls, v: Any) -> str:
+        value = str(v).strip()
+        value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
+        value = re.sub(r"_+", "_", value).strip("_")
+        if not value:
+            value = "RELATED_TO"
+        if value[0].isdigit():
+            value = f"REL_{value}"
+        return value.upper()
+
     def get_property_dict(self) -> dict[str, Any]:
-        return {prop.key: prop.value for prop in self.properties}
+        result: dict[str, Any] = {}
+        for prop in self.properties:
+            if prop.value is None:
+                continue
+            if str(prop.value).strip().lower() in _CORRUPTED_VALUES:
+                continue
+            result[prop.key] = prop.value
+        return result
 
     def add_property(
         self, key: str, value: Any, type: str | PropertyType
@@ -277,6 +392,7 @@ def open_spg_result_to_extraction_result(
 
 def get_open_spg_llm_prompt(
     text: str,
+    pub_node_id: str,
     author_id: str | int | None = None,
     platform: str | None = None,
     metadata: dict | None = None,
@@ -291,14 +407,13 @@ def get_open_spg_llm_prompt(
     metadata_instruction = ""
     metadata_json_str = ""
     if metadata is not None and len(metadata) > 0:
-        metadata_json_str = json.dumps(metadata, ensure_ascii=False, indent=2)
+        cleaned_metadata = {k: v for k, v in metadata.items() if k not in ("category", "language")}
+        metadata_json_str = json.dumps(cleaned_metadata, ensure_ascii=False, indent=2)
 
         excluded_fields = []
-        if "language" in metadata:
-            excluded_fields.append("'language' (2-letter code)")
-        if "location" in metadata:
+        if "location" in cleaned_metadata:
             excluded_fields.append("'location' (human-readable location)")
-        if "geo" in metadata or "geo_lat" in metadata or "geo_long" in metadata:
+        if "geo" in cleaned_metadata or "geo_lat" in cleaned_metadata or "geo_long" in cleaned_metadata:
             excluded_fields.append("'geo'/'geo_lat'/'geo_long' (coordinates)")
 
         excluded_text = ", ".join(excluded_fields) if excluded_fields else "none"
@@ -313,7 +428,7 @@ CRITICAL INSTRUCTION FOR PRE-EXTRACTED METADATA:
 - STRICTLY FORBIDDEN: DO NOT extract or include any of these pre-extracted fields in your output.
 - Focus strictly on extracting NEW business logic entities (Actors, Entities, Events, Places) and their relations from the text.
 - The pre-extracted metadata will be merged into the Content node automatically; you do NOT need to include these as properties in your extraction output.
-- If you see information in the text that matches pre-extracted metadata (e.g., language, location, coordinates), IGNORE it completely and do NOT add it to your extraction.
+- If you see information in the text that matches pre-extracted metadata (e.g., location, coordinates), IGNORE it completely and do NOT add it to your extraction.
 """
 
     prompt = f"""You are an OpenSPG (Semantic Parsing Graph) incremental knowledge accumulation engine. Your task is to extract or update knowledge entities and relationships from the provided text, treating the graph as a persistent state that grows incrementally across any domain (IT, politics, lifestyle, science, etc.).
@@ -323,6 +438,10 @@ CRITICAL OpenSPG DOCTRINE:
 - If a post mentions that a blogger has a second child, you must extract a property {{'key': 'children_count', 'value': 2, 'type': 'numeric'}} for that Actor node, so the graph updates its state incrementally.
 - Every entity may have multiple properties added across different texts. Do not replace existing properties; only add new ones or update numeric/text values when new information is provided.
 - Use ONLY the four core universal labels: Actor (persons, organizations, groups, social media accounts, channels — the universal node type for ALL social profiles across Telegram, Instagram, YouTube, TikTok, and Threads), Entity (abstract concepts, products, technologies, objects), Event (occurrences, meetings, incidents), Place (geographic locations, cities, coordinates).
+
+MAIN POST ENTITY:
+The text below is from a single post/publication. You MUST create a node for this post with the EXACT id: "{pub_node_id}".
+Label this node as "Event" or "Entity" as appropriate. All relations that discuss, mention, or are about the post's core content MUST use "{pub_node_id}" as their source_id or target_id.
 
 OpenSPG Principles:
 - Build a connected subgraph of entities and relationships.
@@ -350,24 +469,23 @@ Extraction Instructions:
      "label": "Actor" | "Entity" | "Event" | "Place" (exactly one of these four),
      "name": "Human-readable display name",
      "properties": [
-       {{"key": "property_name", "value": <any>, "type": "text" | "numeric" | "geo" | "language" | "location"}}
+       {{"key": "property_name", "value": <any>, "type": "text" | "numeric" | "geo" | "location"}}
      ]
    }}
    
    CRITICAL: "properties" is a LIST OF OBJECTS, each with 'key', 'value', and 'type' fields. NOT a dictionary.
    
    PROPERTY TYPE RULES (strict enforcement):
-   - "text": string values (names, descriptions, languages, etc.)
+   - "text": string values (names, descriptions, etc.)
    - "numeric": int or float values (counts, years, quantities, IDs, timestamps)
    - "geo": array of exactly two floats [latitude, longitude] (e.g., [55.7558, 37.6173])
-   - "language": 2-letter language code string (e.g., "en", "ru", "zh")
    - "location": human-readable location string (e.g., "Moscow, Russia", "Cupertino, CA")
 
    CRITICAL: Property keys MUST be in strict snake_case (e.g., 'birth_date', 'co_founder' -> 'co_founder'). No hyphens or spaces allowed in keys.
    
    EXAMPLES OF PROPERTIES:
    - Actor: [{{'key': 'platform', 'value': 'telegram', 'type': 'text'}}, {{'key': 'platform_id', 'value': '123456', 'type': 'text'}}, {{'key': 'nationality', 'value': 'Russian', 'type': 'text'}}]
-   - Entity: [{{'key': 'category', 'value': 'programming_language', 'type': 'text'}}, {{'key': 'release_year', 'value': 1991, 'type': 'numeric'}}]
+   - Entity: [{{'key': 'domain', 'value': 'programming_language', 'type': 'text'}}, {{'key': 'release_year', 'value': 1991, 'type': 'numeric'}}]
    - Event: [{{'key': 'timestamp', 'value': 1712345678, 'type': 'numeric'}}, {{'key': 'location', 'value': 'San Francisco', 'type': 'location'}}]
    - Place: [{{'key': 'coordinates', 'value': [55.7558, 37.6173], 'type': 'geo'}}, {{'key': 'country', 'value': 'Russia', 'type': 'text'}}]
 
@@ -381,7 +499,7 @@ Extraction Instructions:
      "source_id": "entity_id",
      "relation_type": "UPPER_SNAKE_CASE",
      "target_id": "entity_id",
-     "properties": [{{"key": "...", "value": <any>, "type": "text" | "numeric" | "geo" | "language" | "location"}}]
+     "properties": [{{"key": "...", "value": <any>, "type": "text" | "numeric" | "geo" | "location"}}]
    }}
 
 {author_instruction}4. INCREMENTAL AGGREGATION STRATEGY:
@@ -393,7 +511,6 @@ Extraction Instructions:
    - Text properties can be extended (e.g., add new 'alternate_name' or 'description').
    - Always prefer extracting concrete, factual properties over vague ones.
    - MANDATORY PROPERTY EXTRACTION: ALWAYS extract the following property types if present in the text AND NOT already provided in pre-extracted metadata:
-     * Language: 2-letter language code (e.g., "en", "ru", "zh") with type "language" - SKIP if already in metadata
      * Location: human-readable location string (e.g., "Moscow, Russia") with type "location" - SKIP if already in metadata
      * Geo: coordinates as [latitude, longitude] array with type "geo" - SKIP if already in metadata
      * Text: any textual data (names, descriptions, etc.) with type "text"
@@ -405,14 +522,26 @@ Extraction Instructions:
    - Only include entities and relations that are directly and explicitly mentioned in the text.
    - Omit less important or peripheral entities to stay within the limit.
 
-6. OUTPUT FORMAT:
-Return ONLY a valid JSON object with exactly this structure:
+6. PROPERTY VALUE QUALITY (MANDATORY):
+   - NEVER output properties with values like "unknown", "un", "none", "null", "undefined", or empty strings ("").
+   - If the exact factual value of a property is NOT known or is uncertain, COMPLETELY OMIT that property from the "properties" list. Do NOT use placeholder or corrupted values.
+   - Corrupted placeholder values cause downstream parse failures and pollute the knowledge graph with garbage data.
+   - Only include properties where you can provide a CONCRETE, FACTUAL, verifiable value.
+
+7. JSON FORMAT COMPLIANCE (MANDATORY):
+   - The JSON structure MUST be 100% compliant with the OpenSPG schema defined above.
+   - Absolutely NO markdown wrapping (no ```json or ``` delimiters around the output).
+   - No trailing commas anywhere in the JSON object or arrays.
+   - No formatting errors — every opening bracket/brace must have a matching closing counterpart.
+   - Any JSON parse failure will corrupt the entire extraction result for this post.
+   - Your ENTIRE response must be a single valid JSON object and nothing else.
+
+8. OUTPUT FORMAT:
+Return ONLY a valid JSON object with exactly this structure. No markdown, no code blocks, no explanations:
 {{
   "entities": [ ... ],
   "relations": [ ... ]
 }}
-
-Do not include any explanatory text, markdown formatting, or code block delimiters. The response must be pure JSON.
 
 TOPIC COVERAGE RULE (MANDATORY for Knowledge Augmented Generation):
 Any key concepts, technologies, products, or subjects discussed in the text MUST be represented as Entity nodes. The main subject or publication of the text MUST connect to these Entity nodes using the ABOUT relationship. For example, if a post discusses Python programming, you MUST create an Entity node for "Python" and connect the publication to it via ABOUT. The ABOUT relation is the PRIMARY connection between a post/publication and its core subjects — always prefer ABOUT over DISCUSSES for the main topic link.
@@ -435,7 +564,7 @@ Example for a tech blog post:
       "label": "Entity",
       "name": "Python",
       "properties": [
-        {{"key": "category", "value": "programming_language", "type": "text"}},
+        {{"key": "domain", "value": "programming_language", "type": "text"}},
         {{"key": "release_year", "value": 1991, "type": "numeric"}}
       ]
     }},

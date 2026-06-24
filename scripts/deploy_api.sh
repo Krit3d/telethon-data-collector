@@ -105,74 +105,62 @@ if [ "$DEPLOY_MODE" = "build-only" ]; then
     echo "    All logs:           ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE logs --tail=100'"
     echo "=========================================="
 else
-    echo "Building and starting API infrastructure and service (qdrant, api)..."
-    ssh "$SSH_USER@$SSH_HOST" "cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d --build qdrant api"
+    echo "Starting core API infrastructure and services (qdrant, nginx_llm, api) without recreating running containers..."
+    ssh "$SSH_USER@$SSH_HOST" "cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d --no-recreate qdrant nginx_llm api"
 
-    echo "Waiting for API service to become ready..."
+    echo "Waiting for services to become ready..."
 
     ssh "$SSH_USER@$SSH_HOST" bash -c "'
     cd /opt/telethon-api
 
-    SERVICE_NAME=\"api\"
-
-    MAX_WAIT=60
+    SERVICES=\"api\"
+    MAX_WAIT=120
     ELAPSED=0
-    while [ \$ELAPSED -lt \$MAX_WAIT ]; do
-        CONTAINER_ID=\$(docker compose -f $COMPOSE_FILE ps -q \$SERVICE_NAME 2>/dev/null)
 
-        if [ -z \"\$CONTAINER_ID\" ]; then
-            echo \"Container for \$SERVICE_NAME not found, waiting...\"
+    for SERVICE_NAME in \$SERVICES; do
+        while [ \$ELAPSED -lt \$MAX_WAIT ]; do
+            CONTAINER_ID=\$(docker compose -f $COMPOSE_FILE ps -q \$SERVICE_NAME 2>/dev/null)
+
+            if [ -z \"\$CONTAINER_ID\" ]; then
+                echo \"Container for \$SERVICE_NAME not found, waiting...\"
+                sleep 5
+                ELAPSED=\$((ELAPSED + 5))
+                continue
+            fi
+
+            STATUS=\$(docker inspect --format=\"{{.State.Status}}\" \$CONTAINER_ID 2>/dev/null)
+            if [ \"\$STATUS\" != \"running\" ]; then
+                echo \"\$SERVICE_NAME container is \$STATUS, waiting...\"
+                sleep 5
+                ELAPSED=\$((ELAPSED + 5))
+                continue
+            fi
+
+            HEALTH=\$(docker inspect --format=\"{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}\" \$CONTAINER_ID 2>/dev/null)
+
+            if [ \"\$HEALTH\" = \"healthy\" ] || [ \"\$HEALTH\" = \"no-healthcheck\" ]; then
+                echo \"\$SERVICE_NAME is ready!\"
+                break
+            fi
+
+            echo \"Waiting for \$SERVICE_NAME to become healthy... (\$ELAPSED/\$MAX_WAIT seconds)\"
             sleep 5
             ELAPSED=\$((ELAPSED + 5))
-            continue
+        done
+
+        if [ \$ELAPSED -ge \$MAX_WAIT ]; then
+            echo \"Warning: Timeout waiting for \$SERVICE_NAME to become ready.\"
         fi
 
-        STATUS=\$(docker inspect --format=\"{{.State.Status}}\" \$CONTAINER_ID 2>/dev/null)
-        if [ \"\$STATUS\" != \"running\" ]; then
-            echo \"Container is \$STATUS, waiting...\"
-            sleep 5
-            ELAPSED=\$((ELAPSED + 5))
-            continue
-        fi
-
-        HEALTH=\$(docker inspect --format=\"{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}\" \$CONTAINER_ID 2>/dev/null)
-
-        if [ \"\$HEALTH\" = \"healthy\" ] || [ \"\$HEALTH\" = \"no-healthcheck\" ]; then
-            echo \"\$SERVICE_NAME is ready!\"
-            break
-        fi
-
-        echo \"Waiting for \$SERVICE_NAME to become healthy... (\$ELAPSED/\$MAX_WAIT seconds)\"
-        sleep 5
-        ELAPSED=\$((ELAPSED + 5))
+        echo \"\"
+        echo \"=== Last 20 lines of \$SERVICE_NAME logs ===\"
+        docker compose -f $COMPOSE_FILE logs --tail=20 \$SERVICE_NAME
     done
-
-    if [ \$ELAPSED -ge \$MAX_WAIT ]; then
-        echo \"Warning: Timeout waiting for \$SERVICE_NAME to become ready.\"
-    fi
-
-    echo \"\"
-    echo \"=== Last 20 lines of \$SERVICE_NAME logs ===\"
-    docker compose -f $COMPOSE_FILE logs --tail=20 \$SERVICE_NAME
     '"
 
     echo ""
     echo "=========================================="
-    echo "Infrastructure and API service updated successfully!"
-    echo ""
-    echo "To start the embedding_worker and graph_worker manually, use the following commands:"
-    echo ""
-    echo "  Start embedding_worker:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d embedding_worker && docker compose -f $COMPOSE_FILE logs -f --tail=50 embedding_worker'"
-    echo ""
-    echo "  Start graph_worker:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d graph_worker && docker compose -f $COMPOSE_FILE logs -f --tail=50 graph_worker'"
-    echo ""
-    echo "  Stop embedding_worker:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE stop embedding_worker'"
-    echo ""
-    echo "  Stop graph_worker:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE stop graph_worker'"
+    echo "Infrastructure and all services updated successfully!"
     echo "=========================================="
 fi
 

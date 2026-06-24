@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from src.config.config import Settings
+from src.graph.schema import decode_unicode_escapes
 from src.graph.extractor.client import LLMClient
 from src.graph.extractor.enrich_author import enrich_author_node
 from src.graph.extractor.enrich_pub import enrich_publication_node
@@ -14,6 +15,33 @@ from src.graph.extractor.extraction_helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_author_name(
+    account_metadata: dict[str, Any] | None,
+    author_id: int,
+) -> str:
+    if account_metadata:
+        for key in ("title", "display_name", "username"):
+            value = account_metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return f"Author {author_id}"
+
+
+def _resolve_publication_name(
+    account_metadata: dict[str, Any] | None,
+    platform_content_id: str,
+    post_id: int,
+) -> str:
+    if platform_content_id:
+        return platform_content_id
+    if account_metadata:
+        for key in ("title", "display_name", "username"):
+            value = account_metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return f"Post {post_id}"
 
 
 class KnowledgeExtractor:
@@ -54,16 +82,19 @@ class KnowledgeExtractor:
                 )
                 return
 
-        result = await self._llm_client.call_llm(
-            text=text,
-            author_id=author_id,
-            post_id=post_id,
-            metadata=raw_metadata if raw_metadata else None,
-            platform=platform,
-        )
+        cleaned_raw_metadata = raw_metadata.copy() if raw_metadata else None
+        if cleaned_raw_metadata is not None:
+            cleaned_raw_metadata.pop("category", None)
+            cleaned_raw_metadata.pop("language", None)
+
+        cleaned_account_metadata = account_metadata.copy() if account_metadata else None
+        if cleaned_account_metadata is not None:
+            cleaned_account_metadata.pop("category", None)
+            cleaned_account_metadata.pop("language", None)
 
         platform_slug = platform.lower() if platform else "unknown"
         author_node_id = f"actor_{platform_slug}_{author_id}"
+
         clean_content_id = re.sub(
             r"[^a-z0-9_]", "_", str(platform_content_id).strip().lower()
         )
@@ -76,50 +107,71 @@ class KnowledgeExtractor:
                 pub_node_id = (
                     f"event_publication_{platform_slug}_{clean_content_id}"
                 )
-            pub_display_name = f"Publication {platform_content_id}"
         else:
             pub_node_id = f"event_publication_{platform_slug}_{post_id}"
-            pub_display_name = f"Publication {post_id}"
 
-        llm_author_ids: set[str] = set()
-        llm_pub_ids: set[str] = set()
+        pub_display_name = _resolve_publication_name(
+            account_metadata, platform_content_id, post_id
+        )
+
+        result = await self._llm_client.call_llm(
+            text=text,
+            author_id=author_id,
+            post_id=post_id,
+            pub_node_id=pub_node_id,
+            metadata=cleaned_raw_metadata if cleaned_raw_metadata else None,
+            platform=platform,
+        )
+
+        _FILTERED_PROPERTY_KEYS = {"category", "language"}
         for entity in result.entities:
+            entity.properties = [
+                p for p in entity.properties
+                if p.key not in _FILTERED_PROPERTY_KEYS
+            ]
+
+        fallback_author_ids: set[str] = set()
+        fallback_pub_ids: set[str] = set()
+        for entity in result.entities:
+            if entity.id in (author_node_id, pub_node_id):
+                continue
             for prop in entity.properties:
                 if prop.key == "type" and prop.value == "author":
-                    llm_author_ids.add(entity.id)
+                    fallback_author_ids.add(entity.id)
                     break
                 if prop.key == "type" and prop.value == "publication":
-                    llm_pub_ids.add(entity.id)
+                    fallback_pub_ids.add(entity.id)
                     break
+        llm_fallback_ids = fallback_author_ids | fallback_pub_ids
         result.entities = [
-            e
-            for e in result.entities
-            if e.id not in llm_author_ids and e.id not in llm_pub_ids
+            e for e in result.entities if e.id not in llm_fallback_ids
         ]
         for rel in result.relations:
-            if rel.source_id in llm_author_ids:
+            if rel.source_id in fallback_author_ids:
                 rel.source_id = author_node_id
-            if rel.target_id in llm_author_ids:
+            if rel.target_id in fallback_author_ids:
                 rel.target_id = author_node_id
-            if rel.source_id in llm_pub_ids:
+            if rel.source_id in fallback_pub_ids:
                 rel.source_id = pub_node_id
-            if rel.target_id in llm_pub_ids:
+            if rel.target_id in fallback_pub_ids:
                 rel.target_id = pub_node_id
-        if llm_author_ids or llm_pub_ids:
+        if llm_fallback_ids:
             logger.info(
-                "Remapped LLM IDs for post_id=%d: "
-                "author_ids=%s, pub_ids=%s",
+                "Safety remap for post_id=%d: author=%s, pub=%s",
                 post_id,
-                llm_author_ids,
-                llm_pub_ids,
+                fallback_author_ids,
+                fallback_pub_ids,
             )
+
+        author_display_name = _resolve_author_name(account_metadata, author_id)
 
         author_entity = find_or_create_entity(
             result.entities,
             entity_id=author_node_id,
             label="Actor",
-            name=f"Author {author_id}",
+            name=author_display_name,
         )
+        author_entity.name = decode_unicode_escapes(author_display_name)
 
         author_prop_keys = {p.key for p in author_entity.properties}
         if "platform" not in author_prop_keys:
@@ -129,22 +181,23 @@ class KnowledgeExtractor:
         if "platform_id" not in author_prop_keys:
             author_entity.add_property("platform_id", str(author_id), "text")
 
-        if account_metadata:
+        if cleaned_account_metadata:
             enrich_author_node(
                 result.entities,
                 result.relations,
                 author_node_id,
-                account_metadata,
+                cleaned_account_metadata,
                 platform=platform,
                 process_language_data=process_language,
             )
 
-        find_or_create_entity(
+        pub_entity = find_or_create_entity(
             result.entities,
             entity_id=pub_node_id,
             label="Event",
             name=pub_display_name,
         )
+        pub_entity.name = decode_unicode_escapes(pub_display_name)
 
         author_subscribers: int | None = None
         if account_metadata is not None:
@@ -158,10 +211,9 @@ class KnowledgeExtractor:
             pub_node_id,
             post_id,
             post_metrics,
-            raw_metadata,
+            cleaned_raw_metadata or {},
             platform,
             author_subscribers=author_subscribers,
-            process_language_data=process_language,
         )
 
         find_or_create_relation(

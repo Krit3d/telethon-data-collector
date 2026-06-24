@@ -10,10 +10,9 @@ from src.graph.extractor.extraction_helpers import (
     find_entity,
     find_or_create_entity,
     find_or_create_relation,
-    normalize_language,
     sanitize_id,
 )
-from src.graph.schema import ExtractedEntity, ExtractedRelation, PropertyType
+from src.graph.schema import ExtractedEntity, ExtractedRelation
 from src.graph.utils import _convert_to_dict
 
 logger = logging.getLogger(__name__)
@@ -50,6 +49,26 @@ def enrich_author_node(
     for src_key, (prop_type, target_key) in base_field_map.items():
         value = meta_copy.get(src_key)
         if value is not None and target_key not in existing:
+            if prop_type == "numeric":
+                if isinstance(value, str):
+                    try:
+                        value = float(value)
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "Skipping non-numeric value '%s' for property %s on entity %s",
+                            value,
+                            target_key,
+                            author.id,
+                        )
+                        continue
+                elif not isinstance(value, (int, float)):
+                    logger.warning(
+                        "Skipping invalid numeric value %r for property %s on entity %s",
+                        value,
+                        target_key,
+                        author.id,
+                    )
+                    continue
             try:
                 author.add_property(target_key, value, prop_type)
             except (ValidationError, ValueError) as exc:
@@ -267,19 +286,6 @@ def enrich_author_node(
                     author.id,
                     exc,
                 )
-
-    account_lang = normalize_language(meta_copy.get("language"))
-    if process_language_data and account_lang is not None and "language" not in existing:
-        try:
-            author.add_property(
-                "language", account_lang, PropertyType.LANGUAGE
-            )
-        except (ValidationError, ValueError) as exc:
-            logger.warning(
-                "Failed to enrich language for entity %s: %s",
-                author.id,
-                exc,
-            )
 
     audience_locations = meta_copy.get("audience_locations")
     if isinstance(audience_locations, list):

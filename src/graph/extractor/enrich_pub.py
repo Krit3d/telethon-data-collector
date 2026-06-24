@@ -9,10 +9,9 @@ from src.graph.extractor.extraction_helpers import (
     find_entity,
     find_or_create_entity,
     find_or_create_relation,
-    normalize_language,
     sanitize_id,
 )
-from src.graph.schema import ExtractedEntity, ExtractedRelation, PropertyType
+from src.graph.schema import ExtractedEntity, ExtractedRelation
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,6 @@ def enrich_publication_node(
     raw_metadata: dict[str, Any],
     platform: str | None,
     author_subscribers: int | None,
-    process_language_data: bool,
 ) -> None:
     pub = find_entity(entities, source_node_id)
     if pub is None:
@@ -273,15 +271,3 @@ def enrich_publication_node(
                 target_id=audio_entity_id,
             )
 
-    pub_lang = normalize_language(raw_metadata.get("language"))
-    if process_language_data and pub_lang is not None and "language" not in existing:
-        try:
-            pub.add_property(
-                "language", pub_lang, PropertyType.LANGUAGE
-            )
-        except (ValidationError, ValueError) as exc:
-            logger.warning(
-                "Failed to enrich language for entity %s: %s",
-                pub.id,
-                exc,
-            )

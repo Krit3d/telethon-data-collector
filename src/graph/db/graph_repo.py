@@ -130,6 +130,67 @@ class GraphRepository:
 
         return sanitized
 
+    _NUMERIC_KEYS: set[str] = {
+        "follower_count", "views", "reactions_count",
+        "comments_count", "shares_count", "db_post_id",
+        "last_modified_at", "engagement_rate", "confidence",
+    }
+
+    def _clean_numeric_properties(self, props: dict[str, Any]) -> dict[str, Any]:
+        keys_to_remove: list[str] = []
+
+        for key in props:
+            if key not in self._NUMERIC_KEYS:
+                continue
+
+            value = props[key]
+
+            if value is None or value == "":
+                keys_to_remove.append(key)
+                continue
+
+            if isinstance(value, str):
+                stripped = re.sub(r"[^0-9.\-]", "", value)
+
+                if not stripped or stripped in ("-", ".") or stripped.count(".") > 1:
+                    logger.warning(
+                        "Removing non-numeric property '%s' with unparseable value '%s'",
+                        key, value,
+                    )
+                    keys_to_remove.append(key)
+                    continue
+
+                try:
+                    if "." in stripped:
+                        parsed = float(stripped)
+                    else:
+                        parsed = int(stripped)
+                except (ValueError, OverflowError):
+                    logger.warning(
+                        "Failed to parse numeric property '%s' from value '%s', removing it",
+                        key, value,
+                    )
+                    keys_to_remove.append(key)
+                    continue
+
+                props[key] = parsed
+                continue
+
+            if isinstance(value, float):
+                if value == int(value):
+                    props[key] = int(value)
+                continue
+
+            if isinstance(value, int):
+                continue
+
+            keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            props.pop(key, None)
+
+        return props
+
     async def upsert_graph_node(
         self, label: str, properties: dict, merge_key: str = "id",
         session: AsyncSession | None = None,
@@ -145,6 +206,7 @@ class GraphRepository:
             )
 
         props = self._sanitize_properties(properties)
+        props = self._clean_numeric_properties(props)
 
         if merge_key not in props:
             props[merge_key] = properties.get(merge_key)
@@ -152,7 +214,7 @@ class GraphRepository:
         set_clauses: list[str] = []
         set_params: dict[str, Any] = {}
         for key, value in props.items():
-            if key == merge_key:
+            if key == merge_key or value is None:
                 continue
             set_clauses.append(f"n.{key} = $prop_{key}")
             set_params[f"prop_{key}"] = value
@@ -217,6 +279,8 @@ class GraphRepository:
         set_clauses: list[str] = []
         set_params: dict[str, Any] = {}
         for key, value in props.items():
+            if value is None:
+                continue
             set_clauses.append(f"r.{key} = $prop_{key}")
             set_params[f"prop_{key}"] = value
 
