@@ -33,6 +33,15 @@ async def upsert_and_deduplicate_account(
     if platform not in SUPPORTED_PLATFORMS:
         raise ValueError(f"Unsupported platform: {platform}. Must be one of {SUPPORTED_PLATFORMS}")
 
+    platform_id = platform_id.strip()
+    if " " in platform_id or "\n" in platform_id or len(platform_id) > 100:
+        logger.warning(
+            "Invalid platform_id for platform=%s, first 50 chars: %r",
+            platform,
+            platform_id[:50],
+        )
+        platform_id = ""
+
     conditions = []
     if platform_id:
         conditions.append(

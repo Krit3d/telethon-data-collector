@@ -39,9 +39,15 @@ def _is_retryable_db_error(exc: BaseException) -> bool:
     if _asyncpg_exc is not None:
         if isinstance(exc, (_asyncpg_exc.SerializationError, _asyncpg_exc.DeadlockDetectedError)):
             return True
+        if isinstance(exc, _asyncpg_exc.InternalServerError):
+            if "Entity failed to be updated" in str(exc):
+                return True
     if isinstance(exc, DBAPIError) and exc.orig is not None and _asyncpg_exc is not None:
         if isinstance(exc.orig, (_asyncpg_exc.SerializationError, _asyncpg_exc.DeadlockDetectedError)):
             return True
+        if isinstance(exc.orig, _asyncpg_exc.InternalServerError):
+            if "Entity failed to be updated" in str(exc):
+                return True
     return False
 
 

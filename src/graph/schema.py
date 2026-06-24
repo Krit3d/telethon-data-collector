@@ -221,6 +221,7 @@ class ExtractedEntity(BaseModel):
     def sanitize_entity_name(cls, data: dict[str, Any]) -> dict[str, Any]:
         if isinstance(data, dict) and "name" in data and isinstance(data["name"], str):
             name = data["name"]
+            name = name.lstrip("#").strip()
             name = decode_unicode_escapes(name)
             name = re.sub(r"\[.*?\]", "", name)
             name = re.sub(r"\s+", " ", name).strip()

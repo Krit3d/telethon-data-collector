@@ -32,12 +32,12 @@ class SearchResultItem(BaseModel):
     account_id: int
     text: str
     score: float
+    vector_score: float
+    graph_score: float
     created_at: datetime
     url: str | None = None
-    # Optional author info when include_author_info=True
     author_id: int | None = None
     author_name: str | None = None
-    # Indicates if the result was prioritized by the Graph (OpenSPG) logic
     boosted: bool = False
 
 

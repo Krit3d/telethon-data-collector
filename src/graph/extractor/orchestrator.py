@@ -66,10 +66,22 @@ class KnowledgeExtractor:
         platform: str | None = None,
         account_metadata: dict[str, Any] | None = None,
         platform_content_id: str = "",
+        account_id: int | None = None,
     ) -> None:
         process_language = getattr(self.settings, "process_language_data", False)
 
         logger.info("Processing post_id=%d for knowledge extraction", post_id)
+
+        _author_str = str(author_id)
+        if len(_author_str) > 100 or " " in _author_str or "\n" in _author_str:
+            logger.warning(
+                "Corrupted author_id detected for post_id=%d (len=%d), "
+                "falling back to account_id=%s",
+                post_id,
+                len(_author_str),
+                account_id,
+            )
+            author_id = int(account_id) if account_id is not None else 0
 
         if account_metadata is not None:
             account_status = account_metadata.get("status")
@@ -305,6 +317,35 @@ class KnowledgeExtractor:
                 source_id=author_node_id,
                 relation_type="COVERS_TOPIC",
                 target_id=topic_id,
+            )
+
+        _PLACEHOLDER_NAMES = frozenset({
+            "", "#", "other", "unknown", "none", "null", "undefined", "n_a",
+        })
+        pre_filter_count = len(result.entities)
+        kept_entities = []
+        discarded_ids: set[str] = set()
+        for entity in result.entities:
+            trimmed_name = entity.name.strip()
+            if len(trimmed_name) < 2:
+                discarded_ids.add(entity.id)
+                continue
+            if trimmed_name.lower() in _PLACEHOLDER_NAMES:
+                discarded_ids.add(entity.id)
+                continue
+            kept_entities.append(entity)
+        result.entities = kept_entities
+        if discarded_ids:
+            result.relations = [
+                r for r in result.relations
+                if r.source_id not in discarded_ids
+                and r.target_id not in discarded_ids
+            ]
+            logger.info(
+                "Garbage filtration for post_id=%d: discarded %d entities, %d relations removed",
+                post_id,
+                len(discarded_ids),
+                pre_filter_count - len(result.entities),
             )
 
         current_ts = int(time.time())
