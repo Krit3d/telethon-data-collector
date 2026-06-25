@@ -366,25 +366,15 @@ class KnowledgeExtractor:
             if "confidence" not in rel_prop_keys:
                 relation.add_property("confidence", 0.5, "numeric")
 
-        qdrant_task: asyncio.Task | None = None
+        async def _save_graph() -> None:
+            async with self._write_semaphore:
+                await graph_repo.save_extraction_result(post_id, result)
+
+        tasks = [_save_graph()]
         if qdrant is not None:
-            qdrant_task = asyncio.create_task(
-                qdrant.upsert_entities(result.entities)
-            )
+            tasks.append(qdrant.upsert_entities(result.entities))
 
-        async with self._write_semaphore:
-            await graph_repo.save_extraction_result(post_id, result)
-
-        if qdrant_task is not None:
-            try:
-                await qdrant_task
-            except Exception as exc:
-                logger.error(
-                    "Qdrant sync failed for post_id=%d: %s",
-                    post_id,
-                    exc,
-                    exc_info=True,
-                )
+        await asyncio.gather(*tasks)
 
         logger.info(
             "Completed extraction for post_id=%d: %d entities, %d relations",

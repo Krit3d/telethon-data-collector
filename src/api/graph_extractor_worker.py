@@ -16,7 +16,7 @@ try:
 except ImportError:
     PostgresError = Exception
 
-from openai import APIConnectionError, APIStatusError, RateLimitError
+from openai import APIConnectionError, APIStatusError, RateLimitError, APITimeoutError
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
@@ -40,11 +40,12 @@ RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     ConnectionError,
     OSError,
     IntegrityError,
+    json.JSONDecodeError,
+    ValueError,
+    APITimeoutError,
 )
 
 UNRECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
-    json.JSONDecodeError,
-    ValueError,
     TypeError,
     KeyError,
     AttributeError,
@@ -509,8 +510,7 @@ class GraphExtractionWorker:
                         },
                     )
                     await session.commit()
-                await self.extractor_repo.mark_content_extracted(post.id)
-                return True
+                return False
             except Exception as db_err:
                 logger.error(
                     "Failed to record dead-letter for content id=%s: %s",

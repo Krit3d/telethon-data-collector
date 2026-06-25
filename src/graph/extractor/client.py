@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 from json_repair import repair_json
-from openai import AsyncOpenAI, APIStatusError, APIConnectionError, RateLimitError
+from openai import AsyncOpenAI, APIStatusError, APIConnectionError, APITimeoutError, RateLimitError
 from pydantic import ValidationError
 
 from src.config.config import Settings
@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0
-_RETRY_MAX_DELAY = 20.0
-_STAGGER_MAX = 0.05
+_RETRY_MAX_DELAY = 15.0
+_STAGGER_MAX = 5.0
 
 _DOMAIN_ENTITY_MAPPING = (
     "\n\nMANDATORY PUBLICATION ANCHOR & RELATIONSHIP EXTRACTION RULES:\n"
@@ -125,9 +125,9 @@ class LLMClient:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._semaphore = asyncio.Semaphore(getattr(settings, "llm_max_concurrency", 8))
+        self._semaphore = asyncio.Semaphore(getattr(settings, "llm_max_concurrency", settings.graph_concurrency))
         http_limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-        http_timeout = httpx.Timeout(90.0, connect=10.0)
+        http_timeout = httpx.Timeout(120.0, connect=15.0, read=90.0, write=15.0)
         http_client = httpx.AsyncClient(limits=http_limits, timeout=http_timeout)
         self._client = AsyncOpenAI(
             api_key=settings.cloud_ru_api_key,
@@ -321,7 +321,7 @@ class LLMClient:
                 await asyncio.sleep(delay)
                 continue
 
-            except (APIConnectionError, APIStatusError) as exc:
+            except (APIConnectionError, APIStatusError, APITimeoutError) as exc:
                 last_error = exc
                 logger.warning(
                     "API error on attempt %d/%d for post_id=%d: %s",

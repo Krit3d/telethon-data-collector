@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import httpx
 import logging
 import struct
 import uuid
@@ -29,9 +30,14 @@ class QdrantService:
         self.settings = settings
         self.collection_name = settings.qdrant_collection_name or POSTS_COLLECTION
 
+        http_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+            timeout=httpx.Timeout(60.0, connect=10.0, read=45.0, write=10.0),
+        )
         self.openai_client = AsyncOpenAI(
             api_key=settings.cloud_ru_api_key,
             base_url=settings.cloud_ru_base_url,
+            http_client=http_client,
         )
 
         self.client = AsyncQdrantClient(
@@ -478,7 +484,7 @@ class QdrantService:
             )
 
             await self.client.upsert(
-                collection_name=self.collection_name, points=[point],
+                collection_name=self.collection_name, points=[point], wait=True,
             )
 
             logger.debug(
