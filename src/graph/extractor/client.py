@@ -5,6 +5,7 @@ import random
 import re
 from typing import Any
 
+import httpx
 from json_repair import repair_json
 from openai import AsyncOpenAI, APIStatusError, APIConnectionError, RateLimitError
 from pydantic import ValidationError
@@ -17,8 +18,7 @@ logger = logging.getLogger(__name__)
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0
 _RETRY_MAX_DELAY = 20.0
-_REQUEST_TIMEOUT = 240.0
-_STAGGER_MAX = 0.3
+_STAGGER_MAX = 0.05
 
 _DOMAIN_ENTITY_MAPPING = (
     "\n\nMANDATORY PUBLICATION ANCHOR & RELATIONSHIP EXTRACTION RULES:\n"
@@ -74,14 +74,65 @@ _DOMAIN_ENTITY_MAPPING = (
 )
 
 
+def _sanitize_property(prop: dict[str, Any]) -> None:
+    if not isinstance(prop, dict):
+        return
+    prop_type = prop.get("type")
+    if prop_type != "numeric":
+        return
+    val = prop.get("value")
+    if isinstance(val, bool):
+        prop["type"] = "text"
+        return
+    if isinstance(val, (int, float)):
+        return
+    if isinstance(val, str):
+        try:
+            stripped = val.strip()
+            if "." in stripped:
+                prop["value"] = float(stripped)
+            else:
+                prop["value"] = int(stripped)
+        except (ValueError, TypeError):
+            prop["type"] = "text"
+    else:
+        prop["type"] = "text"
+
+
+def _sanitize_parsed_payload(parsed: dict[str, Any]) -> dict[str, Any]:
+    for entity in parsed.get("entities", []):
+        if not isinstance(entity, dict):
+            continue
+        for field in ("id", "name", "label"):
+            val = entity.get(field)
+            if val is not None and not isinstance(val, str):
+                entity[field] = str(val)
+        for prop in entity.get("properties", []):
+            _sanitize_property(prop)
+    for relation in parsed.get("relations", []):
+        if not isinstance(relation, dict):
+            continue
+        for field in ("source_id", "target_id"):
+            val = relation.get(field)
+            if val is not None and not isinstance(val, str):
+                relation[field] = str(val)
+        for prop in relation.get("properties", []):
+            _sanitize_property(prop)
+    return parsed
+
+
 class LLMClient:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._semaphore = asyncio.Semaphore(getattr(settings, "llm_max_concurrency", 8))
+        http_limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+        http_timeout = httpx.Timeout(90.0, connect=10.0)
+        http_client = httpx.AsyncClient(limits=http_limits, timeout=http_timeout)
         self._client = AsyncOpenAI(
             api_key=settings.cloud_ru_api_key,
             base_url=settings.cloud_ru_base_url,
-            timeout=_REQUEST_TIMEOUT,
+            http_client=http_client,
             max_retries=0,
         )
 
@@ -147,7 +198,8 @@ class LLMClient:
 
         for attempt in range(_MAX_RETRIES):
             try:
-                response = await self._client.chat.completions.create(
+                async with self._semaphore:
+                    response = await self._client.chat.completions.create(
                         model=self.settings.cloud_ru_llm_model,
                         messages=[
                             {
@@ -201,6 +253,7 @@ class LLMClient:
 
                 try:
                     parsed = json.loads(content)
+                    parsed = _sanitize_parsed_payload(parsed)
                 except json.JSONDecodeError as original_err:
                     logger.info(
                         "Raw JSON parsing failed for post_id=%d, "
@@ -210,6 +263,7 @@ class LLMClient:
                     repaired = repair_json(content)
                     try:
                         parsed = json.loads(repaired)
+                        parsed = _sanitize_parsed_payload(parsed)
                     except json.JSONDecodeError as repair_err:
                         logger.error(
                             "JSON decode failed after repair for "

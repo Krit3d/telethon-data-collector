@@ -1,11 +1,13 @@
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from typing import Any, ClassVar
 
 from sqlalchemy import text
+from sqlalchemy.exc import InternalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from src.config.config import Settings
@@ -29,7 +31,8 @@ class GraphRepository:
         self.graph_name: str = settings.graph_name
         self._subgraph_query_timeout = self._SUBGRAPH_QUERY_TIMEOUT
         if GraphRepository._write_semaphore is None:
-            GraphRepository._write_semaphore = asyncio.Semaphore(3)
+            write_concurrency = getattr(settings, 'graph_write_concurrency', 6)
+            GraphRepository._write_semaphore = asyncio.Semaphore(write_concurrency)
 
     def _resolve_graph_name(self) -> str:
         name = self.graph_name
@@ -143,7 +146,10 @@ class GraphRepository:
                 )
                 continue
 
-            if isinstance(value, str):
+            # Serialize lists and dicts to JSON strings for Apache AGE compatibility
+            if isinstance(value, (list, dict)):
+                sanitized[clean_key] = json.dumps(value, ensure_ascii=False)
+            elif isinstance(value, str):
                 sanitized[clean_key] = self._clean_string_for_age(value)
             else:
                 sanitized[clean_key] = value
@@ -211,6 +217,48 @@ class GraphRepository:
 
         return props
 
+    async def _delete_and_create_node(
+        self, label: str, properties: dict, merge_key: str,
+        merge_val: Any, session: AsyncSession,
+    ) -> None:
+        graph_name = self._resolve_graph_name()
+        params_dict: dict[str, Any] = {"merge_val": merge_val}
+        set_params: dict[str, Any] = {}
+        for key, value in properties.items():
+            if key == merge_key or value is None:
+                continue
+            set_params[f"prop_{key}"] = value
+        params_dict.update(set_params)
+        params = json.dumps(params_dict)
+
+        delete_query = text(f"""
+            SELECT * FROM cypher('{graph_name}',
+                $$ MATCH (n:{label} {{{merge_key}: $merge_val}})
+                   DETACH DELETE n $$,
+                CAST(:params AS agtype)
+            ) AS (v agtype)
+        """)
+        await self._execute_in_transaction(
+            delete_query, {"params": json.dumps({"merge_val": merge_val})}, session=session
+        )
+
+        set_clauses: list[str] = []
+        for key in set_params:
+            set_clauses.append(f"n.`{key.replace('prop_', '')}` = ${key}")
+        set_clause_str = ", ".join(set_clauses)
+
+        create_query = text(f"""
+            SELECT * FROM cypher('{graph_name}',
+                $$ CREATE (n:{label} {{{merge_key}: $merge_val
+                   {',' + set_clause_str if set_clause_str else ''}}})
+                   RETURN n $$,
+                CAST(:params AS agtype)
+            ) AS (v agtype)
+        """)
+        await self._execute_in_transaction(
+            create_query, {"params": params}, session=session
+        )
+
     async def upsert_graph_node(
         self, label: str, properties: dict, merge_key: str = "id",
         session: AsyncSession | None = None,
@@ -257,7 +305,43 @@ class GraphRepository:
         }
         params = json.dumps(params_dict)
 
-        await self._execute_in_transaction(query, {"params": params}, session=session)
+        for attempt in range(3):
+            try:
+                if session is not None:
+                    async with session.begin_nested():
+                        await self._execute_in_transaction(query, {"params": params}, session=session)
+                else:
+                    await self._execute_in_transaction(query, {"params": params}, session=session)
+                break
+            except InternalError as exc:
+                err_msg = str(exc)
+                if "Entity failed to be updated" in err_msg or "concurrently updated" in err_msg:
+                    if attempt < 2:
+                        await asyncio.sleep(random.uniform(0.05, 0.25))
+                        continue
+                    merge_val = props.get(merge_key)
+                    logger.warning(
+                        "AGE entity update failed for (%s, %s=%s): %s. "
+                        "Attempting DETACH DELETE + CREATE fallback.",
+                        label, merge_key, merge_val, exc,
+                    )
+                    if session is not None:
+                        async with session.begin_nested():
+                            await self._delete_and_create_node(
+                                label, props, merge_key, merge_val, session
+                            )
+                    else:
+                        async with self.async_session() as fallback_session:
+                            async with fallback_session.begin():
+                                await self._delete_and_create_node(
+                                    label, props, merge_key, merge_val, fallback_session
+                                )
+                    logger.info(
+                        "Fallback DETACH DELETE + CREATE succeeded for (%s, %s=%s)",
+                        label, merge_key, merge_val,
+                    )
+                    break
+                raise
 
     async def upsert_graph_edge(
         self,
@@ -325,7 +409,22 @@ class GraphRepository:
         }
         params = json.dumps(params_dict)
 
-        await self._execute_in_transaction(query, {"params": params}, session=session)
+        for attempt in range(3):
+            try:
+                if session is not None:
+                    async with session.begin_nested():
+                        await self._execute_in_transaction(query, {"params": params}, session=session)
+                else:
+                    await self._execute_in_transaction(query, {"params": params}, session=session)
+                break
+            except InternalError as exc:
+                err_msg = str(exc)
+                if "Entity failed to be updated" in err_msg or "concurrently updated" in err_msg or "tuple concurrently updated" in err_msg:
+                    if attempt < 2:
+                        await asyncio.sleep(random.uniform(0.05, 0.25))
+                        continue
+                    raise
+                raise
 
     async def _query_nodes_by_label(
         self, label: str, node_ids: list[str]

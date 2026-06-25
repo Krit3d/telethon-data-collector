@@ -206,6 +206,8 @@ class ExtractedEntity(BaseModel):
             value = f"entity_{uuid.uuid4().hex[:8]}"
         if value[0].isdigit():
             value = f"ent_{value}"
+        if len(value) < 5:
+            value = f"{value}_{uuid.uuid4().hex[:6]}"
         return value
 
     @field_validator("label", mode="before")

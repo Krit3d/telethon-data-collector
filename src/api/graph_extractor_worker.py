@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import random
+import time
 import signal
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
@@ -23,6 +25,7 @@ from src.embeddings.qdrant_service import QdrantService
 from src.graph.db.extractor_repo import ExtractorRepository
 from src.graph.db.graph_repo import GraphRepository
 from src.graph.extractor import KnowledgeExtractor
+from src.graph.schema import OpenSPGExtractionResult
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +56,11 @@ _DB_MAX_BACKOFF_RETRIES = 5
 _DB_JITTER_MAX = 1.0
 
 _RETRY_MAX_ATTEMPTS = 2
-_RETRY_JITTER_MIN = 0.5
-_RETRY_JITTER_MAX = 2.0
+_RETRY_BASE_DELAY = 1.0
+_RETRY_MAX_DELAY = 30.0
+
+_DEAD_LETTER_THRESHOLD = 5
+_LLM_CACHE_MAX_SIZE = 200
 
 _STRIP_KEYS: tuple[str, ...] = (
     "category",
@@ -144,6 +150,12 @@ def _db_backoff_delay(attempt: int) -> float:
     return exponential + jitter
 
 
+def _retry_backoff_delay(attempt: int) -> float:
+    exponential = min(_RETRY_BASE_DELAY * (2 ** attempt), _RETRY_MAX_DELAY)
+    jitter = random.uniform(0.5, 1.5)
+    return exponential + jitter
+
+
 class GraphExtractionWorker:
 
     def __init__(
@@ -167,6 +179,12 @@ class GraphExtractionWorker:
         self.poll_interval = poll_interval
         self.priority_mode: bool = False
         self._shutdown_event = asyncio.Event()
+        self._llm_cache: OrderedDict[int, OpenSPGExtractionResult] = OrderedDict()
+        self._retry_counts: dict[int, int] = {}
+        self._dead_letters: set[int] = set()
+        self._queue: asyncio.Queue[Content] = asyncio.Queue(
+            maxsize=settings.graph_concurrency * 2
+        )
 
     def handle_shutdown(self, *args: object) -> None:
         logger.info("Shutdown signal received, stopping graph extraction worker...")
@@ -218,14 +236,7 @@ class GraphExtractionWorker:
             return []
         return []
 
-    async def run(self) -> None:
-        logger.info(
-            "Graph extraction worker started (batch_size=%d, poll_interval=%ds, priority_mode=%s)",
-            self.batch_size,
-            self.poll_interval,
-            self.priority_mode,
-        )
-
+    async def _producer_loop(self) -> None:
         while not self._shutdown_event.is_set():
             try:
                 posts = await self._fetch_batch_with_backoff()
@@ -242,53 +253,90 @@ class GraphExtractionWorker:
                         break
                     continue
 
-                logger.info(
-                    "Processing batch of %d ungraphed content items", len(posts)
-                )
-
-                sem = asyncio.Semaphore(self.settings.extractor_concurrency)
-                marked_count: int = 0
-                mark_lock = asyncio.Lock()
-
-                async def process_one(post: Content) -> None:
-                    nonlocal marked_count
-                    async with sem:
-                        should_mark = await self._process_single_post(post)
-                        if should_mark:
-                            await self.extractor_repo.mark_content_graphed(post.id)
-                            async with mark_lock:
-                                marked_count += 1
-
-                tasks = [asyncio.create_task(process_one(p)) for i, p in enumerate(posts)]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Log any per-post exceptions without crashing the batch
-                for i, res in enumerate(results):
-                    if isinstance(res, Exception):
-                        logger.warning(
-                            "Post id=%s failed with %s — will be retried in next batch",
-                            posts[i].id,
-                            res,
-                        )
-
-                if marked_count:
+                filtered_posts = [p for p in posts if p.id not in self._dead_letters]
+                if len(filtered_posts) < len(posts):
                     logger.info(
-                        "Batch completed: %d posts marked as graphed", marked_count
+                        "Filtered out %d dead-letter posts from batch",
+                        len(posts) - len(filtered_posts),
+                    )
+                posts = filtered_posts
+
+                if not posts:
+                    if await self._sleep_with_shutdown_check(float(self.poll_interval)):
+                        break
+                    continue
+
+                logger.info(
+                    "Feeding %d ungraphed content items into the processing queue",
+                    len(posts),
                 )
+
+                for post in posts:
+                    await self._queue.put(post)
 
             except asyncio.CancelledError:
-                logger.info("Graph extraction worker task cancelled")
                 break
             except Exception as e:
                 logger.error(
-                    "Unexpected error in graph extraction worker loop: %s",
+                    "Unexpected error in producer loop: %s",
                     e,
                     exc_info=True,
                 )
                 if await self._sleep_with_shutdown_check(5):
                     break
 
-        logger.info("Graph extraction worker stopped")
+    async def _consumer_loop(self, worker_id: int) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                post = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+            try:
+                logger.info(
+                    "Consumer %d processing post id=%d",
+                    worker_id,
+                    post.id,
+                )
+                success = await self._process_single_post(post)
+                if success:
+                    await self.extractor_repo.mark_content_graphed(post.id)
+                    logger.info(
+                        "Consumer %d marked post id=%d as graphed",
+                        worker_id,
+                        post.id,
+                    )
+            except Exception as e:
+                logger.error(
+                    "Consumer %d error processing post id=%d: %s",
+                    worker_id,
+                    post.id,
+                    e,
+                )
+            finally:
+                self._queue.task_done()
+
+    async def run(self) -> None:
+        logger.info(
+            "Graph extraction worker started (queue_maxsize=%d, concurrency=%d)",
+            self._queue.maxsize,
+            self.settings.graph_concurrency,
+        )
+
+        producer = asyncio.create_task(self._producer_loop())
+        consumers = [
+            asyncio.create_task(self._consumer_loop(i + 1))
+            for i in range(self.settings.graph_concurrency)
+        ]
+
+        try:
+            await asyncio.gather(producer, *consumers)
+        except asyncio.CancelledError:
+            logger.info("Graph extraction worker task cancelled")
+        finally:
+            logger.info("Graph extraction worker stopped")
 
     async def _process_single_post(self, post: Content) -> bool:
         text_for_processing: str | None = None
@@ -352,10 +400,11 @@ class GraphExtractionWorker:
                     account_metadata["biography"] = fallback_bio
 
         last_recoverable_error: Exception | None = None
+        cached = self._llm_cache.get(post.id)
 
         for attempt in range(_RETRY_MAX_ATTEMPTS):
             try:
-                await self.extractor.process_post(
+                result = await self.extractor.process_post(
                     post_id=post.id,
                     text=text_for_processing,
                     author_id=post.account_id,
@@ -366,15 +415,24 @@ class GraphExtractionWorker:
                     platform=post.account.platform if post.account else None,
                     account_metadata=account_metadata,
                     platform_content_id=post.platform_content_id,
+                    cached_result=cached,
                 )
+                if result is None:
+                    return True
+                if post.id not in self._llm_cache:
+                    self._llm_cache[post.id] = result
+                    if len(self._llm_cache) > _LLM_CACHE_MAX_SIZE:
+                        self._llm_cache.popitem(last=False)
+                self._retry_counts.pop(post.id, None)
+                self._dead_letters.discard(post.id)
                 return True
+
             except UNRECOVERABLE_ERRORS as e:
                 logger.error(
                     "Unrecoverable error extracting knowledge graph for content id=%s: %s",
                     post.id,
                     e,
                 )
-
                 try:
                     async with self.db.async_session() as session:
                         await session.execute(
@@ -401,34 +459,76 @@ class GraphExtractionWorker:
                         db_err,
                         exc_info=db_err,
                     )
-
                 return True
+
             except RECOVERABLE_ERRORS as e:
                 last_recoverable_error = e
                 if attempt < _RETRY_MAX_ATTEMPTS - 1:
-                    jitter = random.uniform(_RETRY_JITTER_MIN, _RETRY_JITTER_MAX)
+                    delay = _retry_backoff_delay(attempt)
                     logger.warning(
                         "Recoverable error extracting knowledge graph for content id=%s "
-                        "(attempt %d/%d): %s. Retrying after %.2fs jitter...",
+                        "(attempt %d/%d): %s. Retrying after %.2fs...",
                         post.id,
                         attempt + 1,
                         _RETRY_MAX_ATTEMPTS,
                         e,
-                        jitter,
+                        delay,
                     )
-                    await asyncio.sleep(jitter)
+                    await asyncio.sleep(delay)
                 continue
-        else:
-            logger.warning(
-                "Recoverable error extracting knowledge graph for content id=%s "
-                "after %d attempts: %s. Post will be retried in a subsequent batch.",
-                post.id,
-                _RETRY_MAX_ATTEMPTS,
-                last_recoverable_error,
-            )
-            return False
 
-        return True
+        current_fails = self._retry_counts.get(post.id, 0) + 1
+        self._retry_counts[post.id] = current_fails
+
+        if current_fails >= _DEAD_LETTER_THRESHOLD:
+            logger.error(
+                "Post id=%s has failed %d consecutive times. "
+                "Moving to dead-letter state.",
+                post.id,
+                current_fails,
+            )
+            self._dead_letters.add(post.id)
+            try:
+                async with self.db.async_session() as session:
+                    await session.execute(
+                        text("""
+                            UPDATE content
+                            SET raw_metadata = COALESCE(raw_metadata, '{}'::jsonb) ||
+                                jsonb_build_object(
+                                    'graph_extraction_error', CAST(:error_msg AS text),
+                                    'graph_retries_exhausted', CAST(:retries AS text),
+                                    'graph_failed_at', CAST(:failed_at AS text)
+                                )
+                            WHERE id = :post_id
+                        """),
+                        {
+                            "post_id": post.id,
+                            "error_msg": str(last_recoverable_error)[:1000],
+                            "retries": str(current_fails),
+                            "failed_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    await session.commit()
+                await self.extractor_repo.mark_content_extracted(post.id)
+                return True
+            except Exception as db_err:
+                logger.error(
+                    "Failed to record dead-letter for content id=%s: %s",
+                    post.id,
+                    db_err,
+                )
+                return False
+
+        logger.warning(
+            "Recoverable error extracting knowledge graph for content id=%s "
+            "after %d attempts (total consecutive failures: %d): %s. "
+            "Post will be retried in a subsequent batch.",
+            post.id,
+            _RETRY_MAX_ATTEMPTS,
+            current_fails,
+            last_recoverable_error,
+        )
+        return False
 
 
 async def run_graph_extractor() -> None:
@@ -462,7 +562,7 @@ async def run_graph_extractor() -> None:
         qdrant=qdrant,
         extractor=extractor,
         settings=settings,
-        batch_size=settings.extractor_batch_size,
+        batch_size=settings.graph_batch_size,
         poll_interval=5,
     )
     worker.priority_mode = getattr(settings, "extraction_priority_mode", False)

@@ -162,18 +162,22 @@ class Settings(BaseSettings):
         description="Logging level",
     )
 
-    # ---- Extraction worker settings ----
+    # ---- Graph extraction worker settings ----
     extraction_priority_mode: bool = Field(
         default=True,
         description="If True, process most recent posts first (ordered by published_at DESC). If False, process oldest posts first (ordered by id ASC).",
     )
-    extractor_concurrency: int = Field(
-        default=5,
-        description="Maximum number of posts extracted in parallel by the extraction worker",
+    graph_concurrency: int = Field(
+        default=15,
+        description="Maximum number of posts extracted in parallel by the graph extraction worker",
     )
-    extractor_batch_size: int = Field(
-        default=20,
-        description="Number of unextracted posts to fetch per poll in the extraction worker",
+    graph_batch_size: int = Field(
+        default=50,
+        description="Number of unextracted posts to fetch per poll in the graph extraction worker",
+    )
+    graph_write_concurrency: int = Field(
+        default=6,
+        description="Maximum concurrent Apache AGE write operations (graph node/edge upserts)",
     )
 
     # ---- Creators coordinator settings ----
@@ -206,6 +210,10 @@ class Settings(BaseSettings):
     embedding_priority_mode: bool = Field(
         default=True,
         description="If True, process most recent posts first for embedding (ordered by published_at DESC). If False, process oldest posts first (ordered by published_at ASC).",
+    )
+    embedding_concurrency: int = Field(
+        default=5,
+        description="Maximum number of posts embedded in parallel by the embedding worker",
     )
     embedding_batch_size: int = Field(
         default=64,

@@ -50,6 +50,7 @@ class KnowledgeExtractor:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._llm_client = LLMClient(settings)
+        self._write_semaphore = asyncio.Semaphore(self.settings.graph_write_concurrency)
 
     async def close(self) -> None:
         await self._llm_client.close()
@@ -68,7 +69,8 @@ class KnowledgeExtractor:
         account_metadata: dict[str, Any] | None = None,
         platform_content_id: str = "",
         account_id: int | None = None,
-    ) -> None:
+        cached_result: Any | None = None,
+    ) -> Any | None:
         process_language = getattr(self.settings, "process_language_data", False)
 
         logger.info("Processing post_id=%d for knowledge extraction", post_id)
@@ -86,14 +88,14 @@ class KnowledgeExtractor:
 
         if account_metadata is not None:
             account_status = account_metadata.get("status")
-            if account_status is not None and account_status != "parsed":
+            if account_status is not None and account_status not in ("parsed", "verified"):
                 logger.warning(
                     "Account metadata status is '%s' (not 'parsed') for "
                     "post_id=%d, skipping extraction",
                     account_status,
                     post_id,
                 )
-                return
+                return None
 
         cleaned_raw_metadata = raw_metadata.copy() if raw_metadata else None
         if cleaned_raw_metadata is not None:
@@ -127,14 +129,18 @@ class KnowledgeExtractor:
             account_metadata, platform_content_id, post_id
         )
 
-        result = await self._llm_client.call_llm(
-            text=text,
-            author_id=author_id,
-            post_id=post_id,
-            pub_node_id=pub_node_id,
-            metadata=cleaned_raw_metadata if cleaned_raw_metadata else None,
-            platform=platform,
-        )
+        if cached_result is not None:
+            result = cached_result
+            logger.info("Using cached extraction result for post_id=%d", post_id)
+        else:
+            result = await self._llm_client.call_llm(
+                text=text,
+                author_id=author_id,
+                post_id=post_id,
+                pub_node_id=pub_node_id,
+                metadata=cleaned_raw_metadata if cleaned_raw_metadata else None,
+                platform=platform,
+            )
 
         _FILTERED_PROPERTY_KEYS = {"category", "language"}
         for entity in result.entities:
@@ -360,15 +366,14 @@ class KnowledgeExtractor:
             if "confidence" not in rel_prop_keys:
                 relation.add_property("confidence", 0.5, "numeric")
 
-        # Run AGE graph save and Qdrant upsert concurrently
-        # (independent databases — no conflict between them)
         qdrant_task: asyncio.Task | None = None
         if qdrant is not None:
             qdrant_task = asyncio.create_task(
                 qdrant.upsert_entities(result.entities)
             )
 
-        await graph_repo.save_extraction_result(post_id, result)
+        async with self._write_semaphore:
+            await graph_repo.save_extraction_result(post_id, result)
 
         if qdrant_task is not None:
             try:
@@ -387,3 +392,4 @@ class KnowledgeExtractor:
             len(result.entities),
             len(result.relations),
         )
+        return result

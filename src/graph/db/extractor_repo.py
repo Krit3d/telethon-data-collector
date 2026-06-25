@@ -18,6 +18,10 @@ class ExtractorRepository:
 
     TARGET_PLATFORM_STATUSES: dict[str, list[str]] = {
         "INSTAGRAM": ["verified"],
+        "TELEGRAM": ["verified"],
+        "TIKTOK": ["verified"],
+        "YOUTUBE": ["verified"],
+        "THREADS": ["verified"],
     }
 
     def __init__(

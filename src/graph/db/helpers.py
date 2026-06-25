@@ -37,7 +37,7 @@ _RETRY_BASE_DELAY = 0.5
 
 def _is_retryable_db_error(exc: BaseException) -> bool:
     if _asyncpg_exc is not None:
-        if isinstance(exc, (_asyncpg_exc.SerializationError, _asyncpg_exc.DeadlockDetectedError)):
+        if isinstance(exc, (_asyncpg_exc.SerializationError, _asyncpg_exc.DeadlockDetectedError, _asyncpg_exc.LockNotAvailableError)):
             return True
         if isinstance(exc, _asyncpg_exc.UniqueViolationError):
             return True
@@ -45,7 +45,7 @@ def _is_retryable_db_error(exc: BaseException) -> bool:
             if "Entity failed to be updated" in str(exc):
                 return True
     if isinstance(exc, DBAPIError) and exc.orig is not None and _asyncpg_exc is not None:
-        if isinstance(exc.orig, (_asyncpg_exc.SerializationError, _asyncpg_exc.DeadlockDetectedError)):
+        if isinstance(exc.orig, (_asyncpg_exc.SerializationError, _asyncpg_exc.DeadlockDetectedError, _asyncpg_exc.LockNotAvailableError)):
             return True
         if isinstance(exc.orig, _asyncpg_exc.UniqueViolationError):
             return True

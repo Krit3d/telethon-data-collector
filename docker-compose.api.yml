@@ -1,19 +1,4 @@
 services:
-  nginx_llm:
-    image: nginx:alpine
-    container_name: nginx_llm
-    restart: always
-    ports:
-      - "8080:80"
-    volumes:
-      - ./docker/nginx-llm.conf:/etc/nginx/nginx.conf:ro
-    networks:
-      - api_network
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
@@ -62,16 +47,8 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
       ONNXRUNTIME_PROVIDER: ${ONNXRUNTIME_PROVIDER:-CPUExecutionProvider}
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
     depends_on:
       - qdrant
-      - nginx_llm
     networks:
       - api_network
     logging:
@@ -101,15 +78,8 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
       ONNXRUNTIME_PROVIDER: ${ONNXRUNTIME_PROVIDER:-CPUExecutionProvider}
-      EXTRACTOR_CONCURRENCY: ${EMBEDDING_CONCURRENCY:-5}
-      EXTRACTOR_BATCH_SIZE: ${EXTRACTOR_BATCH_SIZE:-20}
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+      EMBEDDING_CONCURRENCY: ${EMBEDDING_CONCURRENCY:-5}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-64}
     depends_on:
       - qdrant
     networks:
@@ -141,11 +111,10 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
-      EXTRACTOR_CONCURRENCY: ${GRAPH_CONCURRENCY:-5}
-      EXTRACTOR_BATCH_SIZE: ${EXTRACTOR_BATCH_SIZE:-20}
+      GRAPH_CONCURRENCY: ${GRAPH_CONCURRENCY:-15}
+      GRAPH_BATCH_SIZE: ${GRAPH_BATCH_SIZE:-50}
     depends_on:
       - qdrant
-      - nginx_llm
     networks:
       - api_network
     command: python -m src.api.graph_extractor_worker
