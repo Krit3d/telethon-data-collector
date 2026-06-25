@@ -193,3 +193,24 @@ class ExtractorRepository:
     @with_retry_on_deadlock()
     async def mark_content_graphed(self, content_id: int) -> None:
         await self._mark_content_graph_extracted(content_id, update_updated_at=True)
+
+    @with_retry_on_deadlock()
+    async def mark_content_graphed_batch(self, content_ids: list[int]) -> None:
+        if not content_ids:
+            return
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    update(Content)
+                    .where(Content.id.in_(content_ids))
+                    .values(
+                        is_graph_extracted=True,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                result = cast(CursorResult, await session.execute(stmt))
+                if result.rowcount > 0:
+                    logger.debug(
+                        "Batch marked %d content items as graph extracted",
+                        result.rowcount,
+                    )

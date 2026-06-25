@@ -19,9 +19,15 @@ from src.graph.utils import sanitize_key
 
 def decode_unicode_escapes(val: str) -> str:
     try:
+        def _replace_unicode(m: re.Match) -> str:
+            cp = int(m.group(1), 16)
+            if 0xD800 <= cp <= 0xDFFF:
+                return ""  # Skip surrogate code points (invalid in UTF-8)
+            return chr(cp)
+
         decoded = re.sub(
             r"\\u([0-9a-fA-F]{4})",
-            lambda m: chr(int(m.group(1), 16)),
+            _replace_unicode,
             val,
         )
         return decoded.replace("\\", "/")

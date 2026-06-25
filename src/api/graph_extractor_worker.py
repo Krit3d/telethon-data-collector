@@ -5,12 +5,11 @@ import random
 import signal
 from datetime import datetime, timezone
 
-from sqlalchemy.exc import InternalError, OperationalError
+from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
 from sqlalchemy import text
 
 try:
     import asyncpg.exceptions
-
     PostgresError = asyncpg.exceptions.PostgresError
 except ImportError:
     PostgresError = Exception
@@ -37,6 +36,7 @@ RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     TimeoutError,
     ConnectionError,
     OSError,
+    IntegrityError,
 )
 
 UNRECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
@@ -52,7 +52,7 @@ _DB_BACKOFF_MAX = 60.0
 _DB_MAX_BACKOFF_RETRIES = 5
 _DB_JITTER_MAX = 1.0
 
-_RETRY_MAX_ATTEMPTS = 3
+_RETRY_MAX_ATTEMPTS = 2
 _RETRY_JITTER_MIN = 0.5
 _RETRY_JITTER_MAX = 2.0
 
@@ -246,37 +246,35 @@ class GraphExtractionWorker:
                     "Processing batch of %d ungraphed content items", len(posts)
                 )
 
-                queue: asyncio.Queue[Content] = asyncio.Queue()
-                for post in posts:
-                    await queue.put(post)
+                sem = asyncio.Semaphore(self.settings.extractor_concurrency)
+                marked_count: int = 0
+                mark_lock = asyncio.Lock()
 
-                worker_count = min(
-                    self.settings.extractor_concurrency, len(posts)
+                async def process_one(post: Content) -> None:
+                    nonlocal marked_count
+                    async with sem:
+                        should_mark = await self._process_single_post(post)
+                        if should_mark:
+                            await self.extractor_repo.mark_content_graphed(post.id)
+                            async with mark_lock:
+                                marked_count += 1
+
+                tasks = [asyncio.create_task(process_one(p)) for i, p in enumerate(posts)]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Log any per-post exceptions without crashing the batch
+                for i, res in enumerate(results):
+                    if isinstance(res, Exception):
+                        logger.warning(
+                            "Post id=%s failed with %s — will be retried in next batch",
+                            posts[i].id,
+                            res,
+                        )
+
+                if marked_count:
+                    logger.info(
+                        "Batch completed: %d posts marked as graphed", marked_count
                 )
-
-                async def _queue_worker() -> None:
-                    while not queue.empty():
-                        try:
-                            post = queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                        try:
-                            await self._process_single_post(post)
-                        except Exception as exc:
-                            logger.error(
-                                "Unhandled exception in queue worker for content id=%s: %s",
-                                post.id,
-                                exc,
-                                exc_info=exc,
-                            )
-                        finally:
-                            queue.task_done()
-
-                workers = [_queue_worker() for _ in range(worker_count)]
-                await asyncio.gather(*workers)
-
-                if await self._sleep_with_shutdown_check(1):
-                    break
 
             except asyncio.CancelledError:
                 logger.info("Graph extraction worker task cancelled")
@@ -292,7 +290,7 @@ class GraphExtractionWorker:
 
         logger.info("Graph extraction worker stopped")
 
-    async def _process_single_post(self, post: Content) -> None:
+    async def _process_single_post(self, post: Content) -> bool:
         text_for_processing: str | None = None
 
         has_content = post.content is not None and post.content.strip()
@@ -314,8 +312,7 @@ class GraphExtractionWorker:
                 "Content id=%s has no content or transcription, skipping graph extraction",
                 post.id,
             )
-            await self.extractor_repo.mark_content_graphed(post.id)
-            return
+            return True
 
         logger.debug("Extracting knowledge graph from content id=%s", post.id)
 
@@ -370,7 +367,7 @@ class GraphExtractionWorker:
                     account_metadata=account_metadata,
                     platform_content_id=post.platform_content_id,
                 )
-                break
+                return True
             except UNRECOVERABLE_ERRORS as e:
                 logger.error(
                     "Unrecoverable error extracting knowledge graph for content id=%s: %s",
@@ -405,8 +402,7 @@ class GraphExtractionWorker:
                         exc_info=db_err,
                     )
 
-                await self.extractor_repo.mark_content_graphed(post.id)
-                return
+                return True
             except RECOVERABLE_ERRORS as e:
                 last_recoverable_error = e
                 if attempt < _RETRY_MAX_ATTEMPTS - 1:
@@ -430,11 +426,9 @@ class GraphExtractionWorker:
                 _RETRY_MAX_ATTEMPTS,
                 last_recoverable_error,
             )
-            return
+            return False
 
-        await self.extractor_repo.mark_content_graphed(post.id)
-
-        logger.info("Completed graph extraction for content id=%s", post.id)
+        return True
 
 
 async def run_graph_extractor() -> None:

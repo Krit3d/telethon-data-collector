@@ -3,8 +3,7 @@ import json
 import logging
 import random
 import re
-import time
-from typing import Any, ClassVar
+from typing import Any
 
 from json_repair import repair_json
 from openai import AsyncOpenAI, APIStatusError, APIConnectionError, RateLimitError
@@ -15,10 +14,11 @@ from src.graph.schema import OpenSPGExtractionResult
 
 logger = logging.getLogger(__name__)
 
-_MAX_RETRIES = 5
-_RETRY_BASE_DELAY = 2.0
-_RETRY_MAX_DELAY = 120.0
-_RATE_LIMIT_COOLDOWN = 60.0
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 1.0
+_RETRY_MAX_DELAY = 20.0
+_REQUEST_TIMEOUT = 240.0
+_STAGGER_MAX = 0.3
 
 _DOMAIN_ENTITY_MAPPING = (
     "\n\nMANDATORY PUBLICATION ANCHOR & RELATIONSHIP EXTRACTION RULES:\n"
@@ -52,7 +52,7 @@ _DOMAIN_ENTITY_MAPPING = (
     'add property: {"key": "type", "value": "region", "type": "text"}\n\n'
     "STRICT ENTITY NAME RULE:\n"
     "The 'name' property of EVERY entity MUST be a clean, literal name extracted directly from the source text. "
-    "It MUST contain ONLY the actual text as written by the author — nothing else.\n"
+    "It MUST contain ONLY the actual text as written by the author \u2014 nothing else.\n"
     "You are ABSOLUTELY PROHIBITED from placing any of the following inside the 'name' property:\n"
     "  - Placeholder labels or tags: [Null], [N/A], [Unknown], [Untitled]\n"
     "  - Bracketed role tags: [Author], [Brand], [Topic], [Person], [Organization]\n"
@@ -76,45 +76,27 @@ _DOMAIN_ENTITY_MAPPING = (
 
 class LLMClient:
 
-    _rate_limit_until: ClassVar[float] = 0.0
-
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._client = AsyncOpenAI(
             api_key=settings.cloud_ru_api_key,
             base_url=settings.cloud_ru_base_url,
+            timeout=_REQUEST_TIMEOUT,
+            max_retries=0,
         )
 
     async def close(self) -> None:
         await self._client.close()
 
-    async def _acquire_rate_limit_slot(self) -> None:
-        now = time.monotonic()
-        remaining = LLMClient._rate_limit_until - now
-        if remaining > 0:
-            logger.info(
-                "Rate limit cooldown active, %.1fs remaining — "
-                "all concurrent workers will wait",
-                remaining,
-            )
-            await asyncio.sleep(remaining)
-
-    def _activate_rate_limit_cooldown(self) -> None:
-        LLMClient._rate_limit_until = time.monotonic() + _RATE_LIMIT_COOLDOWN
-        logger.warning(
-            "Rate limit cooldown activated for %.1fs — "
-            "all concurrent workers will pause before next API call",
-            _RATE_LIMIT_COOLDOWN,
-        )
-
     @staticmethod
-    def _backoff_delay(attempt: int) -> float:
+    def _backoff_delay(attempt: int, is_rate_limit: bool = False) -> float:
         exponential = min(_RETRY_BASE_DELAY * (2 ** attempt), _RETRY_MAX_DELAY)
-        return random.uniform(0.0, exponential)
+        jitter = random.uniform(1.0, 2.0) if is_rate_limit else random.uniform(0.5, 1.5)
+        return exponential * jitter
 
     @staticmethod
     def _sanitize_llm_content(raw: str) -> str:
-        cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+        cleaned = re.sub(r"<thinking>.*?</thinking>", "", raw, flags=re.DOTALL)
         cleaned = re.sub(r"```json\s*", "", cleaned)
         cleaned = re.sub(r"```\s*$", "", cleaned)
         return cleaned.strip()
@@ -140,9 +122,13 @@ class LLMClient:
         pub_node_id: str,
         metadata: dict[str, Any] | None = None,
         platform: str | None = None,
+        stagger: bool = True,
     ) -> OpenSPGExtractionResult:
         if not self.settings.cloud_ru_api_key:
             raise RuntimeError("Cloud.ru API key is not configured")
+
+        if stagger:
+            await asyncio.sleep(random.random() * _STAGGER_MAX)
 
         prompt = self._build_prompt(text, pub_node_id, author_id, platform, metadata)
         schema = OpenSPGExtractionResult.model_json_schema()
@@ -160,37 +146,35 @@ class LLMClient:
         last_error: BaseException | None = None
 
         for attempt in range(_MAX_RETRIES):
-            await self._acquire_rate_limit_slot()
-
             try:
                 response = await self._client.chat.completions.create(
-                    model=self.settings.cloud_ru_llm_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a highly meticulous OpenSPG knowledge extraction engine. "
-                                "Extract entities and relations from the provided text following the "
-                                "schema and classification rules strictly. "
-                                "Every entity MUST include a 'type' marker property indicating its "
-                                "domain classification (topic, person, brand, organization, author, "
-                                "publication, region, or other)."
-                            ),
+                        model=self.settings.cloud_ru_llm_model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a highly meticulous OpenSPG knowledge extraction engine. "
+                                    "Extract entities and relations from the provided text following the "
+                                    "schema and classification rules strictly. "
+                                    "Every entity MUST include a 'type' marker property indicating its "
+                                    "domain classification (topic, person, brand, organization, author, "
+                                    "publication, region, or other)."
+                                ),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.3,
+                        max_tokens=4096,
+                        frequency_penalty=0.2,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "OpenSPGExtractionResult",
+                                "strict": True,
+                                "schema": schema,
+                            },
                         },
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.3,
-                    max_tokens=4096,
-                    frequency_penalty=0.2,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "OpenSPGExtractionResult",
-                            "strict": True,
-                            "schema": schema,
-                        },
-                    },
-                )
+                    )
 
                 content = (
                     response.choices[0].message.content
@@ -271,8 +255,7 @@ class LLMClient:
 
             except RateLimitError as exc:
                 last_error = exc
-                self._activate_rate_limit_cooldown()
-                delay = self._backoff_delay(attempt)
+                delay = self._backoff_delay(attempt, is_rate_limit=True)
                 logger.warning(
                     "Rate limit on attempt %d/%d for post_id=%d, "
                     "retrying in %.1fs",

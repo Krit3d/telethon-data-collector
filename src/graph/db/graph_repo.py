@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class GraphRepository:
 
     _SUBGRAPH_QUERY_TIMEOUT: float = 15.0
-    _lock: ClassVar[asyncio.Lock | None] = None
+    _write_semaphore: ClassVar[asyncio.Semaphore | None] = None
 
     def __init__(
         self,
@@ -28,8 +28,8 @@ class GraphRepository:
         self.settings = settings
         self.graph_name: str = settings.graph_name
         self._subgraph_query_timeout = self._SUBGRAPH_QUERY_TIMEOUT
-        if GraphRepository._lock is None:
-            GraphRepository._lock = asyncio.Lock()
+        if GraphRepository._write_semaphore is None:
+            GraphRepository._write_semaphore = asyncio.Semaphore(3)
 
     def _resolve_graph_name(self) -> str:
         name = self.graph_name
@@ -120,6 +120,11 @@ class GraphRepository:
         val = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", val)
         val = val.replace("\\", "/")
         val = re.sub(r" +", " ", val)
+        # Strip surrogate characters that are invalid in UTF-8
+        try:
+            val = val.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+        except (ValueError, UnicodeError):
+            pass
         return val.strip()
 
     def _sanitize_properties(self, properties: dict) -> dict:
@@ -616,8 +621,8 @@ class GraphRepository:
     async def save_extraction_result(
         self, post_id: int, result: Any
     ) -> None:
-        assert GraphRepository._lock is not None
-        async with GraphRepository._lock:
+        assert GraphRepository._write_semaphore is not None
+        async with GraphRepository._write_semaphore:
             async with self.async_session() as session:
                 async with session.begin():
                     entity_id_to_label: dict[str, str] = {}

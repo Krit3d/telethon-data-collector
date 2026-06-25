@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -359,11 +360,19 @@ class KnowledgeExtractor:
             if "confidence" not in rel_prop_keys:
                 relation.add_property("confidence", 0.5, "numeric")
 
+        # Run AGE graph save and Qdrant upsert concurrently
+        # (independent databases — no conflict between them)
+        qdrant_task: asyncio.Task | None = None
+        if qdrant is not None:
+            qdrant_task = asyncio.create_task(
+                qdrant.upsert_entities(result.entities)
+            )
+
         await graph_repo.save_extraction_result(post_id, result)
 
-        if qdrant is not None:
+        if qdrant_task is not None:
             try:
-                await qdrant.upsert_entities(result.entities)
+                await qdrant_task
             except Exception as exc:
                 logger.error(
                     "Qdrant sync failed for post_id=%d: %s",
