@@ -479,7 +479,7 @@ async def search_content(
             if account is None or getattr(account, "status", None) != "verified":
                 continue
 
-            if payload.location is not None:
+            if payload.location and payload.location.strip():
                 if not _author_matches_location(content, edges_data, payload.location):
                     continue
 

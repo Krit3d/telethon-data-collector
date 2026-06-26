@@ -7,7 +7,8 @@ from typing import Any
 
 import httpx
 from json_repair import repair_json
-from openai import AsyncOpenAI, APIStatusError, APIConnectionError, APITimeoutError, RateLimitError
+from openai import APIStatusError, APIConnectionError, APITimeoutError, RateLimitError
+from evolution_openai import EvolutionAsyncOpenAI
 from pydantic import ValidationError
 
 from src.config.config import Settings
@@ -74,51 +75,134 @@ _DOMAIN_ENTITY_MAPPING = (
 )
 
 
-def _sanitize_property(prop: dict[str, Any]) -> None:
-    if not isinstance(prop, dict):
-        return
-    prop_type = prop.get("type")
-    if prop_type != "numeric":
-        return
-    val = prop.get("value")
-    if isinstance(val, bool):
+def _sanitize_property(prop: Any) -> dict[str, Any] | None:
+    if not isinstance(prop, dict) or "key" not in prop:
+        return None
+    if not isinstance(prop.get("type"), str):
         prop["type"] = "text"
-        return
-    if isinstance(val, (int, float)):
-        return
-    if isinstance(val, str):
-        try:
-            stripped = val.strip()
-            if "." in stripped:
-                prop["value"] = float(stripped)
-            else:
-                prop["value"] = int(stripped)
-        except (ValueError, TypeError):
-            prop["type"] = "text"
+    if prop.get("value") is None:
+        prop["value"] = ""
+    if prop.get("type") == "geo" and prop.get("key") == "coordinates":
+        val = prop.get("value")
+        if not isinstance(val, list) or len(val) != 2:
+            return None
+        for coord in val:
+            if coord is None or not isinstance(coord, (int, float)):
+                return None
+    return prop
+
+
+def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
+    processing: list[dict[str, Any]] = []
+    if isinstance(parsed, list):
+        processing = list(parsed)
+    elif isinstance(parsed, dict):
+        processing = list(parsed.get("entities", [])) + list(parsed.get("relations", []))
     else:
-        prop["type"] = "text"
-
-
-def _sanitize_parsed_payload(parsed: dict[str, Any]) -> dict[str, Any]:
-    for entity in parsed.get("entities", []):
-        if not isinstance(entity, dict):
+        return {"entities": [], "relations": []}
+    flat: list[dict[str, Any]] = []
+    while processing:
+        item = processing.pop(0)
+        if not isinstance(item, dict):
             continue
-        for field in ("id", "name", "label"):
-            val = entity.get(field)
-            if val is not None and not isinstance(val, str):
-                entity[field] = str(val)
-        for prop in entity.get("properties", []):
-            _sanitize_property(prop)
-    for relation in parsed.get("relations", []):
-        if not isinstance(relation, dict):
+        for nested_field in ("entities", "relations"):
+            nested = item.get(nested_field)
+            if isinstance(nested, list):
+                processing.extend(nested)
+        flat.append(item)
+    ENTITY_ID_KEYS = ("id", "_id", "id_", "entity_id", "node_id")
+    ENTITY_NAME_KEYS = ("name", "display_name", "title")
+    ENTITY_LABEL_KEYS = ("label", "entity_type")
+    SOURCE_ID_KEYS = ("source_id", "source", "_source", "from_id", "start_node_id")
+    TARGET_ID_KEYS = ("target_id", "target", "_target", "to_id", "end_node_id")
+    RELATION_TYPE_KEYS = ("relation_type", "type", "relation", "edge_label")
+    final_entities: list[dict[str, Any]] = []
+    final_relations: list[dict[str, Any]] = []
+    for item in flat:
+        if not isinstance(item, dict):
             continue
-        for field in ("source_id", "target_id"):
-            val = relation.get(field)
-            if val is not None and not isinstance(val, str):
-                relation[field] = str(val)
-        for prop in relation.get("properties", []):
-            _sanitize_property(prop)
-    return parsed
+        source_id: str | None = None
+        target_id: str | None = None
+        for key in SOURCE_ID_KEYS:
+            val = item.get(key)
+            if val is not None:
+                source_id = str(val) if not isinstance(val, str) else val
+                break
+        for key in TARGET_ID_KEYS:
+            val = item.get(key)
+            if val is not None:
+                target_id = str(val) if not isinstance(val, str) else val
+                break
+        if source_id is not None or target_id is not None:
+            relation_type: str | None = None
+            for key in RELATION_TYPE_KEYS:
+                val = item.get(key)
+                if val is not None:
+                    relation_type = str(val) if not isinstance(val, str) else val
+                    break
+            if relation_type is None:
+                relation_type = "RELATED_TO"
+            properties = item.get("properties", [])
+            if not isinstance(properties, list):
+                properties = []
+            properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
+            final_relations.append({
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation_type": relation_type,
+                "properties": properties,
+            })
+        else:
+            entity_id: str | None = None
+            for key in ENTITY_ID_KEYS:
+                val = item.get(key)
+                if val is not None:
+                    entity_id = str(val) if not isinstance(val, str) else val
+                    break
+            name: str | None = None
+            for key in ENTITY_NAME_KEYS:
+                val = item.get(key)
+                if val is not None:
+                    name = str(val) if not isinstance(val, str) else val
+                    break
+            label: str | None = None
+            for key in ENTITY_LABEL_KEYS:
+                val = item.get(key)
+                if val is not None:
+                    label = str(val) if not isinstance(val, str) else val
+                    break
+            if entity_id is None and name is not None:
+                entity_id = name.lower().replace(" ", "_")
+            if entity_id is None and name is None:
+                continue
+            if name is None and entity_id is not None:
+                name = entity_id.lstrip("_")
+                for prefix in ("actor_", "place_", "event_"):
+                    if name.startswith(prefix):
+                        name = name[len(prefix):]
+                        break
+                name = name.replace("_", " ").title().strip()
+            assert entity_id is not None
+            if label is None:
+                if entity_id.startswith("actor_"):
+                    label = "Actor"
+                elif entity_id.startswith("place_"):
+                    label = "Place"
+                elif entity_id.startswith("event_"):
+                    label = "Event"
+                else:
+                    label = "Entity"
+            properties = item.get("properties", [])
+            if not isinstance(properties, list):
+                properties = []
+            properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
+            final_entities.append({
+                "id": entity_id,
+                "name": name,
+                "label": label,
+                "properties": properties,
+            })
+    return {"entities": final_entities, "relations": final_relations}
 
 
 class LLMClient:
@@ -126,12 +210,20 @@ class LLMClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._semaphore = asyncio.Semaphore(getattr(settings, "llm_max_concurrency", settings.graph_concurrency))
-        http_limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-        http_timeout = httpx.Timeout(120.0, connect=15.0, read=90.0, write=15.0)
+        http_limits = httpx.Limits(max_connections=200, max_keepalive_connections=100)
+        http_timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
         http_client = httpx.AsyncClient(limits=http_limits, timeout=http_timeout)
-        self._client = AsyncOpenAI(
-            api_key=settings.cloud_ru_api_key,
-            base_url=settings.cloud_ru_base_url,
+        key_id = settings.ml_inference_key_id
+        secret = settings.ml_inference_secret
+        base_url = settings.ml_inference_base_url
+        if not key_id or not secret:
+            raise RuntimeError("ML Inference credentials (key_id and secret) are not configured")
+        if not base_url:
+            raise RuntimeError("ML Inference base_url is not configured")
+        self._client = EvolutionAsyncOpenAI(
+            key_id=key_id,
+            secret=secret,
+            base_url=base_url,
             http_client=http_client,
             max_retries=0,
         )
@@ -147,9 +239,14 @@ class LLMClient:
 
     @staticmethod
     def _sanitize_llm_content(raw: str) -> str:
-        cleaned = re.sub(r"<thinking>.*?</thinking>", "", raw, flags=re.DOTALL)
-        cleaned = re.sub(r"```json\s*", "", cleaned)
-        cleaned = re.sub(r"```\s*$", "", cleaned)
+        cleaned = re.sub(r"<(think|thinking)>.*?(?:</\1>|$)", "", raw, flags=re.DOTALL | re.IGNORECASE)
+        match = re.search(r"```(?:json)?\s*\n?(.*?)(?:\n?\s*```|$)", cleaned, flags=re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            return cleaned[first_brace:last_brace + 1].strip()
         return cleaned.strip()
 
     def _build_prompt(
@@ -163,7 +260,12 @@ class LLMClient:
         from src.graph.schema import get_open_spg_llm_prompt
 
         base = get_open_spg_llm_prompt(text, pub_node_id, author_id, platform, metadata)
-        return f"{base}{_DOMAIN_ENTITY_MAPPING}"
+        return (
+            f"{base}{_DOMAIN_ENTITY_MAPPING}"
+            "\n\nCRITICAL: Your final output MUST be a single valid JSON object wrapped inside a ```json ... ``` code block. "
+            "NEVER use null for 'type' properties. NEVER use [null, null] for coordinates. "
+            "Ensure strict schema adherence."
+        )
 
     async def call_llm(
         self,
@@ -175,8 +277,10 @@ class LLMClient:
         platform: str | None = None,
         stagger: bool = True,
     ) -> OpenSPGExtractionResult:
-        if not self.settings.cloud_ru_api_key:
-            raise RuntimeError("Cloud.ru API key is not configured")
+        if not self.settings.ml_inference_key_id or not self.settings.ml_inference_secret:
+            raise RuntimeError("ML Inference credentials (key_id and secret) are not configured")
+        if not self.settings.ml_inference_model:
+            raise RuntimeError("ML Inference model is not configured")
 
         if stagger:
             await asyncio.sleep(random.random() * _STAGGER_MAX)
@@ -196,36 +300,35 @@ class LLMClient:
 
         last_error: BaseException | None = None
 
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a highly meticulous OpenSPG knowledge extraction engine. "
+                    "You MUST FIRST write your thought process and reasoning inside "
+                    "<think>...</think> tags. ONLY AFTER thinking, output your response "
+                    "as a valid JSON object wrapped in ```json ... ``` blocks. "
+                    "Extract entities and relations strictly following the schema. "
+                    "Every entity MUST include a 'type' marker property indicating "
+                    "its domain classification. "
+                    "Never output null for 'type'. Never output [null, null] for coordinates. "
+                    "Ensure strict adherence to the schema.\n\n"
+                    "Here is the strict JSON schema you MUST follow:\n"
+                    + json.dumps(schema)
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
         for attempt in range(_MAX_RETRIES):
             try:
                 async with self._semaphore:
                     response = await self._client.chat.completions.create(
-                        model=self.settings.cloud_ru_llm_model,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a highly meticulous OpenSPG knowledge extraction engine. "
-                                    "Extract entities and relations from the provided text following the "
-                                    "schema and classification rules strictly. "
-                                    "Every entity MUST include a 'type' marker property indicating its "
-                                    "domain classification (topic, person, brand, organization, author, "
-                                    "publication, region, or other)."
-                                ),
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.3,
+                        model=self.settings.ml_inference_model,
+                        messages=messages,
+                        temperature=0.6,
                         max_tokens=4096,
                         frequency_penalty=0.2,
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "OpenSPGExtractionResult",
-                                "strict": True,
-                                "schema": schema,
-                            },
-                        },
                     )
 
                 content = (
@@ -274,29 +377,7 @@ class LLMClient:
                         )
                         raise original_err from repair_err
 
-                try:
-                    result = OpenSPGExtractionResult.model_validate(parsed)
-                except ValidationError as val_err:
-                    sanitized = self._sanitize_validation_payload(parsed, val_err)
-                    if sanitized is not None:
-                        logger.warning(
-                            "Partial validation recovery for post_id=%d "
-                            "after sanitizing %d entities / %d relations",
-                            post_id,
-                            len(sanitized.entities),
-                            len(sanitized.relations),
-                        )
-                        return sanitized
-                    logger.error(
-                        "Pydantic validation failed for post_id=%d: %s "
-                        "raw[:500]=%s | repaired[:500]=%s",
-                        post_id,
-                        val_err,
-                        raw_preview,
-                        content[:500],
-                        exc_info=True,
-                    )
-                    raise
+                result = OpenSPGExtractionResult.model_validate(parsed)
 
                 logger.info(
                     "LLM extraction succeeded for post_id=%d: "
@@ -335,29 +416,17 @@ class LLMClient:
                     await asyncio.sleep(delay)
                     continue
 
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, ValidationError, TypeError, AttributeError) as exc:
                 last_error = exc
                 logger.warning(
-                    "JSON decode error on attempt %d/%d for post_id=%d: %s",
+                    "Validation/decode error on attempt %d/%d for post_id=%d: %s",
                     attempt + 1,
                     _MAX_RETRIES,
                     post_id,
                     exc,
                 )
-                if attempt < _MAX_RETRIES - 1:
-                    delay = self._backoff_delay(attempt)
-                    await asyncio.sleep(delay)
-                    continue
-
-            except ValidationError as exc:
-                last_error = exc
-                logger.warning(
-                    "Validation error on attempt %d/%d for post_id=%d: %s",
-                    attempt + 1,
-                    _MAX_RETRIES,
-                    post_id,
-                    exc,
-                )
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": f"Your output failed validation:\n{exc}\nPlease fix the schema errors, do not lose any data, and return ONLY the corrected valid JSON."})
                 if attempt < _MAX_RETRIES - 1:
                     delay = self._backoff_delay(attempt)
                     await asyncio.sleep(delay)
@@ -369,79 +438,3 @@ class LLMClient:
             f"LLM extraction failed after {_MAX_RETRIES} attempts "
             f"for post_id={post_id}"
         )
-
-    @staticmethod
-    def _sanitize_validation_payload(
-        parsed: dict[str, Any], original_error: ValidationError
-    ) -> OpenSPGExtractionResult | None:
-        try:
-            entities_raw = parsed.get("entities", [])
-            relations_raw = parsed.get("relations", [])
-
-            sanitized_entities: list[Any] = []
-            for idx, ent in enumerate(entities_raw):
-                if not isinstance(ent, dict):
-                    continue
-                ent_copy = dict(ent)
-                if not isinstance(ent_copy.get("name"), str) or not ent_copy["name"].strip():
-                    ent_copy["name"] = f"Entity_{idx}"
-                if not isinstance(ent_copy.get("id"), str) or not ent_copy["id"].strip():
-                    ent_copy["id"] = f"entity_{idx}"
-                if not isinstance(ent_copy.get("label"), str) or not ent_copy["label"].strip():
-                    ent_copy["label"] = "Entity"
-                props = ent_copy.get("properties", [])
-                if not isinstance(props, list):
-                    ent_copy["properties"] = []
-                else:
-                    cleaned_props = []
-                    for prop in props:
-                        if not isinstance(prop, dict):
-                            continue
-                        p = dict(prop)
-                        if not isinstance(p.get("key"), str) or not p["key"].strip():
-                            continue
-                        if p.get("value") is None:
-                            p["value"] = ""
-                        if not isinstance(p.get("type"), str):
-                            p["type"] = "text"
-                        cleaned_props.append(p)
-                    ent_copy["properties"] = cleaned_props
-                sanitized_entities.append(ent_copy)
-
-            sanitized_relations: list[Any] = []
-            valid_entity_ids = {e.get("id") for e in sanitized_entities if isinstance(e, dict)}
-            for rel in relations_raw:
-                if not isinstance(rel, dict):
-                    continue
-                rel_copy = dict(rel)
-                src = rel_copy.get("source_id", "")
-                tgt = rel_copy.get("target_id", "")
-                if src not in valid_entity_ids or tgt not in valid_entity_ids:
-                    continue
-                if not isinstance(rel_copy.get("relation_type"), str) or not rel_copy["relation_type"].strip():
-                    rel_copy["relation_type"] = "MENTIONS"
-                props = rel_copy.get("properties", [])
-                if not isinstance(props, list):
-                    rel_copy["properties"] = []
-                else:
-                    cleaned_props = []
-                    for prop in props:
-                        if not isinstance(prop, dict):
-                            continue
-                        p = dict(prop)
-                        if not isinstance(p.get("key"), str) or not p["key"].strip():
-                            continue
-                        if p.get("value") is None:
-                            p["value"] = ""
-                        if not isinstance(p.get("type"), str):
-                            p["type"] = "text"
-                        cleaned_props.append(p)
-                    rel_copy["properties"] = cleaned_props
-                sanitized_relations.append(rel_copy)
-
-            return OpenSPGExtractionResult(
-                entities=sanitized_entities,
-                relations=sanitized_relations,
-            )
-        except Exception:
-            return None

@@ -7,7 +7,7 @@ import time
 from typing import Any, ClassVar
 
 from sqlalchemy import text
-from sqlalchemy.exc import InternalError
+from sqlalchemy.exc import InternalError, OperationalError, DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from src.config.config import Settings
@@ -305,7 +305,7 @@ class GraphRepository:
         }
         params = json.dumps(params_dict)
 
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 if session is not None:
                     async with session.begin_nested():
@@ -313,11 +313,11 @@ class GraphRepository:
                 else:
                     await self._execute_in_transaction(query, {"params": params}, session=session)
                 break
-            except InternalError as exc:
+            except (InternalError, OperationalError, DBAPIError, IntegrityError) as exc:
                 err_msg = str(exc)
-                if "Entity failed to be updated" in err_msg or "concurrently updated" in err_msg:
-                    if attempt < 2:
-                        await asyncio.sleep(random.uniform(0.05, 0.25))
+                if any(x in err_msg.lower() for x in ("entity failed to be updated", "concurrently updated", "lock timeout", "deadlock", "tuple concurrently updated", "duplicate key value", "unique constraint")):
+                    if attempt < 4:
+                        await asyncio.sleep((2 ** attempt) * 0.1 + random.uniform(0.05, 0.2))
                         continue
                     merge_val = props.get(merge_key)
                     logger.warning(
@@ -409,7 +409,7 @@ class GraphRepository:
         }
         params = json.dumps(params_dict)
 
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 if session is not None:
                     async with session.begin_nested():
@@ -417,11 +417,11 @@ class GraphRepository:
                 else:
                     await self._execute_in_transaction(query, {"params": params}, session=session)
                 break
-            except InternalError as exc:
+            except (InternalError, OperationalError, DBAPIError, IntegrityError) as exc:
                 err_msg = str(exc)
-                if "Entity failed to be updated" in err_msg or "concurrently updated" in err_msg or "tuple concurrently updated" in err_msg:
-                    if attempt < 2:
-                        await asyncio.sleep(random.uniform(0.05, 0.25))
+                if any(x in err_msg.lower() for x in ("entity failed to be updated", "concurrently updated", "lock timeout", "deadlock", "tuple concurrently updated", "duplicate key value", "unique constraint")):
+                    if attempt < 4:
+                        await asyncio.sleep((2 ** attempt) * 0.1 + random.uniform(0.05, 0.2))
                         continue
                     raise
                 raise
@@ -725,7 +725,8 @@ class GraphRepository:
             async with self.async_session() as session:
                 async with session.begin():
                     entity_id_to_label: dict[str, str] = {}
-                    for entity in result.entities:
+                    sorted_entities = sorted(result.entities, key=lambda e: e.id)
+                    for entity in sorted_entities:
                         entity_id_to_label[entity.id] = entity.label
                         try:
                             props: dict[str, Any] = {
@@ -755,16 +756,18 @@ class GraphRepository:
                             raise
 
                     pub_node_id: str | None = None
-                    for entity in result.entities:
+                    for entity in sorted_entities:
                         if entity.id.startswith("event_publication_"):
                             pub_node_id = entity.id
                             break
 
                     if pub_node_id is not None:
                         pub_label = entity_id_to_label.get(pub_node_id, "Event")
-                        for entity in result.entities:
-                            if entity.id == pub_node_id:
-                                continue
+                        sorted_mention_targets = sorted(
+                            [e for e in sorted_entities if e.id != pub_node_id],
+                            key=lambda e: e.id,
+                        )
+                        for entity in sorted_mention_targets:
                             try:
                                 await self.upsert_graph_edge(
                                     start_label=pub_label,
@@ -791,7 +794,8 @@ class GraphRepository:
                                     exc,
                                 )
 
-                    for relation in result.relations:
+                    sorted_relations = sorted(result.relations, key=lambda r: (r.source_id, r.relation_type, r.target_id))
+                    for relation in sorted_relations:
                         start_label = entity_id_to_label.get(relation.source_id, "Entity")
                         end_label = entity_id_to_label.get(relation.target_id, "Entity")
                         try:

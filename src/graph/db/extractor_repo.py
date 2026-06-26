@@ -57,10 +57,12 @@ class ExtractorRepository:
                 .options(joinedload(Content.account))
                 .where(
                     Content.is_embedded == False,
-                    Content.content.isnot(None),
-                    Content.content != "",
                     Content.raw_metadata.isnot(None),
                     Account.raw_metadata.isnot(None),
+                    or_(
+                        and_(Content.content.isnot(None), Content.content != ""),
+                        and_(Content.transcription.isnot(None), Content.transcription != ""),
+                    ),
                 )
             )
             stmt = self._apply_account_filters(stmt)
@@ -117,7 +119,6 @@ class ExtractorRepository:
             conditions.append(
                 or_(
                     and_(Content.content.isnot(None), Content.content != ""),
-                    and_(Content.transcription.isnot(None), Content.transcription != ""),
                     and_(Content.raw_metadata.isnot(None), Content.raw_metadata != {}),
                 )
             )

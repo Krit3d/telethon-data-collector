@@ -48,7 +48,7 @@ class Settings(BaseSettings):
         default=None,
         description="API key for Qdrant authentication",
     )
-    # ---- Cloud.ru Evolution Foundation Models (Shared API) ----
+    # Cloud.ru Evolution Foundation Models (Shared API)
     cloud_ru_api_key: str = Field(
         ...,
         description="Access API Key for Cloud.ru Foundation Models",
@@ -65,6 +65,25 @@ class Settings(BaseSettings):
         default="deepseek-ai/DeepSeek-V4-Pro",
         description="Model name for chat completions",
     )
+
+    # Cloud.ru Evolution ML Inference Service
+    ml_inference_base_url: str | None = Field(
+        default=None,
+        description="Base URL for dedicated ML Inference service",
+    )
+    ml_inference_model: str | None = Field(
+        default=None,
+        description="Model name for dedicated ML Inference",
+    )
+    ml_inference_key_id: str | None = Field(
+        default=None,
+        description="IAM Key ID for dedicated ML Inference",
+    )
+    ml_inference_secret: str | None = Field(
+        default=None,
+        description="IAM Secret for dedicated ML Inference",
+    )
+
     qdrant_batch_size: int | None = Field(
         default=None,
         description="Batch size for Qdrant upsert operations",

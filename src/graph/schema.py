@@ -56,7 +56,7 @@ class Property(BaseModel):
         ..., description="Property type category from PropertyType enum"
     )
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     @model_validator(mode="before")
     @classmethod
@@ -116,7 +116,7 @@ class Property(BaseModel):
                     else:
                         data["value"] = float(stripped)
                 except (ValueError, TypeError):
-                    pass
+                    data["type"] = PropertyType.TEXT
 
             value_after = data.get("value")
             if isinstance(value_after, str):
@@ -194,7 +194,7 @@ class ExtractedEntity(BaseModel):
         description="List of typed properties (age, coordinates, language, etc.)",
     )
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     @field_validator("id", mode="before")
     @classmethod
@@ -266,7 +266,7 @@ class ExtractedRelation(BaseModel):
         description="Optional list of typed relation properties",
     )
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     @field_validator("source_id", "target_id", mode="before")
     @classmethod
@@ -318,7 +318,7 @@ class OpenSPGExtractionResult(BaseModel):
         default_factory=list, description="List of extracted relation edges"
     )
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
 
 class SPGNode(BaseModel):
@@ -539,14 +539,14 @@ Extraction Instructions:
 
 7. JSON FORMAT COMPLIANCE (MANDATORY):
    - The JSON structure MUST be 100% compliant with the OpenSPG schema defined above.
-   - Absolutely NO markdown wrapping (no ```json or ``` delimiters around the output).
+   - You MUST wrap your final JSON output in ```json and ``` delimiters.
    - No trailing commas anywhere in the JSON object or arrays.
    - No formatting errors — every opening bracket/brace must have a matching closing counterpart.
    - Any JSON parse failure will corrupt the entire extraction result for this post.
-   - Your ENTIRE response must be a single valid JSON object and nothing else.
+   - You may include your reasoning process (e.g., inside <think> tags), but the final output MUST contain exactly one valid JSON object wrapped in markdown blocks.
 
 8. OUTPUT FORMAT:
-Return ONLY a valid JSON object with exactly this structure. No markdown, no code blocks, no explanations:
+After your reasoning, return the JSON object wrapped in ```json ... ``` with exactly this structure:
 {{
   "entities": [ ... ],
   "relations": [ ... ]
