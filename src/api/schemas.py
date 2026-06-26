@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SearchRequest(BaseModel):
@@ -25,6 +25,35 @@ class SearchRequest(BaseModel):
         default=None,
         description="Minimum engagement rate for the post",
     )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "query": "AI content creators in tech",
+                    "limit": 10,
+                    "score_threshold": 0.35,
+                    "include_author_info": False,
+                    "location": "",
+                    "min_followers": 0,
+                    "min_engagement_rate": 0.0,
+                }
+            ]
+        }
+    }
+
+    @model_validator(mode="before")
+    @classmethod
+    def clear_empty_fields(cls, data: dict[str, Any] | Any) -> dict[str, Any] | Any:
+        if not isinstance(data, dict):
+            return data
+        if data.get("location") == "":
+            data["location"] = None
+        if data.get("min_followers") == 0:
+            data["min_followers"] = None
+        if data.get("min_engagement_rate") in (0, 0.0):
+            data["min_engagement_rate"] = None
+        return data
 
 
 class SearchResultItem(BaseModel):
