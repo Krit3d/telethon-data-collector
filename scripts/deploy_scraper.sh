@@ -55,8 +55,8 @@ COMPOSE_FILE="docker-compose.scraper.yml"
 echo "Building crawler Docker image..."
 docker compose -f $COMPOSE_FILE build crawler
 
-echo "Starting infrastructure containers (db, llm_proxy)..."
-docker compose -f $COMPOSE_FILE up -d db llm_proxy
+echo "Starting database infrastructure container (db)..."
+docker compose -f $COMPOSE_FILE up -d db
 
 echo "Waiting for db service to become healthy (max 60 seconds)..."
 SERVICE="db"

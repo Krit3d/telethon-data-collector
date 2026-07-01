@@ -3,6 +3,7 @@ services:
     image: apache/age@sha256:4241e2d8bb86a6b2ea44e9ad06c73856e12b209de295124603a599dd7feb70eb
     container_name: tg_parser_db
     restart: always
+    shm_size: 1gb
     env_file:
       - .env
     environment:
@@ -202,23 +203,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  llm_proxy:
-    image: nginx:alpine
-    container_name: tg_parser_llm_proxy
-    restart: always
-    env_file:
-      - .env
-    ports:
-      - "${TS_IP_SCRAPER}:8080:8080"
-    volumes:
-      - ./docker/nginx-llm.conf:/etc/nginx/nginx.conf:ro
-    networks:
-      - scraper_network
-    logging:
-      driver: local
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 networks:
   scraper_network:
