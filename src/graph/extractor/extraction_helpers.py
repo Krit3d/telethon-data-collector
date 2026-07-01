@@ -4,6 +4,21 @@ from typing import Any
 from src.graph.schema import ExtractedEntity, ExtractedRelation
 
 
+_TRANSLIT_MAP = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e',
+    'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'j', 'к': 'k',
+    'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r',
+    'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts',
+    'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '',
+    'э': 'e', 'ю': 'yu', 'я': 'ya',
+}
+
+
+def _transliterate_cyrillic(text: str) -> str:
+    lower = text.lower()
+    return ''.join(_TRANSLIT_MAP.get(c, c) for c in lower)
+
+
 def clean_telegram_link(val: str) -> str:
     val = val.strip()
     if val.startswith("@"):
@@ -19,7 +34,8 @@ def clean_telegram_link(val: str) -> str:
 
 def clean_hashtag(tag: str) -> str:
     cleaned = tag.strip().lstrip("#").strip()
-    return re.sub(r"[^a-zA-Z0-9_]", "_", cleaned).strip("_").lower()
+    translit = _transliterate_cyrillic(cleaned)
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9_]", "_", translit).strip("_"))
 
 
 def normalize_language(value: Any) -> str | None:
@@ -32,7 +48,8 @@ def normalize_language(value: Any) -> str | None:
 
 
 def sanitize_id(value: str) -> str:
-    return re.sub(r"[^a-z0-9_]", "_", value.lower().strip()).strip("_")
+    translit = _transliterate_cyrillic(value.strip())
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9_]", "_", translit).strip("_"))
 
 
 def find_entity(

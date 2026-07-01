@@ -1,11 +1,14 @@
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar, cast
 
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 try:
     import asyncpg.exceptions as _asyncpg_exc
@@ -99,3 +102,19 @@ def parse_agtype(value: Any) -> Any:
         return json.loads(text_val)
     except (json.JSONDecodeError, TypeError):
         return text_val
+
+
+def get_stable_lock_id(entity_id: str) -> int:
+    h = hashlib.md5(entity_id.encode("utf-8")).hexdigest()
+    val = int(h[:16], 16)
+    if val >= 2**63:
+        val -= 2**64
+    return val
+
+
+async def acquire_advisory_locks(session: AsyncSession, entity_ids: list[str] | set[str]) -> None:
+    await session.execute(text("SET LOCAL lock_timeout = '30s'"))
+    sorted_ids = sorted(entity_ids)
+    for eid in sorted_ids:
+        lock_id = get_stable_lock_id(eid)
+        await session.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})

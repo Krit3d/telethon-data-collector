@@ -1,8 +1,6 @@
-import hashlib
 import asyncio
 import json
 import logging
-import random
 import re
 import time
 from typing import Any
@@ -11,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from src.config.config import Settings
-from src.graph.db.helpers import ID_PREFIX_TO_LABEL, parse_agtype, connection_retry
+from src.graph.db.helpers import ID_PREFIX_TO_LABEL, acquire_advisory_locks, parse_agtype, connection_retry
 
 logger = logging.getLogger(__name__)
 
@@ -215,13 +213,6 @@ class GraphRepository:
             props.pop(key, None)
 
         return props
-
-    def _get_stable_lock_id(self, entity_id: str) -> int:
-        h = hashlib.md5(entity_id.encode("utf-8")).hexdigest()
-        val = int(h[:16], 16)
-        if val >= 2**63:
-            val -= 2**64
-        return val
 
     async def _delete_and_create_node(
         self, label: str, properties: dict, merge_key: str,
@@ -712,13 +703,7 @@ class GraphRepository:
                     entity_ids.add(relation.source_id)
                     entity_ids.add(relation.target_id)
 
-                sorted_ids = sorted(entity_ids)
-                for eid in sorted_ids:
-                    lock_id = self._get_stable_lock_id(eid)
-                    await session.execute(
-                        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-                        {"lock_id": lock_id},
-                    )
+                await acquire_advisory_locks(session, entity_ids)
 
                 entity_id_to_label: dict[str, str] = {}
                 for entity in result.entities:

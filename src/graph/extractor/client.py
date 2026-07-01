@@ -10,6 +10,7 @@ from evolution_openai import EvolutionAsyncOpenAI
 from pydantic import ValidationError
 
 from src.config.config import Settings
+from src.graph.extractor.extraction_helpers import sanitize_id
 from src.graph.schema import OpenSPGExtractionResult
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
     RELATION_TYPE_KEYS = ("relation_type", "type", "relation", "edge_label")
     final_entities: list[dict[str, Any]] = []
     final_relations: list[dict[str, Any]] = []
+    old_id_to_new_id: dict[str, str] = {}
     for item in parsed.get("entities", []):
         if not isinstance(item, dict):
             continue
@@ -103,12 +105,16 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
                 label = "Event"
             else:
                 label = "Entity"
+        assert name is not None
+        assert entity_id is not None
+        new_id = f"{label.lower()}_{sanitize_id(name)}"
+        old_id_to_new_id[entity_id] = new_id
         properties = item.get("properties", [])
         if not isinstance(properties, list):
             properties = []
         properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
         final_entities.append({
-            "id": entity_id,
+            "id": new_id,
             "name": name,
             "label": label,
             "properties": properties,
@@ -138,6 +144,8 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
                 break
         if relation_type is None:
             relation_type = "RELATED_TO"
+        source_id = old_id_to_new_id.get(source_id, source_id)
+        target_id = old_id_to_new_id.get(target_id, target_id)
         properties = item.get("properties", [])
         if not isinstance(properties, list):
             properties = []
@@ -185,6 +193,10 @@ class LLMClient:
 
     @staticmethod
     def _sanitize_llm_content(raw: str) -> str:
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            return raw[start:end + 1]
         return raw.strip()
 
     def _build_prompt(
@@ -302,17 +314,7 @@ class LLMClient:
                     break
 
                 content = self._sanitize_llm_content(content)
-
-                try:
-                    parsed = json.loads(content)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "JSON decode error on attempt %d/%d for post_id=%d, returning empty result",
-                        attempt + 1,
-                        _MAX_RETRIES,
-                        post_id,
-                    )
-                    parsed = {"entities": [], "relations": []}
+                parsed = json.loads(content)
 
                 parsed = _sanitize_parsed_payload(parsed)
                 result = OpenSPGExtractionResult.model_validate(parsed)
