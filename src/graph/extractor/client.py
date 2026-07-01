@@ -337,6 +337,9 @@ class LLMClient:
                     parsed = json.loads(content)
                     parsed = _sanitize_parsed_payload(parsed)
                 except json.JSONDecodeError as original_err:
+                    if not raw_response_text.strip().endswith("```"):
+                        logger.warning("Physical truncation detected for post_id=%d: raw response does not end with closing code fence", post_id)
+                        raise original_err
                     logger.warning(f"Raw LLM response causing parse error for post_id={post_id}: {raw_response_text}")
                     logger.info(
                         "Raw JSON parsing failed for post_id=%d, "

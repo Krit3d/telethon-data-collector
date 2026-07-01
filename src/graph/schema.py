@@ -214,15 +214,23 @@ class ExtractedEntity(BaseModel):
     @classmethod
     def sanitize_label(cls, v: Any) -> str:
         value = str(v).strip()
+        if not value:
+            return "Entity"
         value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
         value = re.sub(r"_+", "_", value).strip("_")
         if not value:
-            value = "Entity"
+            return "Entity"
         if value[0].isdigit():
             value = f"Label_{value}"
         else:
             value = value[0].upper() + value[1:]
-        return value
+        if value in ("Actor", "Person", "Brand", "Organization", "Company", "Author"):
+            return "Actor"
+        if value in ("Place", "Location", "City", "Country", "Geo"):
+            return "Place"
+        if value in ("Event", "Show", "Publication", "Incident"):
+            return "Event"
+        return "Entity"
 
     @model_validator(mode="before")
     @classmethod
@@ -419,9 +427,10 @@ def get_open_spg_llm_prompt(
         "",
         "Instructions:",
         f"1. Create Actor node for {actor_id} (properties: platform={platform_val}, platform_id={author_id if author_id is not None else 'N/A'}).",
-        f"2. Extract exactly 8-10 key entities total — Persons, Organizations, Brands, Places, Events, or Topics. Map Person/Organization/Brand to 'Actor' label, Place to 'Place', Event to 'Event', Topic to 'Entity'. Link each to {pub_node_id} with MENTIONS or ABOUT relation as appropriate.",
-        "3. For every relation, include a property: {\"key\": \"sentiment\", \"value\": \"positive|negative|neutral\", \"type\": \"text\"}.",
-        "4. Strictly ignore minor credit lists (makeup, photographers, assistants, production crew). These waste tokens and cause JSON truncation.",
+        f"2. Extract at most 3-4 key semantic concept entities per post (excluding the author Actor node) — Topics, Events, Places, Organizations, or Brands relevant to the content. Map each to the appropriate label. Do NOT extract individual hashtags as separate topic nodes.",
+        "3. If the post contains a large block of hashtags, consolidate them into 2-3 high-level concept entities (e.g., group #portraitmood, #portrait_shots, #make_portraits into a single Entity node named 'Portrait Photography').",
+        "4. For every relation, include a property: {\"key\": \"sentiment\", \"value\": \"positive|negative|neutral\", \"type\": \"text\"}.",
+        "5. Strictly ignore minor credit lists (makeup, photographers, assistants, production crew). These waste tokens and cause JSON truncation.",
         "",
         "The very first character of your response must be '<think>'. Do not output anything before '<think>' — no introductions, no formatting, no numbered lists, no whitespace.",
         "Write no more than 3 concise sentences of analysis inside <think>...</think> tags, then output the JSON.",
