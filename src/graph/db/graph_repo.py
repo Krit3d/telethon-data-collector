@@ -263,15 +263,11 @@ class GraphRepository:
         self, label: str, properties: dict, merge_key: str = "id",
         session: AsyncSession | None = None,
     ) -> None:
-        if not re.match(r"^[A-Za-z0-9_]+$", label):
-            raise ValueError(
-                f"Invalid label '{label}': must be alphanumeric with underscores"
-            )
-
-        if not re.match(r"^[A-Za-z0-9_]+$", merge_key):
-            raise ValueError(
-                f"Invalid merge_key '{merge_key}': must be alphanumeric with underscores"
-            )
+        label = re.sub(r"[^A-Za-z0-9_]", "", label)
+        if not label:
+            label = "Entity"
+        if not merge_key:
+            merge_key = "id"
 
         props = self._sanitize_properties(properties)
         props = self._clean_numeric_properties(props)
@@ -355,27 +351,20 @@ class GraphRepository:
         edge_properties: dict | None = None,
         session: AsyncSession | None = None,
     ) -> None:
-        for identifier_name, identifier_value in [
-            ("start_label", start_label),
-            ("edge_label", edge_label),
-            ("end_label", end_label),
-        ]:
-            if not re.match(r"^[A-Za-z0-9_]+$", identifier_value):
-                raise ValueError(
-                    f"Invalid {identifier_name} '{identifier_value}': "
-                    "must be alphanumeric with underscores"
-                )
-
-        if not re.match(r"^[A-Za-z0-9_]+$", start_merge_key):
-            raise ValueError(
-                f"Invalid start_merge_key '{start_merge_key}': "
-                "must be alphanumeric with underscores"
-            )
-        if not re.match(r"^[A-Za-z0-9_]+$", end_merge_key):
-            raise ValueError(
-                f"Invalid end_merge_key '{end_merge_key}': "
-                "must be alphanumeric with underscores"
-            )
+        start_label = re.sub(r"[^A-Za-z0-9_]", "", start_label)
+        if not start_label:
+            start_label = "Entity"
+        end_label = re.sub(r"[^A-Za-z0-9_]", "", end_label)
+        if not end_label:
+            end_label = "Entity"
+        edge_label = re.sub(r"[^A-Za-z0-9_]", "", edge_label)
+        edge_label = edge_label.upper()
+        if not edge_label:
+            edge_label = "RELATED_TO"
+        if not start_merge_key:
+            start_merge_key = "id"
+        if not end_merge_key:
+            end_merge_key = "id"
 
         edge_properties = edge_properties or {}
         props = self._sanitize_properties(edge_properties)
@@ -755,45 +744,6 @@ class GraphRepository:
                             )
                             raise
 
-                    pub_node_id: str | None = None
-                    for entity in sorted_entities:
-                        if entity.id.startswith("event_publication_"):
-                            pub_node_id = entity.id
-                            break
-
-                    if pub_node_id is not None:
-                        pub_label = entity_id_to_label.get(pub_node_id, "Event")
-                        sorted_mention_targets = sorted(
-                            [e for e in sorted_entities if e.id != pub_node_id],
-                            key=lambda e: e.id,
-                        )
-                        for entity in sorted_mention_targets:
-                            try:
-                                await self.upsert_graph_edge(
-                                    start_label=pub_label,
-                                    start_merge_key="id",
-                                    start_merge_val=pub_node_id,
-                                    edge_label="MENTIONS",
-                                    end_label=entity.label,
-                                    end_merge_key="id",
-                                    end_merge_val=entity.id,
-                                    edge_properties={},
-                                    session=session,
-                                )
-                                logger.debug(
-                                    "Created MENTIONS edge: %s -[:MENTIONS]-> %s(%s)",
-                                    pub_node_id,
-                                    entity.label,
-                                    entity.id,
-                                )
-                            except Exception as exc:
-                                logger.error(
-                                    "Failed MENTIONS edge (post_id=%d, entity_id=%s): %s",
-                                    post_id,
-                                    entity.id,
-                                    exc,
-                                )
-
                     sorted_relations = sorted(result.relations, key=lambda r: (r.source_id, r.relation_type, r.target_id))
                     for relation in sorted_relations:
                         start_label = entity_id_to_label.get(relation.source_id, "Entity")
@@ -825,7 +775,6 @@ class GraphRepository:
                                 relation.relation_type,
                                 exc,
                             )
-                            raise
 
     async def execute_cypher(self, query: str) -> Any:
         result = await self._execute_in_transaction(text(query))

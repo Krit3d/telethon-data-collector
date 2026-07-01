@@ -22,56 +22,15 @@ _RETRY_MAX_DELAY = 15.0
 _STAGGER_MAX = 5.0
 
 _DOMAIN_ENTITY_MAPPING = (
-    "\n\nMANDATORY PUBLICATION ANCHOR & RELATIONSHIP EXTRACTION RULES:\n"
-    "The text you are analyzing is ALWAYS a social media publication (post).\n"
-    "A main publication node already exists in the graph with a dynamic ID provided in the prompt.\n"
-    "You MUST NOT create a new Publication entity for the post itself.\n"
-    "Instead, you MUST use the provided dynamic publication node ID as the source for all outgoing relations.\n\n"
-    "You MUST connect ALL other extracted entities to the provided publication node using its actual dynamic ID:\n"
-    "  - For every extracted Topic (Entity): create an ABOUT relation:\n"
-    "    source_id=<pub_node_id>, relation_type=\"ABOUT\", target_id=<topic_entity_id>\n"
-    "  - For every extracted Person, Brand, Organization (Actors) or Place: create a MENTIONS relation:\n"
-    "    source_id=<pub_node_id>, relation_type=\"MENTIONS\", target_id=<entity_id>,\n"
-    "    and include the \"sentiment\" property: {\"key\": \"sentiment\", \"value\": \"<positive|negative|neutral>\", \"type\": \"text\"}\n"
-    "  - You MAY also create direct relations between other entities when explicitly mentioned in the text,\n"
-    "    e.g., Actor -[LOCATED_IN]-> Place, Actor -[COLLABORATES_WITH]-> Actor.\n"
-    "  - Every relation originating from the publication node MUST reference valid target entity ids from the same extraction.\n\n"
-    "ADDITIONAL DOMAIN ENTITY CLASSIFICATION RULES:\n"
-    "You MUST classify each extracted entity using a 'type' marker property in its properties list.\n\n"
-    "Classification mapping (domain concept -> OpenSPG label + type marker property):\n"
-    "  - Topic (subject, theme, discussion point, trend, concept) -> label: Entity, "
-    'add property: {"key": "type", "value": "topic", "type": "text"}\n'
-    "  - Person (individual, public figure, influencer, expert) -> label: Actor, "
-    'add property: {"key": "type", "value": "person", "type": "text"}\n'
-    "  - Brand (company, product line, trademark, startup) -> label: Actor, "
-    'add property: {"key": "type", "value": "brand", "type": "text"}\n'
-    "  - Organization (institution, agency, team, group, department) -> label: Actor, "
-    'add property: {"key": "type", "value": "organization", "type": "text"}\n'
-    "  - Author (blogger, content creator, journalist) -> label: Actor, "
-    'add property: {"key": "type", "value": "author", "type": "text"}\n'
-    "  - Region (geographic area, country, city, district) -> label: Place, "
-    'add property: {"key": "type", "value": "region", "type": "text"}\n\n'
-    "STRICT ENTITY NAME RULE:\n"
-    "The 'name' property of EVERY entity MUST be a clean, literal name extracted directly from the source text. "
-    "It MUST contain ONLY the actual text as written by the author \u2014 nothing else.\n"
-    "You are ABSOLUTELY PROHIBITED from placing any of the following inside the 'name' property:\n"
-    "  - Placeholder labels or tags: [Null], [N/A], [Unknown], [Untitled]\n"
-    "  - Bracketed role tags: [Author], [Brand], [Topic], [Person], [Organization]\n"
-    "  - Entity classification suffixes or prefixes (e.g. 'Brand: Nike', 'Author John')\n"
-    "  - Platform names or generic descriptors instead of the real name (e.g. 'YouTube Channel', 'Telegram Post')\n"
-    "  - Any synthetic, inferred, or invented text that does not appear verbatim in the original text\n"
-    "If the real name cannot be determined, set 'name' to an empty string and add a 'reason' property explaining why.\n\n"
-    "STRICT RELATIONSHIP RULES:\n"
-    "  1. You MUST output ABOUT relations for every Topic that is discussed by the publication.\n"
-    "     Format: source_id=<pub_node_id>, relation_type=ABOUT, target_id=<topic_entity_id>\n"
-    "  2. You MUST output MENTIONS relations when the publication references a Brand, Person, or Organization.\n"
-    "     Format: source_id=<pub_node_id>, relation_type=MENTIONS, target_id=<entity_id>\n"
-    "  3. Every MENTIONS relation MUST include a sentiment property:\n"
-    '     {"key": "sentiment", "value": "<positive|negative|neutral>", "type": "text"}\n'
-    "     Determine sentiment based on the context and tone of the mention in the text.\n\n"
-    "Every extracted entity MUST include the 'type' marker property. "
-    "If an entity does not fit any of the above categories, use the most appropriate "
-    "OpenSPG label (Actor/Entity/Place) and set type to 'other'."
+    "===DOMAIN SCHEMA REFERENCE===\n"
+    "SOURCE_NODE: PUB_NODE_ID (always the source for all relations)\n"
+    "TARGET_NODES:\n"
+    "  Topic Entity -> relation: ABOUT (source=PUB_NODE_ID, target=Topic)\n"
+    "  Person|Brand|Organization|Place -> relation: MENTIONS (source=PUB_NODE_ID, target=Entity)\n"
+    "SENTIMENT RULE: MENTIONS relation MUST include property: {\"key\": \"sentiment\", \"value\": \"positive|negative|neutral\", \"type\": \"text\"}\n"
+    "STRICT NODE LABELS: Actor | Place | Entity | Event\n"
+    "PROHIBITED VALUES: 'unknown', 'null', 'none', 'undefined', '' (empty string), [null, null] for coordinates\n"
+    "NAMES: must be verbatim from SOURCE_TEXT, no paraphrasing"
 )
 
 
@@ -212,7 +171,7 @@ class LLMClient:
         self._semaphore = asyncio.Semaphore(getattr(settings, "llm_max_concurrency", settings.graph_concurrency))
         http_limits = httpx.Limits(max_connections=200, max_keepalive_connections=100)
         http_timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
-        http_client = httpx.AsyncClient(limits=http_limits, timeout=http_timeout)
+        http_client = httpx.AsyncClient(limits=http_limits, timeout=http_timeout, verify=False)
         key_id = settings.ml_inference_key_id
         secret = settings.ml_inference_secret
         base_url = settings.ml_inference_base_url
@@ -239,15 +198,24 @@ class LLMClient:
 
     @staticmethod
     def _sanitize_llm_content(raw: str) -> str:
-        cleaned = re.sub(r"<(think|thinking)>.*?(?:</\1>|$)", "", raw, flags=re.DOTALL | re.IGNORECASE)
-        match = re.search(r"```(?:json)?\s*\n?(.*?)(?:\n?\s*```|$)", cleaned, flags=re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        first_brace = cleaned.find("{")
-        last_brace = cleaned.rfind("}")
+        if not raw:
+            return ""
+        think_end = raw.rfind("</think>")
+        if think_end != -1:
+            sliced = raw[think_end + len("</think>"):]
+        else:
+            sliced = raw
+        blocks = re.findall(r"```(?:json)?\s*\n?(.*?)\n?\s*```", sliced, flags=re.DOTALL)
+        for block in reversed(blocks):
+            if '"entities"' in block or '"relations"' in block:
+                return block.strip()
+        first_brace = sliced.find("{")
+        last_brace = sliced.rfind("}")
         if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-            return cleaned[first_brace:last_brace + 1].strip()
-        return cleaned.strip()
+            extracted = sliced[first_brace:last_brace + 1].strip()
+            if extracted:
+                return extracted
+        return sliced
 
     def _build_prompt(
         self,
@@ -260,12 +228,7 @@ class LLMClient:
         from src.graph.schema import get_open_spg_llm_prompt
 
         base = get_open_spg_llm_prompt(text, pub_node_id, author_id, platform, metadata)
-        return (
-            f"{base}{_DOMAIN_ENTITY_MAPPING}"
-            "\n\nCRITICAL: Your final output MUST be a single valid JSON object wrapped inside a ```json ... ``` code block. "
-            "NEVER use null for 'type' properties. NEVER use [null, null] for coordinates. "
-            "Ensure strict schema adherence."
-        )
+        return f"{base}{_DOMAIN_ENTITY_MAPPING}"
 
     async def call_llm(
         self,
@@ -286,17 +249,6 @@ class LLMClient:
             await asyncio.sleep(random.random() * _STAGGER_MAX)
 
         prompt = self._build_prompt(text, pub_node_id, author_id, platform, metadata)
-        schema = OpenSPGExtractionResult.model_json_schema()
-
-        if "$defs" in schema:
-            if "ExtractedEntity" in schema["$defs"]:
-                entity_schema = schema["$defs"]["ExtractedEntity"]
-                if "required" in entity_schema and "properties" not in entity_schema["required"]:
-                    entity_schema["required"].append("properties")
-            if "ExtractedRelation" in schema["$defs"]:
-                relation_schema = schema["$defs"]["ExtractedRelation"]
-                if "required" in relation_schema and "properties" not in relation_schema["required"]:
-                    relation_schema["required"].append("properties")
 
         last_error: BaseException | None = None
 
@@ -304,17 +256,42 @@ class LLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You are a highly meticulous OpenSPG knowledge extraction engine. "
-                    "You MUST FIRST write your thought process and reasoning inside "
-                    "<think>...</think> tags. ONLY AFTER thinking, output your response "
-                    "as a valid JSON object wrapped in ```json ... ``` blocks. "
-                    "Extract entities and relations strictly following the schema. "
-                    "Every entity MUST include a 'type' marker property indicating "
-                    "its domain classification. "
-                    "Never output null for 'type'. Never output [null, null] for coordinates. "
-                    "Ensure strict adherence to the schema.\n\n"
-                    "Here is the strict JSON schema you MUST follow:\n"
-                    + json.dumps(schema)
+                    "You are a ROBOTIC JSON API, NOT a chatbot. You perform ONE function: structured knowledge graph extraction.\n"
+                    "ABSOLUTE REQUIREMENTS:\n"
+                    "- Your response must start with the <think> tag, contain step-by-step reasoning, end with the </think> tag, and then output the JSON block inside ```json ... ```.\n"
+                    "- Keep your <think> reasoning extremely brief — no more than 3 bullet points.\n"
+                    "- Never translate, paraphrase, or summarize the input text.\n"
+                    "- Never use conversational language, greetings, or sign-offs.\n"
+                    "- Never output markdown outside the required <think>...</think> and ```json ... ``` blocks.\n"
+                    "OUTPUT RULE: <think>[reasoning]</think>```json\n{\n  ...\n}\n```\n"
+                    "VIOLATION OF ANY REQUIREMENT CAUSES IMMEDIATE SYSTEM FAILURE.\n\n"
+                    "You must output a JSON object with exactly two keys: 'entities' and 'relations'. "
+                    "Strict maximum limit: 8-10 key entities per response to fit into the token budget.\n"
+                    "Focus ONLY on main actors and brands. Ignore extensive credit lists (stylists, makeup, lighting, assistants) to prevent token exhaustion.\n"
+                    "Use this exact structure (fill in your own values):\n"
+                    '{\n'
+                    '  "entities": [\n'
+                    '    {\n'
+                    '      "id": "actor_unique_id",\n'
+                    '      "label": "Actor",\n'
+                    '      "name": "Display Name",\n'
+                    '      "properties": [\n'
+                    '        {"key": "platform", "value": "INSTAGRAM", "type": "text"}\n'
+                    '      ]\n'
+                    '    }\n'
+                    '  ],\n'
+                    '  "relations": [\n'
+                    '    {\n'
+                    '      "source_id": "PUB_NODE_ID",\n'
+                    '      "relation_type": "ABOUT",\n'
+                    '      "target_id": "topic_unique_id",\n'
+                    '      "properties": [\n'
+                    '        {"key": "sentiment", "value": "positive", "type": "text"}\n'
+                    '      ]\n'
+                    '    }\n'
+                    '  ]\n'
+                    '}\n'
+                    "FAILURE MODE WARNING: If you output anything other than the expected format, the parser will crash and all extracted data will be permanently lost."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -326,9 +303,10 @@ class LLMClient:
                     response = await self._client.chat.completions.create(
                         model=self.settings.ml_inference_model,
                         messages=messages,
-                        temperature=0.6,
+                        temperature=0.1,
                         max_tokens=4096,
-                        frequency_penalty=0.2,
+                        frequency_penalty=0.0,
+                        top_p=0.85,
                     )
 
                 content = (
@@ -351,6 +329,7 @@ class LLMClient:
                         continue
                     break
 
+                raw_response_text = content
                 content = self._sanitize_llm_content(content)
                 raw_preview = content[:500]
 
@@ -358,24 +337,40 @@ class LLMClient:
                     parsed = json.loads(content)
                     parsed = _sanitize_parsed_payload(parsed)
                 except json.JSONDecodeError as original_err:
+                    logger.warning(f"Raw LLM response causing parse error for post_id={post_id}: {raw_response_text}")
                     logger.info(
                         "Raw JSON parsing failed for post_id=%d, "
                         "attempting repair",
                         post_id,
                     )
                     repaired = repair_json(content)
-                    try:
-                        parsed = json.loads(repaired)
-                        parsed = _sanitize_parsed_payload(parsed)
-                    except json.JSONDecodeError as repair_err:
-                        logger.error(
-                            "JSON decode failed after repair for "
-                            "post_id=%d: %s",
+                    if not repaired or not repaired.strip():
+                        logger.warning(
+                            "Repair returned empty content for post_id=%d, "
+                            "falling back to empty schema",
                             post_id,
-                            repair_err,
-                            exc_info=True,
                         )
-                        raise original_err from repair_err
+                        parsed = {"entities": [], "relations": []}
+                    else:
+                        try:
+                            parsed = json.loads(repaired)
+                            if len(parsed.get("entities", [])) > 2 and len(parsed.get("relations", [])) == 0:
+                                logger.warning(
+                                    "Suspected token limit truncation for post_id=%d: %d entities with 0 relations, raising to retry",
+                                    post_id,
+                                    len(parsed.get("entities", [])),
+                                )
+                                raise original_err
+                            parsed = _sanitize_parsed_payload(parsed)
+                        except json.JSONDecodeError as repair_err:
+                            logger.error(
+                                "JSON decode failed after repair for "
+                                "post_id=%d: %s",
+                                post_id,
+                                repair_err,
+                                exc_info=True,
+                            )
+                            raise original_err from repair_err
 
                 result = OpenSPGExtractionResult.model_validate(parsed)
 
