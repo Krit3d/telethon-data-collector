@@ -5,7 +5,8 @@ from typing import Any, cast
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
 from src.config.config import Settings
 from src.db.database import with_retry_on_deadlock
@@ -54,7 +55,7 @@ class ExtractorRepository:
             stmt = (
                 select(Content)
                 .join(Account, Content.account_id == Account.id)
-                .options(joinedload(Content.account))
+                .options(selectinload(Content.account))
                 .where(
                     Content.is_embedded == False,
                     Content.raw_metadata.isnot(None),
@@ -123,10 +124,18 @@ class ExtractorRepository:
                 )
             )
 
+        conditions.append(
+            or_(
+                Content.raw_metadata["graph_status"].astext.is_(None),
+                Content.raw_metadata["graph_status"].astext != "processing",
+            )
+        )
+        conditions.append(Content.raw_metadata["graph_extraction_error"].astext.is_(None))
+
         stmt = (
             select(Content)
             .join(Account, Content.account_id == Account.id)
-            .options(joinedload(Content.account))
+            .options(selectinload(Content.account))
             .where(*conditions)
         )
         stmt = self._apply_account_filters(stmt)
@@ -156,40 +165,46 @@ class ExtractorRepository:
         self, limit: int, priority_mode: bool
     ) -> list[Content]:
         async with self.async_session() as session:
-            stmt = await self._build_ungraphed_query(
-                require_content=True,
-                priority_mode=priority_mode,
-            )
-            stmt = stmt.limit(limit)
-            result = await session.execute(stmt)
-            return list(result.scalars().all())
+            async with session.begin():
+                stmt = await self._build_ungraphed_query(
+                    require_content=True,
+                    priority_mode=priority_mode,
+                )
+                stmt = stmt.limit(limit).with_for_update(skip_locked=True, of=Content)
+                result = await session.execute(stmt)
+                posts = list(result.scalars().all())
+                if not posts:
+                    return []
+                for post in posts:
+                    if post.raw_metadata is None:
+                        post.raw_metadata = {}
+                    post.raw_metadata["graph_status"] = "processing"
+                    post.raw_metadata["claimed_at"] = datetime.now(timezone.utc).isoformat()
+                    flag_modified(post, "raw_metadata")
+                return posts
 
     @with_retry_on_deadlock()
     async def _mark_content_graph_extracted(
         self, content_id: int, update_updated_at: bool
     ) -> None:
-        values: dict[str, Any] = {"is_graph_extracted": True}
-        if update_updated_at:
-            values["updated_at"] = datetime.now(timezone.utc)
-
         async with self.async_session() as session:
             async with session.begin():
-                stmt = (
-                    update(Content)
-                    .where(Content.id == content_id)
-                    .values(**values)
-                )
-                result = cast(CursorResult, await session.execute(stmt))
-
-                if result.rowcount > 0:
-                    logger.debug(
-                        "Marked content id=%d as graph extracted", content_id
-                    )
-                else:
+                stmt = select(Content).where(Content.id == content_id)
+                result = await session.execute(stmt)
+                content = result.scalar_one_or_none()
+                if content is None:
                     logger.warning(
                         "Content id=%d not found when marking as graph extracted",
                         content_id,
                     )
+                    return
+                content.is_graph_extracted = True
+                if content.raw_metadata is None:
+                    content.raw_metadata = {}
+                content.raw_metadata["graph_status"] = "graphed"
+                if update_updated_at:
+                    content.updated_at = datetime.now(timezone.utc)
+                flag_modified(content, "raw_metadata")
 
     @with_retry_on_deadlock()
     async def mark_content_extracted(self, content_id: int) -> None:
@@ -219,3 +234,16 @@ class ExtractorRepository:
                         "Batch marked %d content items as graph extracted",
                         result.rowcount,
                     )
+
+    @with_retry_on_deadlock()
+    async def release_content_claim(self, content_id: int) -> None:
+        async with self.async_session() as session:
+            async with session.begin():
+                stmt = select(Content).where(Content.id == content_id)
+                result = await session.execute(stmt)
+                content = result.scalar_one_or_none()
+                if content:
+                    if content.raw_metadata is None:
+                        content.raw_metadata = {}
+                    content.raw_metadata["graph_status"] = "failed"
+                    flag_modified(content, "raw_metadata")

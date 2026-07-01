@@ -5,7 +5,7 @@ import random
 import time
 import signal
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
 from sqlalchemy import text
@@ -296,28 +296,33 @@ class GraphExtractionWorker:
                 break
 
             try:
-                logger.info(
-                    "Consumer %d processing post id=%d",
-                    worker_id,
-                    post.id,
-                )
+                logger.info("Consumer %d processing post id=%d", worker_id, post.id)
                 success = await self._process_single_post(post)
                 if success:
                     await self.extractor_repo.mark_content_graphed(post.id)
-                    logger.info(
-                        "Consumer %d marked post id=%d as graphed",
-                        worker_id,
-                        post.id,
-                    )
+                    logger.info("Consumer %d marked post id=%d as graphed", worker_id, post.id)
+                else:
+                    await self.extractor_repo.release_content_claim(post.id)
             except Exception as e:
-                logger.error(
-                    "Consumer %d error processing post id=%d: %s",
-                    worker_id,
-                    post.id,
-                    e,
-                )
+                logger.error("Consumer %d error processing post id=%d: %s", worker_id, post.id, e)
+                await self.extractor_repo.release_content_claim(post.id)
             finally:
                 self._queue.task_done()
+
+    async def _recover_stale_claims(self) -> None:
+        threshold = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        async with self.db.async_session() as session:
+            async with session.begin():
+                await session.execute(
+                    text("""
+                        UPDATE content
+                        SET raw_metadata = raw_metadata - 'graph_status' - 'claimed_at'
+                        WHERE is_graph_extracted = false
+                          AND raw_metadata->>'graph_status' = 'processing'
+                          AND raw_metadata->>'claimed_at' < :threshold
+                    """),
+                    {"threshold": threshold}
+                )
 
     async def run(self) -> None:
         logger.info(
@@ -325,6 +330,9 @@ class GraphExtractionWorker:
             self._queue.maxsize,
             self.settings.graph_concurrency,
         )
+
+        logger.info("Recovering stale graph extraction claims...")
+        await self._recover_stale_claims()
 
         producer = asyncio.create_task(self._producer_loop())
         consumers = [

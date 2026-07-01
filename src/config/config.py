@@ -196,7 +196,15 @@ class Settings(BaseSettings):
     )
     graph_write_concurrency: int = Field(
         default=6,
-        description="Maximum concurrent Apache AGE write operations (graph node/edge upserts)",
+        description="Maximum concurrent graph write transactions per worker (connection pool governor)",
+    )
+    worker_id: int = Field(
+        default=0,
+        description="Partition identifier for this worker instance (0-based). Used with total_workers for modulo-based DB partitioning.",
+    )
+    total_workers: int = Field(
+        default=1,
+        description="Total number of concurrent worker instances. When > 1, each worker handles a non-overlapping partition via Content.id modulo.",
     )
 
     # ---- Creators coordinator settings ----

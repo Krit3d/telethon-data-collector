@@ -2,11 +2,9 @@ import asyncio
 import json
 import logging
 import random
-import re
 from typing import Any
 
 import httpx
-from json_repair import repair_json
 from openai import APIStatusError, APIConnectionError, APITimeoutError, RateLimitError
 from evolution_openai import EvolutionAsyncOpenAI
 from pydantic import ValidationError
@@ -22,7 +20,7 @@ _RETRY_MAX_DELAY = 15.0
 _STAGGER_MAX = 5.0
 
 _DOMAIN_ENTITY_MAPPING = (
-    "===DOMAIN SCHEMA REFERENCE===\n"
+    "DOMAIN SCHEMA REFERENCE\n"
     "SOURCE_NODE: PUB_NODE_ID (always the source for all relations)\n"
     "TARGET_NODES:\n"
     "  Topic Entity -> relation: ABOUT (source=PUB_NODE_ID, target=Topic)\n"
@@ -52,23 +50,8 @@ def _sanitize_property(prop: Any) -> dict[str, Any] | None:
 
 
 def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
-    processing: list[dict[str, Any]] = []
-    if isinstance(parsed, list):
-        processing = list(parsed)
-    elif isinstance(parsed, dict):
-        processing = list(parsed.get("entities", [])) + list(parsed.get("relations", []))
-    else:
+    if not isinstance(parsed, dict):
         return {"entities": [], "relations": []}
-    flat: list[dict[str, Any]] = []
-    while processing:
-        item = processing.pop(0)
-        if not isinstance(item, dict):
-            continue
-        for nested_field in ("entities", "relations"):
-            nested = item.get(nested_field)
-            if isinstance(nested, list):
-                processing.extend(nested)
-        flat.append(item)
     ENTITY_ID_KEYS = ("id", "_id", "id_", "entity_id", "node_id")
     ENTITY_NAME_KEYS = ("name", "display_name", "title")
     ENTITY_LABEL_KEYS = ("label", "entity_type")
@@ -77,90 +60,94 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
     RELATION_TYPE_KEYS = ("relation_type", "type", "relation", "edge_label")
     final_entities: list[dict[str, Any]] = []
     final_relations: list[dict[str, Any]] = []
-    for item in flat:
+    for item in parsed.get("entities", []):
+        if not isinstance(item, dict):
+            continue
+        entity_id: str | None = None
+        for key in ENTITY_ID_KEYS:
+            val = item.get(key)
+            if val is not None:
+                entity_id = str(val) if not isinstance(val, str) else val
+                break
+        name: str | None = None
+        for key in ENTITY_NAME_KEYS:
+            val = item.get(key)
+            if val is not None:
+                name = str(val) if not isinstance(val, str) else val
+                break
+        label: str | None = None
+        for key in ENTITY_LABEL_KEYS:
+            val = item.get(key)
+            if val is not None:
+                label = str(val) if not isinstance(val, str) else val
+                break
+        if entity_id is None and name is not None:
+            entity_id = name.lower().replace(" ", "_")
+        if entity_id is None and name is None:
+            continue
+        if name is None and entity_id is not None:
+            name = entity_id.lstrip("_")
+            for prefix in ("actor_", "place_", "event_"):
+                if name.startswith(prefix):
+                    name = name[len(prefix):]
+                    break
+            name = name.replace("_", " ").title().strip()
+        if label is None:
+            if entity_id is None:
+                continue
+            if entity_id.startswith("actor_"):
+                label = "Actor"
+            elif entity_id.startswith("place_"):
+                label = "Place"
+            elif entity_id.startswith("event_"):
+                label = "Event"
+            else:
+                label = "Entity"
+        properties = item.get("properties", [])
+        if not isinstance(properties, list):
+            properties = []
+        properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
+        final_entities.append({
+            "id": entity_id,
+            "name": name,
+            "label": label,
+            "properties": properties,
+        })
+    for item in parsed.get("relations", []):
         if not isinstance(item, dict):
             continue
         source_id: str | None = None
-        target_id: str | None = None
         for key in SOURCE_ID_KEYS:
             val = item.get(key)
             if val is not None:
                 source_id = str(val) if not isinstance(val, str) else val
                 break
+        target_id: str | None = None
         for key in TARGET_ID_KEYS:
             val = item.get(key)
             if val is not None:
                 target_id = str(val) if not isinstance(val, str) else val
                 break
-        if source_id is not None or target_id is not None:
-            relation_type: str | None = None
-            for key in RELATION_TYPE_KEYS:
-                val = item.get(key)
-                if val is not None:
-                    relation_type = str(val) if not isinstance(val, str) else val
-                    break
-            if relation_type is None:
-                relation_type = "RELATED_TO"
-            properties = item.get("properties", [])
-            if not isinstance(properties, list):
-                properties = []
-            properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
-            final_relations.append({
-                "source_id": source_id,
-                "target_id": target_id,
-                "relation_type": relation_type,
-                "properties": properties,
-            })
-        else:
-            entity_id: str | None = None
-            for key in ENTITY_ID_KEYS:
-                val = item.get(key)
-                if val is not None:
-                    entity_id = str(val) if not isinstance(val, str) else val
-                    break
-            name: str | None = None
-            for key in ENTITY_NAME_KEYS:
-                val = item.get(key)
-                if val is not None:
-                    name = str(val) if not isinstance(val, str) else val
-                    break
-            label: str | None = None
-            for key in ENTITY_LABEL_KEYS:
-                val = item.get(key)
-                if val is not None:
-                    label = str(val) if not isinstance(val, str) else val
-                    break
-            if entity_id is None and name is not None:
-                entity_id = name.lower().replace(" ", "_")
-            if entity_id is None and name is None:
-                continue
-            if name is None and entity_id is not None:
-                name = entity_id.lstrip("_")
-                for prefix in ("actor_", "place_", "event_"):
-                    if name.startswith(prefix):
-                        name = name[len(prefix):]
-                        break
-                name = name.replace("_", " ").title().strip()
-            assert entity_id is not None
-            if label is None:
-                if entity_id.startswith("actor_"):
-                    label = "Actor"
-                elif entity_id.startswith("place_"):
-                    label = "Place"
-                elif entity_id.startswith("event_"):
-                    label = "Event"
-                else:
-                    label = "Entity"
-            properties = item.get("properties", [])
-            if not isinstance(properties, list):
-                properties = []
-            properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
-            final_entities.append({
-                "id": entity_id,
-                "name": name,
-                "label": label,
-                "properties": properties,
-            })
+        if source_id is None or target_id is None:
+            continue
+        relation_type: str | None = None
+        for key in RELATION_TYPE_KEYS:
+            val = item.get(key)
+            if val is not None:
+                relation_type = str(val) if not isinstance(val, str) else val
+                break
+        if relation_type is None:
+            relation_type = "RELATED_TO"
+        properties = item.get("properties", [])
+        if not isinstance(properties, list):
+            properties = []
+        properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
+        final_relations.append({
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation_type": relation_type,
+            "properties": properties,
+        })
     return {"entities": final_entities, "relations": final_relations}
 
 
@@ -198,24 +185,7 @@ class LLMClient:
 
     @staticmethod
     def _sanitize_llm_content(raw: str) -> str:
-        if not raw:
-            return ""
-        think_end = raw.rfind("</think>")
-        if think_end != -1:
-            sliced = raw[think_end + len("</think>"):]
-        else:
-            sliced = raw
-        blocks = re.findall(r"```(?:json)?\s*\n?(.*?)\n?\s*```", sliced, flags=re.DOTALL)
-        for block in reversed(blocks):
-            if '"entities"' in block or '"relations"' in block:
-                return block.strip()
-        first_brace = sliced.find("{")
-        last_brace = sliced.rfind("}")
-        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-            extracted = sliced[first_brace:last_brace + 1].strip()
-            if extracted:
-                return extracted
-        return sliced
+        return raw.strip()
 
     def _build_prompt(
         self,
@@ -252,52 +222,53 @@ class LLMClient:
 
         last_error: BaseException | None = None
 
-        messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a ROBOTIC JSON API, NOT a chatbot. You perform ONE function: structured knowledge graph extraction.\n"
-                    "ABSOLUTE REQUIREMENTS:\n"
-                    "- Your response must start with the <think> tag, contain step-by-step reasoning, end with the </think> tag, and then output the JSON block inside ```json ... ```.\n"
-                    "- Keep your <think> reasoning extremely brief — no more than 3 bullet points.\n"
-                    "- Never translate, paraphrase, or summarize the input text.\n"
-                    "- Never use conversational language, greetings, or sign-offs.\n"
-                    "- Never output markdown outside the required <think>...</think> and ```json ... ``` blocks.\n"
-                    "OUTPUT RULE: <think>[reasoning]</think>```json\n{\n  ...\n}\n```\n"
-                    "VIOLATION OF ANY REQUIREMENT CAUSES IMMEDIATE SYSTEM FAILURE.\n\n"
-                    "You must output a JSON object with exactly two keys: 'entities' and 'relations'. "
-                    "Strict maximum limit: 8-10 key entities per response to fit into the token budget.\n"
-                    "Focus ONLY on main actors and brands. Ignore extensive credit lists (stylists, makeup, lighting, assistants) to prevent token exhaustion.\n"
-                    "Use this exact structure (fill in your own values):\n"
-                    '{\n'
-                    '  "entities": [\n'
-                    '    {\n'
-                    '      "id": "actor_unique_id",\n'
-                    '      "label": "Actor",\n'
-                    '      "name": "Display Name",\n'
-                    '      "properties": [\n'
-                    '        {"key": "platform", "value": "INSTAGRAM", "type": "text"}\n'
-                    '      ]\n'
-                    '    }\n'
-                    '  ],\n'
-                    '  "relations": [\n'
-                    '    {\n'
-                    '      "source_id": "PUB_NODE_ID",\n'
-                    '      "relation_type": "ABOUT",\n'
-                    '      "target_id": "topic_unique_id",\n'
-                    '      "properties": [\n'
-                    '        {"key": "sentiment", "value": "positive", "type": "text"}\n'
-                    '      ]\n'
-                    '    }\n'
-                    '  ]\n'
-                    '}\n'
-                    "FAILURE MODE WARNING: If you output anything other than the expected format, the parser will crash and all extracted data will be permanently lost."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ]
-
         for attempt in range(_MAX_RETRIES):
+            messages: list[dict[str, str]] = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a ROBOTIC JSON API, NOT a chatbot. You perform ONE function: structured knowledge graph extraction.\n"
+                        "ABSOLUTE REQUIREMENTS:\n"
+                        "- You must respond with a single JSON object containing exactly three keys: \"thinking\", \"entities\", and \"relations\".\n"
+                        "- Write your step-by-step reasoning inside the \"thinking\" string property first, before outputting the arrays.\n"
+                        "- Keep your reasoning extremely brief — no more than 3 bullet points.\n"
+                        "- Never translate, paraphrase, or summarize the input text.\n"
+                        "- Never use conversational language, greetings, or sign-offs.\n"
+                        "- Never output anything outside the JSON object.\n"
+                        "VIOLATION OF ANY REQUIREMENT CAUSES IMMEDIATE SYSTEM FAILURE.\n\n"
+                        "You must output a JSON object with exactly three keys: 'thinking', 'entities', and 'relations'. "
+                        "Strict maximum limit: 8-10 key entities per response to fit into the token budget.\n"
+                        "Extract key Topics, Persons, Brands, Places, Organizations, and Events mentioned in the text.\n"
+                        "Use this exact structure (fill in your own values):\n"
+                        '{\n'
+                        '  "thinking": "Brief reasoning here",\n'
+                        '  "entities": [\n'
+                        '    {\n'
+                        '      "id": "actor_unique_id",\n'
+                        '      "label": "Actor",\n'
+                        '      "name": "Display Name",\n'
+                        '      "properties": [\n'
+                        '        {"key": "platform", "value": "INSTAGRAM", "type": "text"}\n'
+                        '      ]\n'
+                        '    }\n'
+                        '  ],\n'
+                        '  "relations": [\n'
+                        '    {\n'
+                        '      "source_id": "PUB_NODE_ID",\n'
+                        '      "relation_type": "ABOUT",\n'
+                        '      "target_id": "topic_unique_id",\n'
+                        '      "properties": [\n'
+                        '        {"key": "sentiment", "value": "positive", "type": "text"}\n'
+                        '      ]\n'
+                        '    }\n'
+                        '  ]\n'
+                        '}\n'
+                        "FAILURE MODE WARNING: If you output anything other than the expected format, the parser will crash and all extracted data will be permanently lost."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+
             try:
                 async with self._semaphore:
                     response = await self._client.chat.completions.create(
@@ -307,6 +278,7 @@ class LLMClient:
                         max_tokens=4096,
                         frequency_penalty=0.0,
                         top_p=0.85,
+                        response_format={"type": "json_object"},
                     )
 
                 content = (
@@ -329,52 +301,20 @@ class LLMClient:
                         continue
                     break
 
-                raw_response_text = content
                 content = self._sanitize_llm_content(content)
-                raw_preview = content[:500]
 
                 try:
                     parsed = json.loads(content)
-                    parsed = _sanitize_parsed_payload(parsed)
-                except json.JSONDecodeError as original_err:
-                    if not raw_response_text.strip().endswith("```"):
-                        logger.warning("Physical truncation detected for post_id=%d: raw response does not end with closing code fence", post_id)
-                        raise original_err
-                    logger.warning(f"Raw LLM response causing parse error for post_id={post_id}: {raw_response_text}")
-                    logger.info(
-                        "Raw JSON parsing failed for post_id=%d, "
-                        "attempting repair",
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "JSON decode error on attempt %d/%d for post_id=%d, returning empty result",
+                        attempt + 1,
+                        _MAX_RETRIES,
                         post_id,
                     )
-                    repaired = repair_json(content)
-                    if not repaired or not repaired.strip():
-                        logger.warning(
-                            "Repair returned empty content for post_id=%d, "
-                            "falling back to empty schema",
-                            post_id,
-                        )
-                        parsed = {"entities": [], "relations": []}
-                    else:
-                        try:
-                            parsed = json.loads(repaired)
-                            if len(parsed.get("entities", [])) > 2 and len(parsed.get("relations", [])) == 0:
-                                logger.warning(
-                                    "Suspected token limit truncation for post_id=%d: %d entities with 0 relations, raising to retry",
-                                    post_id,
-                                    len(parsed.get("entities", [])),
-                                )
-                                raise original_err
-                            parsed = _sanitize_parsed_payload(parsed)
-                        except json.JSONDecodeError as repair_err:
-                            logger.error(
-                                "JSON decode failed after repair for "
-                                "post_id=%d: %s",
-                                post_id,
-                                repair_err,
-                                exc_info=True,
-                            )
-                            raise original_err from repair_err
+                    parsed = {"entities": [], "relations": []}
 
+                parsed = _sanitize_parsed_payload(parsed)
                 result = OpenSPGExtractionResult.model_validate(parsed)
 
                 logger.info(
@@ -423,8 +363,6 @@ class LLMClient:
                     post_id,
                     exc,
                 )
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": f"Your output failed validation:\n{exc}\nPlease fix the schema errors, do not lose any data, and return ONLY the corrected valid JSON."})
                 if attempt < _MAX_RETRIES - 1:
                     delay = self._backoff_delay(attempt)
                     await asyncio.sleep(delay)

@@ -244,6 +244,18 @@ class ExtractedEntity(BaseModel):
             data["name"] = name
         return data
 
+    @model_validator(mode="after")
+    def align_id_prefix_with_label(self) -> ExtractedEntity:
+        if self.label == "Actor" and not self.id.startswith("actor_"):
+            self.id = f"actor_{self.id}"
+        elif self.label == "Place" and not self.id.startswith("place_"):
+            self.id = f"place_{self.id}"
+        elif self.label == "Event" and not self.id.startswith("event_"):
+            self.id = f"event_{self.id}"
+        elif self.label == "Entity" and not self.id.startswith("topic_") and not self.id.startswith("entity_"):
+            self.id = f"topic_{self.id}"
+        return self
+
     def get_property_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for prop in self.properties:
@@ -432,21 +444,20 @@ def get_open_spg_llm_prompt(
         "4. For every relation, include a property: {\"key\": \"sentiment\", \"value\": \"positive|negative|neutral\", \"type\": \"text\"}.",
         "5. Strictly ignore minor credit lists (makeup, photographers, assistants, production crew). These waste tokens and cause JSON truncation.",
         "",
-        "The very first character of your response must be '<think>'. Do not output anything before '<think>' — no introductions, no formatting, no numbered lists, no whitespace.",
-        "Write no more than 3 concise sentences of analysis inside <think>...</think> tags, then output the JSON.",
+        "The first character of your response must be the opening brace '{' of a raw JSON object.",
+        "Respond with a single raw JSON object containing exactly three keys: \"thinking\", \"entities\", and \"relations\".",
+        "Write your step-by-step reasoning inside the \"thinking\" string property first, before outputting the arrays.",
+        "No conversational text, headers, or markdown wrappers are allowed.",
         "",
-        "Output format:",
-        "<think>",
-        "[reasoning about entities and relations]",
-        "</think>",
-        "```json",
+        "Example JSON structure (fill in your own values):",
         "{",
+        '  "thinking": "Brief step-by-step reasoning here",',
         '  "entities": [',
         "    {",
         '      "id": "actor_telegram_12345",',
         '      "label": "Actor",',
         '      "name": "Author Name",',
-        "      \"properties\": [",
+        '      "properties": [',
         '        {"key": "platform", "value": "telegram", "type": "text"},',
         '        {"key": "platform_id", "value": "12345", "type": "text"}',
         "      ]",
@@ -473,7 +484,6 @@ def get_open_spg_llm_prompt(
         "    }",
         "  ]",
         "}",
-        "```",
         "",
         'Forbidden values: empty strings, "unknown", "null", or missing values in id, name, label, or key fields.',
     ]
