@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from typing import Any
 
 import httpx
@@ -20,6 +21,18 @@ _RETRY_BASE_DELAY = 1.0
 _RETRY_MAX_DELAY = 15.0
 _STAGGER_MAX = 5.0
 
+_GARBAGE_EXACT: frozenset[str] = frozenset({
+    "unknown", "null", "none", "undefined", "n_a", "other", "id", "#", "", "topic", "category", "language",
+})
+
+_GARBAGE_SUBSTRINGS: tuple[str, ...] = (
+    "<name>", "name>", "<name",
+)
+
+_CANONICAL_PREFIXES: tuple[str, ...] = (
+    "actor_", "place_", "event_", "topic_", "event_publication_",
+)
+
 _DOMAIN_ENTITY_MAPPING = (
     "DOMAIN SCHEMA REFERENCE\n"
     "SOURCE_NODE: PUB_NODE_ID (always the source for all relations)\n"
@@ -31,6 +44,21 @@ _DOMAIN_ENTITY_MAPPING = (
     "PROHIBITED VALUES: 'unknown', 'null', 'none', 'undefined', '' (empty string), [null, null] for coordinates\n"
     "NAMES: must be verbatim from SOURCE_TEXT, no paraphrasing"
 )
+
+_SYSTEM_PREFIXES: tuple[str, ...] = (
+    "actor_", "place_", "event_", "topic_", "event_publication_",
+)
+
+
+def _is_garbage_value(val: str) -> bool:
+    stripped = val.strip().lower()
+    if len(stripped) < 2:
+        return True
+    if stripped in _GARBAGE_EXACT:
+        return True
+    if any(sub in stripped for sub in _GARBAGE_SUBSTRINGS):
+        return True
+    return False
 
 
 def _sanitize_property(prop: Any) -> dict[str, Any] | None:
@@ -50,7 +78,51 @@ def _sanitize_property(prop: Any) -> dict[str, Any] | None:
     return prop
 
 
-def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
+def _force_label_from_prefix(new_id: str) -> str:
+    if new_id.startswith("actor_"):
+        return "Actor"
+    if new_id.startswith("place_"):
+        return "Place"
+    if new_id.startswith("event_") or new_id.startswith("event_publication_"):
+        return "Event"
+    if new_id.startswith("topic_"):
+        return "Entity"
+    return "Entity"
+
+
+def _resolve_preliminary_label(raw_label: str | None, entity_id: str | None) -> str:
+    if raw_label is not None:
+        cleaned = raw_label.strip().lower()
+        if cleaned in ("actor", "person", "brand", "organization", "company", "creator", "user", "coauthor"):
+            return "Actor"
+        if cleaned in ("place", "location", "city", "country", "region", "address"):
+            return "Place"
+        if cleaned in ("event", "publication", "post", "show", "incident", "video", "photo"):
+            return "Event"
+        return "Entity"
+    if entity_id is not None:
+        eid_low = entity_id.lower()
+        if eid_low.startswith("actor_"):
+            return "Actor"
+        if eid_low.startswith("place_"):
+            return "Place"
+        if eid_low.startswith("event_") or eid_low.startswith("event_publication_"):
+            return "Event"
+    return "Entity"
+
+
+def _canonicalize_id(raw_id: str | None) -> str:
+    if raw_id is None:
+        return ""
+    s = raw_id.strip().lower()
+    for prefix in _CANONICAL_PREFIXES:
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    return re.sub(r'[^a-z0-9]', '', s)
+
+
+def _sanitize_parsed_payload(parsed: Any, pub_node_id: str | None = None) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         return {"entities": [], "relations": []}
     ENTITY_ID_KEYS = ("id", "_id", "id_", "entity_id", "node_id")
@@ -61,7 +133,8 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
     RELATION_TYPE_KEYS = ("relation_type", "type", "relation", "edge_label")
     final_entities: list[dict[str, Any]] = []
     final_relations: list[dict[str, Any]] = []
-    old_id_to_new_id: dict[str, str] = {}
+    exact_map: dict[str, str] = {}
+    canonical_map: dict[str, str] = {}
     for item in parsed.get("entities", []):
         if not isinstance(item, dict):
             continue
@@ -89,26 +162,35 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
             continue
         if name is None and entity_id is not None:
             name = entity_id.lstrip("_")
-            for prefix in ("actor_", "place_", "event_"):
+            for prefix in _SYSTEM_PREFIXES:
                 if name.startswith(prefix):
                     name = name[len(prefix):]
                     break
             name = name.replace("_", " ").title().strip()
-        if label is None:
-            if entity_id is None:
-                continue
-            if entity_id.startswith("actor_"):
-                label = "Actor"
-            elif entity_id.startswith("place_"):
-                label = "Place"
-            elif entity_id.startswith("event_"):
-                label = "Event"
-            else:
-                label = "Entity"
+        preliminary_label = _resolve_preliminary_label(label, entity_id)
         assert name is not None
         assert entity_id is not None
-        new_id = f"{label.lower()}_{sanitize_id(name)}"
-        old_id_to_new_id[entity_id] = new_id
+        name = name.strip()
+        if _is_garbage_value(name) or _is_garbage_value(entity_id):
+            continue
+        eid_low = entity_id.lower()
+        if any(eid_low.startswith(p) for p in _SYSTEM_PREFIXES):
+            new_id = eid_low
+        elif name.startswith("#"):
+            name = name.lstrip("#").strip()
+            new_id = f"topic_hashtag_{sanitize_id(name)}"
+        elif preliminary_label == "Place":
+            new_id = f"place_{sanitize_id(name)}"
+        elif preliminary_label == "Actor":
+            new_id = f"actor_{sanitize_id(name)}"
+        elif preliminary_label == "Event":
+            new_id = f"event_{sanitize_id(name)}"
+        else:
+            new_id = f"topic_{sanitize_id(name)}"
+        label = _force_label_from_prefix(new_id)
+        exact_map[entity_id] = new_id
+        canonical_map[_canonicalize_id(entity_id)] = new_id
+        canonical_map[_canonicalize_id(name)] = new_id
         properties = item.get("properties", [])
         if not isinstance(properties, list):
             properties = []
@@ -123,6 +205,12 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
             "label": label,
             "properties": properties,
         })
+    valid_new_ids = {e["id"] for e in final_entities}
+    if pub_node_id:
+        p_id_low = pub_node_id.lower()
+        exact_map[p_id_low] = p_id_low
+        canonical_map[_canonicalize_id(pub_node_id)] = p_id_low
+        valid_new_ids.add(p_id_low)
     for item in parsed.get("relations", []):
         if not isinstance(item, dict):
             continue
@@ -148,15 +236,21 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
                 break
         if relation_type is None:
             relation_type = "RELATED_TO"
-        source_id = old_id_to_new_id.get(source_id, source_id)
-        target_id = old_id_to_new_id.get(target_id, target_id)
+        resolved_source = exact_map.get(source_id)
+        if resolved_source is None:
+            resolved_source = canonical_map.get(_canonicalize_id(source_id), source_id)
+        resolved_target = exact_map.get(target_id)
+        if resolved_target is None:
+            resolved_target = canonical_map.get(_canonicalize_id(target_id), target_id)
+        if resolved_source not in valid_new_ids or resolved_target not in valid_new_ids:
+            continue
         properties = item.get("properties", [])
         if not isinstance(properties, list):
             properties = []
         properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
         final_relations.append({
-            "source_id": source_id,
-            "target_id": target_id,
+            "source_id": resolved_source,
+            "target_id": resolved_target,
             "relation_type": relation_type,
             "properties": properties,
         })
@@ -243,43 +337,16 @@ class LLMClient:
                 {
                     "role": "system",
                     "content": (
-                        "You are a ROBOTIC JSON API, NOT a chatbot. You perform ONE function: structured knowledge graph extraction.\n"
-                        "ABSOLUTE REQUIREMENTS:\n"
-                        "- You must respond with a single JSON object containing exactly three keys: \"thinking\", \"entities\", and \"relations\".\n"
-                        "- Write your step-by-step reasoning inside the \"thinking\" string property first, before outputting the arrays.\n"
-                        "- Keep your reasoning extremely brief — no more than 3 bullet points.\n"
-                        "- Never translate, paraphrase, or summarize the input text.\n"
-                        "- Never use conversational language, greetings, or sign-offs.\n"
-                        "- Never output anything outside the JSON object.\n"
-                        "VIOLATION OF ANY REQUIREMENT CAUSES IMMEDIATE SYSTEM FAILURE.\n\n"
-                        "You must output a JSON object with exactly three keys: 'thinking', 'entities', and 'relations'. "
-                        "Strict maximum limit: 8-10 key entities per response to fit into the token budget.\n"
-                        "Extract key Topics, Persons, Brands, Places, Organizations, and Events mentioned in the text.\n"
-                        "Use this exact structure (fill in your own values):\n"
-                        '{\n'
-                        '  "thinking": "Brief reasoning here",\n'
-                        '  "entities": [\n'
-                        '    {\n'
-                        '      "id": "actor_unique_id",\n'
-                        '      "label": "Actor",\n'
-                        '      "name": "Display Name",\n'
-                        '      "properties": [\n'
-                        '        {"key": "platform", "value": "INSTAGRAM", "type": "text"}\n'
-                        '      ]\n'
-                        '    }\n'
-                        '  ],\n'
-                        '  "relations": [\n'
-                        '    {\n'
-                        '      "source_id": "PUB_NODE_ID",\n'
-                        '      "relation_type": "ABOUT",\n'
-                        '      "target_id": "topic_unique_id",\n'
-                        '      "properties": [\n'
-                        '        {"key": "sentiment", "value": "positive", "type": "text"}\n'
-                        '      ]\n'
-                        '    }\n'
-                        '  ]\n'
-                        '}\n'
-                        "FAILURE MODE WARNING: If you output anything other than the expected format, the parser will crash and all extracted data will be permanently lost."
+                        "Deterministic JSON extraction. "
+                        "Keys: thinking, entities, relations. "
+                        "thinking: 1-2 sentence reasoning. "
+                        "entities: [{id: lowercase_snake, name: verbatim_from_text, label: one_of(Actor|Place|Entity|Event), properties: [{key, value, type}]}] "
+                        "relations: [{source_id, target_id, relation_type: ABOUT|MENTIONS|LOCATED_IN, properties: [{key, value, type}]}] "
+                        "CRITICAL: If a real entity name is NOT present in the source text, do NOT extract that entity. "
+                        "FORBIDDEN name/id values: <name>, name>, unknown, null, none, undefined, n_a, other, id. "
+                        "Names must match source text exactly. "
+                        "source_id must be PUB_NODE_ID, target_id must exist in entities. "
+                        "Output ONLY valid JSON."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -290,10 +357,8 @@ class LLMClient:
                     response = await self._client.chat.completions.create(
                         model=self.settings.ml_inference_model,
                         messages=messages,
-                        temperature=0.1,
-                        max_tokens=4096,
-                        frequency_penalty=0.0,
-                        top_p=0.85,
+                        temperature=0.0,
+                        max_tokens=2048,
                         response_format={"type": "json_object"},
                     )
 
@@ -320,7 +385,14 @@ class LLMClient:
                 content = self._sanitize_llm_content(content)
                 parsed = json.loads(content)
 
-                parsed = _sanitize_parsed_payload(parsed)
+                logger.info(
+                    "RAW LLM output for post_id=%d: %d entities, %d relations",
+                    post_id,
+                    len(parsed.get("entities", [])),
+                    len(parsed.get("relations", [])),
+                )
+
+                parsed = _sanitize_parsed_payload(parsed, pub_node_id=pub_node_id)
                 result = OpenSPGExtractionResult.model_validate(parsed)
 
                 logger.info(

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import re
@@ -6,6 +8,7 @@ from typing import Any
 
 from src.config.config import Settings
 from src.graph.schema import decode_unicode_escapes
+from src.graph.schema import ExtractedEntity
 from src.graph.extractor.client import LLMClient
 from src.graph.extractor.enrich_author import enrich_author_node
 from src.graph.extractor.enrich_pub import enrich_publication_node
@@ -16,6 +19,15 @@ from src.graph.extractor.extraction_helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PLACEHOLDER_NAME_PATTERN = re.compile(r"^<[^>]+>$")
+
+
+def merge_properties(target: ExtractedEntity, source: ExtractedEntity) -> None:
+    target_keys = {p.key for p in target.properties}
+    for prop in source.properties:
+        if prop.key not in target_keys:
+            target.properties.append(prop)
 
 
 def _resolve_author_name(
@@ -31,18 +43,18 @@ def _resolve_author_name(
 
 
 def _resolve_publication_name(
-    account_metadata: dict[str, Any] | None,
     platform_content_id: str,
     post_id: int,
 ) -> str:
     if platform_content_id:
         return platform_content_id
-    if account_metadata:
-        for key in ("title", "display_name", "username"):
-            value = account_metadata.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
     return f"Post {post_id}"
+
+
+def _ensure_actor_type_property(entity: ExtractedEntity) -> None:
+    prop_keys = {p.key for p in entity.properties}
+    if "type" not in prop_keys:
+        entity.add_property("type", "person", "text")
 
 
 class KnowledgeExtractor:
@@ -78,8 +90,7 @@ class KnowledgeExtractor:
         _author_str = str(author_id)
         if len(_author_str) > 100 or " " in _author_str or "\n" in _author_str:
             logger.warning(
-                "Corrupted author_id detected for post_id=%d (len=%d), "
-                "falling back to account_id=%s",
+                "Corrupted author_id detected for post_id=%d (len=%d), falling back to account_id=%s",
                 post_id,
                 len(_author_str),
                 account_id,
@@ -90,8 +101,7 @@ class KnowledgeExtractor:
             account_status = account_metadata.get("status")
             if account_status is not None and account_status not in ("parsed", "verified"):
                 logger.warning(
-                    "Account metadata status is '%s' (not 'parsed') for "
-                    "post_id=%d, skipping extraction",
+                    "Account metadata status is '%s' (not 'parsed') for post_id=%d, skipping extraction",
                     account_status,
                     post_id,
                 )
@@ -126,7 +136,7 @@ class KnowledgeExtractor:
             pub_node_id = f"event_publication_{platform_slug}_{post_id}"
 
         pub_display_name = _resolve_publication_name(
-            account_metadata, platform_content_id, post_id
+            platform_content_id, post_id
         )
 
         if cached_result is not None:
@@ -142,6 +152,9 @@ class KnowledgeExtractor:
                 platform=platform,
             )
 
+        if result is None:
+            return None
+
         _FILTERED_PROPERTY_KEYS = {"category", "language"}
         for entity in result.entities:
             entity.properties = [
@@ -155,16 +168,13 @@ class KnowledgeExtractor:
             if entity.id in (author_node_id, pub_node_id):
                 continue
             for prop in entity.properties:
-                if prop.key == "type" and prop.value == "author":
+                if prop.key == "type" and isinstance(prop.value, str) and prop.value.lower() == "author":
                     fallback_author_ids.add(entity.id)
                     break
-                if prop.key == "type" and prop.value == "publication":
+                if prop.key == "type" and isinstance(prop.value, str) and prop.value.lower() == "publication":
                     fallback_pub_ids.add(entity.id)
                     break
         llm_fallback_ids = fallback_author_ids | fallback_pub_ids
-        result.entities = [
-            e for e in result.entities if e.id not in llm_fallback_ids
-        ]
         for rel in result.relations:
             if rel.source_id in fallback_author_ids:
                 rel.source_id = author_node_id
@@ -183,6 +193,7 @@ class KnowledgeExtractor:
             )
 
         author_display_name = _resolve_author_name(account_metadata, author_id)
+        author_display_name = decode_unicode_escapes(author_display_name).strip()
 
         author_entity = find_or_create_entity(
             result.entities,
@@ -190,7 +201,8 @@ class KnowledgeExtractor:
             label="Actor",
             name=author_display_name,
         )
-        author_entity.name = decode_unicode_escapes(author_display_name)
+        author_entity.label = "Actor"
+        author_entity.name = author_display_name
 
         author_prop_keys = {p.key for p in author_entity.properties}
         if "platform" not in author_prop_keys:
@@ -210,13 +222,16 @@ class KnowledgeExtractor:
                 process_language_data=process_language,
             )
 
+        pub_display_name = decode_unicode_escapes(pub_display_name).strip()
+
         pub_entity = find_or_create_entity(
             result.entities,
             entity_id=pub_node_id,
             label="Event",
             name=pub_display_name,
         )
-        pub_entity.name = decode_unicode_escapes(pub_display_name)
+        pub_entity.label = "Event"
+        pub_entity.name = pub_display_name
 
         author_subscribers: int | None = None
         if account_metadata is not None:
@@ -235,6 +250,20 @@ class KnowledgeExtractor:
             author_subscribers=author_subscribers,
         )
 
+        for fb_id in fallback_author_ids:
+            fb_entity = find_entity(result.entities, fb_id)
+            if fb_entity is not None:
+                merge_properties(author_entity, fb_entity)
+
+        for fb_id in fallback_pub_ids:
+            fb_entity = find_entity(result.entities, fb_id)
+            if fb_entity is not None:
+                merge_properties(pub_entity, fb_entity)
+
+        result.entities = [
+            e for e in result.entities if e.id not in llm_fallback_ids
+        ]
+
         find_or_create_relation(
             result.relations,
             source_id=author_node_id,
@@ -245,7 +274,7 @@ class KnowledgeExtractor:
         coauthors = raw_metadata.get("coauthors")
         if isinstance(coauthors, list):
             for coauthor in coauthors:
-                coauthor_name = str(coauthor).strip()
+                coauthor_name = decode_unicode_escapes(str(coauthor)).strip()
                 if not coauthor_name:
                     continue
                 coauthor_slug = re.sub(
@@ -258,6 +287,7 @@ class KnowledgeExtractor:
                     label="Actor",
                     name=coauthor_name,
                 )
+                _ensure_actor_type_property(coauthor_entity)
                 coauthor_prop_keys = {p.key for p in coauthor_entity.properties}
                 if "platform" not in coauthor_prop_keys:
                     coauthor_entity.add_property(
@@ -277,7 +307,7 @@ class KnowledgeExtractor:
         tagged_users = raw_metadata.get("tagged_users")
         if isinstance(tagged_users, list):
             for tagged_user in tagged_users:
-                tagged_name = str(tagged_user).strip()
+                tagged_name = decode_unicode_escapes(str(tagged_user)).strip()
                 if not tagged_name:
                     continue
                 tagged_slug = re.sub(
@@ -290,6 +320,7 @@ class KnowledgeExtractor:
                     label="Actor",
                     name=tagged_name,
                 )
+                _ensure_actor_type_property(tagged_entity)
                 tagged_prop_keys = {p.key for p in tagged_entity.properties}
                 if "platform" not in tagged_prop_keys:
                     tagged_entity.add_property(
@@ -308,7 +339,7 @@ class KnowledgeExtractor:
 
         topic_target_ids: set[str] = set()
         for relation in result.relations:
-            if relation.relation_type in ("ABOUT", "DISCUSSES"):
+            if relation.relation_type.upper() in ("ABOUT", "DISCUSSES"):
                 target_entity = find_entity(
                     result.entities, relation.target_id
                 )
@@ -327,7 +358,7 @@ class KnowledgeExtractor:
             )
 
         _PLACEHOLDER_NAMES = frozenset({
-            "", "#", "other", "unknown", "none", "null", "undefined", "n_a",
+            "", "#", "other", "unknown", "none", "null", "undefined", "n_a", "<name>",
         })
         pre_filter_count = len(result.entities)
         kept_entities = []
@@ -338,6 +369,9 @@ class KnowledgeExtractor:
                 discarded_ids.add(entity.id)
                 continue
             if trimmed_name.lower() in _PLACEHOLDER_NAMES:
+                discarded_ids.add(entity.id)
+                continue
+            if _PLACEHOLDER_NAME_PATTERN.match(trimmed_name.lower()):
                 discarded_ids.add(entity.id)
                 continue
             kept_entities.append(entity)
@@ -354,6 +388,54 @@ class KnowledgeExtractor:
                 len(discarded_ids),
                 pre_filter_count - len(result.entities),
             )
+
+        valid_entity_ids = {e.id for e in result.entities}
+        pre_sanitation_count = len(result.relations)
+        kept_relations = []
+        for relation in result.relations:
+            source_valid = relation.source_id in valid_entity_ids
+            target_valid = relation.target_id in valid_entity_ids
+            if source_valid and target_valid:
+                kept_relations.append(relation)
+            else:
+                missing: list[str] = []
+                if not source_valid:
+                    missing.append("source_id")
+                if not target_valid:
+                    missing.append("target_id")
+                logger.warning(
+                    "Relation discarded for post_id=%d: (%s) -[%s]-> (%s) missing %s; available entity IDs sample: %s",
+                    post_id,
+                    relation.source_id,
+                    relation.relation_type,
+                    relation.target_id,
+                    ", ".join(missing),
+                    list(valid_entity_ids)[:20],
+                )
+        result.relations = kept_relations
+        discarded_relations = pre_sanitation_count - len(result.relations)
+        if discarded_relations:
+            logger.info(
+                "Relation sanitation for post_id=%d: discarded %d relations referencing missing entities",
+                post_id,
+                discarded_relations,
+            )
+
+        seen_relations: set[tuple[str, str, str]] = set()
+        deduped_relations = []
+        for r in result.relations:
+            key = (r.source_id, r.relation_type, r.target_id)
+            if key in seen_relations:
+                continue
+            seen_relations.add(key)
+            deduped_relations.append(r)
+        if len(deduped_relations) != len(result.relations):
+            logger.info(
+                "Relation deduplication for post_id=%d: removed %d duplicate relations",
+                post_id,
+                len(result.relations) - len(deduped_relations),
+            )
+        result.relations = deduped_relations
 
         current_ts = int(time.time())
         for entity in result.entities:

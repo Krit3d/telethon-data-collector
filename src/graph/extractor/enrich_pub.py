@@ -146,7 +146,7 @@ def enrich_publication_node(
             cleaned_tag = clean_hashtag(str(tag))
             if not cleaned_tag:
                 continue
-            tag_entity_id = f"hashtag_{cleaned_tag}"
+            tag_entity_id = f"topic_hashtag_{cleaned_tag}"
             tag_entity = find_or_create_entity(
                 entities,
                 entity_id=tag_entity_id,
@@ -179,10 +179,10 @@ def enrich_publication_node(
             and isinstance(lng, (int, float))
         )
         if isinstance(loc_name, str) and loc_name:
-            loc_id = f"loc_{sanitize_id(loc_name)}"
+            loc_id = f"place_{sanitize_id(loc_name)}"
             loc_display = loc_name
         elif has_coords:
-            loc_id = f"loc_{lat}_{lng}"
+            loc_id = f"place_{lat}_{lng}"
             loc_display = f"{lat}, {lng}"
         else:
             loc_id = None
@@ -229,7 +229,7 @@ def enrich_publication_node(
             track_hash = hashlib.md5(
                 track_title.encode("utf-8")
             ).hexdigest()[:12]
-            audio_entity_id = f"audio_{track_hash}"
+            audio_entity_id = f"topic_audio_{track_hash}"
             audio_entity = find_or_create_entity(
                 entities,
                 entity_id=audio_entity_id,
@@ -258,7 +258,7 @@ def enrich_publication_node(
             track_hash = hashlib.md5(
                 music_title.strip().encode("utf-8")
             ).hexdigest()[:12]
-            audio_entity_id = f"audio_{track_hash}"
+            audio_entity_id = f"topic_audio_{track_hash}"
             audio_entity = find_or_create_entity(
                 entities,
                 entity_id=audio_entity_id,

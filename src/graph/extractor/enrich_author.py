@@ -143,7 +143,7 @@ def enrich_author_node(
                 if ckey in telegram_contact_keys:
                     item_str = clean_telegram_link(item_str)
                 clean_val = sanitize_id(item_str)
-                contact_entity_id = f"contact_{ckey}_{clean_val}"
+                contact_entity_id = f"topic_contact_{ckey}_{clean_val}"
                 contact_entity = find_or_create_entity(
                     entities,
                     entity_id=contact_entity_id,
@@ -170,7 +170,7 @@ def enrich_author_node(
         country = geo_data.get("country")
         loc_parts = [p for p in (country, city) if isinstance(p, str) and p]
         if loc_parts:
-            loc_id = "loc_" + "_".join(sanitize_id(p) for p in loc_parts)
+            loc_id = "place_" + "_".join(sanitize_id(p) for p in loc_parts)
             loc_name = ", ".join(loc_parts)
             loc_entity = find_or_create_entity(
                 entities,
@@ -204,7 +204,7 @@ def enrich_author_node(
 
     region = meta_copy.get("region")
     if isinstance(region, str) and region.strip():
-        region_id = f"loc_{sanitize_id(region)}"
+        region_id = f"place_{sanitize_id(region)}"
         region_entity = find_or_create_entity(
             entities,
             entity_id=region_id,
@@ -237,7 +237,7 @@ def enrich_author_node(
                 seen_link_domains.add(domain)
             except (ValueError, TypeError):
                 continue
-            link_entity_id = f"link_{sanitize_id(domain)}"
+            link_entity_id = f"topic_link_{sanitize_id(domain)}"
             link_entity = find_or_create_entity(
                 entities,
                 entity_id=link_entity_id,
@@ -303,7 +303,7 @@ def enrich_author_node(
             location_val = str(location_str).strip()
             if not location_val:
                 continue
-            loc_id = f"audience_loc_{sanitize_id(location_val)}"
+            loc_id = f"place_audience_loc_{sanitize_id(location_val)}"
             loc_entity = find_or_create_entity(
                 entities,
                 entity_id=loc_id,

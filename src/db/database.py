@@ -162,13 +162,13 @@ class Database:
                             logger.debug("Skipped index creation for %s: %s", label, e)
                     await conn.commit()
 
-                async with self.engine.connect() as conn:
-                    conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
-                    try:
-                        await conn.execute(text("VACUUM ANALYZE;"))
-                        logger.info("VACUUM ANALYZE completed")
-                    except Exception as e:
-                        logger.warning("VACUUM ANALYZE failed (non-critical): %s", e)
+                # async with self.engine.connect() as conn:
+                #     conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+                #     try:
+                #         await conn.execute(text("VACUUM ANALYZE;"))
+                #         logger.info("VACUUM ANALYZE completed")
+                #     except Exception as e:
+                #         logger.warning("VACUUM ANALYZE failed (non-critical): %s", e)
 
                 logger.info("Database initialization successful")
                 return

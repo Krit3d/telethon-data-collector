@@ -311,18 +311,25 @@ class GraphExtractionWorker:
 
     async def _recover_stale_claims(self) -> None:
         threshold = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-        async with self.db.async_session() as session:
-            async with session.begin():
-                await session.execute(
-                    text("""
-                        UPDATE content
-                        SET raw_metadata = raw_metadata - 'graph_status' - 'claimed_at'
-                        WHERE is_graph_extracted = false
-                          AND raw_metadata->>'graph_status' = 'processing'
-                          AND raw_metadata->>'claimed_at' < :threshold
-                    """),
-                    {"threshold": threshold}
-                )
+        try:
+            async with self.db.async_session() as session:
+                async with session.begin():
+                    await session.execute(
+                        text("""
+                            UPDATE content
+                            SET raw_metadata = raw_metadata - 'graph_status' - 'claimed_at'
+                            WHERE is_graph_extracted = false
+                              AND raw_metadata->>'graph_status' = 'processing'
+                              AND raw_metadata->>'claimed_at' < :threshold
+                        """),
+                        {"threshold": threshold}
+                    )
+            logger.info("Successfully completed stale graph extraction claims recovery.")
+        except Exception as e:
+            logger.warning(
+                "Failed to recover stale graph extraction claims (non-critical): %s",
+                e,
+            )
 
     async def run(self) -> None:
         logger.info(
