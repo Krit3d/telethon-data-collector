@@ -305,11 +305,7 @@ class GraphRepository:
         }
         params = json.dumps(params_dict)
 
-        if session is not None:
-            async with session.begin_nested():
-                await self._execute_in_transaction(query, {"params": params}, session=session)
-        else:
-            await self._execute_in_transaction(query, {"params": params}, session=session)
+        await self._execute_in_transaction(query, {"params": params}, session=session)
 
     async def upsert_graph_edge(
         self,
@@ -370,11 +366,7 @@ class GraphRepository:
         }
         params = json.dumps(params_dict)
 
-        if session is not None:
-            async with session.begin_nested():
-                await self._execute_in_transaction(query, {"params": params}, session=session)
-        else:
-            await self._execute_in_transaction(query, {"params": params}, session=session)
+        await self._execute_in_transaction(query, {"params": params}, session=session)
 
     async def _query_nodes_by_label(
         self, label: str, node_ids: list[str]

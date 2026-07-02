@@ -36,6 +36,16 @@ def enrich_publication_node(
 
     existing = {p.key for p in pub.properties}
 
+    if "type" not in existing:
+        try:
+            pub.add_property("type", "publication", "text")
+        except (ValidationError, ValueError) as exc:
+            logger.warning(
+                "Failed to enrich property type for entity %s: %s",
+                pub.id,
+                exc,
+            )
+
     if "db_post_id" not in existing:
         try:
             pub.add_property("db_post_id", post_id, "numeric")

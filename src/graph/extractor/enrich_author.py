@@ -37,6 +37,16 @@ def enrich_author_node(
     meta_copy.pop("access_hash", None)
     existing = {p.key for p in author.properties}
 
+    if "type" not in existing:
+        try:
+            author.add_property("type", "author", "text")
+        except (ValidationError, ValueError) as exc:
+            logger.warning(
+                "Failed to enrich property type for entity %s: %s",
+                author.id,
+                exc,
+            )
+
     base_field_map: dict[str, tuple[str, str]] = {
         "follower_count": ("numeric", "follower_count"),
         "subscribers_count": ("numeric", "follower_count"),

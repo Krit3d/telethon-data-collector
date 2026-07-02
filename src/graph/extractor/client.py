@@ -113,6 +113,10 @@ def _sanitize_parsed_payload(parsed: Any) -> dict[str, Any]:
         if not isinstance(properties, list):
             properties = []
         properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
+        if not any(p.get("key") == "type" for p in properties):
+            fallback_map = {"Actor": "person", "Place": "location", "Event": "event"}
+            fallback_value = fallback_map.get(label, "topic")
+            properties.append({"key": "type", "value": fallback_value, "type": "text"})
         final_entities.append({
             "id": new_id,
             "name": name,

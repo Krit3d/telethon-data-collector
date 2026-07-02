@@ -5,6 +5,7 @@ import hashlib
 import httpx
 import logging
 import struct
+import asyncio
 import uuid
 from typing import Any, Final
 
@@ -40,11 +41,20 @@ class QdrantService:
             http_client=http_client,
         )
 
-        self.client = AsyncQdrantClient(
-            url=settings.qdrant_url,
-            timeout=settings.qdrant_timeout,
-            api_key=settings.qdrant_api_key,
-        )
+        if settings.qdrant_grpc_url is not None:
+            self.client = AsyncQdrantClient(
+                url=settings.qdrant_grpc_url,
+                prefer_grpc=True,
+                api_key=settings.qdrant_api_key,
+                timeout=settings.qdrant_timeout,
+            )
+        else:
+            self.client = AsyncQdrantClient(
+                url=settings.qdrant_url,
+                prefer_grpc=False,
+                timeout=settings.qdrant_timeout,
+                api_key=settings.qdrant_api_key,
+            )
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -333,11 +343,22 @@ class QdrantService:
                     )
                 )
 
-            await self.client.upsert(
-                collection_name=self.collection_name,
-                points=point_structs,
-                wait=True,
-            )
+            for attempt in range(1, 4):
+                try:
+                    await self.client.upsert(
+                        collection_name=self.collection_name,
+                        points=point_structs,
+                        wait=True,
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "Upsert attempt %d/3 failed: %s", attempt, e,
+                        extra={"collection": self.collection_name},
+                    )
+                    if attempt == 3:
+                        raise
+                    await asyncio.sleep(1.0)
 
             logger.debug(
                 "Batch upserted %d embeddings to collection %s",
@@ -424,11 +445,22 @@ class QdrantService:
                     )
                 )
 
-            await self.client.upsert(
-                collection_name=ENTITIES_COLLECTION,
-                points=point_structs,
-                wait=True,
-            )
+            for attempt in range(1, 4):
+                try:
+                    await self.client.upsert(
+                        collection_name=ENTITIES_COLLECTION,
+                        points=point_structs,
+                        wait=True,
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "Upsert attempt %d/3 failed: %s", attempt, e,
+                        extra={"collection": ENTITIES_COLLECTION},
+                    )
+                    if attempt == 3:
+                        raise
+                    await asyncio.sleep(1.0)
 
             logger.info(
                 "Upserted %d entity embeddings to Qdrant",
@@ -483,9 +515,20 @@ class QdrantService:
                 payload=payload,
             )
 
-            await self.client.upsert(
-                collection_name=self.collection_name, points=[point], wait=True,
-            )
+            for attempt in range(1, 4):
+                try:
+                    await self.client.upsert(
+                        collection_name=self.collection_name, points=[point], wait=True,
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "Upsert attempt %d/3 failed: %s", attempt, e,
+                        extra={"collection": self.collection_name},
+                    )
+                    if attempt == 3:
+                        raise
+                    await asyncio.sleep(1.0)
 
             logger.debug(
                 "Content embedding upserted for post %s to collection %s",
