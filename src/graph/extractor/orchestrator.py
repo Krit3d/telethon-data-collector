@@ -11,6 +11,7 @@ from src.graph.schema import decode_unicode_escapes
 from src.graph.schema import ExtractedEntity
 from src.graph.extractor.client import LLMClient
 from src.graph.extractor.enrich_author import enrich_author_node
+from src.graph.utils import is_garbage_value, sanitize_id
 from src.graph.extractor.enrich_pub import enrich_publication_node
 from src.graph.extractor.extraction_helpers import (
     find_entity,
@@ -19,8 +20,6 @@ from src.graph.extractor.extraction_helpers import (
 )
 
 logger = logging.getLogger(__name__)
-
-_PLACEHOLDER_NAME_PATTERN = re.compile(r"^<[^>]+>$")
 
 
 def merge_properties(target: ExtractedEntity, source: ExtractedEntity) -> None:
@@ -277,9 +276,9 @@ class KnowledgeExtractor:
                 coauthor_name = decode_unicode_escapes(str(coauthor)).strip()
                 if not coauthor_name:
                     continue
-                coauthor_slug = re.sub(
-                    r"[^a-z0-9_]", "_", coauthor_name.lower()
-                )
+                if is_garbage_value(coauthor_name):
+                    continue
+                coauthor_slug = sanitize_id(coauthor_name)
                 coauthor_node_id = f"actor_{platform_slug}_{coauthor_slug}"
                 coauthor_entity = find_or_create_entity(
                     result.entities,
@@ -310,9 +309,9 @@ class KnowledgeExtractor:
                 tagged_name = decode_unicode_escapes(str(tagged_user)).strip()
                 if not tagged_name:
                     continue
-                tagged_slug = re.sub(
-                    r"[^a-z0-9_]", "_", tagged_name.lower()
-                )
+                if is_garbage_value(tagged_name):
+                    continue
+                tagged_slug = sanitize_id(tagged_name)
                 tagged_node_id = f"actor_{platform_slug}_{tagged_slug}"
                 tagged_entity = find_or_create_entity(
                     result.entities,
@@ -357,7 +356,6 @@ class KnowledgeExtractor:
                 target_id=topic_id,
             )
 
-        _PLACEHOLDER_NAMES = frozenset({"", "#", "other", "unknown", "none", "null", "undefined", "n_a", "<name>"})
         pre_filter_count = len(result.entities)
         kept_entities = []
         discarded_ids: set[str] = set()
@@ -365,14 +363,7 @@ class KnowledgeExtractor:
             if entity.id in (author_node_id, pub_node_id):
                 kept_entities.append(entity)
                 continue
-            trimmed_name = entity.name.strip()
-            if len(trimmed_name) < 2:
-                discarded_ids.add(entity.id)
-                continue
-            if trimmed_name.lower() in _PLACEHOLDER_NAMES:
-                discarded_ids.add(entity.id)
-                continue
-            if _PLACEHOLDER_NAME_PATTERN.match(trimmed_name.lower()):
+            if is_garbage_value(entity.name):
                 discarded_ids.add(entity.id)
                 continue
             kept_entities.append(entity)
@@ -449,6 +440,18 @@ class KnowledgeExtractor:
                 len(result.relations) - len(deduped_relations),
             )
         result.relations = deduped_relations
+
+        for relation in result.relations:
+            for prop in relation.properties:
+                if prop.key == "sentiment":
+                    cleaned = str(prop.value).strip().lower()
+                    if cleaned not in {"positive", "negative", "neutral"}:
+                        prop.value = "neutral"
+                    else:
+                        prop.value = cleaned
+                    break
+            if relation.relation_type == "MENTIONS" and not any(p.key == "sentiment" for p in relation.properties):
+                relation.add_property("sentiment", "neutral", "text")
 
         current_ts = int(time.time())
         for entity in result.entities:

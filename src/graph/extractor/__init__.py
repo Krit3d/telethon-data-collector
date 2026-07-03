@@ -9,8 +9,8 @@ from src.graph.extractor.extraction_helpers import (
     find_or_create_entity,
     find_or_create_relation,
     normalize_language,
-    sanitize_id,
 )
+from src.graph.utils import sanitize_id
 
 __all__ = [
     "KnowledgeExtractor",

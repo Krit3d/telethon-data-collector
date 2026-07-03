@@ -11,8 +11,8 @@ from evolution_openai import EvolutionAsyncOpenAI
 from pydantic import ValidationError
 
 from src.config.config import Settings
-from src.graph.extractor.extraction_helpers import sanitize_id
 from src.graph.schema import OpenSPGExtractionResult
+from src.graph.utils import repair_and_load_json, sanitize_id, is_garbage_value
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +20,6 @@ _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0
 _RETRY_MAX_DELAY = 15.0
 _STAGGER_MAX = 5.0
-
-_GARBAGE_EXACT: frozenset[str] = frozenset({
-    "unknown", "null", "none", "undefined", "n_a", "other", "id", "#", "", "topic", "category", "language",
-    "place", "actor", "event", "entity", "location", "loc", "person",
-})
-
-_GARBAGE_SUBSTRINGS: tuple[str, ...] = (
-    "<name>", "name>", "<name",
-)
 
 _CANONICAL_PREFIXES: tuple[str, ...] = (
     "actor_", "place_", "event_", "topic_", "event_publication_",
@@ -40,7 +31,7 @@ _DOMAIN_ENTITY_MAPPING = (
     "TARGET_NODES:\n"
     "  Topic Entity -> relation: ABOUT (source=PUB_NODE_ID, target=Topic)\n"
     "  Person|Brand|Organization|Place -> relation: MENTIONS (source=PUB_NODE_ID, target=Entity)\n"
-    "SENTIMENT RULE: MENTIONS relation MUST include property: {\"key\": \"sentiment\", \"value\": \"positive|negative|neutral\", \"type\": \"text\"}\n"
+    "SENTIMENT: Only 'MENTIONS' has: {\"key\": \"sentiment\", \"value\": \"positive|negative|neutral\", \"type\": \"text\"}. Other relations: no properties.\n"
     "STRICT NODE LABELS: Actor | Place | Entity | Event\n"
     "PROHIBITED VALUES: 'unknown', 'null', 'none', 'undefined', '' (empty string), [null, null] for coordinates\n"
     "NAMES: must be verbatim from SOURCE_TEXT, no paraphrasing"
@@ -49,17 +40,6 @@ _DOMAIN_ENTITY_MAPPING = (
 _SYSTEM_PREFIXES: tuple[str, ...] = (
     "actor_", "place_", "event_", "topic_", "event_publication_",
 )
-
-
-def _is_garbage_value(val: str) -> bool:
-    stripped = val.strip().lower()
-    if len(stripped) < 2:
-        return True
-    if stripped in _GARBAGE_EXACT:
-        return True
-    if any(sub in stripped for sub in _GARBAGE_SUBSTRINGS):
-        return True
-    return False
 
 
 def _sanitize_property(prop: Any) -> dict[str, Any] | None:
@@ -172,7 +152,7 @@ def _sanitize_parsed_payload(parsed: Any, pub_node_id: str | None = None) -> dic
         assert name is not None
         assert entity_id is not None
         name = name.strip()
-        if _is_garbage_value(name) or _is_garbage_value(entity_id):
+        if is_garbage_value(name) or is_garbage_value(entity_id):
             continue
         eid_low = entity_id.lower()
         if any(eid_low.startswith(p) for p in _SYSTEM_PREFIXES):
@@ -261,6 +241,8 @@ def _sanitize_parsed_payload(parsed: Any, pub_node_id: str | None = None) -> dic
         if not isinstance(properties, list):
             properties = []
         properties = [p for p in [_sanitize_property(prop) for prop in properties] if p is not None]
+        if relation_type.upper() == "MENTIONS" and not any(p.get("key") == "sentiment" for p in properties):
+            properties.append({"key": "sentiment", "value": "neutral", "type": "text"})
         final_relations.append({
             "source_id": resolved_source,
             "target_id": resolved_target,
@@ -268,42 +250,6 @@ def _sanitize_parsed_payload(parsed: Any, pub_node_id: str | None = None) -> dic
             "properties": properties,
         })
     return {"entities": final_entities, "relations": final_relations}
-
-
-def _repair_json(text: str) -> dict[str, Any]:
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    in_string = False
-    escaped = False
-    open_braces = 0
-    close_braces = 0
-    open_brackets = 0
-    close_brackets = 0
-    for ch in text:
-        if not escaped and ch == '"':
-            in_string = not in_string
-        if not in_string:
-            if ch == '{':
-                open_braces += 1
-            elif ch == '}':
-                close_braces += 1
-            elif ch == '[':
-                open_brackets += 1
-            elif ch == ']':
-                close_brackets += 1
-        escaped = not escaped and ch == '\\'
-    if open_braces > close_braces or open_brackets > close_brackets:
-        text = text.rstrip()
-        if text.endswith(','):
-            text = text[:-1]
-        text += ']' * (open_brackets - close_brackets)
-        text += '}' * (open_braces - close_braces)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"entities": [], "relations": []}
 
 
 class LLMClient:
@@ -432,7 +378,7 @@ class LLMClient:
                     break
 
                 content = self._sanitize_llm_content(content)
-                parsed = _repair_json(content)
+                parsed = repair_and_load_json(content)
 
                 logger.info(
                     "RAW LLM output for post_id=%d: %d entities, %d relations",

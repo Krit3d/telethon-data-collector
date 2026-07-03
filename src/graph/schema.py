@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import re
-import uuid
-from enum import Enum
 import json
+import re
+from enum import Enum
 from typing import Any
 
 from pydantic import (
@@ -14,7 +13,7 @@ from pydantic import (
     model_validator,
 )
 
-from src.graph.utils import sanitize_key
+from src.graph.utils import is_garbage_value, sanitize_id, sanitize_key
 
 
 def decode_unicode_escapes(val: str) -> str:
@@ -35,7 +34,63 @@ def decode_unicode_escapes(val: str) -> str:
         return val
 
 
-_CORRUPTED_VALUES = frozenset({"un", "unknown", "null", "none", "undefined", ""})
+_ALLOWED_RELATION_TYPES = frozenset({
+    "MENTIONS", "ABOUT", "USES_HASHTAG", "POSTED", "COVERS_TOPIC",
+    "COAUTHOR", "TAGGED_AT", "HAS_CONTACT", "BASED_IN", "LOCATED_IN",
+    "WORKS_AT", "RELATED_TO",
+})
+
+
+def _generate_deterministic_id(label: str, name: str) -> str:
+    sanitized = sanitize_id(name)
+    if not sanitized:
+        sanitized = "unknown"
+    if sanitized[0].isdigit():
+        sanitized = f"ent_{sanitized}"
+    label_prefix = label.lower().strip()
+    if label_prefix not in ("actor", "place", "event", "entity", "topic"):
+        label_prefix = "entity"
+    return f"{label_prefix}_{sanitized}"
+
+
+def _sanitize_label_text(v: Any) -> str:
+    value = str(v).strip()
+    if not value:
+        return "Entity"
+    value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    if not value:
+        return "Entity"
+    if value[0].isdigit():
+        value = f"Label_{value}"
+    value_lower = value.lower()
+    if value_lower in (
+        "actor", "person", "brand", "organization", "company",
+        "author", "ctor", "user", "creator", "shoooter", "shooter",
+    ):
+        return "Actor"
+    if value_lower in (
+        "place", "location", "city", "country", "geo", "region", "address",
+    ):
+        return "Place"
+    if value_lower in (
+        "event", "show", "publication", "incident", "wedding", "post",
+    ):
+        return "Event"
+    if value_lower in ("ntity", "name", "entity_name"):
+        return "Entity"
+    return "Entity"
+
+
+def _sanitize_id_text(v: Any) -> str:
+    value = sanitize_id(str(v))
+    if not value:
+        return "entity_unknown"
+    if value[0].isdigit():
+        value = f"ent_{value}"
+    return value
+
+
 
 
 class PropertyType(str, Enum):
@@ -48,13 +103,9 @@ class PropertyType(str, Enum):
 
 
 class Property(BaseModel):
-    key: str = Field(..., description="Property name/key")
-    value: Any | None = Field(
-        default=None, description="Property value (validated based on type)"
-    )
-    type: PropertyType = Field(
-        ..., description="Property type category from PropertyType enum"
-    )
+    key: str
+    value: Any | None = None
+    type: PropertyType
 
     model_config = ConfigDict(extra="ignore")
 
@@ -94,7 +145,7 @@ class Property(BaseModel):
                 return data
 
             if prop_type == PropertyType.TEXT and isinstance(value, str):
-                if value.strip().lower() in _CORRUPTED_VALUES:
+                if is_garbage_value(value):
                     data["value"] = None
                     return data
 
@@ -142,106 +193,81 @@ class Property(BaseModel):
                 isinstance(value, str) and len(value) == 2 and value.isalpha()
             ):
                 self.value = None
-                return self
+            return self
 
         if prop_type == PropertyType.NUMERIC:
             if not isinstance(value, (int, float)):
-                raise ValueError(
-                    f"Property '{self.key}' with type NUMERIC must have an int or float value, got {type(value).__name__}"
-                )
+                self.value = str(value)
+                self.type = PropertyType.TEXT
+            return self
 
-        elif prop_type == PropertyType.GEO:
+        if prop_type == PropertyType.GEO:
             if not (
                 isinstance(value, list)
                 and len(value) == 2
-                and all(isinstance(coord, (int, float)) for coord in value)
+                and all(isinstance(c, (int, float)) for c in value)
             ):
-                raise ValueError(
-                    f"Property '{self.key}' with type GEO must be a list of two floats, got {value!r}"
-                )
+                self.value = None
+            return self
 
-        elif prop_type == PropertyType.TEXT:
-            if not isinstance(value, str):
-                raise ValueError(
-                    f"Property '{self.key}' with type TEXT must be a string, got {type(value).__name__}"
-                )
-
-        elif prop_type == PropertyType.LOCATION:
-            if not isinstance(value, str):
-                raise ValueError(
-                    f"Property '{self.key}' with type LOCATION must be a string, got {type(value).__name__}"
-                )
-
-        elif prop_type == PropertyType.CATEGORY:
+        if prop_type == PropertyType.TEXT:
             if not isinstance(value, str):
                 self.value = str(value)
+            if isinstance(self.value, str) and is_garbage_value(self.value):
+                self.value = None
+            return self
+
+        if prop_type == PropertyType.LOCATION:
+            if not isinstance(value, str):
+                self.value = str(value)
+            return self
+
+        if prop_type == PropertyType.CATEGORY:
+            if not isinstance(value, str):
+                self.value = str(value)
+            return self
 
         return self
 
 
 class ExtractedEntity(BaseModel):
-    id: str = Field(
-        ...,
-        description="Unique standardized identifier (e.g., 'person_pavel_durov')",
-    )
-    label: str = Field(
-        ...,
-        description="Entity type (e.g., 'Person', 'Organization', 'Location')",
-    )
-    name: str = Field(..., description="Display name for the entity")
-    properties: list[Property] = Field(
-        default_factory=list,
-        description="List of typed properties (age, coordinates, language, etc.)",
-    )
+    id: str
+    label: str
+    name: str
+    properties: list[Property] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore")
 
     @field_validator("id", mode="before")
     @classmethod
     def sanitize_id(cls, v: Any) -> str:
-        value = str(v).strip()
-        value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
-        value = re.sub(r"_+", "_", value).strip("_")
-        if not value:
-            value = f"entity_{uuid.uuid4().hex[:8]}"
-        if value[0].isdigit():
-            value = f"ent_{value}"
-        if len(value) < 5:
-            value = f"{value}_{uuid.uuid4().hex[:6]}"
-        return value
+        return _sanitize_id_text(v)
 
     @field_validator("label", mode="before")
     @classmethod
     def sanitize_label(cls, v: Any) -> str:
-        value = str(v).strip()
-        if not value:
-            return "Entity"
-        value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
-        value = re.sub(r"_+", "_", value).strip("_")
-        if not value:
-            return "Entity"
-        if value[0].isdigit():
-            value = f"Label_{value}"
-        else:
-            value = value[0].upper() + value[1:]
-        if value in ("Actor", "Person", "Brand", "Organization", "Company", "Author"):
-            return "Actor"
-        if value in ("Place", "Location", "City", "Country", "Geo"):
-            return "Place"
-        if value in ("Event", "Show", "Publication", "Incident"):
-            return "Event"
-        return "Entity"
+        return _sanitize_label_text(v)
 
     @model_validator(mode="before")
     @classmethod
     def sanitize_entity_name(cls, data: dict[str, Any]) -> dict[str, Any]:
-        if isinstance(data, dict) and "name" in data and isinstance(data["name"], str):
-            name = data["name"]
-            name = name.lstrip("#").strip()
-            name = decode_unicode_escapes(name)
-            name = re.sub(r"\[.*?\]", "", name)
-            name = re.sub(r"\s+", " ", name).strip()
-            data["name"] = name
+        if isinstance(data, dict):
+            if "name" in data and isinstance(data["name"], str):
+                name = data["name"]
+                name = name.lstrip("#").strip()
+                name = decode_unicode_escapes(name)
+                name = re.sub(r"\[.*?\]", "", name)
+                name = re.sub(r"\s+", " ", name).strip()
+                if is_garbage_value(name):
+                    name = "Unnamed Entity"
+                data["name"] = name
+            if "id" in data and isinstance(data["id"], str):
+                if is_garbage_value(data["id"]):
+                    label_raw = str(data.get("label", "Entity"))
+                    name_raw = data.get("name", "")
+                    if is_garbage_value(name_raw) or name_raw == "Unnamed Entity":
+                        name_raw = "unknown"
+                    data["id"] = _generate_deterministic_id(label_raw, name_raw)
         return data
 
     @model_validator(mode="after")
@@ -256,49 +282,48 @@ class ExtractedEntity(BaseModel):
             self.id = f"topic_{self.id}"
         return self
 
+    @model_validator(mode="after")
+    def filter_properties(self) -> ExtractedEntity:
+        self.properties = [
+            p for p in self.properties
+            if p.value is not None
+            and not (isinstance(p.value, str) and is_garbage_value(p.value))
+        ]
+        return self
+
     def get_property_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for prop in self.properties:
             if prop.value is None:
                 continue
-            if str(prop.value).strip().lower() in _CORRUPTED_VALUES:
+            if isinstance(prop.value, str) and is_garbage_value(prop.value):
                 continue
             result[prop.key] = prop.value
         return result
 
-    def add_property(
-        self, key: str, value: Any, type: str | PropertyType
-    ) -> None:
-        if isinstance(type, str):
-            type = PropertyType(type)
-        self.properties.append(Property(key=key, value=value, type=type))
+    def add_property(self, key: str, value: Any, type: str | PropertyType) -> None:
+        if isinstance(type, PropertyType):
+            resolved_type = type
+        else:
+            try:
+                resolved_type = PropertyType(type)
+            except ValueError:
+                resolved_type = PropertyType.TEXT
+        self.properties.append(Property(key=key, value=value, type=resolved_type))
 
 
 class ExtractedRelation(BaseModel):
-    source_id: str = Field(..., description="ID of the source entity")
-    relation_type: str = Field(
-        ...,
-        description="Strict relationship type (e.g., 'LOCATED_IN', 'WORKS_AT', 'DISCUSSES')",
-    )
-    target_id: str = Field(..., description="ID of the target entity")
-    properties: list[Property] = Field(
-        default_factory=list,
-        description="Optional list of typed relation properties",
-    )
+    source_id: str
+    relation_type: str
+    target_id: str
+    properties: list[Property] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore")
 
     @field_validator("source_id", "target_id", mode="before")
     @classmethod
     def sanitize_relation_id(cls, v: Any) -> str:
-        value = str(v).strip()
-        value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
-        value = re.sub(r"_+", "_", value).strip("_")
-        if not value:
-            value = f"entity_{uuid.uuid4().hex[:8]}"
-        if value[0].isdigit():
-            value = f"ent_{value}"
-        return value
+        return _sanitize_id_text(v)
 
     @field_validator("relation_type", mode="before")
     @classmethod
@@ -307,38 +332,70 @@ class ExtractedRelation(BaseModel):
         value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
         value = re.sub(r"_+", "_", value).strip("_")
         if not value:
-            value = "RELATED_TO"
+            return "RELATED_TO"
         if value[0].isdigit():
             value = f"REL_{value}"
-        return value.upper()
+        value = value.upper()
+        if value not in _ALLOWED_RELATION_TYPES:
+            return "RELATED_TO"
+        return value
+
+    @model_validator(mode="after")
+    def filter_properties(self) -> ExtractedRelation:
+        self.properties = [
+            p for p in self.properties
+            if p.value is not None
+            and not (isinstance(p.value, str) and is_garbage_value(p.value))
+        ]
+        return self
 
     def get_property_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for prop in self.properties:
             if prop.value is None:
                 continue
-            if str(prop.value).strip().lower() in _CORRUPTED_VALUES:
+            if isinstance(prop.value, str) and is_garbage_value(prop.value):
                 continue
             result[prop.key] = prop.value
         return result
 
-    def add_property(
-        self, key: str, value: Any, type: str | PropertyType
-    ) -> None:
-        if isinstance(type, str):
-            type = PropertyType(type)
-        self.properties.append(Property(key=key, value=value, type=type))
+    def add_property(self, key: str, value: Any, type: str | PropertyType) -> None:
+        if isinstance(type, PropertyType):
+            resolved_type = type
+        else:
+            try:
+                resolved_type = PropertyType(type)
+            except ValueError:
+                resolved_type = PropertyType.TEXT
+        self.properties.append(Property(key=key, value=value, type=resolved_type))
 
 
 class OpenSPGExtractionResult(BaseModel):
-    entities: list[ExtractedEntity] = Field(
-        default_factory=list, description="List of extracted entity nodes"
-    )
-    relations: list[ExtractedRelation] = Field(
-        default_factory=list, description="List of extracted relation edges"
-    )
+    entities: list[ExtractedEntity] = Field(default_factory=list)
+    relations: list[ExtractedRelation] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="after")
+    def filter_bad_entities_and_relations(self) -> OpenSPGExtractionResult:
+        valid_ids: set[str] = set()
+        filtered_entities: list[ExtractedEntity] = []
+        for entity in self.entities:
+            if is_garbage_value(entity.name) or entity.name == "Unnamed Entity":
+                continue
+            if not entity.id:
+                continue
+            filtered_entities.append(entity)
+            valid_ids.add(entity.id)
+        self.entities = filtered_entities
+
+        filtered_relations: list[ExtractedRelation] = []
+        for relation in self.relations:
+            if relation.source_id == relation.target_id:
+                continue
+            filtered_relations.append(relation)
+        self.relations = filtered_relations
+        return self
 
 
 class SPGNode(BaseModel):
@@ -372,6 +429,38 @@ class LLMNode(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    @field_validator("id", mode="before")
+    @classmethod
+    def sanitize_llm_node_id(cls, v: Any) -> str:
+        return _sanitize_id_text(v)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def sanitize_llm_node_label(cls, v: Any) -> str:
+        return _sanitize_label_text(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_llm_node_name(cls, data: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(data, dict):
+            if "name" in data and isinstance(data["name"], str):
+                name = data["name"]
+                name = name.lstrip("#").strip()
+                name = decode_unicode_escapes(name)
+                name = re.sub(r"\[.*?\]", "", name)
+                name = re.sub(r"\s+", " ", name).strip()
+                if is_garbage_value(name):
+                    name = "Unnamed Entity"
+                data["name"] = name
+            if "id" in data and isinstance(data["id"], str):
+                if is_garbage_value(data["id"]):
+                    label_raw = str(data.get("label", "Entity"))
+                    name_raw = data.get("name", "")
+                    if is_garbage_value(name_raw) or name_raw == "Unnamed Entity":
+                        name_raw = "unknown"
+                    data["id"] = _generate_deterministic_id(label_raw, name_raw)
+        return data
+
 
 class LLMEdge(BaseModel):
     source_id: str
@@ -380,6 +469,26 @@ class LLMEdge(BaseModel):
     properties: dict[str, Any] = {}
 
     model_config = ConfigDict(extra="allow")
+
+    @field_validator("source_id", "target_id", mode="before")
+    @classmethod
+    def sanitize_llm_edge_id(cls, v: Any) -> str:
+        return _sanitize_id_text(v)
+
+    @field_validator("relation_type", mode="before")
+    @classmethod
+    def sanitize_llm_edge_relation_type(cls, v: Any) -> str:
+        value = str(v).strip()
+        value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
+        value = re.sub(r"_+", "_", value).strip("_")
+        if not value:
+            return "RELATED_TO"
+        if value[0].isdigit():
+            value = f"REL_{value}"
+        value = value.upper()
+        if value not in _ALLOWED_RELATION_TYPES:
+            return "RELATED_TO"
+        return value
 
 
 class LLMExtractionResult(BaseModel):
@@ -391,7 +500,7 @@ class LLMExtractionResult(BaseModel):
 
 def entity_to_spg_node(entity: ExtractedEntity) -> SPGNode:
     prop_dict = entity.get_property_dict()
-    spg_properties = {
+    spg_properties: dict[str, Any] = {
         "id": entity.id,
         "name": entity.name,
         **prop_dict,
@@ -441,7 +550,7 @@ def get_open_spg_llm_prompt(
         f"1. Create Actor node for {actor_id} (properties: platform={platform_val}, platform_id={author_id if author_id is not None else 'N/A'}).",
         f"2. Extract at most 3-4 key semantic concept entities per post (excluding the author Actor node) — Topics, Events, Places, Organizations, or Brands relevant to the content. Map each to the appropriate label. Do NOT extract individual hashtags as separate topic nodes.",
         "3. If the post contains a large block of hashtags, consolidate them into 2-3 high-level concept entities (e.g., group #portraitmood, #portrait_shots, #make_portraits into a single Entity node named 'Portrait Photography').",
-        "4. For every relation, include a property: {\"key\": \"sentiment\", \"value\": \"positive|negative|neutral\", \"type\": \"text\"}.",
+        "4. Strictly and only for 'MENTIONS' relations, include a sentiment property: {\"key\": \"sentiment\", \"value\": \"positive|negative|neutral\", \"type\": \"text\"}. Do NOT generate any properties (including sentiment) for other relation types.",
         "5. Strictly ignore minor credit lists (makeup, photographers, assistants, production crew). These waste tokens and cause JSON truncation.",
         "",
         "The first character of your response must be the opening brace '{' of a raw JSON object.",
