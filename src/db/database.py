@@ -43,13 +43,14 @@ def with_retry_on_deadlock(
 
                     is_deadlock = "40p01" in error_msg or "deadlock detected" in error_msg
                     is_serialization = "40001" in error_msg or "serialization failure" in error_msg
+                    is_lock_timeout = "55p03" in error_msg or "lock timeout" in error_msg or "locknotavailable" in error_msg
 
-                    if not (is_deadlock or is_serialization):
+                    if not (is_deadlock or is_serialization or is_lock_timeout):
                         raise
 
                     if attempt == max_retries:
                         logger.error(
-                            "Failed after %d retries on deadlock/serialization failure: %s",
+                            "Failed after %d retries on deadlock/serialization/lock timeout failure: %s",
                             max_retries,
                             e,
                         )
@@ -110,6 +111,23 @@ class Database:
                 f"Invalid graph name: '{graph_name}'. "
                 "Must be a valid SQL identifier matching ^[a-zA-Z_][a-zA-Z0-9_]*$"
             )
+
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = 'content'"
+                    ") AND EXISTS ("
+                    "SELECT 1 FROM ag_catalog.ag_graph WHERE name = :graph_name"
+                    ")"
+                ),
+                {"graph_name": graph_name},
+            )
+            already_initialized = result.scalar()
+            if already_initialized:
+                logger.info("Database already initialized, skipping setup")
+                return
 
         last_exception: Exception | None = None
         start_time = asyncio.get_event_loop().time()

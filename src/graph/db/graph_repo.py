@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from typing import Any
@@ -9,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from src.config.config import Settings
+from src.db.database import with_retry_on_deadlock
 from src.graph.db.helpers import ID_PREFIX_TO_LABEL, parse_agtype, connection_retry
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,10 @@ class GraphRepository:
         "loc", "location", "place", "actor", "event", "entity", "topic",
         "unknown", "null", "none", "undefined", "n_a", "other", "id"
     })
+
+    _verified_entities: set[str] = set()
+    _cache_warmed: bool = False
+    _cache_lock: asyncio.Lock | None = None
 
     def __init__(
         self,
@@ -51,6 +57,25 @@ class GraphRepository:
             async with new_session.begin():
                 return await new_session.execute(query, params)
 
+    async def warm_up_cache(self) -> None:
+        graph_name = self._resolve_graph_name()
+        try:
+            query = text(
+                f"SELECT * FROM ag_catalog.cypher('{graph_name}', $$ MATCH (n) RETURN n.id $$) AS (id agtype)"
+            )
+            result = await self._execute_in_transaction(query)
+            for row in result:
+                raw_id = parse_agtype(row[0])
+                if raw_id is not None:
+                    GraphRepository._verified_entities.add(str(raw_id))
+            GraphRepository._cache_warmed = True
+            logger.info(
+                "L1 cache warmed with %d pre-existing entities",
+                len(GraphRepository._verified_entities),
+            )
+        except Exception:
+            logger.warning("L1 cache warming failed", exc_info=True)
+
     async def initialize_graph(self) -> None:
         graph_name = self._resolve_graph_name()
         check_query = text(
@@ -67,6 +92,7 @@ class GraphRepository:
             logger.info("Created AGE graph '%s'", graph_name)
         else:
             logger.debug("AGE graph '%s' already exists", graph_name)
+        await self.warm_up_cache()
 
     async def _check_graph_has_edges(self) -> bool:
         graph_name = self._resolve_graph_name()
@@ -263,6 +289,7 @@ class GraphRepository:
             create_query, {"params": params}, session=session
         )
 
+    @with_retry_on_deadlock(max_retries=5, base_delay=0.2)
     async def upsert_graph_node(
         self, label: str, properties: dict, merge_key: str = "id",
         session: AsyncSession | None = None,
@@ -316,6 +343,7 @@ class GraphRepository:
                 )
                 await new_session.execute(query, {"params": params})
 
+    @with_retry_on_deadlock(max_retries=5, base_delay=0.2)
     async def upsert_graph_edge(
         self,
         start_label: str,
@@ -682,6 +710,11 @@ class GraphRepository:
     async def save_extraction_result(
         self, post_id: int, result: Any
     ) -> None:
+        if GraphRepository._cache_lock is None:
+            GraphRepository._cache_lock = asyncio.Lock()
+        async with GraphRepository._cache_lock:
+            if not GraphRepository._cache_warmed:
+                await self.warm_up_cache()
         filtered_entities = []
         discarded_ids = set()
         for entity in result.entities:
@@ -706,64 +739,61 @@ class GraphRepository:
                 and r.target_id not in discarded_ids
             ]
 
-        entity_id_to_label: dict[str, str] = {}
-        for entity in result.entities:
-            entity_id_to_label[entity.id] = entity.label
-            try:
-                props: dict[str, Any] = {
-                    "id": entity.id,
-                    "name": entity.name,
-                    **entity.get_property_dict(),
-                }
-                await self.upsert_graph_node(
-                    label=entity.label,
-                    properties=props,
-                    merge_key="id",
-                )
-                logger.debug(
-                    "Upserted entity: label=%s, id=%s",
-                    entity.label,
-                    entity.id,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Failed to upsert entity (post_id=%d, label=%s, id=%s): %s",
-                    post_id,
-                    entity.label,
-                    entity.id,
-                    exc,
-                )
-                raise
+        entities_to_upsert = [
+            e for e in result.entities
+            if e.id not in GraphRepository._verified_entities
+        ]
 
+        unverified_ids: set[str] = set()
+        for entity in entities_to_upsert:
+            unverified_ids.add(entity.id)
         for relation in result.relations:
-            start_label = entity_id_to_label.get(relation.source_id, "Entity")
-            end_label = entity_id_to_label.get(relation.target_id, "Entity")
-            try:
-                await self.upsert_graph_edge(
-                    start_label=start_label,
-                    start_merge_key="id",
-                    start_merge_val=relation.source_id,
-                    edge_label=relation.relation_type,
-                    end_label=end_label,
-                    end_merge_key="id",
-                    end_merge_val=relation.target_id,
-                    edge_properties=relation.get_property_dict(),
-                )
-                logger.debug(
-                    "Upserted relation: %s(%s)-[%s]->%s(%s)",
-                    start_label,
-                    relation.source_id,
-                    relation.relation_type,
-                    end_label,
-                    relation.target_id,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Failed relation upsert (post_id=%d, type=%s): %s",
-                    post_id,
-                    relation.relation_type,
-                    exc,
-                )
+            if relation.source_id not in GraphRepository._verified_entities:
+                unverified_ids.add(relation.source_id)
+            if relation.target_id not in GraphRepository._verified_entities:
+                unverified_ids.add(relation.target_id)
+
+        sorted_unverified_ids = sorted(unverified_ids)
+        entity_id_to_label: dict[str, str] = {}
+
+        async with self.async_session() as session:
+            async with session.begin():
+                if sorted_unverified_ids:
+                    await session.execute(
+                        text("SELECT pg_catalog.pg_advisory_xact_lock(hashtext(val)::bigint) FROM unnest(CAST(:vals AS text[])) AS val"),
+                        {"vals": sorted_unverified_ids}
+                    )
+
+                for entity in entities_to_upsert:
+                    entity_id_to_label[entity.id] = entity.label
+                    props: dict[str, Any] = {
+                        "id": entity.id,
+                        "name": entity.name,
+                        **entity.get_property_dict(),
+                    }
+                    await self.upsert_graph_node(
+                        label=entity.label,
+                        properties=props,
+                        merge_key="id",
+                        session=session,
+                    )
+
+                for relation in result.relations:
+                    start_label = entity_id_to_label.get(relation.source_id, "Entity")
+                    end_label = entity_id_to_label.get(relation.target_id, "Entity")
+                    await self.upsert_graph_edge(
+                        start_label=start_label,
+                        start_merge_key="id",
+                        start_merge_val=relation.source_id,
+                        edge_label=relation.relation_type,
+                        end_label=end_label,
+                        end_merge_key="id",
+                        end_merge_val=relation.target_id,
+                        edge_properties=relation.get_property_dict(),
+                        session=session,
+                    )
+
+        GraphRepository._verified_entities.update(sorted_unverified_ids)
 
     async def execute_cypher(self, query: str) -> Any:
         result = await self._execute_in_transaction(text(query))

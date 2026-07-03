@@ -1,8 +1,9 @@
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, cast
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -175,12 +176,13 @@ class ExtractorRepository:
                 posts = list(result.scalars().all())
                 if not posts:
                     return []
-                for post in posts:
-                    if post.raw_metadata is None:
-                        post.raw_metadata = {}
-                    post.raw_metadata["graph_status"] = "processing"
-                    post.raw_metadata["claimed_at"] = datetime.now(timezone.utc).isoformat()
-                    flag_modified(post, "raw_metadata")
+                ids = [post.id for post in posts]
+                now_str = datetime.now(timezone.utc).isoformat()
+                update_json = json.dumps({"graph_status": "processing", "claimed_at": now_str})
+                await session.execute(
+                    text(f"UPDATE {Content.__tablename__} SET raw_metadata = COALESCE(raw_metadata, '{{}}'::jsonb) || CAST(:update_json AS jsonb) WHERE id = ANY(:ids)"),
+                    {"update_json": update_json, "ids": ids},
+                )
                 return posts
 
     @with_retry_on_deadlock()

@@ -6,10 +6,11 @@ import httpx
 import logging
 import struct
 import asyncio
+import random
 import uuid
 from typing import Any, Final
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
 
@@ -223,19 +224,33 @@ class QdrantService:
 
         valid_texts = [texts[i] for i in valid_indices]
 
-        try:
-            raw_response = await self.openai_client.embeddings.with_raw_response.create(
-                model=self.settings.cloud_ru_embedding_model,
-                input=valid_texts,
-            )
-            payload = raw_response.http_response.json()
-        except Exception as e:
-            logger.error(
-                "Cloud.ru embedding API call failed",
-                exc_info=e,
-                extra={"text_count": len(valid_texts)},
-            )
-            raise RuntimeError(f"Cloud embedding generation failed: {e}") from e
+        max_retries = 6
+        base_delay = 1.0
+        max_delay = 10.0
+        for attempt in range(1, max_retries + 1):
+            try:
+                raw_response = await self.openai_client.embeddings.with_raw_response.create(
+                    model=self.settings.cloud_ru_embedding_model,
+                    input=valid_texts,
+                )
+                payload = raw_response.http_response.json()
+                break
+            except RateLimitError:
+                if attempt == max_retries:
+                    logger.error(
+                        "Cloud.ru embedding API rate limits exceeded after %d attempts",
+                        attempt,
+                    )
+                    raise RuntimeError("Cloud.ru embedding API rate limits were exceeded")
+                sleep_duration = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                sleep_duration *= random.uniform(0.5, 1.5)
+                logger.warning(
+                    "Rate limited on attempt %d/%d, sleeping for %.2fs",
+                    attempt,
+                    max_retries,
+                    sleep_duration,
+                )
+                await asyncio.sleep(sleep_duration)
 
         dense_map: dict[int, list[float]] = {}
         sparse_map: dict[int, models.SparseVector] = {}

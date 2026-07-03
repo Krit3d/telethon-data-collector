@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0
 _RETRY_MAX_DELAY = 15.0
-_STAGGER_MAX = 5.0
 
 _CANONICAL_PREFIXES: tuple[str, ...] = (
     "actor_", "place_", "event_", "topic_", "event_publication_",
@@ -313,15 +312,11 @@ class LLMClient:
         pub_node_id: str,
         metadata: dict[str, Any] | None = None,
         platform: str | None = None,
-        stagger: bool = True,
     ) -> OpenSPGExtractionResult:
         if not self.settings.ml_inference_key_id or not self.settings.ml_inference_secret:
             raise RuntimeError("ML Inference credentials (key_id and secret) are not configured")
         if not self.settings.ml_inference_model:
             raise RuntimeError("ML Inference model is not configured")
-
-        if stagger:
-            await asyncio.sleep(random.random() * _STAGGER_MAX)
 
         prompt = self._build_prompt(text, pub_node_id, author_id, platform, metadata)
 
