@@ -551,7 +551,10 @@ async def run_graph_extractor() -> None:
 
     logger.info("Starting knowledge graph extraction worker")
 
-    db = Database(settings.db_url)
+    concurrency = settings.graph_concurrency
+    pool_size = max(concurrency // 2, 5)
+    max_overflow = max(concurrency // 5, 2)
+    db = Database(settings.db_url, pool_size=pool_size, max_overflow=max_overflow)
     await db.init_db(graph_name=settings.graph_name)
 
     qdrant = None

@@ -77,12 +77,12 @@ def with_retry_on_deadlock(
 
 
 class Database:
-    def __init__(self, db_url: str, echo: bool = False) -> None:
+    def __init__(self, db_url: str, echo: bool = False, pool_size: int = 20, max_overflow: int = 10) -> None:
         self.engine = create_async_engine(
             db_url,
             echo=echo,
-            pool_size=20,
-            max_overflow=10,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
             pool_timeout=15.0,
             pool_pre_ping=True,
             pool_recycle=3600,
@@ -118,60 +118,65 @@ class Database:
 
         for attempt in range(1, max_retries + 1):
             try:
-                async with self.engine.begin() as conn:
-                    await conn.run_sync(Base.metadata.create_all)
-                    await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
-                    await conn.execute(text("LOAD 'age';"))
-                    await conn.execute(
-                        text('SET search_path = ag_catalog, "$user", public;')
-                    )
-                    await conn.execute(
-                        text(
-                            f"SELECT create_graph('{graph_name}') WHERE NOT EXISTS "
-                            f"(SELECT 1 FROM ag_graph WHERE name = '{graph_name}');"
-                        )
-                    )
+                async with self.engine.connect() as lock_conn:
+                    await lock_conn.execute(text("SELECT pg_advisory_lock(8675309)"))
+                    try:
+                        async with self.engine.begin() as conn:
+                            await conn.run_sync(Base.metadata.create_all)
+                            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS age;"))
+                            await conn.execute(text("LOAD 'age';"))
+                            await conn.execute(
+                                text('SET search_path = ag_catalog, "$user", public;')
+                            )
+                            await conn.execute(
+                                text(
+                                    f"SELECT create_graph('{graph_name}') WHERE NOT EXISTS "
+                                    f"(SELECT 1 FROM ag_graph WHERE name = '{graph_name}');"
+                                )
+                            )
 
-                    for label in vertex_labels:
-                        try:
-                            await conn.execute(text(f"""
-                                DO $$
-                                BEGIN
-                                    IF NOT EXISTS (
-                                        SELECT 1 FROM information_schema.tables
-                                        WHERE table_schema = '{graph_name}'
-                                        AND table_name = '{label}'
-                                    ) THEN
-                                        PERFORM create_vlabel('{graph_name}', '{label}');
-                                    END IF;
-                                END
-                                $$;
-                            """))
-                        except Exception as e:
-                            logger.warning("Failed to create vertex label %s: %s", label, e)
+                            for label in vertex_labels:
+                                try:
+                                    await conn.execute(text(f"""
+                                        DO $$
+                                        BEGIN
+                                            IF NOT EXISTS (
+                                                SELECT 1 FROM information_schema.tables
+                                                WHERE table_schema = '{graph_name}'
+                                                AND table_name = '{label}'
+                                            ) THEN
+                                                PERFORM create_vlabel('{graph_name}', '{label}');
+                                            END IF;
+                                        END
+                                        $$;
+                                    """))
+                                except Exception as e:
+                                    logger.warning("Failed to create vertex label %s: %s", label, e)
 
-                async with self.engine.connect() as conn:
-                    for label in vertex_labels:
-                        try:
-                            await conn.execute(text(f"""
-                                CREATE INDEX IF NOT EXISTS idx_{label.lower()}_id
-                                ON {graph_name}."{label}"
-                                USING btree (agtype_access_operator(properties, '"id"'));
-                            """))
-                        except Exception as e:
-                            logger.debug("Skipped index creation for %s: %s", label, e)
-                    await conn.commit()
+                        async with self.engine.connect() as conn:
+                            for label in vertex_labels:
+                                try:
+                                    await conn.execute(text(f"""
+                                        CREATE INDEX IF NOT EXISTS idx_{label.lower()}_id
+                                        ON {graph_name}."{label}"
+                                        USING btree (agtype_access_operator(properties, '"id"'));
+                                    """))
+                                except Exception as e:
+                                    logger.debug("Skipped index creation for %s: %s", label, e)
+                            await conn.commit()
 
-                # async with self.engine.connect() as conn:
-                #     conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
-                #     try:
-                #         await conn.execute(text("VACUUM ANALYZE;"))
-                #         logger.info("VACUUM ANALYZE completed")
-                #     except Exception as e:
-                #         logger.warning("VACUUM ANALYZE failed (non-critical): %s", e)
+                        # async with self.engine.connect() as conn:
+                        #     conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+                        #     try:
+                        #         await conn.execute(text("VACUUM ANALYZE;"))
+                        #         logger.info("VACUUM ANALYZE completed")
+                        #     except Exception as e:
+                        #         logger.warning("VACUUM ANALYZE failed (non-critical): %s", e)
 
-                logger.info("Database initialization successful")
-                return
+                        logger.info("Database initialization successful")
+                        return
+                    finally:
+                        await lock_conn.execute(text("SELECT pg_advisory_unlock(8675309)"))
 
             except Exception as e:
                 last_exception = e

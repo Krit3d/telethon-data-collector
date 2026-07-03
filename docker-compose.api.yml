@@ -95,7 +95,7 @@ services:
       context: .
       dockerfile: docker/api/Dockerfile
       target: cpu-runner
-    container_name: graph_worker
+    # container_name: graph_worker
     restart: always
     env_file:
       - .env
