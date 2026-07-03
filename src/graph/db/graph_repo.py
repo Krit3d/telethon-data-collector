@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from src.config.config import Settings
-from src.graph.db.helpers import ID_PREFIX_TO_LABEL, acquire_advisory_locks, parse_agtype, connection_retry
+from src.graph.db.helpers import ID_PREFIX_TO_LABEL, parse_agtype, connection_retry
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +305,16 @@ class GraphRepository:
         }
         params = json.dumps(params_dict)
 
-        await self._execute_in_transaction(query, {"params": params}, session=session)
+        if session is not None:
+            await self._execute_in_transaction(query, {"params": params}, session=session)
+            return
+        async with self.async_session() as new_session:
+            async with new_session.begin():
+                await new_session.execute(
+                    text("SELECT pg_catalog.pg_advisory_xact_lock(hashtext(:val)::bigint)"),
+                    {"val": props.get(merge_key)}
+                )
+                await new_session.execute(query, {"params": params})
 
     async def upsert_graph_edge(
         self,
@@ -366,7 +375,18 @@ class GraphRepository:
         }
         params = json.dumps(params_dict)
 
-        await self._execute_in_transaction(query, {"params": params}, session=session)
+        if session is not None:
+            await self._execute_in_transaction(query, {"params": params}, session=session)
+            return
+        sorted_vals = sorted([str(start_merge_val), str(end_merge_val)])
+        async with self.async_session() as new_session:
+            async with new_session.begin():
+                for val in sorted_vals:
+                    await new_session.execute(
+                        text("SELECT pg_catalog.pg_advisory_xact_lock(hashtext(:val)::bigint)"),
+                        {"val": val}
+                    )
+                await new_session.execute(query, {"params": params})
 
     async def _query_nodes_by_label(
         self, label: str, node_ids: list[str]
@@ -686,77 +706,64 @@ class GraphRepository:
                 and r.target_id not in discarded_ids
             ]
 
-        async with self.async_session() as session:
-            async with session.begin():
-                entity_ids: set[str] = set()
-                for entity in result.entities:
-                    entity_ids.add(entity.id)
-                for relation in result.relations:
-                    entity_ids.add(relation.source_id)
-                    entity_ids.add(relation.target_id)
+        entity_id_to_label: dict[str, str] = {}
+        for entity in result.entities:
+            entity_id_to_label[entity.id] = entity.label
+            try:
+                props: dict[str, Any] = {
+                    "id": entity.id,
+                    "name": entity.name,
+                    **entity.get_property_dict(),
+                }
+                await self.upsert_graph_node(
+                    label=entity.label,
+                    properties=props,
+                    merge_key="id",
+                )
+                logger.debug(
+                    "Upserted entity: label=%s, id=%s",
+                    entity.label,
+                    entity.id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to upsert entity (post_id=%d, label=%s, id=%s): %s",
+                    post_id,
+                    entity.label,
+                    entity.id,
+                    exc,
+                )
+                raise
 
-                await acquire_advisory_locks(session, entity_ids)
-
-                entity_id_to_label: dict[str, str] = {}
-                for entity in result.entities:
-                    entity_id_to_label[entity.id] = entity.label
-                    try:
-                        props: dict[str, Any] = {
-                            "id": entity.id,
-                            "name": entity.name,
-                            **entity.get_property_dict(),
-                        }
-                        await self.upsert_graph_node(
-                            label=entity.label,
-                            properties=props,
-                            merge_key="id",
-                            session=session,
-                        )
-                        logger.debug(
-                            "Upserted entity: label=%s, id=%s",
-                            entity.label,
-                            entity.id,
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "Failed to upsert entity (post_id=%d, label=%s, id=%s): %s",
-                            post_id,
-                            entity.label,
-                            entity.id,
-                            exc,
-                        )
-                        raise
-
-                for relation in result.relations:
-                    start_label = entity_id_to_label.get(relation.source_id, "Entity")
-                    end_label = entity_id_to_label.get(relation.target_id, "Entity")
-                    try:
-                        await self.upsert_graph_edge(
-                            start_label=start_label,
-                            start_merge_key="id",
-                            start_merge_val=relation.source_id,
-                            edge_label=relation.relation_type,
-                            end_label=end_label,
-                            end_merge_key="id",
-                            end_merge_val=relation.target_id,
-                            edge_properties=relation.get_property_dict(),
-                            session=session,
-                        )
-                        logger.debug(
-                            "Upserted relation: %s(%s)-[%s]->%s(%s)",
-                            start_label,
-                            relation.source_id,
-                            relation.relation_type,
-                            end_label,
-                            relation.target_id,
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "Failed relation upsert (post_id=%d, type=%s): %s",
-                            post_id,
-                            relation.relation_type,
-                            exc,
-                        )
+        for relation in result.relations:
+            start_label = entity_id_to_label.get(relation.source_id, "Entity")
+            end_label = entity_id_to_label.get(relation.target_id, "Entity")
+            try:
+                await self.upsert_graph_edge(
+                    start_label=start_label,
+                    start_merge_key="id",
+                    start_merge_val=relation.source_id,
+                    edge_label=relation.relation_type,
+                    end_label=end_label,
+                    end_merge_key="id",
+                    end_merge_val=relation.target_id,
+                    edge_properties=relation.get_property_dict(),
+                )
+                logger.debug(
+                    "Upserted relation: %s(%s)-[%s]->%s(%s)",
+                    start_label,
+                    relation.source_id,
+                    relation.relation_type,
+                    end_label,
+                    relation.target_id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed relation upsert (post_id=%d, type=%s): %s",
+                    post_id,
+                    relation.relation_type,
+                    exc,
+                )
 
     async def execute_cypher(self, query: str) -> Any:
         result = await self._execute_in_transaction(text(query))

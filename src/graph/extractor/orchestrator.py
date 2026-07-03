@@ -357,13 +357,14 @@ class KnowledgeExtractor:
                 target_id=topic_id,
             )
 
-        _PLACEHOLDER_NAMES = frozenset({
-            "", "#", "other", "unknown", "none", "null", "undefined", "n_a", "<name>",
-        })
+        _PLACEHOLDER_NAMES = frozenset({"", "#", "other", "unknown", "none", "null", "undefined", "n_a", "<name>"})
         pre_filter_count = len(result.entities)
         kept_entities = []
         discarded_ids: set[str] = set()
         for entity in result.entities:
+            if entity.id in (author_node_id, pub_node_id):
+                kept_entities.append(entity)
+                continue
             trimmed_name = entity.name.strip()
             if len(trimmed_name) < 2:
                 discarded_ids.add(entity.id)
@@ -393,6 +394,18 @@ class KnowledgeExtractor:
         pre_sanitation_count = len(result.relations)
         kept_relations = []
         for relation in result.relations:
+            if relation.target_id not in valid_entity_ids:
+                for prefix in ("topic_", "place_", "actor_", "event_"):
+                    candidate = f"{prefix}{relation.target_id}"
+                    if candidate in valid_entity_ids:
+                        relation.target_id = candidate
+                        break
+            if relation.source_id not in valid_entity_ids:
+                for prefix in ("topic_", "place_", "actor_", "event_"):
+                    candidate = f"{prefix}{relation.source_id}"
+                    if candidate in valid_entity_ids:
+                        relation.source_id = candidate
+                        break
             source_valid = relation.source_id in valid_entity_ids
             target_valid = relation.target_id in valid_entity_ids
             if source_valid and target_valid:

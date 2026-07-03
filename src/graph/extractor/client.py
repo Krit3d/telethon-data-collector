@@ -23,6 +23,7 @@ _STAGGER_MAX = 5.0
 
 _GARBAGE_EXACT: frozenset[str] = frozenset({
     "unknown", "null", "none", "undefined", "n_a", "other", "id", "#", "", "topic", "category", "language",
+    "place", "actor", "event", "entity", "location", "loc", "person",
 })
 
 _GARBAGE_SUBSTRINGS: tuple[str, ...] = (
@@ -242,6 +243,18 @@ def _sanitize_parsed_payload(parsed: Any, pub_node_id: str | None = None) -> dic
         resolved_target = exact_map.get(target_id)
         if resolved_target is None:
             resolved_target = canonical_map.get(_canonicalize_id(target_id), target_id)
+        if resolved_source not in valid_new_ids:
+            for _prefix in ("topic_", "place_", "actor_", "event_"):
+                _candidate = f"{_prefix}{resolved_source}"
+                if _candidate in valid_new_ids:
+                    resolved_source = _candidate
+                    break
+        if resolved_target not in valid_new_ids:
+            for _prefix in ("topic_", "place_", "actor_", "event_"):
+                _candidate = f"{_prefix}{resolved_target}"
+                if _candidate in valid_new_ids:
+                    resolved_target = _candidate
+                    break
         if resolved_source not in valid_new_ids or resolved_target not in valid_new_ids:
             continue
         properties = item.get("properties", [])
@@ -255,6 +268,42 @@ def _sanitize_parsed_payload(parsed: Any, pub_node_id: str | None = None) -> dic
             "properties": properties,
         })
     return {"entities": final_entities, "relations": final_relations}
+
+
+def _repair_json(text: str) -> dict[str, Any]:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    in_string = False
+    escaped = False
+    open_braces = 0
+    close_braces = 0
+    open_brackets = 0
+    close_brackets = 0
+    for ch in text:
+        if not escaped and ch == '"':
+            in_string = not in_string
+        if not in_string:
+            if ch == '{':
+                open_braces += 1
+            elif ch == '}':
+                close_braces += 1
+            elif ch == '[':
+                open_brackets += 1
+            elif ch == ']':
+                close_brackets += 1
+        escaped = not escaped and ch == '\\'
+    if open_braces > close_braces or open_brackets > close_brackets:
+        text = text.rstrip()
+        if text.endswith(','):
+            text = text[:-1]
+        text += ']' * (open_brackets - close_brackets)
+        text += '}' * (open_braces - close_braces)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"entities": [], "relations": []}
 
 
 class LLMClient:
@@ -383,7 +432,7 @@ class LLMClient:
                     break
 
                 content = self._sanitize_llm_content(content)
-                parsed = json.loads(content)
+                parsed = _repair_json(content)
 
                 logger.info(
                     "RAW LLM output for post_id=%d: %d entities, %d relations",
