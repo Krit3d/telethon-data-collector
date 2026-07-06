@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
@@ -61,7 +60,6 @@ class KnowledgeExtractor:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._llm_client = LLMClient(settings)
-        self._write_semaphore = asyncio.Semaphore(self.settings.graph_write_concurrency)
 
     async def close(self) -> None:
         await self._llm_client.close()
@@ -74,7 +72,6 @@ class KnowledgeExtractor:
         author_id: int,
         post_metrics: dict[str, int | None],
         raw_metadata: dict[str, Any],
-        graph_repo: Any,
         qdrant: Any | None = None,
         platform: str | None = None,
         account_metadata: dict[str, Any] | None = None,
@@ -464,15 +461,8 @@ class KnowledgeExtractor:
             if "confidence" not in rel_prop_keys:
                 relation.add_property("confidence", 0.5, "numeric")
 
-        async def _save_graph() -> None:
-            async with self._write_semaphore:
-                await graph_repo.save_extraction_result(post_id, result)
-
-        tasks = [_save_graph()]
         if qdrant is not None:
-            tasks.append(qdrant.upsert_entities(result.entities))
-
-        await asyncio.gather(*tasks)
+            await qdrant.upsert_entities(result.entities)
 
         logger.info(
             "Completed extraction for post_id=%d: %d entities, %d relations",

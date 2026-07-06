@@ -25,7 +25,6 @@ from src.db.database import Database
 from src.db.models import Content
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.db.extractor_repo import ExtractorRepository
-from src.graph.db.graph_repo import GraphRepository
 from src.graph.extractor import KnowledgeExtractor
 from src.graph.schema import OpenSPGExtractionResult
 
@@ -165,7 +164,6 @@ class GraphExtractionWorker:
         self,
         db: Database,
         extractor_repo: ExtractorRepository,
-        graph_repo: GraphRepository,
         qdrant: QdrantService | None,
         extractor: KnowledgeExtractor,
         settings: Settings,
@@ -174,7 +172,6 @@ class GraphExtractionWorker:
     ) -> None:
         self.db = db
         self.extractor_repo = extractor_repo
-        self.graph_repo = graph_repo
         self.qdrant = qdrant
         self.extractor = extractor
         self.settings = settings
@@ -438,7 +435,6 @@ class GraphExtractionWorker:
                     author_id=post.account_id,
                     post_metrics=post_metrics,
                     raw_metadata=raw_metadata,
-                    graph_repo=self.graph_repo,
                     qdrant=self.qdrant,
                     platform=post.account.platform if post.account else None,
                     account_metadata=account_metadata,
@@ -582,13 +578,11 @@ async def run_graph_extractor() -> None:
 
     extractor = KnowledgeExtractor(settings)
 
-    graph_repo = GraphRepository(db.async_session, settings)
     extractor_repo = ExtractorRepository(db.async_session, settings)
 
     worker = GraphExtractionWorker(
         db=db,
         extractor_repo=extractor_repo,
-        graph_repo=graph_repo,
         qdrant=qdrant,
         extractor=extractor,
         settings=settings,

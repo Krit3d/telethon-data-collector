@@ -5,13 +5,6 @@ import re
 import time
 from typing import Any
 
-from asyncpg.exceptions import (
-    DeadlockDetectedError,
-    InternalServerError,
-    LockNotAvailableError,
-    SerializationError,
-    UniqueViolationError,
-)
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
@@ -35,7 +28,6 @@ class GraphRepository:
     _verified_entities: set[str] = set()
     _cache_warmed: bool = False
     _cache_lock: asyncio.Lock | None = None
-    _write_semaphore: asyncio.Semaphore | None = None
 
     def __init__(
         self,
@@ -46,8 +38,6 @@ class GraphRepository:
         self.settings = settings
         self.graph_name: str = settings.graph_name
         self._subgraph_query_timeout = self._SUBGRAPH_QUERY_TIMEOUT
-        if GraphRepository._write_semaphore is None:
-            GraphRepository._write_semaphore = asyncio.Semaphore(3)
 
     def _resolve_graph_name(self) -> str:
         name = self.graph_name
@@ -716,193 +706,124 @@ class GraphRepository:
 
         return all_edges
 
-    async def save_extraction_result(
-        self, post_id: int, result: Any
-    ) -> None:
+    async def save_extraction_results_batch(self, results: list[Any]) -> None:
+        if not results:
+            return
         if GraphRepository._cache_lock is None:
             GraphRepository._cache_lock = asyncio.Lock()
         async with GraphRepository._cache_lock:
             if not GraphRepository._cache_warmed:
                 await self.warm_up_cache()
-        filtered_entities: list[Any] = []
+
+        all_entities: dict[str, Any] = {}
+        all_relations: dict[tuple[str, str, str], Any] = {}
         discarded_ids: set[str] = set()
-        for entity in result.entities:
-            eid_clean = entity.id.lower()
-            for prefix in ("place_", "actor_", "topic_", "event_", "entity_"):
-                if eid_clean.startswith(prefix):
-                    eid_clean = eid_clean[len(prefix):]
-                    break
-            if (
-                eid_clean in self._JUNK_IDS_AND_NAMES
-                or entity.name.lower().strip() in self._JUNK_IDS_AND_NAMES
-                or len(entity.name.strip()) < 2
-            ):
-                discarded_ids.add(entity.id)
-                continue
-            filtered_entities.append(entity)
-        result.entities = filtered_entities
+
+        for result in results:
+            for entity in result.entities:
+                eid_clean = entity.id.lower()
+                for prefix in ("place_", "actor_", "topic_", "event_", "entity_"):
+                    if eid_clean.startswith(prefix):
+                        eid_clean = eid_clean[len(prefix):]
+                        break
+                name_clean = entity.name.lower().strip()
+                if eid_clean in self._JUNK_IDS_AND_NAMES or name_clean in self._JUNK_IDS_AND_NAMES or len(entity.name.strip()) < 2:
+                    discarded_ids.add(entity.id)
+                else:
+                    all_entities[entity.id] = entity
+
+            for relation in result.relations:
+                rel_key = (relation.source_id, relation.target_id, relation.relation_type)
+                all_relations[rel_key] = relation
+
         if discarded_ids:
-            result.relations = [
-                r for r in result.relations
-                if r.source_id not in discarded_ids
-                and r.target_id not in discarded_ids
-            ]
+            all_relations = {
+                k: v for k, v in all_relations.items()
+                if v.source_id not in discarded_ids and v.target_id not in discarded_ids
+            }
 
-        unverified_ids: list[str] = [
-            e.id for e in result.entities
-            if e.id not in GraphRepository._verified_entities
-        ]
-        unverified_set: set[str] = set(unverified_ids)
+        unique_ids: set[str] = set()
+        for eid in all_entities:
+            unique_ids.add(eid)
+        for rel in all_relations.values():
+            unique_ids.add(rel.source_id)
+            unique_ids.add(rel.target_id)
+        sorted_unique_ids = sorted(unique_ids)
 
-        entity_map: dict[str, str] = {}
-        var_counter = 0
-        for entity in result.entities:
-            var_name = f"v{var_counter}"
-            entity_map[entity.id] = var_name
-            var_counter += 1
-
-        match_lines: list[str] = []
-        merge_node_lines: list[str] = []
-        merge_edge_lines: list[str] = []
-        params: dict[str, Any] = {}
-
-        var_counter = 0
-        for entity in result.entities:
-            var_name = f"v{var_counter}"
-            var_counter += 1
+        node_groups: dict[tuple[str, tuple[str, ...]], list[dict]] = {}
+        for entity in all_entities.values():
+            props = self._sanitize_properties({
+                "id": entity.id,
+                "name": entity.name,
+                **entity.get_property_dict(),
+            })
+            props = self._clean_numeric_properties(props)
             label = re.sub(r"[^A-Za-z0-9_]", "", entity.label or "Entity") or "Entity"
+            sorted_keys = tuple(sorted(k for k in props if k != "name"))
+            group_key = (label, sorted_keys)
+            node_groups.setdefault(group_key, []).append(props)
 
-            params[f"{var_name}_id"] = entity.id
+        node_label_map: dict[str, str] = {
+            e.id: (re.sub(r"[^A-Za-z0-9_]", "", e.label or "Entity") or "Entity")
+            for e in all_entities.values()
+        }
 
-            if entity.id in unverified_set:
-                props = self._sanitize_properties({
-                    "id": entity.id,
-                    "name": entity.name,
-                    **entity.get_property_dict(),
-                })
-                props = self._clean_numeric_properties(props)
-
-                set_parts: list[str] = []
-                for key, value in props.items():
-                    param_key = f"{var_name}_{key}"
-                    params[param_key] = value
-                    set_parts.append(f"{var_name}.`{key}` = ${param_key}")
-
-                if set_parts:
-                    merge_node_lines.append(
-                        f"MERGE ({var_name}:{label} {{id: ${var_name}_id}}) "
-                        f"SET {', '.join(set_parts)}"
-                    )
-                else:
-                    merge_node_lines.append(
-                        f"MERGE ({var_name}:{label} {{id: ${var_name}_id}})"
-                    )
-            else:
-                match_lines.append(
-                    f"MATCH ({var_name}:{label} {{id: ${var_name}_id}})"
-                )
-
-        edge_counter = 0
-        for relation in result.relations:
-            src_var = entity_map.get(relation.source_id)
-            if src_var is None:
-                src_var = f"v{var_counter}"
-                entity_map[relation.source_id] = src_var
-                params[f"{src_var}_id"] = relation.source_id
+        edge_groups: dict[tuple[str, str, str, tuple[str, ...]], list[dict]] = {}
+        for rel in all_relations.values():
+            src_label = node_label_map.get(rel.source_id)
+            if src_label is None:
                 for prefix, lbl in ID_PREFIX_TO_LABEL.items():
-                    if relation.source_id.startswith(prefix):
-                        label = lbl
+                    if rel.source_id.startswith(prefix):
+                        src_label = lbl
                         break
                 else:
-                    label = "Entity"
-                if relation.source_id in unverified_set:
-                    merge_node_lines.append(
-                        f"MERGE ({src_var}:{label} {{id: ${src_var}_id}})"
-                    )
-                else:
-                    match_lines.append(
-                        f"MATCH ({src_var}:{label} {{id: ${src_var}_id}})"
-                    )
-                var_counter += 1
-
-            tgt_var = entity_map.get(relation.target_id)
-            if tgt_var is None:
-                tgt_var = f"v{var_counter}"
-                entity_map[relation.target_id] = tgt_var
-                params[f"{tgt_var}_id"] = relation.target_id
+                    src_label = "Entity"
+            tgt_label = node_label_map.get(rel.target_id)
+            if tgt_label is None:
                 for prefix, lbl in ID_PREFIX_TO_LABEL.items():
-                    if relation.target_id.startswith(prefix):
-                        label = lbl
+                    if rel.target_id.startswith(prefix):
+                        tgt_label = lbl
                         break
                 else:
-                    label = "Entity"
-                if relation.target_id in unverified_set:
-                    merge_node_lines.append(
-                        f"MERGE ({tgt_var}:{label} {{id: ${tgt_var}_id}})"
-                    )
-                else:
-                    match_lines.append(
-                        f"MATCH ({tgt_var}:{label} {{id: ${tgt_var}_id}})"
-                    )
-                var_counter += 1
+                    tgt_label = "Entity"
+            edge_label = re.sub(r"[^A-Za-z0-9_]", "", rel.relation_type).upper() or "RELATED_TO"
+            edge_props = self._sanitize_properties(rel.get_property_dict())
+            sorted_keys = tuple(sorted(edge_props.keys()))
+            group_key = (src_label, tgt_label, edge_label, sorted_keys)
+            item = {"sid": rel.source_id, "tid": rel.target_id, **edge_props}
+            edge_groups.setdefault(group_key, []).append(item)
 
-            edge_label = re.sub(r"[^A-Za-z0-9_]", "", relation.relation_type).upper() or "RELATED_TO"
-            edge_props = self._sanitize_properties(relation.get_property_dict())
-            edge_var = f"r{edge_counter}"
-
-            if edge_props:
-                set_parts: list[str] = []
-                for key, value in edge_props.items():
-                    param_key = f"e{edge_counter}_{key}"
-                    params[param_key] = value
-                    set_parts.append(f"{edge_var}.`{key}` = ${param_key}")
-                merge_edge_lines.append(
-                    f"MERGE ({src_var})-[{edge_var}:{edge_label}]->({tgt_var}) "
-                    f"SET {', '.join(set_parts)}"
-                )
-            else:
-                merge_edge_lines.append(
-                    f"MERGE ({src_var})-[{edge_var}:{edge_label}]->({tgt_var})"
-                )
-
-            edge_counter += 1
-
-        cypher_body = "\n".join(match_lines + merge_node_lines + merge_edge_lines)
-        query = text(f"SELECT * FROM ag_catalog.cypher('{self._resolve_graph_name()}', $$ {cypher_body} $$, CAST(:params AS agtype)) AS (v agtype)")
-
-        assert GraphRepository._write_semaphore is not None
-        async with GraphRepository._write_semaphore:
-            for attempt in range(5):
-                try:
-                    async with self.async_session() as session:
-                        async with session.begin():
-                            await session.execute(query, {"params": json.dumps(params)})
-                    break
-                except DBAPIError as e:
-                    orig = e.orig
-                    sqlstate = getattr(orig, 'sqlstate', '') or ''
-                    if isinstance(orig, (DeadlockDetectedError, SerializationError, LockNotAvailableError, UniqueViolationError)) or sqlstate in ('40001', '40P01', '55P03', '23505'):
-                        if attempt == 4:
-                            raise
-                        logger.warning(
-                            "Transient database conflict on post %d (SQLSTATE %s), retrying (attempt %d/5)...",
-                            post_id, sqlstate, attempt + 1
+        graph_name = self._resolve_graph_name()
+        try:
+            async with self.async_session() as session:
+                async with session.begin():
+                    for val in sorted_unique_ids:
+                        await session.execute(
+                            text("SELECT pg_catalog.pg_advisory_xact_lock(hashtext(:val)::bigint)"),
+                            {"val": val}
                         )
-                        await asyncio.sleep(0.1 * (attempt + 1))
-                        continue
-                    if isinstance(orig, InternalServerError):
-                        err_msg = str(orig)
-                        if 'failed to be updated' in err_msg or '3' in err_msg:
-                            if attempt == 4:
-                                raise
-                            logger.warning(
-                                "Transient database update conflict on post %d, retrying (attempt %d/5)...",
-                                post_id, attempt + 1
-                            )
-                            await asyncio.sleep(0.1 * (attempt + 1))
-                            continue
-                    raise
-            GraphRepository._verified_entities.update(unverified_ids)
+                    for (label, sorted_keys), batch_list in node_groups.items():
+                        set_clause = ", ".join(f"n.`{k}` = item.`{k}`" for k in sorted_keys)
+                        query_str = f"UNWIND $batch AS item MERGE (n:{label} {{id: item.id}}) SET {set_clause} RETURN 1"
+                        cypher_query = text(f"SELECT * FROM ag_catalog.cypher('{graph_name}', $$ {query_str} $$, CAST(:params AS agtype)) AS (v agtype)")
+                        await session.execute(cypher_query, {"params": json.dumps({"batch": batch_list})})
+
+                    for (src_label, tgt_label, edge_label, sorted_keys), batch_list in edge_groups.items():
+                        set_clause = ", ".join(f"r.`{k}` = item.`{k}`" for k in sorted_keys)
+                        query_str = f"UNWIND $batch AS item MATCH (a:{src_label} {{id: item.sid}}) MATCH (b:{tgt_label} {{id: item.tid}}) MERGE (a)-[r:{edge_label}]->(b) SET {set_clause} RETURN 1"
+                        cypher_query = text(f"SELECT * FROM ag_catalog.cypher('{graph_name}', $$ {query_str} $$, CAST(:params AS agtype)) AS (v agtype)")
+                        await session.execute(cypher_query, {"params": json.dumps({"batch": batch_list})})
+
+            GraphRepository._verified_entities.update(all_entities.keys())
+            logger.info(
+                "Batch saved %d nodes and %d relations across %d extraction results",
+                len(all_entities), len(all_relations), len(results),
+            )
+        except DBAPIError:
+            logger.exception(
+                "Batch graph save failed for %d results (%d nodes, %d relations)",
+                len(results), len(all_entities), len(all_relations),
+            )
 
     async def execute_cypher(self, query: str) -> Any:
         result = await self._execute_in_transaction(text(query))
