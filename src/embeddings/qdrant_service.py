@@ -8,6 +8,7 @@ import struct
 import asyncio
 import random
 import uuid
+import warnings
 from typing import Any, Final
 
 from openai import AsyncOpenAI, RateLimitError
@@ -16,6 +17,8 @@ from qdrant_client.http import models
 
 from src.config.config import Settings
 from src.graph.schema import ExtractedEntity, PropertyType
+
+warnings.filterwarnings("ignore", message="Api key is used with an insecure connection.")
 
 logger = logging.getLogger(__name__)
 

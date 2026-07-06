@@ -6,9 +6,11 @@ import time
 import signal
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
-from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
 from sqlalchemy import text
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError, InternalError, OperationalError
 
 try:
     import asyncpg.exceptions
@@ -217,7 +219,7 @@ class GraphExtractionWorker:
                 last_db_error = e
                 delay = _db_backoff_delay(attempt)
                 logger.warning(
-                    "Database error while fetching content (attempt %d/%d): %s. "
+                    "Database error while fetching content (attempt %d/%d): %r. "
                     "Retrying after %.1fs backoff...",
                     attempt + 1,
                     _DB_MAX_BACKOFF_RETRIES,
@@ -314,7 +316,14 @@ class GraphExtractionWorker:
         try:
             async with self.db.async_session() as session:
                 async with session.begin():
-                    await session.execute(
+                    lock_result = await session.execute(
+                        text("SELECT pg_catalog.pg_try_advisory_xact_lock(hashtext('graph_stale_claims_recovery')::bigint)")
+                    )
+                    acquired = lock_result.scalar()
+                    if not acquired:
+                        logger.debug("Another worker is recovering stale claims, skipping.")
+                        return
+                    result = cast(CursorResult, await session.execute(
                         text("""
                             UPDATE content
                             SET raw_metadata = raw_metadata - 'graph_status' - 'claimed_at'
@@ -323,8 +332,11 @@ class GraphExtractionWorker:
                               AND raw_metadata->>'claimed_at' < :threshold
                         """),
                         {"threshold": threshold}
-                    )
-            logger.info("Successfully completed stale graph extraction claims recovery.")
+                    ))
+            if result.rowcount > 0:
+                logger.info("Successfully recovered %d stale graph extraction claims.", result.rowcount)
+            else:
+                logger.debug("No stale graph extraction claims to recover.")
         except Exception as e:
             logger.warning(
                 "Failed to recover stale graph extraction claims (non-critical): %s",
@@ -483,7 +495,7 @@ class GraphExtractionWorker:
                     delay = _retry_backoff_delay(attempt)
                     logger.warning(
                         "Recoverable error extracting knowledge graph for content id=%s "
-                        "(attempt %d/%d): %s. Retrying after %.2fs...",
+                        "(attempt %d/%d): %r. Retrying after %.2fs...",
                         post.id,
                         attempt + 1,
                         _RETRY_MAX_ATTEMPTS,
@@ -536,7 +548,7 @@ class GraphExtractionWorker:
 
         logger.warning(
             "Recoverable error extracting knowledge graph for content id=%s "
-            "after %d attempts (total consecutive failures: %d): %s. "
+            "after %d attempts (total consecutive failures: %d): %r. "
             "Post will be retried in a subsequent batch.",
             post.id,
             _RETRY_MAX_ATTEMPTS,
