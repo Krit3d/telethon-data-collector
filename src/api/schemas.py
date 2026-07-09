@@ -63,6 +63,7 @@ class SearchResultItem(BaseModel):
     score: float
     vector_score: float
     graph_score: float
+    er_score: float
     created_at: datetime
     url: str | None = None
     author_id: int | None = None

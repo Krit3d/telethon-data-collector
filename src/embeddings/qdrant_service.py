@@ -37,7 +37,7 @@ class QdrantService:
 
         http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
-            timeout=httpx.Timeout(60.0, connect=10.0, read=45.0, write=10.0),
+            timeout=httpx.Timeout(60.0, connect=10.0, read=60.0, write=10.0),
         )
         self.openai_client = AsyncOpenAI(
             api_key=settings.cloud_ru_api_key,
@@ -64,6 +64,22 @@ class QdrantService:
     async def initialize(self) -> None:
         if self._initialized:
             return
+
+        max_attempts = 15
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self.client.get_collections()
+                logger.info("Qdrant connection established")
+                break
+            except Exception:
+                if attempt == max_attempts:
+                    logger.error(
+                        "Qdrant initialization failed: All connection attempts failed after retries",
+                        extra={"url": self.settings.qdrant_url},
+                    )
+                    raise RuntimeError("Qdrant initialization failed: All connection attempts failed after retries")
+                logger.warning("Qdrant not ready yet (attempt %d/15), retrying...", attempt)
+                await asyncio.sleep(5)
 
         try:
             await self._ensure_collection()
@@ -196,6 +212,73 @@ class QdrantService:
                 extra={"collection": self.collection_name},
             )
             raise
+
+    async def _optimize_collections_for_production(self) -> None:
+        try:
+            await self.client.update_collection(
+                collection_name=self.collection_name,
+                hnsw_config=models.HnswConfigDiff(on_disk=True),
+                vectors_config={
+                    "text": models.VectorParamsDiff(
+                        on_disk=True,
+                        quantization_config=models.ScalarQuantization(
+                            scalar=models.ScalarQuantizationConfig(
+                                type=models.ScalarType.INT8,
+                                quantile=0.99,
+                                always_ram=False,
+                            ),
+                        ),
+                    ),
+                    "video_clip": models.VectorParamsDiff(
+                        on_disk=True,
+                        quantization_config=models.ScalarQuantization(
+                            scalar=models.ScalarQuantizationConfig(
+                                type=models.ScalarType.INT8,
+                                quantile=0.99,
+                                always_ram=False,
+                            ),
+                        ),
+                    ),
+                },
+            )
+            logger.info(
+                "Optimized posts collection for production",
+                extra={"collection": self.collection_name},
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to optimize posts collection for production: %s",
+                e,
+                extra={"collection": self.collection_name},
+            )
+
+        try:
+            await self.client.update_collection(
+                collection_name=ENTITIES_COLLECTION,
+                hnsw_config=models.HnswConfigDiff(on_disk=True),
+                vectors_config={
+                    "text": models.VectorParamsDiff(
+                        on_disk=True,
+                        quantization_config=models.ScalarQuantization(
+                            scalar=models.ScalarQuantizationConfig(
+                                type=models.ScalarType.INT8,
+                                quantile=0.99,
+                                always_ram=False,
+                            ),
+                        ),
+                    ),
+                },
+            )
+            logger.info(
+                "Optimized entities collection for production",
+                extra={"collection": ENTITIES_COLLECTION},
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to optimize entities collection for production: %s",
+                e,
+                extra={"collection": ENTITIES_COLLECTION},
+            )
 
     @staticmethod
     def _make_fallback_sparse(text: str) -> models.SparseVector:
@@ -578,24 +661,14 @@ class QdrantService:
             return []
 
         try:
-            dense_list, sparse_list = await self._generate_cloud_embeddings_batch([query])
+            dense_list, _ = await self._generate_cloud_embeddings_batch([query])
 
             dense_emb = dense_list[0]
-            sparse_emb = sparse_list[0]
 
             response = await self.client.query_points(
                 collection_name=collection_name,
-                prefetch=[
-                    models.Prefetch(
-                        query=dense_emb,
-                        using="text",
-                    ),
-                    models.Prefetch(
-                        query=sparse_emb,
-                        using="text_sparse",
-                    ),
-                ],
-                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query=dense_emb,
+                using="text",
                 limit=limit,
                 score_threshold=score_threshold,
                 with_payload=True,
@@ -650,10 +723,9 @@ class QdrantService:
             return []
 
         try:
-            dense_list, sparse_list = await self._generate_cloud_embeddings_batch([query])
+            dense_list, _ = await self._generate_cloud_embeddings_batch([query])
 
             dense_emb = dense_list[0]
-            sparse_emb = sparse_list[0]
 
             filter_conditions: list[models.Condition] = []
             if min_followers is not None:
@@ -686,19 +758,8 @@ class QdrantService:
 
             response = await self.client.query_points(
                 collection_name=self.collection_name,
-                prefetch=[
-                    models.Prefetch(
-                        query=dense_emb,
-                        using="text",
-                        filter=query_filter,
-                    ),
-                    models.Prefetch(
-                        query=sparse_emb,
-                        using="text_sparse",
-                        filter=query_filter,
-                    ),
-                ],
-                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query=dense_emb,
+                using="text",
                 limit=limit,
                 score_threshold=score_threshold,
                 query_filter=query_filter,
