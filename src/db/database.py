@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
-from sqlalchemy import and_, case, func, or_, select, update, text
+from sqlalchemy import and_, case, func, or_, select, update, text, String
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DBAPIError, OperationalError
@@ -614,6 +614,82 @@ class Database:
                         "Account id=%d not found when updating access_hash",
                         account_id,
                     )
+
+    async def get_search_candidates(
+        self,
+        content_ids: list[int],
+        location: str | None = None,
+        min_followers: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if not content_ids:
+            return []
+
+        async with self.async_session() as session:
+            stmt = (
+                select(
+                    Content.id,
+                    Content.account_id,
+                    Content.content,
+                    Content.transcription,
+                    Content.created_at,
+                    Content.message_id,
+                    Content.platform_content_id,
+                    Account.platform,
+                    Account.username,
+                    Account.title,
+                )
+                .join(Account, Content.account_id == Account.id)
+                .where(Content.id.in_(content_ids))
+            )
+
+            if location:
+                location_escaped = re.escape(location)
+                location_escaped = location_escaped.replace('\\', '\\\\').replace('"', '\\"')
+                location_pattern = f".*{location_escaped}.*"
+
+                stmt = stmt.where(
+                    or_(
+                        func.jsonb_path_exists(
+                            Account.raw_metadata,
+                            f'$.geo_data.country ? (@ like_regex "{location_pattern}" flag "i")',
+                        ),
+                        func.jsonb_path_exists(
+                            Account.raw_metadata,
+                            f'$.geo_data.city ? (@ like_regex "{location_pattern}" flag "i")',
+                        ),
+                        func.jsonb_path_exists(
+                            Account.raw_metadata,
+                            f'$.location.country ? (@ like_regex "{location_pattern}" flag "i")',
+                        ),
+                        func.jsonb_path_exists(
+                            Account.raw_metadata,
+                            f'$.location.city ? (@ like_regex "{location_pattern}" flag "i")',
+                        ),
+                    )
+                )
+
+            if min_followers is not None:
+                stmt = stmt.where(
+                    Account.subscribers_count >= min_followers
+                )
+
+            result = await session.execute(stmt)
+
+            return [
+                {
+                    "id": row.id,
+                    "account_id": row.account_id,
+                    "content": row.content,
+                    "transcription": row.transcription,
+                    "created_at": row.created_at,
+                    "message_id": row.message_id,
+                    "platform_content_id": row.platform_content_id,
+                    "platform": row.platform,
+                    "username": row.username,
+                    "account_title": row.title,
+                }
+                for row in result
+            ]
 
     async def get_latest_message_id(self, account_id: int) -> int | None:
         async with self.async_session() as session:

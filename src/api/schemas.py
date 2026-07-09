@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class SearchRequest(BaseModel):
     query: str = Field(..., description="Text for semantic search")
-    limit: int = Field(default=10, ge=1, le=50, description="Number of results")
+    limit: int = Field(default=100, ge=100, le=1000, description="Number of results, minimum 100, maximum 1000")
     score_threshold: float = Field(
         default=0.20, description="Minimum match threshold"
     )
@@ -31,7 +31,7 @@ class SearchRequest(BaseModel):
             "examples": [
                 {
                     "query": "AI content creators in tech",
-                    "limit": 10,
+                    "limit": 100,
                     "score_threshold": 0.20,
                     "include_author_info": False,
                     "location": "",
