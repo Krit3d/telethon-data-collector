@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+import math
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 import openai
@@ -18,6 +20,18 @@ from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.db.search_repo import GraphSearchRepository
 
+_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "in", "on", "at", "to", "for", "with", "by", "about", "against",
+    "between", "into", "through", "during", "before", "after", "above",
+    "below", "from", "up", "down", "of", "off", "over", "under", "again",
+    "further", "then", "once", "here", "there", "when", "where", "why",
+    "how", "all", "any", "both", "each", "few", "more", "most", "other",
+    "some", "such", "no", "nor", "not", "only", "own", "same", "so",
+    "than", "too", "very", "s", "t", "can", "will", "just", "don",
+    "should", "now"
+}
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_EXPLANATION = (
@@ -25,7 +39,6 @@ _DEFAULT_EXPLANATION = (
     "and has engaged audience interaction."
 )
 _FALLBACK_GRAPH_ENTITIES: list[str] = []
-
 
 def _build_content_url(
     platform: str | None,
@@ -43,12 +56,10 @@ def _build_content_url(
         return f"https://platform/{platform.lower()}/content/{platform_content_id}"
     return None
 
-
 def _normalize_er(er: float) -> float:
     if er > 1.0:
         er = er / 100.0
     return min(1.0, max(0.0, er))
-
 
 def _safe_json_loads(text: str) -> dict[str, Any] | None:
     if not text:
@@ -69,7 +80,6 @@ def _safe_json_loads(text: str) -> dict[str, Any] | None:
             pass
     return None
 
-
 def _safe_json_loads_array(text: str) -> list[dict[str, Any]] | None:
     if not text:
         return None
@@ -88,7 +98,6 @@ def _safe_json_loads_array(text: str) -> list[dict[str, Any]] | None:
         except (json.JSONDecodeError, TypeError):
             pass
     return None
-
 
 class SearchService:
     def __init__(
@@ -109,7 +118,7 @@ class SearchService:
         self._llm_model = settings.cloud_ru_llm_model
 
     async def _call_llm(
-        self, messages: list[dict[str, str]], temperature: float = 0.2,
+        self, messages: list[dict[str, str | list[dict[str, str]]]], temperature: float = 0.2,
     ) -> str:
         response = await self._llm_client.chat.completions.create(
             model=self._llm_model,
@@ -121,9 +130,11 @@ class SearchService:
     async def _reformulate_query(self, raw_query: str) -> tuple[str, list[str]]:
         system_prompt = (
             "You are a search query optimization assistant. "
-            "Given a user project description, output a JSON object with exactly two fields: "
-            '"vector_query" (string): a refined search string optimized for semantic vector search, '
-            '"graph_entities" (list of strings): key topics or entity names to match in a knowledge graph. '
+            "Expand synonyms (e.g., 'car insurance' -> 'kasko', 'auto insurance'), "
+            "disambiguate homonyms (e.g., distinct rocket science vs event marketing). "
+            "Output a clean JSON object with exactly two fields: "
+            '"vector_query" (string, refined semantic query for Qdrant), '
+            '"graph_entities" (list of strings, exact key topics/brands for Apache AGE). '
             "Output ONLY valid JSON, no markdown, no explanation."
         )
         user_prompt = f"Project description: {raw_query}"
@@ -167,8 +178,8 @@ class SearchService:
             authors_json.append(
                 {
                     "author_id": c["author_id"],
-                    "title": c.get("title", ""),
                     "bio": c.get("description", ""),
+                    "subscriber_count": c.get("subscribers_count", 0),
                     "platform": c.get("platform", ""),
                     "top_posts": c.get("top_post_texts", [])[:3],
                 }
@@ -177,8 +188,11 @@ class SearchService:
         system_prompt = (
             "You are an expert talent matching assistant. "
             "Given a project description and a list of authors, evaluate each author's relevance. "
+            "Check for negative signals (NSFW, gambling, illegal promotions): if detected, set final_score to 0.0 and exclude the author. "
+            "Write a professional 2-3 sentence explanation exactly grounded in the provided snippets, no hallucinated achievements. "
+            "Calibrate final_score between 0.0 and 1.0 aligned with NDCG@10 objectives. "
             "Output a JSON array where each element has: "
-            '"author_id" (integer), "final_score" (float between 0 and 1), "explanation" (string, 2-3 sentences, professional tone). '
+            '"author_id" (integer), "final_score" (float between 0 and 1), "explanation" (string). '
             "Output ONLY valid JSON, no markdown, no extra text."
         )
         user_prompt = (
@@ -208,8 +222,10 @@ class SearchService:
                     try:
                         aid_int = int(aid)
                         score_float = float(score)
+                        if score_float < 0.0 or score_float > 1.0:
+                            continue
                         id_to_update[aid_int] = {
-                            "final_score": min(1.0, max(0.0, score_float)),
+                            "final_score": score_float,
                             "explanation": (
                                 str(explanation) if explanation else _DEFAULT_EXPLANATION
                             ),
@@ -234,7 +250,14 @@ class SearchService:
         return candidates
 
     async def execute_search(self, payload: SearchRequest) -> SearchResponse:
-        vector_query, graph_entities = await self._reformulate_query(payload.query)
+        query = payload.query.strip()
+        query_words = query.split()
+        if len(query_words) < 2:
+            return SearchResponse(results=[])
+        if all(word.lower() in _STOPWORDS for word in query_words):
+            return SearchResponse(results=[])
+
+        vector_query, graph_entities = await self._reformulate_query(query)
         logger.info(
             "Query reformulation complete. vector_query=%r graph_entities=%s",
             vector_query,
@@ -319,6 +342,7 @@ class SearchService:
             return SearchResponse(results=[])
 
         author_map: dict[int, dict[str, Any]] = {}
+        current_utc = datetime.now(timezone.utc)
 
         for row in candidates_rows:
             post_id = row["id"]
@@ -337,6 +361,8 @@ class SearchService:
                     "graph_scores": [],
                     "engagement_rates": [],
                     "explanation": _DEFAULT_EXPLANATION,
+                    "has_contacts": False,
+                    "most_recent_post": None,
                 }
 
             author = author_map[account_id]
@@ -344,11 +370,22 @@ class SearchService:
             gs = graph_scores.get(post_id, 0.0)
             er = _normalize_er(post_id_to_er.get(post_id, 0.0))
 
+            published_at = row.get("created_at")
+            decay_factor = 1.0
+            if published_at is not None:
+                if published_at.tzinfo is None:
+                    published_at = published_at.replace(tzinfo=timezone.utc)
+                days = (current_utc - published_at).days
+                decay_factor = math.exp(-0.005 * days)
+                vs *= decay_factor
+                gs *= decay_factor
+                if author["most_recent_post"] is None or published_at > author["most_recent_post"]:
+                    author["most_recent_post"] = published_at
+
             platform = row.get("platform")
             username = row.get("username")
             message_id = row.get("message_id")
             platform_content_id = row.get("platform_content_id")
-            published_at = row.get("created_at")
 
             if published_at is not None:
                 snippet = AuthorPostSnippet(
@@ -373,6 +410,16 @@ class SearchService:
                 author["graph_scores"].append(gs)
                 author["engagement_rates"].append(er)
 
+            raw_metadata = row.get("raw_metadata")
+            parsed_metadata = _safe_json_loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
+            if isinstance(parsed_metadata, dict) and not author["has_contacts"]:
+                contacts = parsed_metadata.get("contacts")
+                if isinstance(contacts, dict):
+                    for key in ["email", "telegram", "phone"]:
+                        if contacts.get(key):
+                            author["has_contacts"] = True
+                            break
+
         ranked_authors: list[dict[str, Any]] = []
         for account_id, author in author_map.items():
             if not author["posts"]:
@@ -383,19 +430,48 @@ class SearchService:
                 sum(author["engagement_rates"]) / len(author["engagement_rates"])
                 if author["engagement_rates"] else 0.0
             )
-            hybrid_score = 0.5 * max_vs + 0.3 * max_gs + 0.2 * avg_er
+            expertise_ratio = len(author["posts"]) / len(author["posts"]) if len(author["posts"]) > 0 else 0.0
+            base_score = 0.4 * max_vs + 0.3 * max_gs + 0.15 * avg_er + 0.15 * expertise_ratio
+            final_raw_score = base_score + (0.15 if author["has_contacts"] else 0.0)
+
+            if author["most_recent_post"] is not None:
+                days_since_last_post = (current_utc - author["most_recent_post"]).days
+                if days_since_last_post > 180 and len(ranked_authors) > 0:
+                    final_raw_score *= 0.1
 
             author["vector_score"] = max_vs
             author["graph_score"] = max_gs
             author["avg_engagement_rate"] = avg_er
-            author["final_score"] = hybrid_score
+            author["final_score"] = final_raw_score
             author["top_post_texts"] = [
                 s["snippet"].text[:200] for s in author["posts"][:3]
             ]
             ranked_authors.append(author)
 
         ranked_authors.sort(key=lambda x: x["final_score"], reverse=True)
-        top_candidates = ranked_authors[:12]
+
+        top_candidates = ranked_authors[:15]
+        platform_counts: dict[str, int] = {}
+        for c in top_candidates:
+            platform = c.get("platform", "UNKNOWN").upper()
+            platform_counts[platform] = platform_counts.get(platform, 0) + 1
+        total_top = len(top_candidates)
+        if total_top > 1 and platform_counts:
+            dominant_platform = max(platform_counts, key=lambda k: platform_counts[k])
+            dominant_count = platform_counts[dominant_platform]
+            if dominant_count / total_top > 0.7:
+                other_platforms = [p for p in platform_counts if p != dominant_platform]
+                has_other_high_score = False
+                for c in ranked_authors:
+                    if c.get("platform", "").upper() in other_platforms and c["final_score"] > 0.3:
+                        has_other_high_score = True
+                        break
+                if has_other_high_score:
+                    for c in top_candidates:
+                        if c.get("platform", "").upper() == dominant_platform:
+                            c["final_score"] *= 0.9
+                    top_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+                    top_candidates = top_candidates[:15]
 
         if len(top_candidates) > 1:
             try:
@@ -468,12 +544,12 @@ class SearchService:
 
         if isinstance(results[0], Exception):
             logger.warning("Qdrant posts search failed", exc_info=results[0])
-        elif results[0] is not None:
+        elif isinstance(results[0], list):
             posts_data = results[0]  # type: ignore[assignment]
 
         if isinstance(results[1], Exception):
             logger.warning("Qdrant entities search failed", exc_info=results[1])
-        elif results[1] is not None:
+        elif isinstance(results[1], list):
             entities_data = results[1]  # type: ignore[assignment]
 
         return posts_data, entities_data
