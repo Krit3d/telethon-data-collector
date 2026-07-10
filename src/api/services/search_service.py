@@ -1,25 +1,47 @@
 import asyncio
+import json
 import logging
 import re
 from typing import Any
 
+import openai
+from openai import AsyncOpenAI
+
 from src.api.schemas import (
-    GraphEdge,
-    GraphEntity,
+    AuthorPostSnippet,
+    AuthorSearchResultItem,
     SearchRequest,
     SearchResponse,
-    SearchResultItem,
 )
+from src.config.config import Settings
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.db.search_repo import GraphSearchRepository
 
 logger = logging.getLogger(__name__)
 
-_MAX_INT32: int = 2147483647
-_MIN_INT32: int = -2147483648
-_CONTENT_LABELS: frozenset[str] = frozenset({"content", "event", "publication"})
-_POISONED_LABELS: frozenset[str] = frozenset({"language", "category"})
+_DEFAULT_EXPLANATION = (
+    "This author creates content relevant to the project description "
+    "and has engaged audience interaction."
+)
+_FALLBACK_GRAPH_ENTITIES: list[str] = []
+
+
+def _build_content_url(
+    platform: str | None,
+    username: str | None,
+    message_id: int | None,
+    account_id: int | None,
+    platform_content_id: str | None,
+) -> str | None:
+    if platform and platform.upper() == "TELEGRAM" and message_id is not None:
+        if username:
+            return f"https://t.me/{username}/{message_id}"
+        if account_id is not None:
+            return f"https://t.me/c/{account_id}/{message_id}"
+    if platform and platform_content_id:
+        return f"https://platform/{platform.lower()}/content/{platform_content_id}"
+    return None
 
 
 def _normalize_er(er: float) -> float:
@@ -28,408 +50,430 @@ def _normalize_er(er: float) -> float:
     return min(1.0, max(0.0, er))
 
 
-def _build_content_url(row: dict[str, Any]) -> str:
+def _safe_json_loads(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
     try:
-        platform = row.get("platform", "TELEGRAM")
-        username = row.get("username")
-        message_id = row.get("message_id")
-        if platform == "TELEGRAM" and message_id is not None:
-            if username:
-                return f"https://t.me/{username}/{message_id}"
-            return f"https://t.me/c/{row.get('account_id', '')}/{message_id}"
-        return (
-            f"https://platform/{platform.lower()}/content/"
-            f"{row.get('platform_content_id', 'unknown')}"
-        )
-    except Exception:
-        return ""
-
-
-def _build_node_id_to_post_id(
-    nodes_data: list[dict[str, Any]],
-) -> dict[str, int]:
-    result: dict[str, int] = {}
-    try:
-        for node in nodes_data:
-            label = (node.get("label") or "").lower()
-            if label not in _CONTENT_LABELS:
-                continue
-            node_id = node.get("id", "")
-            props = node.get("properties", {}) or {}
-            raw_db_post_id = props.get("db_post_id")
-            post_id: int | None = None
-            if raw_db_post_id is not None:
-                try:
-                    post_id = int(raw_db_post_id)
-                except (ValueError, TypeError):
-                    post_id = None
-            if post_id is None:
-                match = re.search(r"(\d+)$", str(node_id))
-                if match:
-                    try:
-                        post_id = int(match.group(1))
-                    except (ValueError, TypeError):
-                        post_id = None
-            if post_id is not None:
-                result[node_id] = post_id
-    except (TypeError, ValueError):
+        result: object = json.loads(text)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, TypeError):
         pass
-    return result
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if json_match:
+        try:
+            result = json.loads(json_match.group(0))
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
 
 
-def _build_post_id_to_er(
-    nodes_data: list[dict[str, Any]],
-    node_id_to_post_id: dict[str, int],
-) -> dict[int, float]:
-    result: dict[int, float] = {}
+def _safe_json_loads_array(text: str) -> list[dict[str, Any]] | None:
+    if not text:
+        return None
     try:
-        for node in nodes_data:
-            node_id = node.get("id", "")
-            if node_id not in node_id_to_post_id:
-                continue
-            post_id = node_id_to_post_id[node_id]
-            props = node.get("properties", {}) or {}
-            raw_er = props.get("engagement_rate", 0.0)
-            try:
-                result[post_id] = float(raw_er)
-            except (ValueError, TypeError):
-                result[post_id] = 0.0
-    except (TypeError, ValueError):
+        result: object = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except (json.JSONDecodeError, TypeError):
         pass
-    return result
-
-
-def _compute_kag_scores(
-    vector_scores: dict[int, float],
-    graph_scores: dict[int, float],
-    post_id_to_er: dict[int, float],
-) -> dict[int, tuple[float, float, float, float]]:
-    w_er = 0.10
-
-    all_ids: set[int] = set(vector_scores.keys()) | set(graph_scores.keys())
-    results: dict[int, tuple[float, float, float, float]] = {}
-
-    for cid in all_ids:
-        vector_score = vector_scores.get(cid, 0.0)
-        g_score = graph_scores.get(cid, 0.0)
-        er_score = _normalize_er(post_id_to_er.get(cid, 0.0))
-
-        relevance = 1.0 - (1.0 - vector_score) * (1.0 - g_score)
-        final_score = min(1.0, relevance + (w_er * er_score))
-
-        results[cid] = (final_score, vector_score, g_score, er_score)
-
-    return results
+    json_match = re.search(r"\[.*\]", text, re.DOTALL)
+    if json_match:
+        try:
+            result = json.loads(json_match.group(0))
+            if isinstance(result, list):
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
 
 
 class SearchService:
-
     def __init__(
         self,
+        settings: Settings,
         qdrant: QdrantService,
         db: Database,
         graph_search_repo: GraphSearchRepository,
     ) -> None:
+        self._settings = settings
         self._qdrant = qdrant
         self._db = db
         self._graph_search_repo = graph_search_repo
+        self._llm_client = AsyncOpenAI(
+            api_key=settings.cloud_ru_api_key,
+            base_url=settings.cloud_ru_base_url,
+        )
+        self._llm_model = settings.cloud_ru_llm_model
 
-    async def execute_search(self, payload: SearchRequest) -> SearchResponse:
-        posts_fetch_limit = max(1000, payload.limit * 2)
-        entities_fetch_limit = 80
+    async def _call_llm(
+        self, messages: list[dict[str, str]], temperature: float = 0.2,
+    ) -> str:
+        response = await self._llm_client.chat.completions.create(
+            model=self._llm_model,
+            messages=messages,  # type: ignore[arg-type]
+            temperature=temperature,
+        )
+        return response.choices[0].message.content or ""
 
-        posts_data, entities_data = await asyncio.gather(
-            self._qdrant.search_posts(
-                query=payload.query,
-                limit=posts_fetch_limit,
-                score_threshold=payload.score_threshold,
-                min_followers=payload.min_followers,
-                min_engagement_rate=payload.min_engagement_rate,
-                platform=getattr(payload, "platform", None),
-            ),
-            self._qdrant.search_entities(
-                query=payload.query,
-                limit=entities_fetch_limit,
-                score_threshold=payload.score_threshold,
-            ),
+    async def _reformulate_query(self, raw_query: str) -> tuple[str, list[str]]:
+        system_prompt = (
+            "You are a search query optimization assistant. "
+            "Given a user project description, output a JSON object with exactly two fields: "
+            '"vector_query" (string): a refined search string optimized for semantic vector search, '
+            '"graph_entities" (list of strings): key topics or entity names to match in a knowledge graph. '
+            "Output ONLY valid JSON, no markdown, no explanation."
+        )
+        user_prompt = f"Project description: {raw_query}"
+
+        try:
+            content = await self._call_llm(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+            )
+            parsed = _safe_json_loads(content)
+            if parsed is not None:
+                vector_query = parsed.get("vector_query", raw_query)
+                graph_entities = parsed.get("graph_entities", [])
+                if not isinstance(vector_query, str) or not vector_query.strip():
+                    vector_query = raw_query
+                if not isinstance(graph_entities, list):
+                    graph_entities = _FALLBACK_GRAPH_ENTITIES
+                else:
+                    graph_entities = [str(e) for e in graph_entities if e]
+                return vector_query, graph_entities
+        except openai.APIError:
+            logger.warning("LLM query reformulation failed, using original query", exc_info=True)
+        except Exception:
+            logger.warning("Unexpected error in query reformulation", exc_info=True)
+
+        return raw_query, _FALLBACK_GRAPH_ENTITIES
+
+    async def _rerank_and_explain(
+        self,
+        project_description: str,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return candidates
+
+        authors_json: list[dict[str, Any]] = []
+        for c in candidates:
+            authors_json.append(
+                {
+                    "author_id": c["author_id"],
+                    "title": c.get("title", ""),
+                    "bio": c.get("description", ""),
+                    "platform": c.get("platform", ""),
+                    "top_posts": c.get("top_post_texts", [])[:3],
+                }
+            )
+
+        system_prompt = (
+            "You are an expert talent matching assistant. "
+            "Given a project description and a list of authors, evaluate each author's relevance. "
+            "Output a JSON array where each element has: "
+            '"author_id" (integer), "final_score" (float between 0 and 1), "explanation" (string, 2-3 sentences, professional tone). '
+            "Output ONLY valid JSON, no markdown, no extra text."
+        )
+        user_prompt = (
+            f"Project description: {project_description}\n\n"
+            f"Authors: {json.dumps(authors_json, ensure_ascii=False)}"
         )
 
-        entities_data = [
-            e for e in entities_data
-            if (e.get("label") or e.get("entity_label") or "").lower()
-            not in _POISONED_LABELS
-        ]
-
-        entity_id_to_score: dict[str, float] = {
-            e["entity_id"]: e["score"] for e in entities_data
-        }
-        entity_ids: set[str] = set(entity_id_to_score.keys())
-
-        if entity_ids:
-            logger.info(
-                "Found %d entities. Score range: %.4f-%.4f",
-                len(entity_ids),
-                min(entity_id_to_score.values()),
-                max(entity_id_to_score.values()),
+        try:
+            content = await self._call_llm(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
             )
-        else:
-            logger.info("No entities found; graph traversal will be skipped.")
+            parsed = _safe_json_loads_array(content)
+            if parsed is not None:
+                id_to_update: dict[int, dict[str, Any]] = {}
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    aid = item.get("author_id")
+                    score = item.get("final_score")
+                    explanation = item.get("explanation")
+                    if aid is None or score is None:
+                        continue
+                    try:
+                        aid_int = int(aid)
+                        score_float = float(score)
+                        id_to_update[aid_int] = {
+                            "final_score": min(1.0, max(0.0, score_float)),
+                            "explanation": (
+                                str(explanation) if explanation else _DEFAULT_EXPLANATION
+                            ),
+                        }
+                    except (ValueError, TypeError):
+                        continue
 
-        vector_scores: dict[int, float] = {}
-        for item in posts_data:
+                if id_to_update:
+                    for c in candidates:
+                        aid = c.get("author_id")
+                        if aid in id_to_update:
+                            c["final_score"] = id_to_update[aid]["final_score"]
+                            c["explanation"] = id_to_update[aid]["explanation"]
+                    return candidates
+        except openai.APIError:
+            logger.warning("LLM reranking failed, keeping initial scores", exc_info=True)
+        except Exception:
+            logger.warning("Unexpected error in LLM reranking", exc_info=True)
+
+        for c in candidates:
+            c.setdefault("explanation", _DEFAULT_EXPLANATION)
+        return candidates
+
+    async def execute_search(self, payload: SearchRequest) -> SearchResponse:
+        vector_query, graph_entities = await self._reformulate_query(payload.query)
+        logger.info(
+            "Query reformulation complete. vector_query=%r graph_entities=%s",
+            vector_query,
+            graph_entities[:10],
+        )
+
+        posts_fetch_limit = max(1000, payload.limit * 20)
+        entities_fetch_limit = 500
+
+        posts_data, entities_data = await self._fetch_qdrant_data(
+            vector_query, posts_fetch_limit, entities_fetch_limit, payload,
+        )
+
+        entity_id_to_score: dict[str, float] = {}
+        label_to_entity_ids: dict[str, list[str]] = {}
+        for e in entities_data:
+            eid = e.get("entity_id", "")
+            score = e.get("score", 0.0)
+            if eid:
+                entity_id_to_score[eid] = score
+                label = e.get("label") or e.get("entity_label") or "Entity"
+                if label not in label_to_entity_ids:
+                    label_to_entity_ids[label] = []
+                label_to_entity_ids[label].append(eid)
+
+        graph_post_entities: dict[int, list[str]] = {}
+        graph_post_ers: dict[int, float] = {}
+
+        if label_to_entity_ids:
             try:
-                vector_scores[int(item["post_id"])] = float(item["score"])
-            except (ValueError, TypeError):
-                continue
-
-        post_id_to_er: dict[int, float] = {}
-        for item in posts_data:
-            try:
-                post_id = int(item["post_id"])
-                raw_er = item.get("engagement_rate", 0.0)
-                post_id_to_er[post_id] = float(raw_er)
-            except (ValueError, TypeError):
-                continue
-
-        graph_post_scores: dict[int, float] = {}
-
-        if entity_ids:
-            try:
-                label_to_entity_ids: dict[str, list[str]] = {}
-                for e in entities_data:
-                    label = e.get("label") or e.get("entity_label") or "Entity"
-                    if label not in label_to_entity_ids:
-                        label_to_entity_ids[label] = []
-                    label_to_entity_ids[label].append(e["entity_id"])
-
                 graph_post_entities, graph_post_ers = (
                     await self._graph_search_repo.search_posts_by_entities(
                         label_to_entity_ids
                     )
                 )
                 logger.info(
-                    "Graph Cypher search returned %d matched posts",
+                    "Graph search returned %d matched posts from %d entity labels",
                     len(graph_post_entities),
+                    len(label_to_entity_ids),
+                )
+            except Exception:
+                logger.warning(
+                    "Graph search failed, continuing without graph data", exc_info=True,
                 )
 
-                for pid, er in graph_post_ers.items():
-                    post_id_to_er[pid] = er
+        vector_scores: dict[int, float] = {}
+        post_id_to_er: dict[int, float] = {}
+        for item in posts_data:
+            try:
+                post_id = int(item["post_id"])
+                vector_scores[post_id] = float(item.get("score", 0.0))
+                raw_er = item.get("engagement_rate", 0.0)
+                post_id_to_er[post_id] = float(raw_er) if raw_er is not None else 0.0
+            except (ValueError, KeyError, TypeError):
+                continue
 
-                for pid, connected_entities in graph_post_entities.items():
-                    try:
-                        pid_int = int(pid)
-                    except (ValueError, TypeError):
-                        continue
-                    entity_scores = [
-                        entity_id_to_score.get(e_id, 0.0)
-                        for e_id in connected_entities
-                    ]
-                    graph_post_scores[pid_int] = max(entity_scores) if entity_scores else 0.0
+        for pid, er in graph_post_ers.items():
+            post_id_to_er[pid] = er
 
-            except Exception:
-                logger.warning("Graph search failed", exc_info=True)
+        graph_scores: dict[int, float] = {}
+        for pid, connected_entities in graph_post_entities.items():
+            try:
+                pid_int = int(pid)
+            except (ValueError, TypeError):
+                continue
+            entity_scores = [entity_id_to_score.get(eid, 0.0) for eid in connected_entities]
+            graph_scores[pid_int] = max(entity_scores) if entity_scores else 0.0
 
-        logger.info(
-            "Vector scored: %d items, Graph scored: %d items",
-            len(vector_scores),
-            len(graph_post_scores),
-        )
+        all_post_ids: set[int] = set(vector_scores.keys()) | set(graph_scores.keys())
+        safe_post_ids: list[int] = sorted(all_post_ids)
 
-        unique_content_ids: set[int] = set(vector_scores.keys()) | set(graph_post_scores.keys())
+        if not safe_post_ids:
+            return SearchResponse(results=[])
 
-        safe_content_ids: list[int] = [
-            cid for cid in unique_content_ids
-            if _MIN_INT32 <= cid <= _MAX_INT32
-        ]
-
-        filtered_count = len(unique_content_ids) - len(safe_content_ids)
-        if filtered_count > 0:
-            logger.warning(
-                "Filtered out %d content IDs exceeding PostgreSQL int32 range "
-                "(min=%d, max=%d). Dropped IDs: %s",
-                filtered_count,
-                _MIN_INT32,
-                _MAX_INT32,
-                sorted(set(unique_content_ids) - set(safe_content_ids)),
-            )
-
-        candidates = await self._db.get_search_candidates(
-            content_ids=safe_content_ids,
+        candidates_rows = await self._db.get_search_candidates(
+            content_ids=safe_post_ids,
             location=payload.location,
             min_followers=payload.min_followers,
         )
 
-        candidate_id_set: set[int] = {row["id"] for row in candidates}
+        if not candidates_rows:
+            return SearchResponse(results=[])
 
-        kag_scores = _compute_kag_scores(vector_scores, graph_post_scores, post_id_to_er)
+        author_map: dict[int, dict[str, Any]] = {}
 
-        merged: list[dict[str, Any]] = []
-        for row in candidates:
-            cid = row["id"]
-            if cid not in kag_scores:
-                continue
-            final_score, vec_score, norm_graph_score, er_score = kag_scores[cid]
-            merged.append(
-                {
-                    "row": row,
-                    "final_score": final_score,
-                    "vector_score": vec_score,
-                    "graph_score": norm_graph_score,
-                    "er_score": er_score,
-                    "url": _build_content_url(row),
-                    "in_graph": cid in graph_post_scores,
-                    "in_vector": cid in vector_scores,
+        for row in candidates_rows:
+            post_id = row["id"]
+            account_id = row["account_id"]
+
+            if account_id not in author_map:
+                author_map[account_id] = {
+                    "author_id": account_id,
+                    "username": row.get("username"),
+                    "title": row.get("account_title", ""),
+                    "description": row.get("description"),
+                    "subscribers_count": row.get("subscribers_count"),
+                    "platform": row.get("platform", "TELEGRAM"),
+                    "posts": [],
+                    "vector_scores": [],
+                    "graph_scores": [],
+                    "engagement_rates": [],
+                    "explanation": _DEFAULT_EXPLANATION,
                 }
-            )
 
-        merged.sort(key=lambda x: x["final_score"], reverse=True)
-        merged = merged[: payload.limit]
+            author = author_map[account_id]
+            vs = vector_scores.get(post_id, 0.0)
+            gs = graph_scores.get(post_id, 0.0)
+            er = _normalize_er(post_id_to_er.get(post_id, 0.0))
 
-        final_post_ids: set[int] = {item["row"]["id"] for item in merged}
-        graph_entities: list[GraphEntity] = []
+            platform = row.get("platform")
+            username = row.get("username")
+            message_id = row.get("message_id")
+            platform_content_id = row.get("platform_content_id")
+            published_at = row.get("created_at")
 
-        if final_post_ids and entity_ids and graph_post_entities:
-            try:
-                active_entity_ids: set[str] = set()
-                top_posts_for_graph = merged[:15]
-                for item in top_posts_for_graph:
-                    pid = item["row"]["id"]
-                    if pid in graph_post_entities:
-                        for eid in graph_post_entities[pid]:
-                            active_entity_ids.add(eid)
+            if published_at is not None:
+                snippet = AuthorPostSnippet(
+                    post_id=post_id,
+                    text=(row.get("content") or row.get("transcription") or "")[:500],
+                    published_at=published_at,
+                    url=_build_content_url(
+                        platform, username, message_id, account_id, platform_content_id,
+                    ),
+                    engagement_rate=er,
+                )
 
-                if not active_entity_ids:
-                    top_entity_ids = [
-                        e["entity_id"] for e in entities_data[:10]
-                    ]
-                    active_entity_ids = set(top_entity_ids)
+                author["posts"].append(
+                    {
+                        "snippet": snippet,
+                        "vector_score": vs,
+                        "graph_score": gs,
+                        "engagement_rate": er,
+                    }
+                )
+                author["vector_scores"].append(vs)
+                author["graph_scores"].append(gs)
+                author["engagement_rates"].append(er)
 
-                if active_entity_ids:
-                    lazy_label_to_ids: dict[str, list[str]] = {}
-                    for e in entities_data:
-                        eid = e["entity_id"]
-                        if eid in active_entity_ids:
-                            label = e.get("label") or e.get("entity_label") or "Entity"
-                            if label not in lazy_label_to_ids:
-                                lazy_label_to_ids[label] = []
-                            lazy_label_to_ids[label].append(eid)
-
-                    lazy_edges_data = await self._graph_search_repo.fetch_subgraph_edges(
-                        lazy_label_to_ids
-                    )
-                    logger.info(
-                        "Optimized lazy hydration: fetched %d edges for %d active entities",
-                        len(lazy_edges_data),
-                        len(active_entity_ids),
-                    )
-
-                    if lazy_edges_data:
-                        lazy_node_ids: set[str] = set()
-                        for edge in lazy_edges_data:
-                            try:
-                                lazy_node_ids.add(edge["source_id"])
-                                lazy_node_ids.add(edge["target_id"])
-                            except (KeyError, TypeError):
-                                continue
-
-                        lazy_node_id_to_label: dict[str, str] = {}
-                        for nid in lazy_node_ids:
-                            if nid in active_entity_ids:
-                                for e in entities_data:
-                                    if e["entity_id"] == nid:
-                                        lazy_node_id_to_label[nid] = (
-                                            e.get("label")
-                                            or e.get("entity_label")
-                                            or "Entity"
-                                        )
-                                        break
-
-                        label_to_node_ids_lazy: dict[str, list[str]] = {}
-                        for nid, lbl in lazy_node_id_to_label.items():
-                            if lbl not in label_to_node_ids_lazy:
-                                label_to_node_ids_lazy[lbl] = []
-                            label_to_node_ids_lazy[lbl].append(nid)
-
-                        if label_to_node_ids_lazy:
-                            nodes_data_lazy = await self._graph_search_repo.fetch_nodes_by_ids(
-                                label_to_node_ids_lazy
-                            )
-                            logger.info(
-                                "Optimized lazy hydration: fetched %d nodes for graph entity details",
-                                len(nodes_data_lazy),
-                            )
-                            node_lookup: dict[str, dict[str, Any]] = {
-                                n["id"]: n for n in nodes_data_lazy
-                            }
-                            entity_lookup: dict[str, GraphEntity] = {}
-
-                            for edge in lazy_edges_data:
-                                try:
-                                    source_id = edge["source_id"]
-                                    target_id = edge["target_id"]
-                                except (KeyError, TypeError):
-                                    continue
-
-                                for nid in (source_id, target_id):
-                                    if nid in active_entity_ids:
-                                        if nid not in entity_lookup:
-                                            nd = node_lookup.get(nid, {})
-                                            entity_lookup[nid] = GraphEntity(
-                                                entity_id=nid,
-                                                entity_label=nd.get("label", "Unknown"),
-                                                entity_name=nd.get("name"),
-                                                properties=nd.get("properties", {}),
-                                                relationships=[],
-                                            )
-                                        ge = entity_lookup[nid]
-                                        rel = GraphEdge(
-                                            source_id=edge.get("source_id", ""),
-                                            source_label=edge.get("source_label", ""),
-                                            source_name=edge.get("source_name"),
-                                            relation_type=edge.get("relation_type", ""),
-                                            target_id=edge.get("target_id", ""),
-                                            target_label=edge.get("target_label", ""),
-                                            target_name=edge.get("target_name"),
-                                        )
-                                        if rel not in ge.relationships:
-                                            ge.relationships.append(rel)
-
-                            graph_entities = list(entity_lookup.values())
-
-            except Exception:
-                logger.warning("Failed to build graph entities with lazy hydration", exc_info=True)
-                graph_entities = []
-
-        results: list[SearchResultItem] = []
-        seen_texts: set[str] = set()
-        for item in merged:
-            row = item["row"]
-            text = (row.get("content") or row.get("transcription") or "").strip().lower()
-            if not text or text in seen_texts:
+        ranked_authors: list[dict[str, Any]] = []
+        for account_id, author in author_map.items():
+            if not author["posts"]:
                 continue
-            seen_texts.add(text)
+            max_vs = max(author["vector_scores"]) if author["vector_scores"] else 0.0
+            max_gs = max(author["graph_scores"]) if author["graph_scores"] else 0.0
+            avg_er = (
+                sum(author["engagement_rates"]) / len(author["engagement_rates"])
+                if author["engagement_rates"] else 0.0
+            )
+            hybrid_score = 0.5 * max_vs + 0.3 * max_gs + 0.2 * avg_er
 
-            author_id: int | None = None
-            author_name: str | None = None
-            if payload.include_author_info:
-                author_id = row.get("account_id")
-                author_name = row.get("account_title")
+            author["vector_score"] = max_vs
+            author["graph_score"] = max_gs
+            author["avg_engagement_rate"] = avg_er
+            author["final_score"] = hybrid_score
+            author["top_post_texts"] = [
+                s["snippet"].text[:200] for s in author["posts"][:3]
+            ]
+            ranked_authors.append(author)
+
+        ranked_authors.sort(key=lambda x: x["final_score"], reverse=True)
+        top_candidates = ranked_authors[:12]
+
+        if len(top_candidates) > 1:
+            try:
+                top_candidates = await self._rerank_and_explain(
+                    payload.query, top_candidates,
+                )
+            except Exception:
+                logger.warning(
+                    "Reranking step failed, using initial scores", exc_info=True,
+                )
+
+        top_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+        final_candidates = top_candidates[: payload.limit]
+
+        results: list[AuthorSearchResultItem] = []
+        for author in final_candidates:
+            sorted_posts = sorted(
+                author["posts"],
+                key=lambda x: (x["vector_score"] + x["graph_score"]) / 2,
+                reverse=True,
+            )
+            relevant_posts = [p["snippet"] for p in sorted_posts]
 
             results.append(
-                SearchResultItem(
-                    post_id=row["id"],
-                    account_id=row["account_id"],
-                    text=row.get("content") or row.get("transcription") or "",
-                    score=item["final_score"],
-                    vector_score=item["vector_score"],
-                    graph_score=item["graph_score"],
-                    er_score=item["er_score"],
-                    created_at=row.get("created_at"),
-                    url=item["url"],
-                    author_id=author_id,
-                    author_name=author_name,
-                    boosted=item["in_graph"],
+                AuthorSearchResultItem(
+                    author_id=author["author_id"],
+                    username=author.get("username"),
+                    title=author.get("title", ""),
+                    description=author.get("description"),
+                    subscribers_count=author.get("subscribers_count"),
+                    platform=author.get("platform", "TELEGRAM"),
+                    final_score=author["final_score"],
+                    vector_score=author["vector_score"],
+                    graph_score=author["graph_score"],
+                    avg_engagement_rate=author["avg_engagement_rate"],
+                    explanation=author.get("explanation", _DEFAULT_EXPLANATION),
+                    relevant_posts=relevant_posts,
                 )
             )
 
-        return SearchResponse(results=results, graph_entities=graph_entities)
+        return SearchResponse(results=results)
+
+    async def _fetch_qdrant_data(
+        self,
+        vector_query: str,
+        posts_limit: int,
+        entities_limit: int,
+        payload: SearchRequest,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        posts_task = self._qdrant.search_posts(
+            query=vector_query,
+            limit=posts_limit,
+            score_threshold=payload.score_threshold,
+            min_followers=payload.min_followers,
+            min_engagement_rate=None,
+            platform=None,
+        )
+        entities_task = self._qdrant.search_entities(
+            query=vector_query,
+            limit=entities_limit,
+            score_threshold=payload.score_threshold,
+        )
+
+        results = await asyncio.gather(
+            posts_task, entities_task, return_exceptions=True,
+        )
+
+        posts_data: list[dict[str, Any]] = []
+        entities_data: list[dict[str, Any]] = []
+
+        if isinstance(results[0], Exception):
+            logger.warning("Qdrant posts search failed", exc_info=results[0])
+        elif results[0] is not None:
+            posts_data = results[0]  # type: ignore[assignment]
+
+        if isinstance(results[1], Exception):
+            logger.warning("Qdrant entities search failed", exc_info=results[1])
+        elif results[1] is not None:
+            entities_data = results[1]  # type: ignore[assignment]
+
+        return posts_data, entities_data

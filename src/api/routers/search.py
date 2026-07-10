@@ -7,7 +7,7 @@ from src.api.services.search_service import SearchService
 router = APIRouter(prefix="/search", tags=["Search"])
 
 
-@router.post("")
+@router.post("/")
 async def search_content(
     payload: SearchRequest,
     service: SearchService = Depends(get_search_service),

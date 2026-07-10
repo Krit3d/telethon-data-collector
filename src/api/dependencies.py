@@ -21,10 +21,12 @@ def get_graph_search_repo(request: Request) -> GraphSearchRepository:
 
 
 def get_search_service(request: Request) -> SearchService:
+    settings = request.app.state.settings
     qdrant = get_qdrant(request)
     db = get_db(request)
     graph_search_repo = get_graph_search_repo(request)
     return SearchService(
+        settings=settings,
         qdrant=qdrant,
         db=db,
         graph_search_repo=graph_search_repo,

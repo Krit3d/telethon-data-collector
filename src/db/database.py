@@ -5,11 +5,11 @@ import random
 import re
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any, cast
+from typing import Any, cast as type_cast
 
-from sqlalchemy import and_, case, func, or_, select, update, text, String
+from sqlalchemy import and_, case, func, or_, select, update, text, cast
+from sqlalchemy.dialects.postgresql import insert, JSONPATH
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -241,7 +241,7 @@ class Database:
                     .where(Account.platform == "TELEGRAM")
                     .values(status="pending")
                 )
-                result = cast(CursorResult, await session.execute(stmt))
+                result = type_cast(CursorResult, await session.execute(stmt))
 
                 if result.rowcount > 0:
                     logger.info(
@@ -330,7 +330,7 @@ class Database:
                     else:
                         stmt = stmt.where(Account.platform == platform)
 
-                result = cast(CursorResult, await session.execute(stmt))
+                result = type_cast(CursorResult, await session.execute(stmt))
 
                 if result.rowcount > 0:
                     logger.debug(
@@ -361,7 +361,7 @@ class Database:
                     .where(Account.status == "processing")
                     .values(status="pending", updated_at=datetime.now(timezone.utc))
                 )
-                result = cast(CursorResult, await session.execute(stmt))
+                result = type_cast(CursorResult, await session.execute(stmt))
                 reset_count = result.rowcount
 
                 if reset_count > 0:
@@ -603,7 +603,7 @@ class Database:
                     .where(Account.platform == "TELEGRAM")
                     .values(access_hash=access_hash, updated_at=datetime.now(timezone.utc))
                 )
-                result = cast(CursorResult, await session.execute(stmt))
+                result = type_cast(CursorResult, await session.execute(stmt))
 
                 if result.rowcount > 0:
                     logger.debug(
@@ -637,6 +637,9 @@ class Database:
                     Account.platform,
                     Account.username,
                     Account.title,
+                    Account.description,
+                    Account.subscribers_count,
+                    Account.raw_metadata,
                 )
                 .join(Account, Content.account_id == Account.id)
                 .where(Content.id.in_(content_ids))
@@ -651,19 +654,19 @@ class Database:
                     or_(
                         func.jsonb_path_exists(
                             Account.raw_metadata,
-                            f'$.geo_data.country ? (@ like_regex "{location_pattern}" flag "i")',
+                            cast(f'$.geo_data.country ? (@ like_regex "{location_pattern}" flag "i")', JSONPATH),
                         ),
                         func.jsonb_path_exists(
                             Account.raw_metadata,
-                            f'$.geo_data.city ? (@ like_regex "{location_pattern}" flag "i")',
+                            cast(f'$.geo_data.city ? (@ like_regex "{location_pattern}" flag "i")', JSONPATH),
                         ),
                         func.jsonb_path_exists(
                             Account.raw_metadata,
-                            f'$.location.country ? (@ like_regex "{location_pattern}" flag "i")',
+                            cast(f'$.location.country ? (@ like_regex "{location_pattern}" flag "i")', JSONPATH),
                         ),
                         func.jsonb_path_exists(
                             Account.raw_metadata,
-                            f'$.location.city ? (@ like_regex "{location_pattern}" flag "i")',
+                            cast(f'$.location.city ? (@ like_regex "{location_pattern}" flag "i")', JSONPATH),
                         ),
                     )
                 )
@@ -687,6 +690,9 @@ class Database:
                     "platform": row.platform,
                     "username": row.username,
                     "account_title": row.title,
+                    "description": row.description,
+                    "subscribers_count": row.subscribers_count,
+                    "raw_metadata": row.raw_metadata,
                 }
                 for row in result
             ]
