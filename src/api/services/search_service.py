@@ -10,7 +10,6 @@ import openai
 from openai import AsyncOpenAI
 
 from src.api.schemas import (
-    AuthorPostSnippet,
     AuthorSearchResultItem,
     SearchRequest,
     SearchResponse,
@@ -45,21 +44,21 @@ _NEGATIVE_SIGNALS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-def _build_content_url(
-    platform: str | None,
-    username: str | None,
-    message_id: int | None,
-    account_id: int | None,
-    platform_content_id: str | None,
-) -> str | None:
-    if platform and platform.upper() == "TELEGRAM" and message_id is not None:
-        if username:
-            return f"https://t.me/{username}/{message_id}"
-        if account_id is not None:
-            return f"https://t.me/c/{account_id}/{message_id}"
-    if platform and platform_content_id:
-        return f"https://platform/{platform.lower()}/content/{platform_content_id}"
-    return None
+# def _build_content_url(
+#     platform: str | None,
+#     username: str | None,
+#     message_id: int | None,
+#     account_id: int | None,
+#     platform_content_id: str | None,
+# ) -> str | None:
+#     if platform and platform.upper() == "TELEGRAM" and message_id is not None:
+#         if username:
+#             return f"https://t.me/{username}/{message_id}"
+#         if account_id is not None:
+#             return f"https://t.me/c/{account_id}/{message_id}"
+#     if platform and platform_content_id:
+#         return f"https://platform/{platform.lower()}/content/{platform_content_id}"
+#     return None
 
 def _normalize_er(er: float) -> float:
     if er > 1.0:
@@ -118,6 +117,7 @@ def _jaccard_similarity(set_a: set[str], set_b: set[str]) -> float:
     intersection = set_a & set_b
     return len(intersection) / len(union)
 
+
 class SearchService:
     def __init__(
         self,
@@ -137,11 +137,11 @@ class SearchService:
         self._llm_model = settings.cloud_ru_llm_model
 
     async def _call_llm(
-        self, messages: list[dict[str, str | list[dict[str, str]]]], temperature: float = 0.2,
+        self, messages: list[dict[str, Any]], temperature: float = 0.2,
     ) -> str:
         response = await self._llm_client.chat.completions.create(
             model=self._llm_model,
-            messages=messages,  # type: ignore[arg-type]
+            messages=messages, # type: ignore[arg-type]
             temperature=temperature,
         )
         return response.choices[0].message.content or ""
@@ -202,6 +202,7 @@ class SearchService:
                     "subscriber_count": c.get("subscribers_count", 0),
                     "platform": c.get("platform", ""),
                     "top_posts": c.get("top_post_texts", [])[:3],
+                    "is_dormant": c.get("is_dormant", False),
                 }
             )
 
@@ -213,7 +214,10 @@ class SearchService:
             "If any negative signals are detected, set the final_score to 0.0. "
             "The 'explanation' field MUST be strictly in Russian, written in a professional, concise tone (2-3 sentences), "
             "explaining why this creator matches the project based strictly on their provided Russian posts and bio. "
-            "Calibrate final_score between 0.0 and 1.0. "
+            "If the author is marked as 'is_dormant': true (no recent posts > 180 days), but you still return them as a rare niche expert, "
+            "you MUST append this exact Russian warning sentence at the end of the explanation: "
+            '"Внимание: автор не публиковал новый контент более 180 дней, но включён в выдачу как редкий эксперт в данной нише." '
+            "Calibrate final_score between 0.0 and 1.0 based on cumulative signals. "
             "Output a JSON array where each element has: "
             '"author_id" (integer), "final_score" (float between 0 and 1), "explanation" (string). '
             "Output ONLY valid JSON, no markdown, no extra text."
@@ -275,10 +279,15 @@ class SearchService:
     async def execute_search(self, payload: SearchRequest) -> SearchResponse:
         query = payload.query.strip()
         query_words = query.split()
-        if len(query_words) < 2:
-            return SearchResponse(results=[])
-        if all(word.lower() in _STOPWORDS for word in query_words):
-            return SearchResponse(results=[])
+        meaningful_words = [w for w in query_words if w.lower() not in _STOPWORDS]
+        if len(query_words) < 2 or len(meaningful_words) == 0:
+            return SearchResponse(
+                results=[],
+                message=(
+                    "Запрос слишком короткий или не содержит значимых слов. "
+                    "Пожалуйста, опишите ваш проект подробнее (например, сферу деятельности, цели или целевую аудиторию)."
+                ),
+            )
 
         vector_query, graph_entities = await self._reformulate_query(query)
         logger.info(
@@ -292,6 +301,11 @@ class SearchService:
 
         posts_data, entities_data = await self._fetch_qdrant_data(
             vector_query, posts_fetch_limit, entities_fetch_limit, payload,
+        )
+        logger.info(
+            "Qdrant fetch complete. posts_data length=%d entities_data length=%d",
+            len(posts_data),
+            len(entities_data),
         )
 
         entity_id_to_score: dict[str, float] = {}
@@ -351,18 +365,43 @@ class SearchService:
 
         all_post_ids: set[int] = set(vector_scores.keys()) | set(graph_scores.keys())
         safe_post_ids: list[int] = sorted(all_post_ids)
+        logger.info(
+            "Unique post IDs in safe_post_ids before DB query: %d",
+            len(safe_post_ids),
+        )
 
         if not safe_post_ids:
-            return SearchResponse(results=[])
+            return SearchResponse(
+                results=[],
+                message=(
+                    "По вашему запросу не найдено подходящих авторов. "
+                    "Попробуйте переформулировать запрос или расширить описание проекта."
+                ),
+            )
 
+        logger.info(
+            "DB candidate query params: location=%r min_followers=%r",
+            payload.location,
+            payload.min_followers,
+        )
         candidates_rows = await self._db.get_search_candidates(
             content_ids=safe_post_ids,
             location=payload.location,
             min_followers=payload.min_followers,
         )
+        logger.info(
+            "Raw candidates fetched from PostgreSQL: %d",
+            len(candidates_rows),
+        )
 
         if not candidates_rows:
-            return SearchResponse(results=[])
+            return SearchResponse(
+                results=[],
+                message=(
+                    "По вашему запросу не найдено подходящих авторов. "
+                    "Попробуйте переформулировать запрос или расширить описание проекта."
+                ),
+            )
 
         author_map: dict[int, dict[str, Any]] = {}
         current_utc = datetime.now(timezone.utc)
@@ -387,6 +426,7 @@ class SearchService:
                     "has_contacts": False,
                     "most_recent_post": None,
                     "matched_entities": set(),
+                    "is_dormant": False,
                 }
 
             author = author_map[account_id]
@@ -406,36 +446,20 @@ class SearchService:
                 if author["most_recent_post"] is None or published_at > author["most_recent_post"]:
                     author["most_recent_post"] = published_at
 
-            platform = row.get("platform")
-            username = row.get("username")
-            message_id = row.get("message_id")
-            platform_content_id = row.get("platform_content_id")
-
             if published_at is not None:
-                snippet = AuthorPostSnippet(
-                    post_id=post_id,
-                    text=(row.get("content") or row.get("transcription") or "")[:500],
-                    published_at=published_at,
-                    url=_build_content_url(
-                        platform, username, message_id, account_id, platform_content_id,
-                    ),
-                    engagement_rate=er,
-                )
-
-                author["posts"].append(
-                    {
-                        "snippet": snippet,
-                        "vector_score": vs,
-                        "graph_score": gs,
-                        "engagement_rate": er,
-                    }
-                )
                 author["vector_scores"].append(vs)
                 author["graph_scores"].append(gs)
                 author["engagement_rates"].append(er)
 
                 post_entity_ids = graph_post_entities.get(post_id, [])
                 author["matched_entities"].update(post_entity_ids)
+
+            author["posts"].append({
+                "post_id": post_id,
+                "text": row.get("content") or row.get("transcription") or "",
+                "published_at": published_at,
+                "engagement_rate": er,
+            })
 
             raw_metadata = row.get("raw_metadata")
             parsed_metadata = _safe_json_loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
@@ -453,15 +477,25 @@ class SearchService:
                 continue
             title = author.get("title", "")
             description = author.get("description") or ""
-            post_texts = [p["snippet"].text for p in author["posts"]]
+            post_texts = [p["text"] for p in author["posts"]]
             all_text = f"{title} {description} {' '.join(post_texts)}"
             if _has_negative_signals(all_text):
                 logger.info("Author %d discarded due to negative signals", account_id)
                 continue
             safe_author_map[account_id] = author
+        logger.info(
+            "Authors in safe_author_map after negative signals check: %d",
+            len(safe_author_map),
+        )
 
         if not safe_author_map:
-            return SearchResponse(results=[])
+            return SearchResponse(
+                results=[],
+                message=(
+                    "По вашему запросу не найдено подходящих авторов. "
+                    "Попробуйте переформулировать запрос или расширить описание проекта."
+                ),
+            )
 
         max_matched_posts = max(len(a["posts"]) for a in safe_author_map.values()) if safe_author_map else 1
 
@@ -489,10 +523,15 @@ class SearchService:
             if author["most_recent_post"] is not None:
                 days_since_last_post = (current_utc - author["most_recent_post"]).days
                 if days_since_last_post > 180:
+                    author["is_dormant"] = True
                     if active_authors_count >= payload.limit:
                         continue
                     else:
                         final_raw_score *= 0.1
+                else:
+                    author["is_dormant"] = False
+            else:
+                author["is_dormant"] = False
 
             author["vector_score"] = max_vs
             author["graph_score"] = max_gs
@@ -500,12 +539,23 @@ class SearchService:
             author["expertise_ratio"] = expertise_ratio
             author["final_score"] = final_raw_score
             author["top_post_texts"] = [
-                s["snippet"].text[:200] for s in author["posts"][:3]
+                s["text"][:200] for s in author["posts"][:3]
             ]
             ranked_authors.append(author)
 
+        logger.info(
+            "Authors in ranked_authors after temporal decay and dormancy rules: %d",
+            len(ranked_authors),
+        )
+
         if not ranked_authors:
-            return SearchResponse(results=[])
+            return SearchResponse(
+                results=[],
+                message=(
+                    "По вашему запросу не найдено подходящих авторов. "
+                    "Попробуйте переформулировать запрос или расширить описание проекта."
+                ),
+            )
 
         mmr_selection_size = min(15, payload.limit * 2)
         mmr_selected: list[dict[str, Any]] = []
@@ -548,31 +598,31 @@ class SearchService:
                 )
 
         for author in top_candidates:
-            score = author["final_score"]
-            if author.get("has_contacts") is True:
-                score += 0.15
-            if author.get("most_recent_post") is not None:
-                days_since_last_post = (current_utc - author["most_recent_post"]).days
-                if days_since_last_post > 180:
-                    score *= 0.1
-            author["final_score"] = min(1.0, max(0.0, score))
+            author["final_score"] = min(1.0, max(0.0, author["final_score"]))
 
         top_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+        logger.info(
+            "Candidates before score_threshold filter: %d threshold=%f",
+            len(top_candidates),
+            payload.score_threshold,
+        )
         final_candidates = [c for c in top_candidates if c["final_score"] >= payload.score_threshold][: payload.limit]
+        logger.info(
+            "Candidates after score_threshold filter: %d",
+            len(final_candidates),
+        )
+
+        if not final_candidates:
+            return SearchResponse(
+                results=[],
+                message=(
+                    "По вашему запросу не найдено подходящих авторов. "
+                    "Попробуйте переформулировать запрос или расширить описание проекта."
+                ),
+            )
 
         results: list[AuthorSearchResultItem] = []
         for author in final_candidates:
-            sorted_posts = sorted(
-                author["posts"],
-                key=lambda x: (x["vector_score"] + x["graph_score"]) / 2,
-                reverse=True,
-            )
-            relevant_posts = [p["snippet"] for p in sorted_posts]
-
-            explanation = author.get("explanation", _DEFAULT_EXPLANATION)
-            if author.get("has_contacts") is True:
-                explanation = explanation + " (В профиле автора найдены контактные данные)."
-
             results.append(
                 AuthorSearchResultItem(
                     author_id=author["author_id"],
@@ -585,8 +635,7 @@ class SearchService:
                     vector_score=author["vector_score"],
                     graph_score=author["graph_score"],
                     avg_engagement_rate=author["avg_engagement_rate"],
-                    explanation=explanation,
-                    relevant_posts=relevant_posts,
+                    explanation=author.get("explanation", _DEFAULT_EXPLANATION),
                 )
             )
 

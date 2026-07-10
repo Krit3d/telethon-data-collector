@@ -1,14 +1,4 @@
-from datetime import datetime
-
 from pydantic import BaseModel, Field, model_validator
-
-
-class AuthorPostSnippet(BaseModel):
-    post_id: int
-    text: str
-    published_at: datetime
-    url: str | None = None
-    engagement_rate: float
 
 
 class AuthorSearchResultItem(BaseModel):
@@ -23,7 +13,6 @@ class AuthorSearchResultItem(BaseModel):
     graph_score: float
     avg_engagement_rate: float
     explanation: str
-    relevant_posts: list[AuthorPostSnippet]
 
 
 class SearchRequest(BaseModel):
@@ -47,3 +36,4 @@ class SearchRequest(BaseModel):
 
 class SearchResponse(BaseModel):
     results: list[AuthorSearchResultItem]
+    message: str | None = None
