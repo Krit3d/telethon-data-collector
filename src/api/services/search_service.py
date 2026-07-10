@@ -35,8 +35,8 @@ _STOPWORDS = {
 logger = logging.getLogger(__name__)
 
 _DEFAULT_EXPLANATION = (
-    "This author creates content relevant to the project description "
-    "and has engaged audience interaction."
+    "Этот автор публикует контент, полностью соответствующий тематике вашего проекта, "
+    "и имеет активную аудиторию."
 )
 _FALLBACK_GRAPH_ENTITIES: list[str] = []
 
@@ -537,7 +537,7 @@ class SearchService:
 
         top_candidates = mmr_selected if mmr_selected else ranked_authors[:15]
 
-        if len(top_candidates) > 1:
+        if len(top_candidates) >= 1:
             try:
                 top_candidates = await self._rerank_and_explain(
                     payload.query, top_candidates,
@@ -547,8 +547,18 @@ class SearchService:
                     "Reranking step failed, using initial scores", exc_info=True,
                 )
 
+        for author in top_candidates:
+            score = author["final_score"]
+            if author.get("has_contacts") is True:
+                score += 0.15
+            if author.get("most_recent_post") is not None:
+                days_since_last_post = (current_utc - author["most_recent_post"]).days
+                if days_since_last_post > 180:
+                    score *= 0.1
+            author["final_score"] = min(1.0, max(0.0, score))
+
         top_candidates.sort(key=lambda x: x["final_score"], reverse=True)
-        final_candidates = top_candidates[: payload.limit]
+        final_candidates = [c for c in top_candidates if c["final_score"] >= payload.score_threshold][: payload.limit]
 
         results: list[AuthorSearchResultItem] = []
         for author in final_candidates:
