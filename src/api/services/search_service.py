@@ -129,12 +129,13 @@ class SearchService:
 
     async def _reformulate_query(self, raw_query: str) -> tuple[str, list[str]]:
         system_prompt = (
-            "You are a search query optimization assistant. "
-            "Expand synonyms (e.g., 'car insurance' -> 'kasko', 'auto insurance'), "
-            "disambiguate homonyms (e.g., distinct rocket science vs event marketing). "
-            "Output a clean JSON object with exactly two fields: "
-            '"vector_query" (string, refined semantic query for Qdrant), '
-            '"graph_entities" (list of strings, exact key topics/brands for Apache AGE). '
+            "You are a search query optimization assistant for Russian/CIS content. "
+            "The input query may be in Russian, English, or a mix of both. "
+            "Generate 'vector_query' as a clean, expanded Russian search query optimized for BGE-M3 semantic search "
+            "(e.g., expand terms, add synonyms like 'КАСКО' for 'автострахование'). "
+            "Generate 'graph_entities' as a list of key topics, brands, or entities strictly in the Russian language "
+            "to match Russian entity nodes in the Apache AGE graph. "
+            "Output strictly in the defined JSON format with English keys ('vector_query' and 'graph_entities'). "
             "Output ONLY valid JSON, no markdown, no explanation."
         )
         user_prompt = f"Project description: {raw_query}"
@@ -186,11 +187,14 @@ class SearchService:
             )
 
         system_prompt = (
-            "You are an expert talent matching assistant. "
-            "Given a project description and a list of authors, evaluate each author's relevance. "
-            "Check for negative signals (NSFW, gambling, illegal promotions): if detected, set final_score to 0.0 and exclude the author. "
-            "Write a professional 2-3 sentence explanation exactly grounded in the provided snippets, no hallucinated achievements. "
-            "Calibrate final_score between 0.0 and 1.0 aligned with NDCG@10 objectives. "
+            "You are an expert talent matching assistant for Russian/CIS content. "
+            "Analyze the Russian project description and the Russian creator metadata (bios and post snippets). "
+            "Detect and penalize negative CIS-specific signals "
+            "(e.g., Russian/CIS scam schemes, online casinos like 1win/1xbet, adult content, fraudulent financial services). "
+            "If any negative signals are detected, set the final_score to 0.0. "
+            "The 'explanation' field MUST be strictly in Russian, written in a professional, concise tone (2-3 sentences), "
+            "explaining why this creator matches the project based strictly on their provided Russian posts and bio. "
+            "Calibrate final_score between 0.0 and 1.0. "
             "Output a JSON array where each element has: "
             '"author_id" (integer), "final_score" (float between 0 and 1), "explanation" (string). '
             "Output ONLY valid JSON, no markdown, no extra text."
