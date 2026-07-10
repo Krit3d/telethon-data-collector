@@ -40,6 +40,11 @@ _DEFAULT_EXPLANATION = (
 )
 _FALLBACK_GRAPH_ENTITIES: list[str] = []
 
+_NEGATIVE_SIGNALS_PATTERN = re.compile(
+    r"(1xbet|1win|casino|казино|вулкан|ставки\s+на\s+спорт|adult|18\+|порно|slots|слоты|scam|скам|криптосигналы|crypto\s*signals|betting|bet|online\s*casino|gambling|азартные\s+игры|ставки)",
+    re.IGNORECASE,
+)
+
 def _build_content_url(
     platform: str | None,
     username: str | None,
@@ -98,6 +103,20 @@ def _safe_json_loads_array(text: str) -> list[dict[str, Any]] | None:
         except (json.JSONDecodeError, TypeError):
             pass
     return None
+
+def _has_negative_signals(text: str | None) -> bool:
+    if not text:
+        return False
+    return _NEGATIVE_SIGNALS_PATTERN.search(text) is not None
+
+def _jaccard_similarity(set_a: set[str], set_b: set[str]) -> float:
+    if not set_a and not set_b:
+        return 0.0
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    intersection = set_a & set_b
+    return len(intersection) / len(union)
 
 class SearchService:
     def __init__(
@@ -367,6 +386,7 @@ class SearchService:
                     "explanation": _DEFAULT_EXPLANATION,
                     "has_contacts": False,
                     "most_recent_post": None,
+                    "matched_entities": set(),
                 }
 
             author = author_map[account_id]
@@ -374,7 +394,7 @@ class SearchService:
             gs = graph_scores.get(post_id, 0.0)
             er = _normalize_er(post_id_to_er.get(post_id, 0.0))
 
-            published_at = row.get("created_at")
+            published_at = row.get("published_at") or row.get("created_at")
             decay_factor = 1.0
             if published_at is not None:
                 if published_at.tzinfo is None:
@@ -414,6 +434,9 @@ class SearchService:
                 author["graph_scores"].append(gs)
                 author["engagement_rates"].append(er)
 
+                post_entity_ids = graph_post_entities.get(post_id, [])
+                author["matched_entities"].update(post_entity_ids)
+
             raw_metadata = row.get("raw_metadata")
             parsed_metadata = _safe_json_loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
             if isinstance(parsed_metadata, dict) and not author["has_contacts"]:
@@ -424,8 +447,33 @@ class SearchService:
                             author["has_contacts"] = True
                             break
 
-        ranked_authors: list[dict[str, Any]] = []
+        safe_author_map: dict[int, dict[str, Any]] = {}
         for account_id, author in author_map.items():
+            if not author["posts"]:
+                continue
+            title = author.get("title", "")
+            description = author.get("description") or ""
+            post_texts = [p["snippet"].text for p in author["posts"]]
+            all_text = f"{title} {description} {' '.join(post_texts)}"
+            if _has_negative_signals(all_text):
+                logger.info("Author %d discarded due to negative signals", account_id)
+                continue
+            safe_author_map[account_id] = author
+
+        if not safe_author_map:
+            return SearchResponse(results=[])
+
+        max_matched_posts = max(len(a["posts"]) for a in safe_author_map.values()) if safe_author_map else 1
+
+        active_authors_count = 0
+        for a in safe_author_map.values():
+            if a["most_recent_post"] is not None:
+                days_since_last_post = (current_utc - a["most_recent_post"]).days
+                if days_since_last_post <= 180:
+                    active_authors_count += 1
+
+        ranked_authors: list[dict[str, Any]] = []
+        for account_id, author in safe_author_map.items():
             if not author["posts"]:
                 continue
             max_vs = max(author["vector_scores"]) if author["vector_scores"] else 0.0
@@ -434,48 +482,60 @@ class SearchService:
                 sum(author["engagement_rates"]) / len(author["engagement_rates"])
                 if author["engagement_rates"] else 0.0
             )
-            expertise_ratio = len(author["posts"]) / len(author["posts"]) if len(author["posts"]) > 0 else 0.0
+            expertise_ratio = len(author["posts"]) / max_matched_posts if max_matched_posts > 0 else 0.0
             base_score = 0.4 * max_vs + 0.3 * max_gs + 0.15 * avg_er + 0.15 * expertise_ratio
             final_raw_score = base_score + (0.15 if author["has_contacts"] else 0.0)
 
             if author["most_recent_post"] is not None:
                 days_since_last_post = (current_utc - author["most_recent_post"]).days
-                if days_since_last_post > 180 and len(ranked_authors) > 0:
-                    final_raw_score *= 0.1
+                if days_since_last_post > 180:
+                    if active_authors_count >= payload.limit:
+                        continue
+                    else:
+                        final_raw_score *= 0.1
 
             author["vector_score"] = max_vs
             author["graph_score"] = max_gs
             author["avg_engagement_rate"] = avg_er
+            author["expertise_ratio"] = expertise_ratio
             author["final_score"] = final_raw_score
             author["top_post_texts"] = [
                 s["snippet"].text[:200] for s in author["posts"][:3]
             ]
             ranked_authors.append(author)
 
-        ranked_authors.sort(key=lambda x: x["final_score"], reverse=True)
+        if not ranked_authors:
+            return SearchResponse(results=[])
 
-        top_candidates = ranked_authors[:15]
-        platform_counts: dict[str, int] = {}
-        for c in top_candidates:
-            platform = c.get("platform", "UNKNOWN").upper()
-            platform_counts[platform] = platform_counts.get(platform, 0) + 1
-        total_top = len(top_candidates)
-        if total_top > 1 and platform_counts:
-            dominant_platform = max(platform_counts, key=lambda k: platform_counts[k])
-            dominant_count = platform_counts[dominant_platform]
-            if dominant_count / total_top > 0.7:
-                other_platforms = [p for p in platform_counts if p != dominant_platform]
-                has_other_high_score = False
-                for c in ranked_authors:
-                    if c.get("platform", "").upper() in other_platforms and c["final_score"] > 0.3:
-                        has_other_high_score = True
-                        break
-                if has_other_high_score:
-                    for c in top_candidates:
-                        if c.get("platform", "").upper() == dominant_platform:
-                            c["final_score"] *= 0.9
-                    top_candidates.sort(key=lambda x: x["final_score"], reverse=True)
-                    top_candidates = top_candidates[:15]
+        mmr_selection_size = min(15, payload.limit * 2)
+        mmr_selected: list[dict[str, Any]] = []
+
+        remaining_candidates = list(ranked_authors)
+
+        for _ in range(min(mmr_selection_size, len(remaining_candidates))):
+            best_candidate = None
+            best_mmr_score = -float("inf")
+
+            for candidate in remaining_candidates:
+                if candidate in mmr_selected:
+                    continue
+                candidate_entities = candidate.get("matched_entities", set())
+                max_similarity = 0.0
+                for selected in mmr_selected:
+                    selected_entities = selected.get("matched_entities", set())
+                    sim = _jaccard_similarity(candidate_entities, selected_entities)
+                    max_similarity = max(max_similarity, sim)
+                mmr_score = 0.7 * candidate["final_score"] - 0.3 * max_similarity
+                if mmr_score > best_mmr_score:
+                    best_mmr_score = mmr_score
+                    best_candidate = candidate
+
+            if best_candidate is None:
+                break
+            mmr_selected.append(best_candidate)
+            remaining_candidates.remove(best_candidate)
+
+        top_candidates = mmr_selected if mmr_selected else ranked_authors[:15]
 
         if len(top_candidates) > 1:
             try:
@@ -499,6 +559,10 @@ class SearchService:
             )
             relevant_posts = [p["snippet"] for p in sorted_posts]
 
+            explanation = author.get("explanation", _DEFAULT_EXPLANATION)
+            if author.get("has_contacts") is True:
+                explanation = explanation + " (В профиле автора найдены контактные данные)."
+
             results.append(
                 AuthorSearchResultItem(
                     author_id=author["author_id"],
@@ -511,7 +575,7 @@ class SearchService:
                     vector_score=author["vector_score"],
                     graph_score=author["graph_score"],
                     avg_engagement_rate=author["avg_engagement_rate"],
-                    explanation=author.get("explanation", _DEFAULT_EXPLANATION),
+                    explanation=explanation,
                     relevant_posts=relevant_posts,
                 )
             )
@@ -549,11 +613,11 @@ class SearchService:
         if isinstance(results[0], Exception):
             logger.warning("Qdrant posts search failed", exc_info=results[0])
         elif isinstance(results[0], list):
-            posts_data = results[0]  # type: ignore[assignment]
+            posts_data = results[0]
 
         if isinstance(results[1], Exception):
             logger.warning("Qdrant entities search failed", exc_info=results[1])
         elif isinstance(results[1], list):
-            entities_data = results[1]  # type: ignore[assignment]
+            entities_data = results[1]
 
         return posts_data, entities_data
