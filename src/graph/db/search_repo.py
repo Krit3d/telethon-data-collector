@@ -21,7 +21,6 @@ def _clean_ag_string(val: object) -> str:
 
 
 def _parse_ag_float(val: object) -> float:
-    """Safely parse an agtype value as a float, defaulting to 0.0."""
     if val is None:
         return 0.0
     try:
@@ -62,13 +61,17 @@ class GraphSearchRepository:
         if not topics:
             return []
 
+        normalized_topics = [t.lower().strip() for t in topics if t]
+        if not normalized_topics:
+            return []
+
         graph_name = self._resolve_graph_name()
-        params = json.dumps({"topics": topics})
+        params = json.dumps({"topics": normalized_topics})
 
         query = text(r"""
             SELECT * FROM ag_catalog.cypher('{graph_name}', $$
                 MATCH (p\:Event)-[r]->(t\:Entity)
-                WHERE (type(r) = 'ABOUT' OR type(r) = 'MENTIONS') AND t.name IN $topics
+                WHERE (type(r) = 'ABOUT' OR type(r) = 'MENTIONS') AND t.name_lower IN $topics
                 RETURN p.db_post_id, COALESCE(p.engagement_rate, 0.0) AS er
                 ORDER BY er DESC
                 LIMIT 150
@@ -93,35 +96,25 @@ class GraphSearchRepository:
             return post_ids
 
     async def search_posts_by_entities(
-        self, label_to_ids: dict[str, list[str]]
+        self, entity_ids: list[str]
     ) -> tuple[dict[int, list[str]], dict[int, float]]:
-        if not label_to_ids:
+        if not entity_ids:
             return {}, {}
 
         graph_name = self._resolve_graph_name()
-
-        union_parts: list[str] = []
-        params_dict: dict[str, list[str]] = {}
-
-        for label, ids in label_to_ids.items():
-            param_key = f"ids_{label}"
-            union_parts.append(
-                f"MATCH (p\\:Event)-[r]->(e\\:{label}) "
-                f"WHERE e.id IN ${param_key} AND p.db_post_id IS NOT NULL "
-                f"RETURN p.db_post_id, e.id, p.engagement_rate"
-            )
-            params_dict[param_key] = ids
-
-        cypher_query = " UNION ".join(union_parts)
-        params_json = json.dumps(params_dict)
+        params = json.dumps({"ids": entity_ids})
 
         query = text(
-            f"SELECT * FROM ag_catalog.cypher('{graph_name}', $$ {cypher_query} $$, CAST(:params AS agtype)) "
+            f"SELECT * FROM ag_catalog.cypher('{graph_name}', $$ "
+            f"MATCH (p\\:Event)-[r]->(e) "
+            f"WHERE e.id IN $ids AND p.db_post_id IS NOT NULL "
+            f"RETURN p.db_post_id, e.id, p.engagement_rate"
+            f" $$, CAST(:params AS agtype)) "
             f"AS (db_post_id agtype, entity_id agtype, engagement_rate agtype)"
         )
 
         async with self.async_session() as session:
-            result = await session.execute(query, {"params": params_json})
+            result = await session.execute(query, {"params": params})
             matched: dict[int, list[str]] = {}
             ers: dict[int, float] = {}
             for row in result:

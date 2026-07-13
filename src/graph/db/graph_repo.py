@@ -755,11 +755,12 @@ class GraphRepository:
             props = self._sanitize_properties({
                 "id": entity.id,
                 "name": entity.name,
+                "name_lower": entity.name.lower().strip(),
                 **entity.get_property_dict(),
             })
             props = self._clean_numeric_properties(props)
             label = re.sub(r"[^A-Za-z0-9_]", "", entity.label or "Entity") or "Entity"
-            sorted_keys = tuple(sorted(k for k in props if k != "name"))
+            sorted_keys = tuple(sorted(k for k in props if k != "name" and k != "name_lower"))
             group_key = (label, sorted_keys)
             node_groups.setdefault(group_key, []).append(props)
 

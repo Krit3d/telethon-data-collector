@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class AuthorSearchResultItem(BaseModel):
-    author_id: int
+    author_id: str
     username: str | None = None
     title: str
     description: str | None = None
