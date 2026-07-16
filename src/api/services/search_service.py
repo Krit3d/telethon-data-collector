@@ -31,6 +31,14 @@ _STOPWORDS = {
     "should", "now"
 }
 
+_RU_STOPWORDS = {
+    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все", "она", "так", "его", "но", "да", "ты", "к", "ко", "у", "же", "вы", "за", "бы", "по", "только", "ее", "мне", "было", "вот", "от", "о", "из", "ему", "им", "уже", "когда", "быть", "был", "него", "до", "вас", "тоже", "себя", "под", "жизнь", "надо", "без", "если", "хочешь", "будет", "свое"
+}
+
+_UNINFORMATIVE_WORDS_RU = {
+    "бизнес", "дело", "проект", "компания", "работа", "услуги", "продукт", "бренд", "блог", "канал", "автор", "человек", "нужен", "ищу", "что-то"
+}
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_EXPLANATION = (
@@ -40,7 +48,7 @@ _DEFAULT_EXPLANATION = (
 _FALLBACK_GRAPH_ENTITIES: list[str] = []
 
 _NEGATIVE_SIGNALS_PATTERN = re.compile(
-    r"\b(1xbet|1win|casino|казино|вулкан|ставки\s+на\s+спорт|adult|18\+|порно|slots|слоты|scam|скам|криптосигналы|crypto\s*signals|betting|bet|online\s*casino|gambling|азартные\s+игры)\b",
+    r"\b(1xbet|1win|casino|казино|вулкан|ставки\s+на\с+спорт|adult|18\+|порно|slots|слоты|scam|скам|криптосигналы|crypto\s*signals|betting|bet|online\s*casino|gambling|азартные\s+игры)\b",
     re.IGNORECASE,
 )
 
@@ -128,6 +136,7 @@ class SearchService:
         self._llm_client = AsyncOpenAI(
             api_key=settings.cloud_ru_api_key,
             base_url=settings.cloud_ru_base_url,
+            timeout=60.0,
         )
         self._llm_model = settings.cloud_ru_llm_model
 
@@ -192,43 +201,96 @@ class SearchService:
 
         return raw_query, _FALLBACK_GRAPH_ENTITIES
 
-    async def _rerank_and_explain(
-        self,
-        project_description: str,
-        candidates: list[dict[str, Any]],
-        limit: int,
-        score_threshold: float,
-    ) -> list[dict[str, Any]]:
+    async def _grade_candidates(self, project_description: str, candidates: list[dict[str, Any]]) -> dict[str, int]:
         if not candidates:
-            return candidates
-
-        top_candidates = candidates[:min(15, len(candidates))]
+            return {}
 
         authors_json: list[dict[str, Any]] = []
-        for c in top_candidates:
-            authors_json.append(
-                {
-                    "author_id": str(c["author_id"]),
-                    "bio": c.get("description", ""),
-                    "subscriber_count": c.get("subscribers_count", 0),
-                    "platform": c.get("platform", ""),
-                    "top_posts": c.get("top_post_texts", [])[:3],
-                    "is_dormant": c.get("is_dormant", False),
-                }
-            )
+        for c in candidates:
+            authors_json.append({
+                "author_id": str(c["author_id"]),
+                "bio": c.get("description", ""),
+                "subscriber_count": c.get("subscribers_count", 0),
+                "platform": c.get("platform", ""),
+                "top_posts": c.get("top_post_texts", [])[:3],
+                "is_dormant": c.get("is_dormant", False),
+            })
 
         system_prompt = (
             "You are an expert talent matching assistant for Russian/CIS content. "
             "Analyze the Russian project description and the Russian creator metadata (bios and post snippets). "
-            "Output a JSON array where each element has: "
-            '"author_id" (string, must be the exact ID as provided without rounding or mathematical alteration), '
-            '"relevance_grade" (integer: 0, 1, or 2), '
+            "Output a JSON array where each element has exactly two keys: "
+            '"author_id" (string, must be the exact ID as provided without rounding or mathematical alteration) and '
+            '"relevance_grade" (integer: 0, 1, or 2). '
+            "Do NOT include any explanation, reasoning, or other fields in the output. "
+            "Relevance grading: "
+            "2 = highly relevant domain expert (dedicated auto-lawyers, professional insurance brokers, specialized accident assessment); "
+            "1 = partially relevant (general-profile lawyers, generic insurance comparison portals); "
+            "0 = completely irrelevant (spam/scam, OR corporate dealership/car brand accounts with no active domain expertise). "
+            "Output ONLY valid JSON array, no markdown, no extra text, no explanation outside JSON."
+        )
+        user_prompt = (
+            f"Project description: {project_description}\n\n"
+            f"Authors: {json.dumps(authors_json, ensure_ascii=False)}"
+        )
+
+        try:
+            content = await self._call_llm(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+            )
+            parsed = _safe_json_loads_array(content)
+            if parsed is not None:
+                grade_map: dict[str, int] = {}
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    aid = item.get("author_id")
+                    grade = item.get("relevance_grade")
+                    if aid is None or grade is None:
+                        continue
+                    try:
+                        aid_str = str(aid)
+                        grade_int = int(grade)
+                        if grade_int not in (0, 1, 2):
+                            continue
+                        grade_map[aid_str] = grade_int
+                    except (ValueError, TypeError):
+                        continue
+                return grade_map
+        except openai.APIError:
+            logger.warning("LLM grading failed, returning empty grade map", exc_info=True)
+        except Exception:
+            logger.warning("Unexpected error in LLM grading", exc_info=True)
+
+        return {}
+
+    async def _generate_explanations(self, project_description: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not candidates:
+            return candidates
+
+        authors_json: list[dict[str, Any]] = []
+        for c in candidates:
+            authors_json.append({
+                "author_id": str(c["author_id"]),
+                "bio": c.get("description", ""),
+                "subscriber_count": c.get("subscribers_count", 0),
+                "platform": c.get("platform", ""),
+                "top_posts": c.get("top_post_texts", [])[:3],
+                "is_dormant": c.get("is_dormant", False),
+            })
+
+        system_prompt = (
+            "You are an expert talent matching assistant for Russian/CIS content. "
+            "Analyze the Russian project description and the Russian creator metadata (bios and post snippets). "
+            "Output a JSON array where each element has exactly two keys: "
+            '"author_id" (string, must be the exact ID as provided without rounding or mathematical alteration) and '
             '"explanation" (string, strictly in Russian, 1-2 short sentences). '
-            "Relevance grading: 0 = completely irrelevant or spam/scam (including CIS-specific negative signals like casino, 1win, adult, scam, betting), "
-            "1 = partially relevant, 2 = highly relevant domain expert. "
-            "If the author is marked as 'is_dormant': true (no recent posts > 180 days), but you still return them as a rare niche expert, "
-            "you MUST append this exact Russian warning sentence at the end of the explanation: "
-            '"Внимание: автор не публиковал новый контент более 180 дней, но включён в выдачу как редкий эксперт в данной нише." '
+            "Analyze the creator's metadata (bio, top posts) relative to the project description "
+            "to write a polished Russian explanation. "
             "Output ONLY valid JSON array, no markdown, no extra text, no explanation outside JSON."
         )
         user_prompt = (
@@ -246,74 +308,113 @@ class SearchService:
             )
             parsed = _safe_json_loads_array(content)
             if parsed is not None:
-                id_to_update: dict[str, dict[str, Any]] = {}
+                id_to_explanation: dict[str, str] = {}
                 for item in parsed:
                     if not isinstance(item, dict):
                         continue
                     aid = item.get("author_id")
-                    relevance_grade = item.get("relevance_grade")
                     explanation = item.get("explanation")
-                    if aid is None or relevance_grade is None:
+                    if aid is None or explanation is None:
                         continue
-                    try:
-                        aid_str = str(aid)
-                        grade_int = int(relevance_grade)
-                        if grade_int not in (0, 1, 2):
-                            continue
-                        id_to_update[aid_str] = {
-                            "relevance_grade": grade_int,
-                            "explanation": (
-                                str(explanation) if explanation else _DEFAULT_EXPLANATION
-                            ),
-                        }
-                    except (ValueError, TypeError):
-                        continue
+                    id_to_explanation[str(aid)] = str(explanation)
 
-                if id_to_update:
-                    for c in top_candidates:
-                        aid = str(c.get("author_id", ""))
-                        if aid in id_to_update:
-                            grade = id_to_update[aid]["relevance_grade"]
-                            base_final_score = c.get("final_score", 0.0)
-                            if grade == 0:
-                                c["final_score"] = 0.0
-                            elif grade == 1:
-                                c["final_score"] = base_final_score * 0.4
-                            else:
-                                c["final_score"] = max(
-                                    min(1.0, base_final_score * 1.2),
-                                    max(score_threshold, 0.4),
-                                )
-                            c["explanation"] = id_to_update[aid]["explanation"]
-                            if c.get("is_dormant", False) and grade == 2:
-                                if not c["explanation"].endswith(_DORMANT_WARNING_RU):
-                                    c["explanation"] += " " + _DORMANT_WARNING_RU
-                    return candidates
+                for c in candidates:
+                    aid = str(c.get("author_id", ""))
+                    explanation = id_to_explanation.get(aid, _DEFAULT_EXPLANATION)
+                    if c.get("is_dormant", False):
+                        if not explanation.endswith(_DORMANT_WARNING_RU):
+                            explanation += " " + _DORMANT_WARNING_RU
+                    c["explanation"] = explanation
+
+                return candidates
         except openai.APIError:
-            logger.warning("LLM reranking failed, keeping initial scores", exc_info=True)
+            logger.warning("LLM explanation generation failed, using default explanation", exc_info=True)
         except Exception:
-            logger.warning("Unexpected error in LLM reranking", exc_info=True)
+            logger.warning("Unexpected error in LLM explanation generation", exc_info=True)
 
-        for c in top_candidates:
+        for c in candidates:
             c.setdefault("explanation", _DEFAULT_EXPLANATION)
         return candidates
 
+    def _apply_bucketed_mmr(
+        self,
+        candidates: list[dict[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        grade_2_candidates = [c for c in candidates if c.get("relevance_grade") == 2 and c.get("final_score", 0.0) > 0.0]
+        grade_1_candidates = [c for c in candidates if c.get("relevance_grade") == 1 and c.get("final_score", 0.0) > 0.0]
+
+        grade_2_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+        grade_1_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+
+        selected: list[dict[str, Any]] = []
+        remaining_grade_2 = list(grade_2_candidates)
+        remaining_grade_1 = list(grade_1_candidates)
+
+        for _ in range(min(limit, len(remaining_grade_2))):
+            if len(selected) >= limit:
+                break
+            best_candidate = None
+            best_mmr_score = -float("inf")
+            for candidate in remaining_grade_2:
+                candidate_entities = candidate.get("matched_entities", set())
+                max_similarity = 0.0
+                for s in selected:
+                    selected_entities = s.get("matched_entities", set())
+                    sim = _jaccard_similarity(candidate_entities, selected_entities)
+                    max_similarity = max(max_similarity, sim)
+                mmr_score = 0.7 * candidate["final_score"] - 0.3 * max_similarity
+                if mmr_score > best_mmr_score:
+                    best_mmr_score = mmr_score
+                    best_candidate = candidate
+            if best_candidate is None:
+                break
+            selected.append(best_candidate)
+            remaining_grade_2.remove(best_candidate)
+
+        if len(selected) < limit:
+            for _ in range(min(limit - len(selected), len(remaining_grade_1))):
+                if len(selected) >= limit:
+                    break
+                best_candidate = None
+                best_mmr_score = -float("inf")
+                for candidate in remaining_grade_1:
+                    candidate_entities = candidate.get("matched_entities", set())
+                    max_similarity = 0.0
+                    for s in selected:
+                        selected_entities = s.get("matched_entities", set())
+                        sim = _jaccard_similarity(candidate_entities, selected_entities)
+                        max_similarity = max(max_similarity, sim)
+                    mmr_score = 0.7 * candidate["final_score"] - 0.3 * max_similarity
+                    if mmr_score > best_mmr_score:
+                        best_mmr_score = mmr_score
+                        best_candidate = candidate
+                if best_candidate is None:
+                    break
+                selected.append(best_candidate)
+                remaining_grade_1.remove(best_candidate)
+
+        return selected
+
     async def execute_search(self, payload: SearchRequest) -> SearchResponse:
         query = payload.query.strip()
-        query_words = query.split()
-        meaningful_words = [w for w in query_words if w.lower() not in _STOPWORDS]
+        query_lower = query.lower()
+        words = query_lower.split()
+        cleaned_words = [re.sub(r'[^\w\s]', '', w) for w in words if re.sub(r'[^\w\s]', '', w)]
+        all_stopwords = _STOPWORDS | _RU_STOPWORDS | _UNINFORMATIVE_WORDS_RU
+        meaningful_words = [w for w in cleaned_words if w not in all_stopwords]
 
-        if not query_words:
+        if not meaningful_words or (len(cleaned_words) <= 2 and not meaningful_words):
             return SearchResponse(
                 results=[],
                 message=(
-                    "Запрос слишком короткий или не содержит значимых слов. "
-                    "Пожалуйста, опишите ваш проект подробнее (например, сферу деятельности, цели или целевую аудиторию)."
+                    "Запрос слишком короткий или не содержит конкретных ключевых слов (например, 'бизнес' или 'дело'). "
+                    "Пожалуйста, опишите ваш проект подробнее, указав конкретную нишу или сферу деятельности."
                 ),
             )
 
-        if len(query_words) == 1:
-            if len(query_words[0]) < 3:
+        if len(cleaned_words) == 1:
+            if len(cleaned_words[0]) < 3:
                 return SearchResponse(
                     results=[],
                     message=(
@@ -433,7 +534,7 @@ class SearchService:
 
         all_post_ids: set[int] = set(vector_scores.keys()) | set(graph_scores.keys()) | set(topic_post_ids)
         for pid in topic_post_ids:
-            graph_scores[pid] = max(graph_scores.get(pid, 0.0), 0.9)
+            graph_scores[pid] = max(graph_scores.get(pid, 0.0), 0.65)
         safe_post_ids: list[int] = sorted(all_post_ids)
         logger.info(
             "Unique post IDs in safe_post_ids before DB query: %d",
@@ -469,7 +570,7 @@ class SearchService:
                 results=[],
                 message=(
                     "По вашему запросу не найдено подходящих авторов. "
-                    "Попробуйста, опишите ваш проект подробнее (например, сферу деятельности, цели или целевую аудиторию)."
+                    "Попробуйте переформулировать запрос или расширить описание проекта."
                 ),
             )
 
@@ -500,7 +601,7 @@ class SearchService:
                 }
 
             author = author_map[account_id]
-            vs = vector_scores.get(post_id, 0.5)
+            vs = vector_scores.get(post_id, 0.0)
             gs = graph_scores.get(post_id, 0.0)
             er = _normalize_er(post_id_to_er.get(post_id, 0.0))
 
@@ -561,23 +662,41 @@ class SearchService:
                 ),
             )
 
-        max_matched_posts = max(len(a["posts"]) for a in safe_author_map.values()) if safe_author_map else 1
+        max_matched_posts = max(
+            sum(
+                1
+                for vs, gs in zip(
+                    a["vector_scores"], a["graph_scores"], strict=False
+                )
+                if vs >= payload.score_threshold or gs >= payload.score_threshold
+            )
+            for a in safe_author_map.values()
+        ) if safe_author_map else 1
+        if max_matched_posts < 1:
+            max_matched_posts = 1
 
         ranked_authors: list[dict[str, Any]] = []
         for account_id, author in safe_author_map.items():
             if not author["posts"]:
                 continue
-            max_vs = max(author["vector_scores"]) if author["vector_scores"] else 0.5
+            max_vs = max(author["vector_scores"]) if author["vector_scores"] else 0.0
             max_gs = max(author["graph_scores"]) if author["graph_scores"] else 0.0
 
             avg_er = (
                 sum(author["engagement_rates"]) / len(author["engagement_rates"])
                 if author["engagement_rates"] else 0.0
             )
-            expertise_ratio = len(author["posts"]) / max_matched_posts if max_matched_posts > 0 else 0.0
+            relevant_posts_count = sum(
+                1
+                for vs, gs in zip(
+                    author["vector_scores"], author["graph_scores"], strict=False
+                )
+                if vs >= payload.score_threshold or gs >= payload.score_threshold
+            )
+            expertise_ratio = relevant_posts_count / max_matched_posts
 
-            initial_topical_score = 0.6 * max_vs + 0.4 * max_gs
-            if initial_topical_score < 0.35:
+            initial_topical_score = max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)
+            if initial_topical_score < payload.score_threshold:
                 author["final_score"] = 0.0
                 author["vector_score"] = max_vs
                 author["graph_score"] = max_gs
@@ -603,9 +722,7 @@ class SearchService:
                     is_dormant = True
                     decay_factor = 0.1
 
-            decayed_max_vs = max_vs * decay_factor
-            decayed_max_gs = max_gs * decay_factor
-            decayed_topical_score = 0.6 * decayed_max_vs + 0.4 * decayed_max_gs
+            decayed_topical_score = (max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)) * decay_factor
 
             base_score = 0.7 * decayed_topical_score + 0.15 * avg_er + 0.15 * expertise_ratio
             contact_multiplier = 1.15 if author["has_contacts"] else 1.0
@@ -642,81 +759,53 @@ class SearchService:
                 ),
             )
 
-        pre_mmr_candidates = [a for a in ranked_authors if a.get("initial_topical_score", 0.0) >= 0.35]
+        ranked_authors.sort(key=lambda x: x["initial_topical_score"], reverse=True)
+
+        rerank_pool_size = min(40, max(20, payload.limit * 2))
+        top_k_candidates = ranked_authors[:min(rerank_pool_size, len(ranked_authors))]
+
         logger.info(
-            "Authors after pre-MMR filtering (initial_topical_score >= 0.35): %d",
-            len(pre_mmr_candidates),
+            "Candidates before LLM grading: %d (pool size cap: %d)", len(top_k_candidates), rerank_pool_size,
         )
 
-        if not pre_mmr_candidates:
-            return SearchResponse(
-                results=[],
-                message=(
-                    "По вашему запросу не найдено подходящих авторов. "
-                    "Попробуйте переформулировать запрос или расширить описание проекта."
-                ),
-            )
-
-        mmr_selection_size = min(15, payload.limit * 2)
-        mmr_selected: list[dict[str, Any]] = []
-
-        remaining_candidates = list(pre_mmr_candidates)
-
-        for _ in range(min(mmr_selection_size, len(remaining_candidates))):
-            best_candidate = None
-            best_mmr_score = -float("inf")
-
-            for candidate in remaining_candidates:
-                if candidate in mmr_selected:
-                    continue
-                candidate_entities = candidate.get("matched_entities", set())
-                max_similarity = 0.0
-                for selected in mmr_selected:
-                    selected_entities = selected.get("matched_entities", set())
-                    sim = _jaccard_similarity(candidate_entities, selected_entities)
-                    max_similarity = max(max_similarity, sim)
-                mmr_score = 0.7 * candidate["final_score"] - 0.3 * max_similarity
-                if mmr_score > best_mmr_score:
-                    best_mmr_score = mmr_score
-                    best_candidate = candidate
-
-            if best_candidate is None:
-                break
-            mmr_selected.append(best_candidate)
-            remaining_candidates.remove(best_candidate)
-
-        top_candidates = mmr_selected if mmr_selected else pre_mmr_candidates[:15]
-
-        if len(top_candidates) >= 1:
+        grade_map: dict[str, int] = {}
+        if len(top_k_candidates) >= 1:
             try:
-                top_candidates = await self._rerank_and_explain(
-                    payload.query, top_candidates, payload.limit, payload.score_threshold,
-                )
+                grade_map = await self._grade_candidates(payload.query, top_k_candidates)
             except Exception:
                 logger.warning(
-                    "Reranking step failed, using initial scores", exc_info=True,
+                    "Stage 1 grading failed, using default grades", exc_info=True,
                 )
 
-        for author in top_candidates:
-            author["final_score"] = min(1.0, max(0.0, author["final_score"]))
+        for c in top_k_candidates:
+            aid = str(c.get("author_id", ""))
+            grade = grade_map.get(aid, 0)
+            base_final_score = c.get("final_score", 0.0)
+            if grade == 2:
+                c["final_score"] = 0.75 + 0.25 * base_final_score
+            elif grade == 1:
+                c["final_score"] = payload.score_threshold + (0.74 - payload.score_threshold) * base_final_score
+            else:
+                c["final_score"] = 0.0
+            c["relevance_grade"] = grade
 
-        top_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+        filtered_candidates = [
+            c for c in top_k_candidates
+            if c.get("final_score", 0.0) > 0.0
+        ]
+
+        final_candidates = self._apply_bucketed_mmr(filtered_candidates, payload.limit)
+
+        if final_candidates:
+            try:
+                final_candidates = await self._generate_explanations(payload.query, final_candidates)
+            except Exception:
+                logger.warning(
+                    "Stage 2 explanation generation failed, using default explanation", exc_info=True,
+                )
+
         logger.info(
-            "Candidates before score_threshold filter: %d threshold=%f",
-            len(top_candidates),
-            payload.score_threshold,
-        )
-        final_candidates: list[dict[str, Any]] = []
-        for c in top_candidates:
-            if c.get("is_dormant", False) and c.get("initial_topical_score", 0.0) >= 0.7:
-                if c["final_score"] < payload.score_threshold:
-                    c["final_score"] = payload.score_threshold + 0.01
-                final_candidates.append(c)
-            elif c["final_score"] >= payload.score_threshold:
-                final_candidates.append(c)
-        final_candidates = final_candidates[: payload.limit]
-        logger.info(
-            "Candidates after score_threshold filter: %d",
+            "Candidates after bucketed MMR: %d",
             len(final_candidates),
         )
 
