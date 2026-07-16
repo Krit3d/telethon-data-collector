@@ -122,10 +122,6 @@ class Account(Base):
         Float, nullable=True,
         comment="Pre-calculated average engagement rate from the author's last posts. Avoids heavy runtime aggregations during search",
     )
-    static_sentiment: Mapped[str | None] = mapped_column(
-        String(50), nullable=True,
-        comment="Pre-calculated prevailing sentiment of the author's recent posts. Avoids heavy runtime aggregations during search",
-    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
