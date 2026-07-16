@@ -85,7 +85,7 @@ services:
       - qdrant
     networks:
       - api_network
-    command: python -m src.api.embedding_worker
+    command: python -m src.api.workers.embedding_worker
     logging:
       driver: json-file
       options:
@@ -118,7 +118,7 @@ services:
       - qdrant
     networks:
       - api_network
-    command: python -m src.api.graph_extractor_worker
+    command: python -m src.api.workers.graph_extractor_worker
     logging:
       driver: json-file
       options:

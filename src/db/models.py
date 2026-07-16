@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Float,
     ForeignKey,
     Index,
     String,
@@ -105,6 +106,27 @@ class Account(Base):
         comment="Arbitrary raw metadata of the author account for OpenSPG domain processing",
     )
 
+    category_id: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, index=True,
+        comment="Hard unique category ID from IAB 3.1 taxonomy (e.g., '653' for dentists). B-Tree indexed for fast filtering",
+    )
+    category_path: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+        comment="Full category breadcrumb (e.g., 'Medical Health > Dental Health'). Used for UI display and parent category search",
+    )
+    explanation: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="Pre-generated author expertise description in Russian for UI display per specification requirements",
+    )
+    static_avg_er: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="Pre-calculated average engagement rate from the author's last posts. Avoids heavy runtime aggregations during search",
+    )
+    static_sentiment: Mapped[str | None] = mapped_column(
+        String(50), nullable=True,
+        comment="Pre-calculated prevailing sentiment of the author's recent posts. Avoids heavy runtime aggregations during search",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -199,6 +221,15 @@ class Content(Base):
         default=False,
         server_default="false",
         comment="True if knowledge graph is extracted",
+    )
+
+    is_enriched: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+        index=True,
+        comment="Marker for content readiness. Worker processes only posts with is_enriched=False, then marks as True after handling. Enables efficient incremental pipeline without reprocessing",
     )
 
     views: Mapped[int | None] = mapped_column(

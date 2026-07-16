@@ -139,6 +139,7 @@ docker compose -f $COMPOSE_FILE logs --tail=20 db crawler parser
 echo "Performing post-deployment cleanup of unused Docker images and build cache..."
 docker image prune -f || true
 docker builder prune -f || true
+docker volume prune -f || true
 
 EOF
 
