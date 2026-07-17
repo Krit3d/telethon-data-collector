@@ -114,6 +114,10 @@ class Account(Base):
         String(512), nullable=True,
         comment="Full category breadcrumb (e.g., 'Medical Health > Dental Health'). Used for UI display and parent category search",
     )
+    category_extension: Mapped[str | None] = mapped_column(
+        String(100), nullable=True,
+        comment="IAB taxonomy extension metadata (e.g., 'SCD' for Special Category Data to handle privacy compliance)",
+    )
     explanation: Mapped[str | None] = mapped_column(
         Text, nullable=True,
         comment="Pre-generated author expertise description in Russian for UI display per specification requirements",

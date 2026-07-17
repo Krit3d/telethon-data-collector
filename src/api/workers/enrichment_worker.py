@@ -6,11 +6,12 @@ import difflib
 import logging
 import signal
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database, with_retry_on_deadlock
@@ -67,12 +68,27 @@ class EnrichmentWorker:
         self._max_concurrent_llm = getattr(settings, 'max_concurrent_llm_requests', None) or 3
         self._llm_semaphore = asyncio.Semaphore(self._max_concurrent_llm)
         if iab_path is None:
-            iab_path = (
-                Path(__file__).resolve().parent.parent.parent.parent
-                / "src"
-                / "config"
-                / "Content Taxonomy 3.1.tsv"
-            )
+            script_dir = Path(__file__).resolve().parent
+            found: Path | None = None
+            for _ in range(4):
+                candidate1 = script_dir / "src" / "config" / "Content Taxonomy 3.1.tsv"
+                candidate2 = script_dir / "config" / "Content Taxonomy 3.1.tsv"
+                if candidate1.exists():
+                    found = candidate1
+                    break
+                if candidate2.exists():
+                    found = candidate2
+                    break
+                script_dir = script_dir.parent
+            if found is not None:
+                iab_path = found
+            else:
+                iab_path = (
+                    Path(__file__).resolve().parent.parent.parent.parent
+                    / "src"
+                    / "config"
+                    / "Content Taxonomy 3.1.tsv"
+                )
         self._iab_path = Path(iab_path)
         self._iab_taxonomy: list[dict[str, str]] = []
         self._iab_loaded = False
@@ -183,71 +199,120 @@ class EnrichmentWorker:
             return 0.0
         return total_er / valid_count
 
+    @with_retry_on_deadlock()
+    async def _handle_processing_failure(self, account_data: AccountData) -> None:
+        async with self._db.async_session() as session:
+            async with session.begin():
+                stmt = (
+                    select(Account)
+                    .where(Account.id == account_data.id)
+                    .with_for_update()
+                )
+                result = await session.execute(stmt)
+                account = result.scalar_one_or_none()
+
+                if account is None:
+                    return
+
+                raw_metadata: dict[str, object] = dict(account.raw_metadata) if account.raw_metadata else {}
+                enrichment_attempts = raw_metadata.get("enrichment_attempts", 0)
+                if not isinstance(enrichment_attempts, int):
+                    enrichment_attempts = 0
+                enrichment_attempts += 1
+                raw_metadata["enrichment_attempts"] = enrichment_attempts
+                account.raw_metadata = raw_metadata
+
+                now = datetime.now(timezone.utc)
+
+                if enrichment_attempts >= 3:
+                    logger.warning(
+                        "Account %d has hit the maximum limit of failed attempts and is being parked",
+                        account_data.id,
+                    )
+                    account.status = "rejected"
+                    account.updated_at = now
+
+                    post_ids = [p.id for p in account_data.posts]
+                    if post_ids:
+                        stmt_content = (
+                            update(Content)
+                            .where(Content.id.in_(post_ids))
+                            .values(is_enriched=True)
+                        )
+                        await session.execute(stmt_content)
+                else:
+                    account.status = "pending"
+                    account.updated_at = now
+
     async def _process_account_dto(self, account_data: AccountData) -> None:
         if not account_data.posts:
             return
 
-        static_avg_er = self._calculate_static_er(account_data.posts, account_data.subscribers_count)
+        try:
+            static_avg_er = self._calculate_static_er(account_data.posts, account_data.subscribers_count)
 
-        system_prompt = (
-            "You are a content categorization assistant. "
-            "Analyze the provided author profile and posts, then return a JSON object with exactly four keys: "
-            "\"tier_1\" (best-fitting top-level IAB 3.1 category, e.g. \"Medical Health\", \"Finance\"), "
-            "\"leaf_name\" (specific subcategory name, e.g. \"Dental Health\" or \"Personal Finance\"), "
-            "\"explanation\" (concise 1-2 sentence Russian description of the author's primary focus and expertise), "
-            "\"sentiment\" (string: \"positive\", \"neutral\", or \"negative\" reflecting prevailing sentiment). "
-            "Output strictly valid JSON, no markdown, no explanation."
-        )
+            system_prompt = (
+                "You are a content categorization assistant. "
+                "Analyze the provided author profile and posts, then return a JSON object with exactly four keys: "
+                '"tier_1" (best-fitting top-level IAB 3.1 category, e.g. "Medical Health", "Finance"), '
+                '"leaf_name" (specific subcategory name, e.g. "Dental Health" or "Personal Finance"), '
+                '"explanation" (concise 1-2 sentence Russian description of the author\'s primary focus and expertise), '
+                '"sentiment" (string: "positive", "neutral", or "negative" reflecting prevailing sentiment). '
+                "Output strictly valid JSON, no markdown, no explanation."
+            )
 
-        bio = account_data.description or ""
-        context_parts: list[str] = [f"Bio: {bio}"]
-        for i, post in enumerate(account_data.posts):
-            parts: list[str] = []
-            if post.content:
-                parts.append(post.content)
-            if post.transcription:
-                parts.append(post.transcription)
-            text = " ".join(parts)
-            if text:
-                context_parts.append(f"Post {i + 1}: {text[:2000]}")
-        user_prompt = "\n\n".join(context_parts)
+            bio = account_data.description or ""
+            context_parts: list[str] = [f"Bio: {bio}"]
+            for i, post in enumerate(account_data.posts):
+                parts: list[str] = []
+                if post.content:
+                    parts.append(post.content)
+                if post.transcription:
+                    parts.append(post.transcription)
+                text = " ".join(parts)
+                if text:
+                    context_parts.append(f"Post {i + 1}: {text[:2000]}")
+            user_prompt = "\n\n".join(context_parts)
 
-        llm_result = await self._call_llm([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ])
+            llm_result = await self._call_llm([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ])
 
-        if llm_result is None:
-            return
+            if llm_result is None:
+                await self._handle_processing_failure(account_data)
+                return
 
-        llm_tier_1 = llm_result.tier_1
-        llm_leaf = llm_result.leaf_name
-        explanation = llm_result.explanation
-        sentiment = llm_result.sentiment
+            llm_tier_1 = llm_result.tier_1
+            llm_leaf = llm_result.leaf_name
+            explanation = llm_result.explanation
+            sentiment = llm_result.sentiment
 
-        category_id, category_path = self._fuzzy_match_taxonomy(llm_tier_1, llm_leaf)
-        if not category_id:
-            category_path = llm_tier_1
+            category_id, category_path = self._fuzzy_match_taxonomy(llm_tier_1, llm_leaf)
+            if not category_id:
+                category_path = llm_tier_1
 
-        post_ids = [p.id for p in account_data.posts]
-        await self._update_account_enrichment(
-            account_id=account_data.id,
-            post_ids=post_ids,
-            category_id=category_id if category_id else None,
-            category_path=category_path if category_path else None,
-            explanation=explanation if explanation else None,
-            static_avg_er=static_avg_er,
-            sentiment=sentiment,
-        )
+            post_ids = [p.id for p in account_data.posts]
+            await self._update_account_enrichment(
+                account_id=account_data.id,
+                post_ids=post_ids,
+                category_id=category_id if category_id else None,
+                category_path=category_path if category_path else None,
+                explanation=explanation if explanation else None,
+                static_avg_er=static_avg_er,
+                sentiment=sentiment,
+            )
 
-        logger.info(
-            "Enriched account %d: category=%s, er=%.4f, sentiment=%s, posts=%d",
-            account_data.id,
-            category_path or "none",
-            static_avg_er,
-            sentiment,
-            len(post_ids),
-        )
+            logger.info(
+                "Enriched account %d: category=%s, er=%.4f, sentiment=%s, posts=%d",
+                account_data.id,
+                category_path or "none",
+                static_avg_er,
+                sentiment,
+                len(post_ids),
+            )
+        except Exception:
+            await self._handle_processing_failure(account_data)
 
     @with_retry_on_deadlock()
     async def _update_account_enrichment(
@@ -271,6 +336,8 @@ class EnrichmentWorker:
                         explanation=explanation,
                         static_avg_er=static_avg_er,
                         static_sentiment=sentiment,
+                        status="parsed",
+                        updated_at=datetime.now(timezone.utc),
                     )
                 )
                 await session.execute(stmt_account)
@@ -286,63 +353,78 @@ class EnrichmentWorker:
         account_dtos: list[AccountData] = []
 
         async with self._db.async_session() as session:
-            subq = (
-                select(Content.account_id)
-                .where(Content.is_enriched == False)
-                .distinct()
-                .subquery()
-            )
-            stmt = (
-                select(Account)
-                .where(Account.id.in_(select(subq.c.account_id)))
-                .limit(self.batch_size)
-                .with_for_update(skip_locked=True)
-            )
-            result = await session.execute(stmt)
-            accounts = list(result.scalars().all())
-
-            if not accounts:
-                logger.debug("No accounts with unenriched content found")
-                return
-
-            account_ids = [a.id for a in accounts]
-            posts_stmt = (
-                select(Content)
-                .where(Content.account_id.in_(account_ids))
-                .where(Content.is_enriched == False)
-                .order_by(Content.published_at.desc())
-            )
-            posts_result = await session.execute(posts_stmt)
-            all_posts = list(posts_result.scalars().all())
-
-            posts_by_account: dict[int, list[Content]] = {}
-            for post in all_posts:
-                if post.account_id not in posts_by_account:
-                    posts_by_account[post.account_id] = []
-                if len(posts_by_account[post.account_id]) < 12:
-                    posts_by_account[post.account_id].append(post)
-
-            for account in accounts:
-                account_posts = posts_by_account.get(account.id, [])
-                post_dtos = [
-                    PostData(
-                        id=post.id,
-                        content=post.content,
-                        transcription=post.transcription,
-                        reactions_count=post.reactions_count,
-                        comments_count=post.comments_count,
-                        shares_count=post.shares_count,
-                    )
-                    for post in account_posts
-                ]
-                account_dtos.append(
-                    AccountData(
-                        id=account.id,
-                        description=account.description,
-                        subscribers_count=account.subscribers_count,
-                        posts=post_dtos,
-                    )
+            async with session.begin():
+                subq = (
+                    select(Content.account_id)
+                    .where(Content.is_enriched == False)
+                    .distinct()
+                    .subquery()
                 )
+                lease_threshold = datetime.now(timezone.utc) - timedelta(minutes=5)
+                stmt = (
+                    select(Account)
+                    .where(Account.id.in_(select(subq.c.account_id)))
+                    .where(
+                        or_(
+                            Account.status != "processing",
+                            Account.updated_at < lease_threshold,
+                        )
+                    )
+                    .limit(self.batch_size)
+                    .with_for_update(skip_locked=True)
+                )
+                result = await session.execute(stmt)
+                accounts = list(result.scalars().all())
+
+                if not accounts:
+                    logger.debug("No accounts with unenriched content found")
+                    return
+
+                now = datetime.now(timezone.utc)
+                for account in accounts:
+                    account.status = "processing"
+                    account.updated_at = now
+
+                await session.flush()
+
+                account_ids = [a.id for a in accounts]
+                posts_stmt = (
+                    select(Content)
+                    .where(Content.account_id.in_(account_ids))
+                    .where(Content.is_enriched == False)
+                    .order_by(Content.published_at.desc())
+                )
+                posts_result = await session.execute(posts_stmt)
+                all_posts = list(posts_result.scalars().all())
+
+                posts_by_account: dict[int, list[Content]] = {}
+                for post in all_posts:
+                    if post.account_id not in posts_by_account:
+                        posts_by_account[post.account_id] = []
+                    if len(posts_by_account[post.account_id]) < 12:
+                        posts_by_account[post.account_id].append(post)
+
+                for account in accounts:
+                    account_posts = posts_by_account.get(account.id, [])
+                    post_dtos = [
+                        PostData(
+                            id=post.id,
+                            content=post.content,
+                            transcription=post.transcription,
+                            reactions_count=post.reactions_count,
+                            comments_count=post.comments_count,
+                            shares_count=post.shares_count,
+                        )
+                        for post in account_posts
+                    ]
+                    account_dtos.append(
+                        AccountData(
+                            id=account.id,
+                            description=account.description,
+                            subscribers_count=account.subscribers_count,
+                            posts=post_dtos,
+                        )
+                    )
 
         logger.info("Processing enrichment batch of %d accounts", len(account_dtos))
 
