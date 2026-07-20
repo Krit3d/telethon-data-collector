@@ -17,6 +17,11 @@ from src.db.models import Account, Content
 logger = logging.getLogger(__name__)
 
 
+class ExplanationResult(BaseModel):
+    is_author_blog: bool
+    explanation: str
+
+
 class CategorySelection(BaseModel):
     category_id: str
 
@@ -174,36 +179,47 @@ class EnrichmentWorker:
 
         return lookup
 
-    async def _generate_explanation(self, context: str) -> str | None:
+    async def _generate_explanation_and_type(self, context: str) -> ExplanationResult | None:
         system_prompt = (
-            "Analyze the author profile and publications to write a factual, dense summary "
-            "of their professional field of expertise in Russian, adhering to these strict rules:\n"
-            "1. GROUNDING: Rely strictly on explicit facts. Do not speculate, extrapolate, "
-            "or assume unstated credentials (e.g., calling them 'expert' or 'doctor' without explicit proof).\n"
-            "2. NOISE FILTER: Ignore social media boilerplate (likes, links, subscribe), transcript artifacts, "
-            "and background song lyrics. Focus only on professional, business, or thematic semantic content.\n"
-            "3. NO DATA FALLBACK: If the context is empty, generic, or lacks thematic substance, output "
-            "exactly: 'Данных для анализа автора недостаточно.' Do not guess.\n"
-            "4. STYLE: Use a formal, objective, third-person tone (e.g., 'Автор специализируется на...', "
-            "'В публикациях рассматриваются...'). Avoid fluff, generalizations, or praise (e.g., 'делится советами').\n"
-            "5. OUTPUT FORMAT: ~150 words (4-5 cohesive sentences) covering: core professional domain, "
-            "key specialized topics/services, and target audience or practical application."
+            "Analyze the provided profile metadata and recent posts to produce a structured result. "
+            "Adhere strictly to the following rules:\n"
+            "1. The 'explanation' field must be written strictly in Russian, regardless of the native language "
+            "of the source context (Kazakh, Bulgarian, English, etc.).\n"
+            "2. The 'explanation' must be a factual, objective, dense professional summary strictly between "
+            "100 and 150 words. It must always end with a complete sentence; do not cut off mid-word.\n"
+            "3. Do not use forced prefix templates like 'Автор специализируется...' or 'Автор делает...'. "
+            "Write naturally based on the entity type, for example: 'Официальный профиль Алматинского "
+            "университета...', 'Экспертный блог практикующего риелтора...'.\n"
+            "4. GROUNDING: Rely strictly on explicit facts. Do not speculate, extrapolate, or assume "
+            "unstated credentials.\n"
+            "5. NOISE FILTER: Ignore social media boilerplate (likes, links, subscribe), transcript "
+            "artifacts, and background song lyrics. Focus only on professional, business, or thematic "
+            "semantic content.\n"
+            "6. NO DATA FALLBACK: If the context is empty, generic, or lacks thematic substance, set "
+            "'explanation' to 'Данных для анализа автора недостаточно.' and 'is_author_blog' to false.\n"
+            "7. Determine 'is_author_blog': Set to true if the account is a personal blog, lifestyle "
+            "creator, or an individual expert promoting their own professional services/consultations "
+            "(e.g., a real estate realtor, private doctor, or lawyer). Set to false if the account "
+            "represents a corporate brand, a local business storefront, a retail shop, an educational "
+            "institution (e.g., a university), or a community platform/club. Note that sponsored content "
+            "or product advertisements do NOT change a personal/creator blog into a corporate business."
         )
         last_exception: Exception | None = None
         for attempt in range(1, 4):
             try:
-                response = await self._llm_client.chat.completions.create(
+                response = await self._llm_client.beta.chat.completions.parse(
                     model=self._llm_model,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": context},
                     ],
                     temperature=0.15,
-                    max_tokens=300,
+                    max_tokens=1000,
+                    response_format=ExplanationResult,
                 )
-                explanation = response.choices[0].message.content
-                if explanation and explanation.strip():
-                    return explanation.strip()
+                parsed = response.choices[0].message.parsed
+                if parsed is not None and parsed.explanation.strip():
+                    return parsed
                 logger.warning("LLM returned empty explanation on attempt %d", attempt)
                 return None
             except Exception as e:
@@ -323,7 +339,7 @@ class EnrichmentWorker:
                 post_er = ((reactions + comments + shares) / subscribers_count) * 100
             else:
                 post_er = 0.0
-            total_er += min(100.0, post_er)
+            total_er += min(30.0, post_er)
         return total_er / len(posts)
 
     async def _try_acquire_account(self) -> dict[str, Any] | None:
@@ -408,6 +424,7 @@ class EnrichmentWorker:
 
         context = "\n\n".join(context_parts)
 
+        is_author_blog: bool | None = None
         explanation: str | None = None
         category_id: str | None = None
         category_path: str | None = None
@@ -415,17 +432,17 @@ class EnrichmentWorker:
         static_avg_er: float = 0.0
 
         try:
-            explanation = await self._generate_explanation(context)
-            if explanation is None:
+            result = await self._generate_explanation_and_type(context)
+            if result is None:
                 logger.error("Skipping save for account %d due to failed explanation generation. Will retry later.", account_id)
                 self._processing_ids.discard(account_id)
                 return
-            if "Данных для анализа автора недостаточно" in explanation:
-                category_id = None
-                category_path = None
-                category_extension = None
-            else:
-                category_id, category_path, category_extension = await self._identify_category(explanation)
+
+            is_author_blog = result.is_author_blog
+            explanation = result.explanation
+
+            category_id, category_path, category_extension = await self._identify_category(explanation)
+
             static_avg_er = self._calculate_static_avg_er(posts_data, subscribers_count)
         except Exception:
             logger.exception("LLM processing failed for account %d", account_id)
@@ -435,11 +452,12 @@ class EnrichmentWorker:
         try:
             async with self._db.async_session() as session:
                 async with session.begin():
-                    result = await session.execute(
+                    acct_result = await session.execute(
                         select(Account).where(Account.id == account_id)
                     )
-                    account = result.scalar_one()
+                    account = acct_result.scalar_one()
 
+                    account.is_author_blog = is_author_blog
                     account.explanation = explanation
                     account.category_id = category_id
                     account.category_path = category_path
@@ -455,9 +473,10 @@ class EnrichmentWorker:
                     )
 
                     logger.info(
-                        "Enriched account %d: category_id=%s category_path=%s category_extension=%s "
-                        "static_avg_er=%.6f posts=%d",
+                        "Enriched account %d: is_author_blog=%s category_id=%s category_path=%s "
+                        "category_extension=%s static_avg_er=%.6f posts=%d",
                         account_id,
+                        is_author_blog,
                         category_id or "none",
                         category_path or "none",
                         category_extension or "none",

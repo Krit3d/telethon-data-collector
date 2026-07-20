@@ -18,6 +18,7 @@ async def main() -> None:
             .options(joinedload(Account.content))
             .where(
                 Account.status == "verified",
+                Account.is_author_blog == True,
                 Account.explanation.isnot(None),
                 Account.category_id.isnot(None),
             )
@@ -31,7 +32,7 @@ async def main() -> None:
     lines.append("# Explanations Audit Report")
     lines.append("")
     lines.append(
-        f"Audit of **{len(accounts)}** verified accounts with generated explanations and category assignments."
+        f"Audit of **{len(accounts)}** verified author blogs with generated explanations and category assignments."
     )
     lines.append("")
     lines.append("---")
@@ -72,9 +73,9 @@ async def main() -> None:
             views = post.views
             total_engagement = reactions + comments + shares
             if views is not None and views > 0:
-                post_er = min(100.0, (total_engagement / views) * 100)
+                post_er = min(30.0, (total_engagement / views) * 100)
             elif subscribers > 0:
-                post_er = min(100.0, (total_engagement / subscribers) * 100)
+                post_er = min(30.0, (total_engagement / subscribers) * 100)
             else:
                 post_er = 0.0
             post_ers.append(post_er)
