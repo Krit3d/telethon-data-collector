@@ -72,9 +72,9 @@ async def main() -> None:
             views = post.views
             total_engagement = reactions + comments + shares
             if views is not None and views > 0:
-                post_er = (total_engagement / views) * 100
+                post_er = min(100.0, (total_engagement / views) * 100)
             elif subscribers > 0:
-                post_er = (total_engagement / subscribers) * 100
+                post_er = min(100.0, (total_engagement / subscribers) * 100)
             else:
                 post_er = 0.0
             post_ers.append(post_er)

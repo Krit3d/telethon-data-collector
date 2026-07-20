@@ -323,7 +323,7 @@ class EnrichmentWorker:
                 post_er = ((reactions + comments + shares) / subscribers_count) * 100
             else:
                 post_er = 0.0
-            total_er += post_er
+            total_er += min(100.0, post_er)
         return total_er / len(posts)
 
     async def _try_acquire_account(self) -> dict[str, Any] | None:
