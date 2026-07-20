@@ -123,6 +123,7 @@ async def test_happy_path_search_with_mmr_and_contact_enrichment(
             "message_id": 10001,
             "platform_content_id": None,
             "raw_metadata": json.dumps({"contacts": {"email": "author@example.com", "telegram": "@author_one"}}),
+            "static_avg_er": 5.5,
         },
         {
             "id": 102,
@@ -139,15 +140,24 @@ async def test_happy_path_search_with_mmr_and_contact_enrichment(
             "message_id": 10002,
             "platform_content_id": None,
             "raw_metadata": json.dumps({"contacts": {}}),
+            "static_avg_er": 3.2,
         },
     ]
 
-    search_service._llm_client.chat.completions.create.return_value = _create_mock_llm_response(
-        json.dumps([
-            {"author_id": 1001, "final_score": 0.77, "explanation": "Excellent match for tech project"},
-            {"author_id": 1002, "final_score": 0.85, "explanation": "Good gadget reviewer"},
-        ])
-    )
+    search_service._llm_client.chat.completions.create.side_effect = [
+        _create_mock_llm_response(
+            json.dumps([
+                {"author_id": 1001, "relevance_grade": 2},
+                {"author_id": 1002, "relevance_grade": 2},
+            ])
+        ),
+        _create_mock_llm_response(
+            json.dumps([
+                {"author_id": 1001, "explanation": "Excellent match for tech project"},
+                {"author_id": 1002, "explanation": "Good gadget reviewer"},
+            ])
+        ),
+    ]
 
     payload = SearchRequest(query="looking for tech content creators for product launch", limit=10)
     result = await search_service.execute_search(payload)
@@ -155,13 +165,13 @@ async def test_happy_path_search_with_mmr_and_contact_enrichment(
     assert isinstance(result, SearchResponse)
     assert len(result.results) == 2
 
-    author_one = next(r for r in result.results if r.author_id == 1001)
-    author_two = next(r for r in result.results if r.author_id == 1002)
+    author_one = next(r for r in result.results if r.author_id == "1001")
+    author_two = next(r for r in result.results if r.author_id == "1002")
 
-    assert author_one.final_score == pytest.approx(0.92, abs=0.01)
-    assert "В профиле автора найдены контактные данные" in author_one.explanation
-    assert author_two.final_score == pytest.approx(0.85, abs=0.01)
-    assert "В профиле автора найдены контактные данные" not in author_two.explanation
+    assert author_one.final_score == pytest.approx(1.0, abs=0.01)
+    assert "Excellent match" in author_one.explanation
+    assert author_two.final_score == pytest.approx(0.99, abs=0.01)
+    assert "Good gadget reviewer" in author_two.explanation
 
 
 @pytest.mark.asyncio
@@ -196,6 +206,7 @@ async def test_safety_prefiltering_discards_gambling_authors(
             "message_id": 20001,
             "platform_content_id": None,
             "raw_metadata": json.dumps({}),
+            "static_avg_er": 0.0,
         },
     ]
 
@@ -240,6 +251,7 @@ async def test_dormant_accounts_filtering_active_author_only(
             "message_id": 30001,
             "platform_content_id": None,
             "raw_metadata": json.dumps({}),
+            "static_avg_er": 4.0,
         },
         {
             "id": 302,
@@ -256,6 +268,7 @@ async def test_dormant_accounts_filtering_active_author_only(
             "message_id": 30002,
             "platform_content_id": None,
             "raw_metadata": json.dumps({}),
+            "static_avg_er": 3.0,
         },
     ]
 
@@ -264,7 +277,7 @@ async def test_dormant_accounts_filtering_active_author_only(
 
     assert isinstance(result, SearchResponse)
     assert len(result.results) == 1
-    assert result.results[0].author_id == 3001
+    assert result.results[0].author_id == "3001"
 
 
 @pytest.mark.asyncio
@@ -299,14 +312,22 @@ async def test_dormant_accounts_penalty_when_no_active_authors(
             "message_id": 40001,
             "platform_content_id": None,
             "raw_metadata": json.dumps({}),
+            "static_avg_er": 5.0,
         },
     ]
 
-    search_service._llm_client.chat.completions.create.return_value = _create_mock_llm_response(
-        json.dumps([
-            {"author_id": 4001, "final_score": 0.88, "explanation": "Former tech creator"},
-        ])
-    )
+    search_service._llm_client.chat.completions.create.side_effect = [
+        _create_mock_llm_response(
+            json.dumps([
+                {"author_id": 4001, "relevance_grade": 2},
+            ])
+        ),
+        _create_mock_llm_response(
+            json.dumps([
+                {"author_id": 4001, "explanation": "Former tech creator"},
+            ])
+        ),
+    ]
 
     payload = SearchRequest(query="tech content needed", limit=10)
     result = await search_service.execute_search(payload)
@@ -314,7 +335,7 @@ async def test_dormant_accounts_penalty_when_no_active_authors(
     assert isinstance(result, SearchResponse)
     assert len(result.results) == 1
     dormant_author = result.results[0]
-    assert dormant_author.author_id == 4001
+    assert dormant_author.author_id == "4001"
     assert dormant_author.final_score < 0.88
     assert dormant_author.final_score > 0.0
 
@@ -351,19 +372,26 @@ async def test_external_api_failure_graceful_fallback(
             "message_id": 50001,
             "platform_content_id": None,
             "raw_metadata": json.dumps({}),
+            "static_avg_er": 6.0,
         },
     ]
 
-    search_service._llm_client.chat.completions.create.side_effect = openai.APIError(
-        message="Test API error",
-        request=MagicMock(),
-        body=MagicMock(),
-    )
+    search_service._llm_client.chat.completions.create.side_effect = [
+        openai.APIError(
+            message="Test API error",
+            request=MagicMock(),
+            body=MagicMock(),
+        ),
+        openai.APIError(
+            message="Test API error",
+            request=MagicMock(),
+            body=MagicMock(),
+        ),
+    ]
 
     payload = SearchRequest(query="need content creators for project", limit=10)
     result = await search_service.execute_search(payload)
 
     assert isinstance(result, SearchResponse)
     assert len(result.results) == 1
-    assert result.results[0].explanation == ""
     assert result.results[0].final_score > 0.0

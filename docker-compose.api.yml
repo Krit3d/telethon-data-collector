@@ -124,6 +124,33 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+  enrichment_worker:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+      target: cpu-runner
+    container_name: enrichment_worker
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - fastembed_cache:/app/model_cache
+    environment:
+      DB_URL: ${DB_URL}
+      CLOUD_RU_API_KEY: ${CLOUD_RU_API_KEY}
+      CLOUD_RU_BASE_URL: ${CLOUD_RU_BASE_URL}
+      CLOUD_RU_LLM_MODEL: ${CLOUD_RU_LLM_MODEL}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      ENRICHMENT_CONCURRENCY: ${ENRICHMENT_CONCURRENCY:-15}
+    networks:
+      - api_network
+    command: python -m src.api.workers.enrichment_worker
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 networks:
   api_network:

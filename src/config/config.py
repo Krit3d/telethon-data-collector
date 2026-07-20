@@ -258,6 +258,12 @@ class Settings(BaseSettings):
         description="Enable processing and storage of language metadata in the knowledge graph",
     )
 
+    # ---- Enrichment worker settings ----
+    enrichment_concurrency: int = Field(
+        default=15,
+        description="Maximum number of accounts processed in parallel by the enrichment worker",
+    )
+
     # ---- API server settings ----
     api_host: str = Field(
         default="0.0.0.0",

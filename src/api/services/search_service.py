@@ -56,11 +56,6 @@ _DORMANT_WARNING_RU = (
     "Внимание: автор не публиковал новый контент более 180 дней, но включён в выдачу как редкий эксперт в данной нише."
 )
 
-def _normalize_er(er: float) -> float:
-    if er > 1.0:
-        er = er / 100.0
-    return min(1.0, max(0.0, er))
-
 def _safe_json_loads(text: str) -> dict[str, Any] | None:
     if not text:
         return None
@@ -510,18 +505,12 @@ class SearchService:
                 )
 
         vector_scores: dict[int, float] = {}
-        post_id_to_er: dict[int, float] = {}
         for item in posts_data:
             try:
                 post_id = int(item["post_id"])
                 vector_scores[post_id] = _calibrate_bge_m3_score(float(item.get("score", 0.0)))
-                raw_er = item.get("engagement_rate", 0.0)
-                post_id_to_er[post_id] = float(raw_er) if raw_er is not None else 0.0
             except (ValueError, KeyError, TypeError):
                 continue
-
-        for pid, er in graph_post_ers.items():
-            post_id_to_er[pid] = er
 
         graph_scores: dict[int, float] = {}
         for pid, connected_entities in graph_post_entities.items():
@@ -582,6 +571,7 @@ class SearchService:
             account_id = row["account_id"]
 
             if account_id not in author_map:
+                raw_static_avg_er = row.get("static_avg_er")
                 author_map[account_id] = {
                     "author_id": account_id,
                     "username": row.get("username"),
@@ -592,7 +582,7 @@ class SearchService:
                     "posts": [],
                     "vector_scores": [],
                     "graph_scores": [],
-                    "engagement_rates": [],
+                    "static_avg_er": float(raw_static_avg_er) if raw_static_avg_er is not None else 0.0,
                     "explanation": _DEFAULT_EXPLANATION,
                     "has_contacts": False,
                     "most_recent_post": None,
@@ -603,7 +593,6 @@ class SearchService:
             author = author_map[account_id]
             vs = vector_scores.get(post_id, 0.0)
             gs = graph_scores.get(post_id, 0.0)
-            er = _normalize_er(post_id_to_er.get(post_id, 0.0))
 
             published_at = row.get("published_at") or row.get("created_at")
             if published_at is not None:
@@ -614,7 +603,6 @@ class SearchService:
 
             author["vector_scores"].append(vs)
             author["graph_scores"].append(gs)
-            author["engagement_rates"].append(er)
 
             post_entity_ids = graph_post_entities.get(post_id, [])
             author["matched_entities"].update(post_entity_ids)
@@ -623,7 +611,6 @@ class SearchService:
                 "post_id": post_id,
                 "text": row.get("content") or row.get("transcription") or "",
                 "published_at": published_at,
-                "engagement_rate": er,
             })
 
             raw_metadata = row.get("raw_metadata")
@@ -682,10 +669,7 @@ class SearchService:
             max_vs = max(author["vector_scores"]) if author["vector_scores"] else 0.0
             max_gs = max(author["graph_scores"]) if author["graph_scores"] else 0.0
 
-            avg_er = (
-                sum(author["engagement_rates"]) / len(author["engagement_rates"])
-                if author["engagement_rates"] else 0.0
-            )
+            normalized_er = min(1.0, max(0.0, author["static_avg_er"] / 15.0))
             relevant_posts_count = sum(
                 1
                 for vs, gs in zip(
@@ -700,7 +684,7 @@ class SearchService:
                 author["final_score"] = 0.0
                 author["vector_score"] = max_vs
                 author["graph_score"] = max_gs
-                author["avg_engagement_rate"] = avg_er
+                author["avg_engagement_rate"] = author["static_avg_er"]
                 author["expertise_ratio"] = expertise_ratio
                 author["initial_topical_score"] = initial_topical_score
                 author["topical_score"] = initial_topical_score
@@ -724,7 +708,7 @@ class SearchService:
 
             decayed_topical_score = (max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)) * decay_factor
 
-            base_score = 0.7 * decayed_topical_score + 0.15 * avg_er + 0.15 * expertise_ratio
+            base_score = 0.7 * decayed_topical_score + 0.15 * normalized_er + 0.15 * expertise_ratio
             contact_multiplier = 1.15 if author["has_contacts"] else 1.0
             final_raw_score = min(1.0, base_score * contact_multiplier)
 
@@ -735,7 +719,7 @@ class SearchService:
 
             author["vector_score"] = max_vs
             author["graph_score"] = max_gs
-            author["avg_engagement_rate"] = avg_er
+            author["avg_engagement_rate"] = author["static_avg_er"]
             author["expertise_ratio"] = expertise_ratio
             author["initial_topical_score"] = initial_topical_score
             author["final_score"] = final_raw_score

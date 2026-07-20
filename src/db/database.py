@@ -640,6 +640,7 @@ class Database:
                     Account.description,
                     Account.subscribers_count,
                     Account.raw_metadata,
+                    Account.static_avg_er,
                 )
                 .join(Account, Content.account_id == Account.id)
                 .where(Content.id.in_(content_ids))
@@ -693,6 +694,7 @@ class Database:
                     "description": row.description,
                     "subscribers_count": row.subscribers_count,
                     "raw_metadata": row.raw_metadata,
+                    "static_avg_er": row.static_avg_er,
                 }
                 for row in result
             ]
