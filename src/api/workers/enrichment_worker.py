@@ -38,12 +38,15 @@ class EnrichmentWorker:
         self.poll_interval = poll_interval
         self._shutdown_event = asyncio.Event()
         self._db = Database(settings.db_url)
+
+        if not settings.deepseek_api_key:
+            raise ValueError("DEEPSEEK_API_KEY must be configured for enrichment worker")
         self._llm_client = AsyncOpenAI(
-            api_key=settings.cloud_ru_api_key,
-            base_url=settings.cloud_ru_base_url,
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
             timeout=60.0,
         )
-        self._llm_model = settings.cloud_ru_llm_model
+        self._llm_model = settings.deepseek_llm_model
         self._processing_ids: set[int] = set()
         self._acquire_lock = asyncio.Lock()
         self._concurrency = getattr(settings, 'enrichment_concurrency', 15)

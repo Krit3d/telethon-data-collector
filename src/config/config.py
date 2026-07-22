@@ -66,6 +66,20 @@ class Settings(BaseSettings):
         description="Model name for chat completions",
     )
 
+    # Direct DeepSeek API
+    deepseek_api_key: str | None = Field(
+        default=None,
+        description="API Key for direct DeepSeek API connection",
+    )
+    deepseek_base_url: str = Field(
+        default="https://api.deepseek.com/v1",
+        description="Direct DeepSeek API base URL",
+    )
+    deepseek_llm_model: str = Field(
+        default="deepseek-chat",
+        description="Direct DeepSeek LLM model name",
+    )
+
     # Cloud.ru Evolution ML Inference Service
     ml_inference_base_url: str | None = Field(
         default=None,
