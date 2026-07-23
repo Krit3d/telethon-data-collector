@@ -184,25 +184,29 @@ class EnrichmentWorker:
 
     async def _generate_explanation_and_type(self, context: str) -> ExplanationResult | None:
         system_prompt = (
-            "Analyze the provided profile metadata and recent posts to produce a structured result. "
-            "Adhere strictly to the following rules:\n"
-            "1. The 'explanation' field must be written strictly in Russian, regardless of the native language "
-            "of the source context (Kazakh, Bulgarian, English, etc.).\n"
-            "2. The 'explanation' must be a factual, objective, dense professional summary strictly between "
-            "100 and 150 words. It must always end with a complete sentence; do not cut off mid-word.\n"
-            "3. Do not use forced prefix templates like 'Автор специализируется...' or 'Автор делает...'. "
+            "You are an expert profile analyzer. Produce a structured JSON summary based strictly on context.\n\n"
+            "CRITICAL LANGUAGE RULE:\n"
+            "The 'explanation' value MUST BE 100% WRITTEN IN RUSSIAN. If the source context is in Ukrainian, Kazakh, English, Bulgarian, or any other language, YOU MUST TRANSLATE ALL FACTS INTO RUSSIAN. Outputting in Ukrainian or any non-Russian language is a critical failure.\n\n"
+            "RULES:\n"
+            "1. LENGTH: 'explanation' must be a factual, objective, dense professional summary strictly between "
+            "100 and 150 words (NEVER below 100 words or 500 characters). It must always end with a complete sentence; do not cut off mid-word.\n"
+            "2. STYLE: Do not use forced prefix templates like 'Автор специализируется...' or 'Автор делает...'. "
             "Write naturally based on the entity type, for example: 'Официальный профиль Алматинского "
             "университета...', 'Экспертный блог практикующего риелтора...'.\n"
+            "3. CONTENT & RATIONALE: Cover in depth:\n"
+            "   (a) ENTITY CLASSIFICATION & NATURE: Explicitly state whether the profile is a personal/creator blog or a corporate/business account, explaining HOW it is run (e.g., whether it combines personal experience with business, acts as a personal expert brand, or serves strictly as a corporate storefront/brand account).\n"
+            "   (b) CORE TOPICS & SERVICES: Highlight specific products, services, or themes covered in recent posts.\n"
+            "   (c) AUDIENCE & BALANCE: Describe the target audience and how personal storytelling vs direct sales/promotions are balanced.\n"
+            "   (d) PRACTICAL VALUE: Summarize the practical takeaways or insights provided to followers.\n"
             "4. GROUNDING: Rely strictly on explicit facts. Do not speculate, extrapolate, or assume "
             "unstated credentials.\n"
             "5. NOISE FILTER: Ignore social media boilerplate (likes, links, subscribe), transcript "
             "artifacts, and background song lyrics. Focus only on professional, business, or thematic "
             "semantic content.\n"
-            "6. NO DATA FALLBACK: If the context is empty, generic, or lacks thematic substance, set "
-            "'explanation' to 'Данных для анализа автора недостаточно.' and 'is_author_blog' to false.\n"
-            "7. Determine 'is_author_blog': Set to true if the account is a personal blog, lifestyle "
-            "creator, or an individual expert promoting their own professional services/consultations "
-            "(e.g., a real estate realtor, private doctor, or lawyer). Set to false if the account "
+            "6. MAXIMUM RECOVERY: Even if provided metadata is minimal, ALWAYS synthesize a full factual account summary based on available context. But NEVER hallucinate.\n"
+            "7. Determine 'is_author_blog': Set true for personal blogs, lifestyle "
+            "creators, or an individual experts promoting their own professional services/consultations "
+            "(e.g., a real estate realtor, private doctor, or lawyer). Set false if the account "
             "represents a corporate brand, a local business storefront, a retail shop, an educational "
             "institution (e.g., a university), or a community platform/club. Note that sponsored content "
             "or product advertisements do NOT change a personal/creator blog into a corporate business.\n\n"
@@ -219,7 +223,7 @@ class EnrichmentWorker:
                     model=self._llm_model,
                     messages=[
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": context},
+                        {"role": "user", "content": f"CRITICAL INSTRUCTION: TRANSLATE ALL FACTS TO RUSSIAN. Output language MUST be 100% Russian.\n\nSource context:\n{context}"},
                     ],
                     temperature=0.15,
                     max_tokens=1000,
@@ -304,11 +308,11 @@ class EnrichmentWorker:
 
     async def _identify_category(self, explanation: str) -> tuple[str | None, str | None, str | None]:
         system_prompt = (
-            "You are a deterministic classification assistant. Map the provided Russian explanation "
-            "to exactly one category ID from the YAML taxonomy."
-            "CRITICAL: You are strictly restricted to the exact IDs present in the YAML taxonomy. "
-            "Never invent or hallucinate any ID. If the explanation matches no category or contains "
-            "'Данных для анализа автора недостаточно', return an empty string for category_id."
+            "You are a deterministic IAB classification assistant. Map the provided Russian profile explanation "
+            "to EXACTLY ONE best-fitting category ID from the provided YAML taxonomy.\n\n"
+            "CRITICAL RULES:\n"
+            "1. 100% MANDATORY CLASSIFICATION: Every single profile MUST be assigned its single closest matching numeric category ID from the taxonomy. Never return an empty string or null category.\n"
+            "2. STRICT IDS ONLY: You are strictly restricted to numeric keys existing in the taxonomy. Never invent or hallucinate new IDs."
         )
 
         messages: list[ChatCompletionMessageParam] = [
