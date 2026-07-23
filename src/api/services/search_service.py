@@ -1,9 +1,11 @@
 import asyncio
+import csv
 import json
 import logging
 import math
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import openai
@@ -11,6 +13,7 @@ from openai import AsyncOpenAI
 
 from src.api.schemas import (
     AuthorSearchResultItem,
+    ReformulatedQuery,
     SearchRequest,
     SearchResponse,
 )
@@ -56,44 +59,6 @@ _DORMANT_WARNING_RU = (
     "Внимание: автор не публиковал новый контент более 180 дней, но включён в выдачу как редкий эксперт в данной нише."
 )
 
-def _safe_json_loads(text: str) -> dict[str, Any] | None:
-    if not text:
-        return None
-    try:
-        result: object = json.loads(text)
-        if isinstance(result, dict):
-            return result
-    except (json.JSONDecodeError, TypeError):
-        pass
-    json_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if json_match:
-        try:
-            result = json.loads(json_match.group(0))
-            if isinstance(result, dict):
-                return result
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return None
-
-def _safe_json_loads_array(text: str) -> list[dict[str, Any]] | None:
-    if not text:
-        return None
-    try:
-        result: object = json.loads(text)
-        if isinstance(result, list):
-            return result
-    except (json.JSONDecodeError, TypeError):
-        pass
-    json_match = re.search(r"\[.*\]", text, re.DOTALL)
-    if json_match:
-        try:
-            result = json.loads(json_match.group(0))
-            if isinstance(result, list):
-                return result
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return None
-
 def _has_negative_signals(text: str | None) -> bool:
     if not text:
         return False
@@ -135,6 +100,69 @@ class SearchService:
         )
         self._llm_model = settings.cloud_ru_llm_model
 
+        taxonomy_path = Path(__file__).resolve().parents[2] / "config" / "Content Taxonomy 3.1.tsv"
+        taxonomy_lines: list[str] = []
+        parent_map: dict[str, str] = {}
+        name_map: dict[str, str] = {}
+        with open(taxonomy_path, encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="\t")
+            for row in reader:
+                if len(row) >= 3 and row[0].strip().isdigit():
+                    uid = row[0].strip()
+                    name = row[2].strip()
+                    taxonomy_lines.append(f"{uid}: {name}")
+                    name_map[uid] = name
+                    parent_raw = row[1].strip() if len(row) > 1 else ""
+                    if parent_raw and parent_raw.isdigit():
+                        parent_map[uid] = parent_raw
+        self._taxonomy_str = "\n".join(taxonomy_lines)
+
+        self._taxonomy_dict: dict[str, dict[str, str]] = {}
+        for uid in name_map:
+            path_parts: list[str] = []
+            current = uid
+            visited = {current}
+            while current in parent_map:
+                current = parent_map[current]
+                if current in visited:
+                    break
+                visited.add(current)
+                if current in name_map:
+                    path_parts.insert(0, name_map[current])
+            path_parts.append(name_map[uid])
+            self._taxonomy_dict[uid] = {
+                "name": name_map[uid],
+                "parent_id": parent_map.get(uid, ""),
+                "path": " > ".join(path_parts),
+            }
+
+    def _calculate_taxonomy_match_score(self, target_iab_ids: list[str], author_category_id: str | int | None) -> float:
+        if author_category_id is None or author_category_id == "" or not target_iab_ids:
+            return 0.0
+        author_cat_str = str(author_category_id).strip()
+        normalized_targets = [tid.strip() for tid in target_iab_ids]
+        if author_cat_str in normalized_targets:
+            return 1.0
+        author_entry = self._taxonomy_dict.get(author_cat_str)
+        if author_entry is None:
+            return 0.0
+        author_path = author_entry["path"]
+        if " > " in author_path:
+            author_parent_path = " > ".join(author_path.split(" > ")[:-1])
+        else:
+            author_parent_path = author_path
+        for target_id in normalized_targets:
+            target_entry = self._taxonomy_dict.get(target_id)
+            if target_entry is not None:
+                target_path = target_entry["path"]
+                if " > " in target_path:
+                    target_parent_path = " > ".join(target_path.split(" > ")[:-1])
+                else:
+                    target_parent_path = target_path
+                if author_parent_path and target_parent_path and author_parent_path == target_parent_path:
+                    return 0.5
+        return 0.0
+
     async def _call_llm(
         self, messages: list[dict[str, Any]], temperature: float = 0.2,
     ) -> str:
@@ -145,213 +173,58 @@ class SearchService:
         )
         return response.choices[0].message.content or ""
 
-    async def _reformulate_query(self, raw_query: str) -> tuple[str, list[str]]:
+    async def _reformulate_query(self, raw_query: str) -> ReformulatedQuery:
         system_prompt = (
-            "You are a search query optimization assistant for Russian/CIS content. "
-            "The input query may be in Russian, English, or a mix of both. "
-            "Generate a JSON object with exactly three keys: "
-            "'dense_query' - a clean, semantically expanded Russian sentence representing the core meaning (for dense vector search); "
-            "'lexical_queries' - an array of strings containing key terms, Russian synonyms, and domain-specific acronyms "
-            "(e.g., for 'автострахование', include 'КАСКО', 'ОСАГО', 'страховой полис') to increase hit rates; "
-            "'graph_entities' - an array of key topics, brands, or entities in Russian to match Apache AGE graph nodes. "
-            "CRITICAL: Any explanatory text or reasoning MUST be in English only. "
-            "Output strictly valid JSON, no markdown, no explanation."
+            "You are an expert search query reformulator for a semantic creator discovery platform. "
+            "Analyze the user project description (Russian/English) and produce a structured ReformulatedQuery:\n"
+            "1. dense_query: Clean, expanded semantic sentence in Russian for dense vector search.\n"
+            "2. lexical_queries: Array of 3-7 keywords, Russian synonyms, and domain acronyms.\n"
+            "3. graph_entities: Array of key topics or entities in Russian for Apache AGE graph nodes.\n"
+            "4. target_iab_ids: Array of up to 3 exact numeric category IDs matching the query intent from the provided IAB Taxonomy.\n"
+            "5. profile_type_intent: Automatically classify intent as 'expert' (individual specialists/creators), "
+            "'business' (clinics, agencies, commercial companies), or 'both'.\n\n"
+            f"Available IAB Taxonomy categories:\n{self._taxonomy_str}"
         )
-        user_prompt = f"Project description: {raw_query}"
 
         try:
-            content = await self._call_llm(
-                [
+            response = await self._llm_client.beta.chat.completions.parse(
+                model=self._llm_model,
+                messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "user", "content": f"Project description: {raw_query}"},
                 ],
+                response_format=ReformulatedQuery,
                 temperature=0.1,
             )
-            parsed = _safe_json_loads(content)
+            parsed = response.choices[0].message.parsed
             if parsed is not None:
-                dense_query = parsed.get("dense_query", "")
-                lexical_queries = parsed.get("lexical_queries", [])
-                graph_entities = parsed.get("graph_entities", [])
-
-                if not isinstance(dense_query, str) or not dense_query.strip():
-                    dense_query = raw_query
-                if not isinstance(lexical_queries, list):
-                    lexical_queries = []
-                else:
-                    lexical_queries = [str(q) for q in lexical_queries if q][:5]
-                if not isinstance(graph_entities, list):
-                    graph_entities = _FALLBACK_GRAPH_ENTITIES
-                else:
-                    graph_entities = [str(e) for e in graph_entities if e]
-
-                combined_query = dense_query
-                if lexical_queries:
-                    combined_query = f"{dense_query} {' '.join(lexical_queries[:3])}"
-
-                return combined_query, graph_entities
+                return parsed
         except openai.APIError:
             logger.warning("LLM query reformulation failed, using original query", exc_info=True)
         except Exception:
             logger.warning("Unexpected error in query reformulation", exc_info=True)
 
-        return raw_query, _FALLBACK_GRAPH_ENTITIES
-
-    async def _grade_candidates(self, project_description: str, candidates: list[dict[str, Any]]) -> dict[str, int]:
-        if not candidates:
-            return {}
-
-        authors_json: list[dict[str, Any]] = []
-        for c in candidates:
-            authors_json.append({
-                "author_id": str(c["author_id"]),
-                "bio": c.get("description", ""),
-                "subscriber_count": c.get("subscribers_count", 0),
-                "platform": c.get("platform", ""),
-                "top_posts": c.get("top_post_texts", [])[:3],
-                "is_dormant": c.get("is_dormant", False),
-            })
-
-        system_prompt = (
-            "You are an expert talent matching assistant for Russian/CIS content. "
-            "Analyze the Russian project description and the Russian creator metadata (bios and post snippets). "
-            "Output a JSON array where each element has exactly two keys: "
-            '"author_id" (string, must be the exact ID as provided without rounding or mathematical alteration) and '
-            '"relevance_grade" (integer: 0, 1, or 2). '
-            "Do NOT include any explanation, reasoning, or other fields in the output. "
-            "Relevance grading: "
-            "2 = highly relevant domain expert (dedicated auto-lawyers, professional insurance brokers, specialized accident assessment); "
-            "1 = partially relevant (general-profile lawyers, generic insurance comparison portals); "
-            "0 = completely irrelevant (spam/scam, OR corporate dealership/car brand accounts with no active domain expertise). "
-            "Output ONLY valid JSON array, no markdown, no extra text, no explanation outside JSON."
-        )
-        user_prompt = (
-            f"Project description: {project_description}\n\n"
-            f"Authors: {json.dumps(authors_json, ensure_ascii=False)}"
+        return ReformulatedQuery(
+            dense_query=raw_query,
+            lexical_queries=[],
+            graph_entities=[],
+            target_iab_ids=[],
+            profile_type_intent="both",
         )
 
-        try:
-            content = await self._call_llm(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-            )
-            parsed = _safe_json_loads_array(content)
-            if parsed is not None:
-                grade_map: dict[str, int] = {}
-                for item in parsed:
-                    if not isinstance(item, dict):
-                        continue
-                    aid = item.get("author_id")
-                    grade = item.get("relevance_grade")
-                    if aid is None or grade is None:
-                        continue
-                    try:
-                        aid_str = str(aid)
-                        grade_int = int(grade)
-                        if grade_int not in (0, 1, 2):
-                            continue
-                        grade_map[aid_str] = grade_int
-                    except (ValueError, TypeError):
-                        continue
-                return grade_map
-        except openai.APIError:
-            logger.warning("LLM grading failed, returning empty grade map", exc_info=True)
-        except Exception:
-            logger.warning("Unexpected error in LLM grading", exc_info=True)
-
-        return {}
-
-    async def _generate_explanations(self, project_description: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not candidates:
-            return candidates
-
-        authors_json: list[dict[str, Any]] = []
-        for c in candidates:
-            authors_json.append({
-                "author_id": str(c["author_id"]),
-                "bio": c.get("description", ""),
-                "subscriber_count": c.get("subscribers_count", 0),
-                "platform": c.get("platform", ""),
-                "top_posts": c.get("top_post_texts", [])[:3],
-                "is_dormant": c.get("is_dormant", False),
-            })
-
-        system_prompt = (
-            "You are an expert talent matching assistant for Russian/CIS content. "
-            "Analyze the Russian project description and the Russian creator metadata (bios and post snippets). "
-            "Output a JSON array where each element has exactly two keys: "
-            '"author_id" (string, must be the exact ID as provided without rounding or mathematical alteration) and '
-            '"explanation" (string, strictly in Russian, 1-2 short sentences). '
-            "Analyze the creator's metadata (bio, top posts) relative to the project description "
-            "to write a polished Russian explanation. "
-            "Output ONLY valid JSON array, no markdown, no extra text, no explanation outside JSON."
-        )
-        user_prompt = (
-            f"Project description: {project_description}\n\n"
-            f"Authors: {json.dumps(authors_json, ensure_ascii=False)}"
-        )
-
-        try:
-            content = await self._call_llm(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-            )
-            parsed = _safe_json_loads_array(content)
-            if parsed is not None:
-                id_to_explanation: dict[str, str] = {}
-                for item in parsed:
-                    if not isinstance(item, dict):
-                        continue
-                    aid = item.get("author_id")
-                    explanation = item.get("explanation")
-                    if aid is None or explanation is None:
-                        continue
-                    id_to_explanation[str(aid)] = str(explanation)
-
-                for c in candidates:
-                    aid = str(c.get("author_id", ""))
-                    explanation = id_to_explanation.get(aid, _DEFAULT_EXPLANATION)
-                    if c.get("is_dormant", False):
-                        if not explanation.endswith(_DORMANT_WARNING_RU):
-                            explanation += " " + _DORMANT_WARNING_RU
-                    c["explanation"] = explanation
-
-                return candidates
-        except openai.APIError:
-            logger.warning("LLM explanation generation failed, using default explanation", exc_info=True)
-        except Exception:
-            logger.warning("Unexpected error in LLM explanation generation", exc_info=True)
-
-        for c in candidates:
-            c.setdefault("explanation", _DEFAULT_EXPLANATION)
-        return candidates
-
-    def _apply_bucketed_mmr(
-        self,
-        candidates: list[dict[str, Any]],
-        limit: int,
-    ) -> list[dict[str, Any]]:
-        grade_2_candidates = [c for c in candidates if c.get("relevance_grade") == 2 and c.get("final_score", 0.0) > 0.0]
-        grade_1_candidates = [c for c in candidates if c.get("relevance_grade") == 1 and c.get("final_score", 0.0) > 0.0]
-
-        grade_2_candidates.sort(key=lambda x: x["final_score"], reverse=True)
-        grade_1_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+    def _apply_flat_mmr(self, candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        candidates = [c for c in candidates if c.get("final_score", 0.0) > 0.0]
+        candidates.sort(key=lambda x: x["final_score"], reverse=True)
 
         selected: list[dict[str, Any]] = []
-        remaining_grade_2 = list(grade_2_candidates)
-        remaining_grade_1 = list(grade_1_candidates)
+        remaining = list(candidates)
 
-        for _ in range(min(limit, len(remaining_grade_2))):
+        for _ in range(min(limit, len(remaining))):
             if len(selected) >= limit:
                 break
             best_candidate = None
             best_mmr_score = -float("inf")
-            for candidate in remaining_grade_2:
+            for candidate in remaining:
                 candidate_entities = candidate.get("matched_entities", set())
                 max_similarity = 0.0
                 for s in selected:
@@ -365,29 +238,7 @@ class SearchService:
             if best_candidate is None:
                 break
             selected.append(best_candidate)
-            remaining_grade_2.remove(best_candidate)
-
-        if len(selected) < limit:
-            for _ in range(min(limit - len(selected), len(remaining_grade_1))):
-                if len(selected) >= limit:
-                    break
-                best_candidate = None
-                best_mmr_score = -float("inf")
-                for candidate in remaining_grade_1:
-                    candidate_entities = candidate.get("matched_entities", set())
-                    max_similarity = 0.0
-                    for s in selected:
-                        selected_entities = s.get("matched_entities", set())
-                        sim = _jaccard_similarity(candidate_entities, selected_entities)
-                        max_similarity = max(max_similarity, sim)
-                    mmr_score = 0.7 * candidate["final_score"] - 0.3 * max_similarity
-                    if mmr_score > best_mmr_score:
-                        best_mmr_score = mmr_score
-                        best_candidate = candidate
-                if best_candidate is None:
-                    break
-                selected.append(best_candidate)
-                remaining_grade_1.remove(best_candidate)
+            remaining.remove(best_candidate)
 
         return selected
 
@@ -426,7 +277,9 @@ class SearchService:
                 ),
             )
 
-        vector_query, graph_entities = await self._reformulate_query(query)
+        reformulated = await self._reformulate_query(query)
+        vector_query = reformulated.dense_query
+        graph_entities = reformulated.graph_entities
         logger.info(
             "Query reformulation complete. vector_query=%r graph_entities=%s",
             vector_query,
@@ -539,15 +392,31 @@ class SearchService:
                 ),
             )
 
+        if payload.author_type == "expert":
+            target_is_author_blog = True
+        elif payload.author_type == "business":
+            target_is_author_blog = False
+        elif payload.author_type in ("all", None):
+            if reformulated.profile_type_intent == "expert":
+                target_is_author_blog = True
+            elif reformulated.profile_type_intent == "business":
+                target_is_author_blog = False
+            else:
+                target_is_author_blog = None
+        else:
+            target_is_author_blog = None
+
         logger.info(
-            "DB candidate query params: location=%r min_followers=%r",
+            "DB candidate query params: location=%r min_followers=%r is_author_blog=%r",
             payload.location,
             payload.min_followers,
+            target_is_author_blog,
         )
         candidates_rows = await self._db.get_search_candidates(
             content_ids=safe_post_ids,
             location=payload.location,
             min_followers=payload.min_followers,
+            is_author_blog=target_is_author_blog,
         )
         logger.info(
             "Raw candidates fetched from PostgreSQL: %d",
@@ -571,7 +440,6 @@ class SearchService:
             account_id = row["account_id"]
 
             if account_id not in author_map:
-                raw_static_avg_er = row.get("static_avg_er")
                 author_map[account_id] = {
                     "author_id": account_id,
                     "username": row.get("username"),
@@ -579,11 +447,16 @@ class SearchService:
                     "description": row.get("description"),
                     "subscribers_count": row.get("subscribers_count"),
                     "platform": row.get("platform", "TELEGRAM"),
+                    "category_path": row.get("category_path"),
+                    "category_id": row.get("category_id"),
+                    "category_extension": row.get("category_extension"),
+                    "is_author_blog": row.get("is_author_blog"),
+                    "contacts": None,
                     "posts": [],
                     "vector_scores": [],
                     "graph_scores": [],
-                    "static_avg_er": float(raw_static_avg_er) if raw_static_avg_er is not None else 0.0,
-                    "explanation": _DEFAULT_EXPLANATION,
+                    "static_avg_er": float(row.get("static_avg_er") or 0.0),
+                    "explanation": row.get("explanation") or _DEFAULT_EXPLANATION,
                     "has_contacts": False,
                     "most_recent_post": None,
                     "matched_entities": set(),
@@ -614,14 +487,22 @@ class SearchService:
             })
 
             raw_metadata = row.get("raw_metadata")
-            parsed_metadata = _safe_json_loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-            if isinstance(parsed_metadata, dict) and not author["has_contacts"]:
+            if isinstance(raw_metadata, str):
+                try:
+                    parsed_metadata = json.loads(raw_metadata)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_metadata = None
+            else:
+                parsed_metadata = raw_metadata
+            if isinstance(parsed_metadata, dict):
                 contacts = parsed_metadata.get("contacts")
                 if isinstance(contacts, dict):
-                    for key in ["email", "telegram", "phone"]:
-                        if contacts.get(key):
-                            author["has_contacts"] = True
-                            break
+                    author["contacts"] = contacts
+                    if not author["has_contacts"]:
+                        for key in ["email", "telegram", "phone"]:
+                            if contacts.get(key):
+                                author["has_contacts"] = True
+                                break
 
         safe_author_map: dict[int, dict[str, Any]] = {}
         for account_id, author in author_map.items():
@@ -680,6 +561,16 @@ class SearchService:
             expertise_ratio = relevant_posts_count / max_matched_posts
 
             initial_topical_score = max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)
+
+            tax_score = self._calculate_taxonomy_match_score(reformulated.target_iab_ids, author.get("category_id"))
+            if tax_score > 0.0:
+                initial_topical_score *= (1.0 + 0.2 * tax_score)
+
+            if target_is_author_blog is True and author.get("is_author_blog") is False:
+                initial_topical_score *= 0.85
+            if target_is_author_blog is False and author.get("is_author_blog") is True:
+                initial_topical_score *= 0.85
+
             if initial_topical_score < payload.score_threshold:
                 author["final_score"] = 0.0
                 author["vector_score"] = max_vs
@@ -712,10 +603,11 @@ class SearchService:
             contact_multiplier = 1.15 if author["has_contacts"] else 1.0
             final_raw_score = min(1.0, base_score * contact_multiplier)
 
+            author["is_dormant"] = is_dormant
+
             if is_dormant:
-                author["is_dormant"] = True
-            else:
-                author["is_dormant"] = False
+                if _DORMANT_WARNING_RU not in author["explanation"]:
+                    author["explanation"] += " " + _DORMANT_WARNING_RU
 
             author["vector_score"] = max_vs
             author["graph_score"] = max_gs
@@ -743,53 +635,19 @@ class SearchService:
                 ),
             )
 
-        ranked_authors.sort(key=lambda x: x["initial_topical_score"], reverse=True)
+        ranked_authors.sort(key=lambda x: x["final_score"], reverse=True)
 
         rerank_pool_size = min(40, max(20, payload.limit * 2))
         top_k_candidates = ranked_authors[:min(rerank_pool_size, len(ranked_authors))]
 
         logger.info(
-            "Candidates before LLM grading: %d (pool size cap: %d)", len(top_k_candidates), rerank_pool_size,
+            "Candidates before flat MMR: %d (pool size cap: %d)", len(top_k_candidates), rerank_pool_size,
         )
 
-        grade_map: dict[str, int] = {}
-        if len(top_k_candidates) >= 1:
-            try:
-                grade_map = await self._grade_candidates(payload.query, top_k_candidates)
-            except Exception:
-                logger.warning(
-                    "Stage 1 grading failed, using default grades", exc_info=True,
-                )
-
-        for c in top_k_candidates:
-            aid = str(c.get("author_id", ""))
-            grade = grade_map.get(aid, 0)
-            base_final_score = c.get("final_score", 0.0)
-            if grade == 2:
-                c["final_score"] = 0.75 + 0.25 * base_final_score
-            elif grade == 1:
-                c["final_score"] = payload.score_threshold + (0.74 - payload.score_threshold) * base_final_score
-            else:
-                c["final_score"] = 0.0
-            c["relevance_grade"] = grade
-
-        filtered_candidates = [
-            c for c in top_k_candidates
-            if c.get("final_score", 0.0) > 0.0
-        ]
-
-        final_candidates = self._apply_bucketed_mmr(filtered_candidates, payload.limit)
-
-        if final_candidates:
-            try:
-                final_candidates = await self._generate_explanations(payload.query, final_candidates)
-            except Exception:
-                logger.warning(
-                    "Stage 2 explanation generation failed, using default explanation", exc_info=True,
-                )
+        final_candidates = self._apply_flat_mmr(top_k_candidates, payload.limit)
 
         logger.info(
-            "Candidates after bucketed MMR: %d",
+            "Candidates after flat MMR: %d",
             len(final_candidates),
         )
 
@@ -817,6 +675,9 @@ class SearchService:
                     graph_score=author["graph_score"],
                     avg_engagement_rate=author["avg_engagement_rate"],
                     explanation=author.get("explanation", _DEFAULT_EXPLANATION),
+                    category_path=author.get("category_path"),
+                    is_author_blog=author.get("is_author_blog"),
+                    contacts=author.get("contacts"),
                 )
             )
 

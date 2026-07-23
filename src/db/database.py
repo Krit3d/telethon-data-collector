@@ -620,6 +620,7 @@ class Database:
         content_ids: list[int],
         location: str | None = None,
         min_followers: int | None = None,
+        is_author_blog: bool | None = None,
     ) -> list[dict[str, Any]]:
         if not content_ids:
             return []
@@ -641,9 +642,16 @@ class Database:
                     Account.subscribers_count,
                     Account.raw_metadata,
                     Account.static_avg_er,
+                    Account.explanation,
+                    Account.category_id,
+                    Account.category_path,
+                    Account.category_extension,
+                    Account.is_author_blog,
                 )
                 .join(Account, Content.account_id == Account.id)
                 .where(Content.id.in_(content_ids))
+                .where(Account.status == "verified")
+                .where(Content.is_enriched == True)
             )
 
             if location:
@@ -677,6 +685,9 @@ class Database:
                     Account.subscribers_count >= min_followers
                 )
 
+            if is_author_blog is not None:
+                stmt = stmt.where(Account.is_author_blog == is_author_blog)
+
             result = await session.execute(stmt)
 
             return [
@@ -695,6 +706,11 @@ class Database:
                     "subscribers_count": row.subscribers_count,
                     "raw_metadata": row.raw_metadata,
                     "static_avg_er": row.static_avg_er,
+                    "explanation": row.explanation,
+                    "category_id": row.category_id,
+                    "category_path": row.category_path,
+                    "category_extension": row.category_extension,
+                    "is_author_blog": row.is_author_blog,
                 }
                 for row in result
             ]
