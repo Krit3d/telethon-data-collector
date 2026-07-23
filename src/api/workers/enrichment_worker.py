@@ -7,7 +7,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select, update
 
 from src.config.config import Settings, load_settings
@@ -205,12 +205,17 @@ class EnrichmentWorker:
             "(e.g., a real estate realtor, private doctor, or lawyer). Set to false if the account "
             "represents a corporate brand, a local business storefront, a retail shop, an educational "
             "institution (e.g., a university), or a community platform/club. Note that sponsored content "
-            "or product advertisements do NOT change a personal/creator blog into a corporate business."
+            "or product advertisements do NOT change a personal/creator blog into a corporate business.\n\n"
+            "EXAMPLE JSON OUTPUT:\n"
+            '{\n'
+            '  "is_author_blog": true,\n'
+            '  "explanation": "..."\n'
+            '}'
         )
         last_exception: Exception | None = None
         for attempt in range(1, 4):
             try:
-                response = await self._llm_client.beta.chat.completions.parse(
+                response = await self._llm_client.chat.completions.create(
                     model=self._llm_model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -218,12 +223,19 @@ class EnrichmentWorker:
                     ],
                     temperature=0.15,
                     max_tokens=1000,
-                    response_format=ExplanationResult,
+                    response_format={"type": "json_object"},
+                    extra_body={"thinking": {"type": "disabled"}},
                 )
-                parsed = response.choices[0].message.parsed
+                content = (response.choices[0].message.content or "").strip()
+                parsed = ExplanationResult.model_validate_json(content)
                 if parsed is not None and parsed.explanation.strip():
                     return parsed
                 logger.warning("LLM returned empty explanation on attempt %d", attempt)
+                return None
+            except (ValidationError, ValueError):
+                logger.warning("Failed to parse explanation JSON on attempt %d", attempt)
+                if attempt < 3:
+                    continue
                 return None
             except Exception as e:
                 last_exception = e
@@ -242,18 +254,37 @@ class EnrichmentWorker:
         return None
 
     async def _call_llm_with_network_retries(self, messages: list[ChatCompletionMessageParam]) -> CategorySelection | None:
+        prompt_messages: list[ChatCompletionMessageParam] = list(messages)
+        if prompt_messages and isinstance(prompt_messages[0], dict):
+            prompt_messages[0] = {  # type: ignore[assignment]
+                **prompt_messages[0],
+                "content": str(prompt_messages[0].get("content", "")) + (
+                    "\n\nEXAMPLE JSON OUTPUT:\n"
+                    '{\n'
+                    '  "category_id": "872"\n'
+                    '}'
+                ),
+            }
+
         last_exception: Exception | None = None
         for attempt in range(1, 4):
             try:
-                response = await self._llm_client.beta.chat.completions.parse(
+                response = await self._llm_client.chat.completions.create(
                     model=self._llm_model,
-                    messages=messages,
+                    messages=prompt_messages,
                     temperature=0.0,
-                    response_format=CategorySelection,
+                    response_format={"type": "json_object"},
+                    extra_body={"thinking": {"type": "disabled"}},
                 )
-                parsed = response.choices[0].message.parsed
+                content = (response.choices[0].message.content or "").strip()
+                parsed = CategorySelection.model_validate_json(content)
                 if parsed is not None:
                     return parsed
+                return None
+            except (ValidationError, ValueError):
+                logger.warning("Failed to parse category selection JSON on attempt %d", attempt)
+                if attempt < 3:
+                    continue
                 return None
             except Exception as e:
                 last_exception = e
