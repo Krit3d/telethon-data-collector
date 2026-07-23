@@ -279,6 +279,7 @@ class SearchService:
 
         reformulated = await self._reformulate_query(query)
         vector_query = reformulated.dense_query
+        combined_query = f"{reformulated.dense_query} {' '.join(reformulated.lexical_queries)}".strip()
         graph_entities = reformulated.graph_entities
         logger.info(
             "Query reformulation complete. vector_query=%r graph_entities=%s",
@@ -296,7 +297,7 @@ class SearchService:
         if graph_entities:
             qdrant_task = asyncio.create_task(
                 self._fetch_qdrant_data(
-                    vector_query, posts_fetch_limit, entities_fetch_limit, payload,
+                    combined_query, posts_fetch_limit, entities_fetch_limit, payload,
                 )
             )
             topic_task = asyncio.create_task(
@@ -315,7 +316,7 @@ class SearchService:
                 logger.warning("Graph topic search failed", exc_info=True)
         else:
             posts_data, entities_data = await self._fetch_qdrant_data(
-                vector_query, posts_fetch_limit, entities_fetch_limit, payload,
+                combined_query, posts_fetch_limit, entities_fetch_limit, payload,
             )
 
         logger.info(
@@ -436,6 +437,8 @@ class SearchService:
         current_utc = datetime.now(timezone.utc)
 
         for row in candidates_rows:
+            if row.get("is_enriched") is False:
+                continue
             post_id = row["id"]
             account_id = row["account_id"]
 
@@ -560,11 +563,13 @@ class SearchService:
             )
             expertise_ratio = relevant_posts_count / max_matched_posts
 
-            initial_topical_score = max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)
+            base_topical_score = max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)
 
             tax_score = self._calculate_taxonomy_match_score(reformulated.target_iab_ids, author.get("category_id"))
             if tax_score > 0.0:
-                initial_topical_score *= (1.0 + 0.2 * tax_score)
+                base_topical_score *= (1.0 + 0.2 * tax_score)
+
+            initial_topical_score = base_topical_score
 
             if target_is_author_blog is True and author.get("is_author_blog") is False:
                 initial_topical_score *= 0.85
@@ -597,7 +602,7 @@ class SearchService:
                     is_dormant = True
                     decay_factor = 0.1
 
-            decayed_topical_score = (max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)) * decay_factor
+            decayed_topical_score = base_topical_score * decay_factor
 
             base_score = 0.7 * decayed_topical_score + 0.15 * normalized_er + 0.15 * expertise_ratio
             contact_multiplier = 1.15 if author["has_contacts"] else 1.0
@@ -685,13 +690,13 @@ class SearchService:
 
     async def _fetch_qdrant_data(
         self,
-        vector_query: str,
+        combined_query: str,
         posts_limit: int,
         entities_limit: int,
         payload: SearchRequest,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         posts_task = self._qdrant.search_posts(
-            query=vector_query,
+            query=combined_query,
             limit=posts_limit,
             score_threshold=max(payload.score_threshold, 0.35),
             min_followers=payload.min_followers,
@@ -699,7 +704,7 @@ class SearchService:
             platform=None,
         )
         entities_task = self._qdrant.search_entities(
-            query=vector_query,
+            query=combined_query,
             limit=entities_limit,
             score_threshold=payload.score_threshold,
         )
