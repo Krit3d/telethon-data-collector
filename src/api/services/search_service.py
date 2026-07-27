@@ -8,8 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import openai
-from openai import AsyncOpenAI
+from openai import (
+    APIError,
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError,
+)
+from pydantic import ValidationError
 
 from src.api.schemas import (
     AuthorSearchResultItem,
@@ -40,6 +46,10 @@ _RU_STOPWORDS = {
 
 _UNINFORMATIVE_WORDS_RU = {
     "бизнес", "дело", "проект", "компания", "работа", "услуги", "продукт", "бренд", "блог", "канал", "автор", "человек", "нужен", "ищу", "что-то"
+}
+
+_SPECIFICITY_EXCLUDED = {
+    "адвокат", "юрист", "помощь", "услуги", "бизнес",
 }
 
 logger = logging.getLogger(__name__)
@@ -74,11 +84,11 @@ def _jaccard_similarity(set_a: set[str], set_b: set[str]) -> float:
     return len(intersection) / len(union)
 
 def _calibrate_bge_m3_score(raw_score: float) -> float:
-    if raw_score <= 0.35:
+    if raw_score <= 0.20:
         return 0.0
     if raw_score >= 0.75:
         return 1.0
-    return (raw_score - 0.35) / (0.75 - 0.35)
+    return (raw_score - 0.20) / (0.75 - 0.20)
 
 
 class SearchService:
@@ -93,12 +103,14 @@ class SearchService:
         self._qdrant = qdrant
         self._db = db
         self._graph_search_repo = graph_search_repo
+        if not settings.deepseek_api_key:
+            raise ValueError("DEEPSEEK_API_KEY must be configured for search service")
         self._llm_client = AsyncOpenAI(
-            api_key=settings.cloud_ru_api_key,
-            base_url=settings.cloud_ru_base_url,
-            timeout=60.0,
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            timeout=30.0,
         )
-        self._llm_model = settings.cloud_ru_llm_model
+        self._llm_model = settings.deepseek_llm_model
 
         taxonomy_path = Path(__file__).resolve().parents[2] / "config" / "Content Taxonomy 3.1.tsv"
         self._cached_yaml_taxonomy, self._taxonomy_dict = self._parse_taxonomy(taxonomy_path)
@@ -245,6 +257,29 @@ class SearchService:
                     return 0.5
         return 0.0
 
+    def _match_iab_categories_in_memory(self, terms: list[str]) -> list[str]:
+        matched_ids: set[str] = set()
+        clean_terms = {t.lower().strip() for t in terms if t.strip()}
+        if not clean_terms:
+            return []
+        for uid, entry in self._taxonomy_dict.items():
+            path = (entry.get("path") or "").lower()
+            ext = (entry.get("extension") or "").lower()
+            for term in clean_terms:
+                if term in path or (ext and term in ext):
+                    matched_ids.add(uid)
+                    break
+        if not matched_ids:
+            return []
+        scored = []
+        for uid in matched_ids:
+            entry = self._taxonomy_dict.get(uid)
+            path = (entry.get("path") or "") if entry else ""
+            depth = path.count(" > ") + 1 if path else 0
+            scored.append((depth, uid))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [uid for _, uid in scored[:5]]
+
     async def _call_llm(
         self, messages: list[dict[str, Any]], temperature: float = 0.2,
     ) -> str:
@@ -257,48 +292,61 @@ class SearchService:
 
     async def _reformulate_query(self, raw_query: str) -> ReformulatedQuery:
         system_prompt = (
-            "You are an expert search query reformulator for a semantic creator discovery platform. "
-            "Analyze the user project description (Russian/English) and produce a structured ReformulatedQuery:\n"
-            "1. dense_query: Clean, expanded semantic sentence in Russian for dense vector search.\n"
-            "2. lexical_queries: Array of 3-7 keywords, Russian synonyms, and domain acronyms.\n"
-            "3. graph_entities: Array of key topics or entities in Russian for Apache AGE graph nodes.\n"
-            "4. target_iab_ids: Array of 3-5 exact numeric category IDs matching the query intent from the provided IAB Taxonomy.\n"
-            "5. profile_type_intent: Automatically classify intent as 'expert' (individual specialists/creators), "
-            "'business' (clinics, agencies, commercial companies), or 'both'.\n\n"
-            f"Available IAB Taxonomy categories:\n{self._cached_yaml_taxonomy}"
+            "You are an expert search query reformulator. "
+            "Analyze the user project description and output JSON with:\n"
+            "- dense_query: Expanded semantic search string in Russian.\n"
+            "- lexical_queries: 3-5 specific domain keywords.\n"
+            "- graph_entities: 3-5 highly specific niche terms/entities in Russian. "
+            "NEVER include generic uninformative words (e.g. 'адвокат', 'юрист', 'бизнес', 'компания', 'услуги', 'помощь').\n"
+            "- profile_type_intent: 'expert', 'business', or 'both'.\n\n"
+            '{"dense_query": "string", "lexical_queries": ["string"], "graph_entities": ["string"], "profile_type_intent": "expert|business|both"}'
         )
 
         try:
-            response = await self._llm_client.beta.chat.completions.parse(
+            response = await self._llm_client.chat.completions.create(
                 model=self._llm_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Project description: {raw_query}"},
                 ],
-                response_format=ReformulatedQuery,
+                extra_body={"thinking": {"type": "disabled"}},
+                response_format={"type": "json_object"},
+                max_tokens=300,
                 temperature=0.1,
             )
-            parsed = response.choices[0].message.parsed
-            if parsed is not None:
-                logger.info(
-                    "LLM reformulated query: dense_query=%r target_iab_ids=%s profile_type_intent=%s",
-                    parsed.dense_query,
-                    parsed.target_iab_ids,
-                    parsed.profile_type_intent,
-                )
-                return parsed
-        except openai.APIError:
-            logger.warning("LLM query reformulation failed, using original query", exc_info=True)
-        except Exception:
-            logger.warning("Unexpected error in query reformulation", exc_info=True)
-
-        return ReformulatedQuery(
-            dense_query=raw_query,
-            lexical_queries=[],
-            graph_entities=[],
-            target_iab_ids=[],
-            profile_type_intent="both",
-        )
+            content = (response.choices[0].message.content or "").strip()
+            parsed = ReformulatedQuery.model_validate_json(content)
+            if not parsed.dense_query.strip():
+                parsed.dense_query = raw_query.strip()
+            if parsed.profile_type_intent not in ("expert", "business", "both"):
+                parsed.profile_type_intent = "both"
+            match_terms = list(parsed.lexical_queries) + list(parsed.graph_entities)
+            parsed.target_iab_ids = self._match_iab_categories_in_memory(match_terms)
+            logger.info(
+                "LLM reformulated query: dense_query=%r target_iab_ids=%s profile_type_intent=%s",
+                parsed.dense_query,
+                parsed.target_iab_ids,
+                parsed.profile_type_intent,
+            )
+            return parsed
+        except (APIConnectionError, APITimeoutError, RateLimitError, APIError):
+            logger.warning("LLM query reformulation failed due to API error, using original query", exc_info=True)
+            return ReformulatedQuery(
+                dense_query=raw_query.strip(),
+                lexical_queries=[],
+                graph_entities=[],
+                target_iab_ids=[],
+                profile_type_intent="both",
+            )
+        except (json.JSONDecodeError, ValidationError):
+            logger.warning("LLM query reformulation returned invalid JSON, using original query", exc_info=True)
+            return ReformulatedQuery(
+                dense_query=raw_query.strip(),
+                lexical_queries=[],
+                graph_entities=[],
+                target_iab_ids=[],
+                profile_type_intent="both",
+            )
 
     def _apply_flat_mmr(self, candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
         candidates = [c for c in candidates if c.get("final_score", 0.0) > 0.0]
@@ -377,8 +425,8 @@ class SearchService:
             graph_entities[:10],
         )
 
-        posts_fetch_limit = 2500
-        entities_fetch_limit = 500
+        posts_fetch_limit = 150
+        entities_fetch_limit = 100
 
         topic_post_ids: list[int] = []
         posts_data: list[dict[str, Any]] = []
@@ -490,13 +538,6 @@ class SearchService:
             target_is_author_blog = True
         elif payload.author_type == "business":
             target_is_author_blog = False
-        elif payload.author_type in ("all", None):
-            if reformulated.profile_type_intent == "expert":
-                target_is_author_blog = True
-            elif reformulated.profile_type_intent == "business":
-                target_is_author_blog = False
-            else:
-                target_is_author_blog = None
         else:
             target_is_author_blog = None
 
@@ -626,6 +667,13 @@ class SearchService:
                 ),
             )
 
+        all_excluded = all_stopwords | _UNINFORMATIVE_WORDS_RU | _SPECIFICITY_EXCLUDED
+        key_specific_terms = {w for w in cleaned_words if len(w) >= 4 and w not in all_excluded}
+        logger.info(
+            "Key specific terms for niche specificity boosting: %s",
+            key_specific_terms,
+        )
+
         max_matched_posts = max(
             sum(
                 1
@@ -709,6 +757,22 @@ class SearchService:
                     decay_factor = 0.1
 
             decayed_topical_score = topical_score * decay_factor
+
+            if key_specific_terms:
+                specificity_multiplier = 1.0
+                title_lower = (author.get("title") or "").lower()
+                desc_lower = (author.get("description") or "").lower()
+                post_texts_lower = " ".join(
+                    p.get("text", "") for p in author["posts"]
+                ).lower()
+                for term in key_specific_terms:
+                    if term in title_lower or term in desc_lower:
+                        specificity_multiplier = 1.35
+                        break
+                    if term in post_texts_lower:
+                        specificity_multiplier = 1.20
+                        break
+                decayed_topical_score = decayed_topical_score * specificity_multiplier
 
             base_score = 0.7 * decayed_topical_score + 0.15 * normalized_er + 0.15 * expertise_ratio
             contact_multiplier = 1.15 if author["has_contacts"] else 1.0
@@ -811,7 +875,7 @@ class SearchService:
         posts_task = self._qdrant.search_posts(
             query=combined_query,
             limit=posts_limit,
-            score_threshold=max(payload.score_threshold, 0.35),
+            score_threshold=payload.score_threshold,
             min_followers=payload.min_followers,
             min_engagement_rate=None,
             platform=None,
