@@ -477,7 +477,7 @@ class SearchService:
                 entity_ids_with_scores.append((eid, score))
 
         entity_ids_with_scores.sort(key=lambda x: x[1], reverse=True)
-        top_entity_ids = [eid for eid, _ in entity_ids_with_scores[:200]]
+        top_entity_ids = [eid for eid, _ in entity_ids_with_scores[:30]]
 
         graph_post_entities: dict[int, list[str]] = {}
         graph_post_ers: dict[int, float] = {}
@@ -517,9 +517,13 @@ class SearchService:
             graph_scores[pid_int] = max(entity_scores) if entity_scores else 0.0
 
         all_post_ids: set[int] = set(vector_scores.keys()) | set(graph_scores.keys()) | set(topic_post_ids)
+        has_specific_terms = any(
+            term.lower() not in _SPECIFICITY_EXCLUDED and term.lower() not in _UNINFORMATIVE_WORDS_RU
+            for term in graph_entities
+        ) if graph_entities else False
         for pid in topic_post_ids:
-            graph_scores[pid] = max(graph_scores.get(pid, 0.0), 0.65)
-        safe_post_ids: list[int] = sorted(all_post_ids)
+            graph_scores[pid] = max(graph_scores.get(pid, 0.0), 0.75 if has_specific_terms else 0.25)
+        safe_post_ids: list[int] = sorted(int(x) for x in all_post_ids)
         logger.info(
             "Unique post IDs in safe_post_ids before DB query: %d",
             len(safe_post_ids),
@@ -708,16 +712,13 @@ class SearchService:
 
             tax_score = self._calculate_taxonomy_match_score(reformulated.target_iab_ids, author.get("category_id"))
 
-            if reformulated.target_iab_ids and author.get("category_id") is not None:
+            if reformulated.target_iab_ids:
                 if tax_score == 1.0:
-                    topical_boost = 1.40
+                    topical_boost = 1.30
                 elif tax_score == 0.5:
-                    topical_boost = 1.20
+                    topical_boost = 1.10
                 else:
-                    if max_vs >= 0.55:
-                        topical_boost = 0.70
-                    else:
-                        topical_boost = 0.45
+                    topical_boost = 0.70
             else:
                 topical_boost = 1.0
 
@@ -758,28 +759,36 @@ class SearchService:
 
             decayed_topical_score = topical_score * decay_factor
 
+            specificity_multiplier = 1.0
             if key_specific_terms:
-                specificity_multiplier = 1.0
                 title_lower = (author.get("title") or "").lower()
                 desc_lower = (author.get("description") or "").lower()
                 post_texts_lower = " ".join(
                     p.get("text", "") for p in author["posts"]
                 ).lower()
+                match_points = 0
                 for term in key_specific_terms:
                     if term in title_lower or term in desc_lower:
-                        specificity_multiplier = 1.35
-                        break
-                    if term in post_texts_lower:
-                        specificity_multiplier = 1.20
-                        break
+                        match_points += 2
+                    elif term in post_texts_lower:
+                        match_points += 1
+                if match_points == 0:
+                    specificity_multiplier = 1.0
+                elif match_points == 1:
+                    specificity_multiplier = 1.20
+                elif match_points == 2:
+                    specificity_multiplier = 1.35
+                else:
+                    specificity_multiplier = 1.50
                 decayed_topical_score = decayed_topical_score * specificity_multiplier
 
-            base_score = 0.7 * decayed_topical_score + 0.15 * normalized_er + 0.15 * expertise_ratio
-            contact_multiplier = 1.15 if author["has_contacts"] else 1.0
-            final_raw_score = min(1.0, base_score * contact_multiplier)
+            if max_vs == 0.0 and specificity_multiplier == 1.0:
+                decayed_topical_score *= 0.35
+                logger.debug("Author %d dampened by vector gate (zero vector score and no key terms)", account_id)
 
-            if final_raw_score < 0.15 and not is_dormant:
-                final_raw_score = 0.15
+            base_score = 0.75 * decayed_topical_score + 0.15 * normalized_er + 0.10 * expertise_ratio
+            contact_multiplier = 1.10 if author["has_contacts"] else 1.0
+            final_raw_score = base_score * contact_multiplier
 
             author["is_dormant"] = is_dormant
 
@@ -815,7 +824,7 @@ class SearchService:
 
         ranked_authors.sort(key=lambda x: x["final_score"], reverse=True)
 
-        rerank_pool_size = min(40, max(20, payload.limit * 2))
+        rerank_pool_size = min(60, max(30, payload.limit * 3))
         top_k_candidates = ranked_authors[:min(rerank_pool_size, len(ranked_authors))]
 
         logger.info(

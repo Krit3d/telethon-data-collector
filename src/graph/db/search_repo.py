@@ -65,6 +65,7 @@ class GraphSearchRepository:
             return []
 
         normalized_topics = [t.lower().strip() for t in topics if t]
+        normalized_topics = normalized_topics[:5]
         if not normalized_topics:
             return []
 
@@ -73,8 +74,11 @@ class GraphSearchRepository:
 
         query = text(r"""
             SELECT * FROM ag_catalog.cypher('{graph_name}', $$
-                MATCH (p\:Event)-[r]->(t\:Entity)
-                WHERE (type(r) = 'ABOUT' OR type(r) = 'MENTIONS') AND t.name_lower IN $topics
+                UNWIND $topics AS topic
+                MATCH (t\:Entity)
+                WHERE t.name_lower = topic
+                MATCH (p\:Event)-[r]->(t)
+                WHERE (type(r) = 'ABOUT' OR type(r) = 'MENTIONS') AND p.db_post_id IS NOT NULL
                 RETURN p.db_post_id, COALESCE(p.engagement_rate, 0.0) AS er
                 ORDER BY er DESC
                 LIMIT 150
@@ -87,15 +91,14 @@ class GraphSearchRepository:
             seen: set[int] = set()
             post_ids: list[int] = []
             for row in result:
-                raw = row[0]
-                if raw is not None:
-                    try:
-                        pid = int(raw)
-                        if pid not in seen:
-                            seen.add(pid)
-                            post_ids.append(pid)
-                    except (ValueError, TypeError):
-                        logger.warning("Could not parse db_post_id value: %s", raw)
+                pid = row.db_post_id
+                if pid is not None:
+                    raw = _clean_ag_string(pid)
+                    if raw.isdigit():
+                        pid_int = int(raw)
+                        if pid_int not in seen:
+                            seen.add(pid_int)
+                            post_ids.append(pid_int)
             return post_ids
 
     @with_retry_on_deadlock()
@@ -105,39 +108,40 @@ class GraphSearchRepository:
         if not entity_ids:
             return {}, {}
 
+        entity_ids = entity_ids[:30]
+
         graph_name = self._resolve_graph_name()
         params = json.dumps({"ids": entity_ids})
 
-        query = text(
-            f"SELECT * FROM ag_catalog.cypher('{graph_name}', $$ "
-            f"MATCH (p\\:Event)-[r]->(e) "
-            f"WHERE e.id IN $ids AND p.db_post_id IS NOT NULL "
-            f"RETURN p.db_post_id, e.id, p.engagement_rate"
-            f" $$, CAST(:params AS agtype)) "
-            f"AS (db_post_id agtype, entity_id agtype, engagement_rate agtype)"
-        )
+        query = text(r"""
+            SELECT * FROM ag_catalog.cypher('{graph_name}', $$
+                UNWIND $ids AS eid
+                MATCH (e\:Entity)
+                WHERE e.id = eid
+                MATCH (p\:Event)-[r]->(e)
+                WHERE (type(r) = 'ABOUT' OR type(r) = 'MENTIONS') AND p.db_post_id IS NOT NULL
+                RETURN p.db_post_id, e.id, p.engagement_rate
+                LIMIT 300
+            $$, CAST(:params AS agtype))
+            AS (db_post_id agtype, entity_id agtype, engagement_rate agtype)
+        """.format(graph_name=graph_name))
 
         async with self.async_session() as session:
             result: Result = await session.execute(query, {"params": params})
             matched: dict[int, list[str]] = {}
             ers: dict[int, float] = {}
             for row in result:
-                raw_db_post_id = row[0]
-                raw_entity_id = row[1]
-                raw_er = row[2]
-                if raw_db_post_id is not None and raw_entity_id is not None:
-                    try:
-                        db_post_id = int(raw_db_post_id)
-                        entity_id = _clean_ag_string(raw_entity_id)
-                        if db_post_id not in matched:
-                            matched[db_post_id] = []
-                        matched[db_post_id].append(entity_id)
-                        ers[db_post_id] = _parse_ag_float(raw_er)
-                    except (ValueError, TypeError):
-                        logger.warning(
-                            "Could not parse search_posts_by_entities row: db_post_id=%s entity_id=%s",
-                            raw_db_post_id, raw_entity_id,
-                        )
+                db_post_id = row.db_post_id
+                entity_id = row.entity_id
+                engagement_rate = row.engagement_rate
+                if db_post_id is not None and entity_id is not None:
+                    raw = _clean_ag_string(db_post_id)
+                    if raw.isdigit():
+                        pid_int = int(raw)
+                        if pid_int not in matched:
+                            matched[pid_int] = []
+                        matched[pid_int].append(_clean_ag_string(entity_id))
+                        ers[pid_int] = _parse_ag_float(engagement_rate)
             return matched, ers
 
     @with_retry_on_deadlock()

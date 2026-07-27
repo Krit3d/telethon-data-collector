@@ -38,7 +38,7 @@ class SearchRequest(BaseModel):
     location: str | None = Field(default="", description="Filter results by author location")
     min_followers: int | None = Field(default=None, description="Minimum subscriber count")
     author_type: str | None = Field(default="expert", description="Filter by author type: 'expert', 'business', or 'all'")
-    include_contacts: bool = Field(default=True, description="Include contacts dictionary in response")
+    include_contacts: bool = Field(default=False, description="Include contacts dictionary in response")
     include_analytics: bool = Field(default=True, description="Include extended analytics fields in response")
 
     @model_validator(mode="before")
