@@ -2,9 +2,11 @@ import json
 import logging
 
 from sqlalchemy import text
+from sqlalchemy.engine import Result
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from src.config.config import Settings
+from src.db.database import with_retry_on_deadlock
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,7 @@ class GraphSearchRepository:
             )
         return name
 
+    @with_retry_on_deadlock()
     async def search_posts_by_topics(self, topics: list[str]) -> list[int]:
         if not topics:
             return []
@@ -80,7 +83,7 @@ class GraphSearchRepository:
         """.format(graph_name=graph_name))
 
         async with self.async_session() as session:
-            result = await session.execute(query, {"params": params})
+            result: Result = await session.execute(query, {"params": params})
             seen: set[int] = set()
             post_ids: list[int] = []
             for row in result:
@@ -95,6 +98,7 @@ class GraphSearchRepository:
                         logger.warning("Could not parse db_post_id value: %s", raw)
             return post_ids
 
+    @with_retry_on_deadlock()
     async def search_posts_by_entities(
         self, entity_ids: list[str]
     ) -> tuple[dict[int, list[str]], dict[int, float]]:
@@ -114,7 +118,7 @@ class GraphSearchRepository:
         )
 
         async with self.async_session() as session:
-            result = await session.execute(query, {"params": params})
+            result: Result = await session.execute(query, {"params": params})
             matched: dict[int, list[str]] = {}
             ers: dict[int, float] = {}
             for row in result:
@@ -136,6 +140,7 @@ class GraphSearchRepository:
                         )
             return matched, ers
 
+    @with_retry_on_deadlock()
     async def fetch_subgraph_edges(self, label_to_ids: dict[str, list[str]]) -> list[dict]:
         if not label_to_ids:
             return []
@@ -178,7 +183,7 @@ class GraphSearchRepository:
         )
 
         async with self.async_session() as session:
-            result = await session.execute(query, {"params": params_json})
+            result: Result = await session.execute(query, {"params": params_json})
             edges: list[dict] = []
             for row in result:
                 try:
@@ -195,6 +200,7 @@ class GraphSearchRepository:
                     continue
             return edges
 
+    @with_retry_on_deadlock()
     async def fetch_nodes_by_ids(self, label_to_ids: dict[str, list[str]]) -> list[dict]:
         if not label_to_ids:
             return []
@@ -222,7 +228,7 @@ class GraphSearchRepository:
         )
 
         async with self.async_session() as session:
-            result = await session.execute(query, {"params": params_json})
+            result: Result = await session.execute(query, {"params": params_json})
             nodes: list[dict] = []
             for row in result:
                 try:

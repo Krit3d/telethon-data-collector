@@ -25,6 +25,10 @@ class AuthorSearchResultItem(BaseModel):
     category_path: str | None = None
     is_author_blog: bool | None = None
     contacts: dict[str, Any] | None = None
+    category_extension: str | None = None
+    has_contacts: bool = False
+    is_dormant: bool = False
+    most_recent_post_at: str | None = None
 
 
 class SearchRequest(BaseModel):
@@ -34,6 +38,8 @@ class SearchRequest(BaseModel):
     location: str | None = Field(default="", description="Filter results by author location")
     min_followers: int | None = Field(default=None, description="Minimum subscriber count")
     author_type: str | None = Field(default="expert", description="Filter by author type: 'expert', 'business', or 'all'")
+    include_contacts: bool = Field(default=True, description="Include contacts dictionary in response")
+    include_analytics: bool = Field(default=True, description="Include extended analytics fields in response")
 
     @model_validator(mode="before")
     @classmethod

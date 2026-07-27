@@ -681,9 +681,7 @@ class Database:
                 )
 
             if min_followers is not None:
-                stmt = stmt.where(
-                    Account.subscribers_count >= min_followers
-                )
+                stmt = stmt.where(Account.subscribers_count >= min_followers)
 
             if is_author_blog is not None:
                 stmt = stmt.where(Account.is_author_blog == is_author_blog)

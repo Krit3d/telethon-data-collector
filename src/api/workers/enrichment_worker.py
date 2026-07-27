@@ -8,7 +8,7 @@ from typing import Any
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
@@ -388,10 +388,18 @@ class EnrichmentWorker:
                         select(Account)
                         .where(Account.status == "verified")
                         .where(
-                            select(Content.id)
-                            .where(Content.account_id == Account.id)
-                            .where(Content.is_enriched == False)
-                            .exists()
+                            or_(
+                                select(Content.id)
+                                .where(Content.account_id == Account.id)
+                                .where(Content.is_enriched == False)
+                                .exists(),
+                                and_(
+                                    Account.is_author_blog.is_(None),
+                                    ~select(Content.id)
+                                    .where(Content.account_id == Account.id)
+                                    .exists()
+                                )
+                            )
                         )
                     )
                     if self._processing_ids:
@@ -415,8 +423,9 @@ class EnrichmentWorker:
                     posts = list(content_result.scalars().all())
 
                     if not posts:
-                        self._processing_ids.discard(account_id)
-                        return None
+                        if account.is_author_blog is not None:
+                            self._processing_ids.discard(account_id)
+                            return None
 
                     return {
                         "account_id": account_id,
@@ -481,6 +490,11 @@ class EnrichmentWorker:
 
             category_id, category_path, category_extension = await self._identify_category(explanation)
 
+            if category_id is None:
+                logger.error("Skipping enrichment save for account %d because category identification failed (API error or invalid response).", account_id)
+                self._processing_ids.discard(account_id)
+                return
+
             static_avg_er = self._calculate_static_avg_er(posts_data, subscribers_count)
         except Exception:
             logger.exception("LLM processing failed for account %d", account_id)
@@ -504,11 +518,12 @@ class EnrichmentWorker:
                     account.updated_at = datetime.now(timezone.utc)
 
                     post_ids = [p["id"] for p in posts_data]
-                    await session.execute(
-                        update(Content)
-                        .where(Content.id.in_(post_ids))
-                        .values(is_enriched=True, updated_at=datetime.now(timezone.utc))
-                    )
+                    if post_ids:
+                        await session.execute(
+                            update(Content)
+                            .where(Content.id.in_(post_ids))
+                            .values(is_enriched=True, updated_at=datetime.now(timezone.utc))
+                        )
 
                     logger.info(
                         "Enriched account %d: is_author_blog=%s category_id=%s category_path=%s "

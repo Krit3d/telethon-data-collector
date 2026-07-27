@@ -101,40 +101,115 @@ class SearchService:
         self._llm_model = settings.cloud_ru_llm_model
 
         taxonomy_path = Path(__file__).resolve().parents[2] / "config" / "Content Taxonomy 3.1.tsv"
-        taxonomy_lines: list[str] = []
-        parent_map: dict[str, str] = {}
-        name_map: dict[str, str] = {}
-        with open(taxonomy_path, encoding="utf-8") as f:
-            reader = csv.reader(f, delimiter="\t")
-            for row in reader:
-                if len(row) >= 3 and row[0].strip().isdigit():
-                    uid = row[0].strip()
-                    name = row[2].strip()
-                    taxonomy_lines.append(f"{uid}: {name}")
-                    name_map[uid] = name
-                    parent_raw = row[1].strip() if len(row) > 1 else ""
-                    if parent_raw and parent_raw.isdigit():
-                        parent_map[uid] = parent_raw
-        self._taxonomy_str = "\n".join(taxonomy_lines)
+        self._cached_yaml_taxonomy, self._taxonomy_dict = self._parse_taxonomy(taxonomy_path)
 
-        self._taxonomy_dict: dict[str, dict[str, str]] = {}
-        for uid in name_map:
-            path_parts: list[str] = []
-            current = uid
-            visited = {current}
-            while current in parent_map:
-                current = parent_map[current]
-                if current in visited:
-                    break
-                visited.add(current)
-                if current in name_map:
-                    path_parts.insert(0, name_map[current])
-            path_parts.append(name_map[uid])
-            self._taxonomy_dict[uid] = {
-                "name": name_map[uid],
-                "parent_id": parent_map.get(uid, ""),
-                "path": " > ".join(path_parts),
+    def _parse_taxonomy(self, path: Path) -> tuple[str, dict[str, dict[str, str | None]]]:
+        if not path.exists():
+            logger.warning("Taxonomy file not found at %s", path)
+            return ("", {})
+
+        rows: list[dict[str, str]] = []
+        with path.open("r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="\t")
+            all_rows = list(reader)
+
+        for row in all_rows:
+            if not row or not row[0].strip() or not row[0].strip().isdigit():
+                continue
+            unique_id = row[0].strip()
+            parent_id = row[1].strip() if len(row) > 1 and row[1].strip() else ""
+            name = row[2].strip() if len(row) > 2 else ""
+            extension = row[7].strip() if len(row) > 7 else ""
+            if not name:
+                continue
+            rows.append({
+                "unique_id": unique_id,
+                "parent_id": parent_id,
+                "name": name,
+                "extension": extension,
+            })
+
+        logger.info("Parsed %d taxonomy entries from %s", len(rows), path)
+
+        tree_dict = self._build_tree(rows)
+        yaml_str = self._dict_to_yaml(tree_dict)
+        lookup_dict = self._build_lookup(rows)
+
+        logger.info(
+            "Built taxonomy YAML (%d chars) and lookup dict with %d entries",
+            len(yaml_str),
+            len(lookup_dict),
+        )
+
+        return yaml_str, lookup_dict
+
+    def _build_tree(self, rows: list[dict[str, str]]) -> dict[str, dict | str]:
+        node_map: dict[str, dict] = {}
+        children_map: dict[str, list[str]] = {}
+
+        for row in rows:
+            uid = row["unique_id"]
+            node_map[uid] = {"name": row["name"], "parent_id": row["parent_id"]}
+            children_map[uid] = []
+
+        for uid, node in node_map.items():
+            parent_id = node["parent_id"]
+            if parent_id and parent_id in children_map:
+                children_map[parent_id].append(uid)
+
+        def _to_dict(uid: str) -> dict | str:
+            children = children_map.get(uid, [])
+            if not children:
+                return node_map[uid]["name"]
+            result: dict[str, dict | str] = {}
+            for child_uid in sorted(children, key=lambda x: int(x) if x.isdigit() else x):
+                result[child_uid] = _to_dict(child_uid)
+            return result
+
+        tree: dict[str, dict | str] = {}
+        for uid, node in node_map.items():
+            if not node["parent_id"]:
+                tree[uid] = _to_dict(uid)
+
+        return tree
+
+    def _dict_to_yaml(self, d: dict[str, dict | str], indent: int = 0) -> str:
+        lines: list[str] = []
+        prefix = "  " * indent
+        for key, value in d.items():
+            if isinstance(value, str):
+                lines.append(f'{prefix}{key}: {value}')
+            elif isinstance(value, dict):
+                lines.append(f'{prefix}{key}:')
+                lines.append(self._dict_to_yaml(value, indent + 1))
+        return "\n".join(lines)
+
+    def _build_lookup(self, rows: list[dict[str, str]]) -> dict[str, dict[str, str | None]]:
+        node_map: dict[str, dict[str, str]] = {}
+        for row in rows:
+            node_map[row["unique_id"]] = {
+                "name": row["name"],
+                "parent_id": row["parent_id"],
+                "extension": row.get("extension", ""),
             }
+
+        def _build_path(uid: str) -> str:
+            parts: list[str] = []
+            current = uid
+            while current and current in node_map:
+                parts.insert(0, node_map[current]["name"])
+                current = node_map[current]["parent_id"]
+            return " > ".join(parts)
+
+        lookup: dict[str, dict[str, str | None]] = {}
+        for uid in node_map:
+            ext = node_map[uid]["extension"]
+            lookup[uid] = {
+                "path": _build_path(uid),
+                "extension": None if ext.strip() == "" else ext,
+            }
+
+        return lookup
 
     def _calculate_taxonomy_match_score(self, target_iab_ids: list[str], author_category_id: str | int | None) -> float:
         if author_category_id is None or author_category_id == "" or not target_iab_ids:
@@ -147,19 +222,26 @@ class SearchService:
         if author_entry is None:
             return 0.0
         author_path = author_entry["path"]
-        if " > " in author_path:
-            author_parent_path = " > ".join(author_path.split(" > ")[:-1])
-        else:
-            author_parent_path = author_path
+        if not author_path:
+            return 0.0
+        author_parts = author_path.split(" > ")
         for target_id in normalized_targets:
             target_entry = self._taxonomy_dict.get(target_id)
-            if target_entry is not None:
-                target_path = target_entry["path"]
-                if " > " in target_path:
-                    target_parent_path = " > ".join(target_path.split(" > ")[:-1])
+            if target_entry is None:
+                continue
+            target_path = target_entry["path"]
+            if not target_path:
+                continue
+            target_parts = target_path.split(" > ")
+            min_len = min(len(author_parts), len(target_parts))
+            common_prefix_len = 0
+            for i in range(min_len):
+                if author_parts[i] == target_parts[i]:
+                    common_prefix_len += 1
                 else:
-                    target_parent_path = target_path
-                if author_parent_path and target_parent_path and author_parent_path == target_parent_path:
+                    break
+            if common_prefix_len >= 1:
+                if common_prefix_len == min_len or common_prefix_len >= 2:
                     return 0.5
         return 0.0
 
@@ -180,10 +262,10 @@ class SearchService:
             "1. dense_query: Clean, expanded semantic sentence in Russian for dense vector search.\n"
             "2. lexical_queries: Array of 3-7 keywords, Russian synonyms, and domain acronyms.\n"
             "3. graph_entities: Array of key topics or entities in Russian for Apache AGE graph nodes.\n"
-            "4. target_iab_ids: Array of up to 3 exact numeric category IDs matching the query intent from the provided IAB Taxonomy.\n"
+            "4. target_iab_ids: Array of 3-5 exact numeric category IDs matching the query intent from the provided IAB Taxonomy.\n"
             "5. profile_type_intent: Automatically classify intent as 'expert' (individual specialists/creators), "
             "'business' (clinics, agencies, commercial companies), or 'both'.\n\n"
-            f"Available IAB Taxonomy categories:\n{self._taxonomy_str}"
+            f"Available IAB Taxonomy categories:\n{self._cached_yaml_taxonomy}"
         )
 
         try:
@@ -198,6 +280,12 @@ class SearchService:
             )
             parsed = response.choices[0].message.parsed
             if parsed is not None:
+                logger.info(
+                    "LLM reformulated query: dense_query=%r target_iab_ids=%s profile_type_intent=%s",
+                    parsed.dense_query,
+                    parsed.target_iab_ids,
+                    parsed.profile_type_intent,
+                )
                 return parsed
         except openai.APIError:
             logger.warning("LLM query reformulation failed, using original query", exc_info=True)
@@ -282,12 +370,14 @@ class SearchService:
         combined_query = f"{reformulated.dense_query} {' '.join(reformulated.lexical_queries)}".strip()
         graph_entities = reformulated.graph_entities
         logger.info(
-            "Query reformulation complete. vector_query=%r graph_entities=%s",
+            "Query reformulation complete. vector_query=%r target_iab_ids=%s profile_type_intent=%s graph_entities=%s",
             vector_query,
+            reformulated.target_iab_ids,
+            reformulated.profile_type_intent,
             graph_entities[:10],
         )
 
-        posts_fetch_limit = 1500
+        posts_fetch_limit = 2500
         entities_fetch_limit = 500
 
         topic_post_ids: list[int] = []
@@ -303,17 +393,20 @@ class SearchService:
             topic_task = asyncio.create_task(
                 self._graph_search_repo.search_posts_by_topics(graph_entities)
             )
-            try:
-                posts_data, entities_data = await qdrant_task
-            except Exception:
+            qdrant_result, topic_result = await asyncio.gather(
+                qdrant_task, topic_task, return_exceptions=True,
+            )
+            if isinstance(qdrant_result, BaseException):
                 logger.warning("Qdrant fetch failed", exc_info=True)
                 posts_data = []
                 entities_data = []
-            try:
-                result = await topic_task
-                topic_post_ids = result if isinstance(result, list) else []
-            except Exception:
+            else:
+                posts_data, entities_data = qdrant_result
+            if isinstance(topic_result, BaseException):
                 logger.warning("Graph topic search failed", exc_info=True)
+                topic_post_ids = []
+            else:
+                topic_post_ids = topic_result if isinstance(topic_result, list) else []
         else:
             posts_data, entities_data = await self._fetch_qdrant_data(
                 combined_query, posts_fetch_limit, entities_fetch_limit, payload,
@@ -458,7 +551,7 @@ class SearchService:
                     "posts": [],
                     "vector_scores": [],
                     "graph_scores": [],
-                    "static_avg_er": float(row.get("static_avg_er") or 0.0),
+                    "static_avg_er": max(0.0, float(row.get("static_avg_er") or 0.0)),
                     "explanation": row.get("explanation") or _DEFAULT_EXPLANATION,
                     "has_contacts": False,
                     "most_recent_post": None,
@@ -566,10 +659,23 @@ class SearchService:
             base_topical_score = max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)
 
             tax_score = self._calculate_taxonomy_match_score(reformulated.target_iab_ids, author.get("category_id"))
-            if tax_score > 0.0:
-                base_topical_score *= (1.0 + 0.2 * tax_score)
 
-            initial_topical_score = base_topical_score
+            if reformulated.target_iab_ids and author.get("category_id") is not None:
+                if tax_score == 1.0:
+                    topical_boost = 1.40
+                elif tax_score == 0.5:
+                    topical_boost = 1.20
+                else:
+                    if max_vs >= 0.55:
+                        topical_boost = 0.70
+                    else:
+                        topical_boost = 0.45
+            else:
+                topical_boost = 1.0
+
+            topical_score = base_topical_score * topical_boost
+
+            initial_topical_score = topical_score
 
             if target_is_author_blog is True and author.get("is_author_blog") is False:
                 initial_topical_score *= 0.85
@@ -602,11 +708,14 @@ class SearchService:
                     is_dormant = True
                     decay_factor = 0.1
 
-            decayed_topical_score = base_topical_score * decay_factor
+            decayed_topical_score = topical_score * decay_factor
 
             base_score = 0.7 * decayed_topical_score + 0.15 * normalized_er + 0.15 * expertise_ratio
             contact_multiplier = 1.15 if author["has_contacts"] else 1.0
             final_raw_score = min(1.0, base_score * contact_multiplier)
+
+            if final_raw_score < 0.15 and not is_dormant:
+                final_raw_score = 0.15
 
             author["is_dormant"] = is_dormant
 
@@ -682,7 +791,11 @@ class SearchService:
                     explanation=author.get("explanation", _DEFAULT_EXPLANATION),
                     category_path=author.get("category_path"),
                     is_author_blog=author.get("is_author_blog"),
-                    contacts=author.get("contacts"),
+                    contacts=author.get("contacts") if payload.include_contacts else None,
+                    category_extension=author.get("category_extension") if payload.include_analytics else None,
+                    has_contacts=author.get("has_contacts", False),
+                    is_dormant=author.get("is_dormant", False),
+                    most_recent_post_at=author["most_recent_post"].isoformat() if author.get("most_recent_post") else None,
                 )
             )
 
