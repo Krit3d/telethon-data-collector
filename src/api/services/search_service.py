@@ -257,29 +257,6 @@ class SearchService:
                     return 0.5
         return 0.0
 
-    def _match_iab_categories_in_memory(self, terms: list[str]) -> list[str]:
-        matched_ids: set[str] = set()
-        clean_terms = {t.lower().strip() for t in terms if t.strip()}
-        if not clean_terms:
-            return []
-        for uid, entry in self._taxonomy_dict.items():
-            path = (entry.get("path") or "").lower()
-            ext = (entry.get("extension") or "").lower()
-            for term in clean_terms:
-                if term in path or (ext and term in ext):
-                    matched_ids.add(uid)
-                    break
-        if not matched_ids:
-            return []
-        scored = []
-        for uid in matched_ids:
-            entry = self._taxonomy_dict.get(uid)
-            path = (entry.get("path") or "") if entry else ""
-            depth = path.count(" > ") + 1 if path else 0
-            scored.append((depth, uid))
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        return [uid for _, uid in scored[:5]]
-
     async def _call_llm(
         self, messages: list[dict[str, Any]], temperature: float = 0.2,
     ) -> str:
@@ -291,15 +268,19 @@ class SearchService:
         return response.choices[0].message.content or ""
 
     async def _reformulate_query(self, raw_query: str) -> ReformulatedQuery:
+        taxonomy_block = self._cached_yaml_taxonomy
         system_prompt = (
-            "You are an expert search query reformulator. "
+            "You are an expert search query reformulator and IAB taxonomy classifier. "
             "Analyze the user project description and output JSON with:\n"
             "- dense_query: Expanded semantic search string in Russian.\n"
             "- lexical_queries: 3-5 specific domain keywords.\n"
             "- graph_entities: 3-5 highly specific niche terms/entities in Russian. "
             "NEVER include generic uninformative words (e.g. 'адвокат', 'юрист', 'бизнес', 'компания', 'услуги', 'помощь').\n"
+            "- target_iab_ids: list of 1 to 5 exact IAB Category UIDs from the taxonomy below that best match the project intent.\n"
             "- profile_type_intent: 'expert', 'business', or 'both'.\n\n"
-            '{"dense_query": "string", "lexical_queries": ["string"], "graph_entities": ["string"], "profile_type_intent": "expert|business|both"}'
+            "IAB Taxonomy:\n"
+            f"{taxonomy_block}\n\n"
+            '{"dense_query": "string", "lexical_queries": ["string"], "graph_entities": ["string"], "target_iab_ids": ["string"], "profile_type_intent": "expert|business|both"}'
         )
 
         try:
@@ -320,8 +301,12 @@ class SearchService:
                 parsed.dense_query = raw_query.strip()
             if parsed.profile_type_intent not in ("expert", "business", "both"):
                 parsed.profile_type_intent = "both"
-            match_terms = list(parsed.lexical_queries) + list(parsed.graph_entities)
-            parsed.target_iab_ids = self._match_iab_categories_in_memory(match_terms)
+            validated_ids: list[str] = []
+            for uid in parsed.target_iab_ids:
+                stripped = uid.strip()
+                if stripped in self._taxonomy_dict:
+                    validated_ids.append(stripped)
+            parsed.target_iab_ids = validated_ids
             logger.info(
                 "LLM reformulated query: dense_query=%r target_iab_ids=%s profile_type_intent=%s",
                 parsed.dense_query,
@@ -698,7 +683,6 @@ class SearchService:
             max_vs = max(author["vector_scores"]) if author["vector_scores"] else 0.0
             max_gs = max(author["graph_scores"]) if author["graph_scores"] else 0.0
 
-            normalized_er = min(1.0, max(0.0, author["static_avg_er"] / 15.0))
             relevant_posts_count = sum(
                 1
                 for vs, gs in zip(
@@ -708,23 +692,11 @@ class SearchService:
             )
             expertise_ratio = relevant_posts_count / max_matched_posts
 
-            base_topical_score = max(max_vs, max_gs) + 0.15 * min(max_vs, max_gs)
-
             tax_score = self._calculate_taxonomy_match_score(reformulated.target_iab_ids, author.get("category_id"))
 
-            if reformulated.target_iab_ids:
-                if tax_score == 1.0:
-                    topical_boost = 1.30
-                elif tax_score == 0.5:
-                    topical_boost = 1.10
-                else:
-                    topical_boost = 0.70
-            else:
-                topical_boost = 1.0
+            T_raw = 0.50 * max_vs + 0.30 * max_gs + 0.20 * tax_score
 
-            topical_score = base_topical_score * topical_boost
-
-            initial_topical_score = topical_score
+            initial_topical_score = T_raw
 
             if target_is_author_blog is True and author.get("is_author_blog") is False:
                 initial_topical_score *= 0.85
@@ -757,8 +729,6 @@ class SearchService:
                     is_dormant = True
                     decay_factor = 0.1
 
-            decayed_topical_score = topical_score * decay_factor
-
             specificity_multiplier = 1.0
             if key_specific_terms:
                 title_lower = (author.get("title") or "").lower()
@@ -775,20 +745,21 @@ class SearchService:
                 if match_points == 0:
                     specificity_multiplier = 1.0
                 elif match_points == 1:
-                    specificity_multiplier = 1.20
+                    specificity_multiplier = 1.10
                 elif match_points == 2:
-                    specificity_multiplier = 1.35
+                    specificity_multiplier = 1.20
                 else:
-                    specificity_multiplier = 1.50
-                decayed_topical_score = decayed_topical_score * specificity_multiplier
+                    specificity_multiplier = 1.25
 
-            if max_vs == 0.0 and specificity_multiplier == 1.0:
-                decayed_topical_score *= 0.35
-                logger.debug("Author %d dampened by vector gate (zero vector score and no key terms)", account_id)
+            T = min(1.0, max(0.0, T_raw * specificity_multiplier * decay_factor))
 
-            base_score = 0.75 * decayed_topical_score + 0.15 * normalized_er + 0.10 * expertise_ratio
-            contact_multiplier = 1.10 if author["has_contacts"] else 1.0
-            final_raw_score = base_score * contact_multiplier
+            E = author["static_avg_er"] / (15.0 + author["static_avg_er"])
+
+            B = 0.70 * T + 0.15 * E + 0.15 * expertise_ratio
+
+            B_contact = B + (0.03 if author["has_contacts"] else 0.0)
+
+            final_score = 0.90 * min(1.0, math.pow(max(0.0, B_contact), 0.85))
 
             author["is_dormant"] = is_dormant
 
@@ -801,8 +772,8 @@ class SearchService:
             author["avg_engagement_rate"] = author["static_avg_er"]
             author["expertise_ratio"] = expertise_ratio
             author["initial_topical_score"] = initial_topical_score
-            author["final_score"] = final_raw_score
-            author["topical_score"] = decayed_topical_score
+            author["final_score"] = final_score
+            author["topical_score"] = T
             author["top_post_texts"] = [
                 s["text"][:200] for s in author["posts"][:3]
             ]
