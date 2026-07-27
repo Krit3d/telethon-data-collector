@@ -65,6 +65,8 @@ _NEGATIVE_SIGNALS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_INSTAGRAM_MEDIA_ID_PATTERN = re.compile(r'^\d+_\d+$')
+
 _DORMANT_WARNING_RU = (
     "Внимание: автор не публиковал новый контент более 180 дней, но включён в выдачу как редкий эксперт в данной нише."
 )
@@ -89,6 +91,27 @@ def _calibrate_bge_m3_score(raw_score: float) -> float:
     if raw_score >= 0.75:
         return 1.0
     return (raw_score - 0.20) / (0.75 - 0.20)
+
+
+def _tokenize_entity_name(name: str) -> list[str]:
+    tokens: list[str] = []
+    parts = re.split(r'[|,\-]', name)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        words = part.split()
+        for w in words:
+            w_clean = w.strip().lower()
+            if len(w_clean) >= 3:
+                tokens.append(w_clean)
+        if len(words) >= 2:
+            for i in range(len(words) - 1):
+                w1 = words[i].strip().lower()
+                w2 = words[i + 1].strip().lower()
+                if len(w1) >= 3 and len(w2) >= 3:
+                    tokens.append(f"{w1} {w2}")
+    return tokens
 
 
 class SearchService:
@@ -413,7 +436,7 @@ class SearchService:
         posts_fetch_limit = 150
         entities_fetch_limit = 100
 
-        topic_post_ids: list[int] = []
+        topic_post_weights: dict[int, float] = {}
         posts_data: list[dict[str, Any]] = []
         entities_data: list[dict[str, Any]] = []
 
@@ -423,8 +446,11 @@ class SearchService:
                     combined_query, posts_fetch_limit, entities_fetch_limit, payload,
                 )
             )
+            expanded_topics = list(graph_entities)
+            for phrase in graph_entities:
+                expanded_topics.extend(_tokenize_entity_name(phrase))
             topic_task = asyncio.create_task(
-                self._graph_search_repo.search_posts_by_topics(graph_entities)
+                self._graph_search_repo.search_posts_by_topics(expanded_topics)
             )
             qdrant_result, topic_result = await asyncio.gather(
                 qdrant_task, topic_task, return_exceptions=True,
@@ -437,46 +463,94 @@ class SearchService:
                 posts_data, entities_data = qdrant_result
             if isinstance(topic_result, BaseException):
                 logger.warning("Graph topic search failed", exc_info=True)
-                topic_post_ids = []
+                topic_post_weights = {}
             else:
-                topic_post_ids = topic_result if isinstance(topic_result, list) else []
+                topic_post_weights = topic_result if isinstance(topic_result, dict) else {}
         else:
             posts_data, entities_data = await self._fetch_qdrant_data(
                 combined_query, posts_fetch_limit, entities_fetch_limit, payload,
             )
 
         logger.info(
-            "Qdrant fetch complete. posts_data length=%d entities_data length=%d topic_post_ids=%d",
+            "Qdrant fetch complete. posts_data length=%d entities_data length=%d topic_post_weights=%d",
             len(posts_data),
             len(entities_data),
-            len(topic_post_ids),
+            len(topic_post_weights),
         )
+
+        logger.info("Qdrant entities count: %d", len(entities_data))
+        for i, e in enumerate(entities_data[:5]):
+            ent_payload = e.get("payload", {}) or {}
+            logger.info(
+                "Qdrant entity %d: id=%s entity_id=%s name=%s name_lower=%s",
+                i,
+                e.get("id"),
+                ent_payload.get("entity_id"),
+                ent_payload.get("name"),
+                ent_payload.get("name_lower"),
+            )
 
         entity_id_to_score: dict[str, float] = {}
         entity_ids_with_scores: list[tuple[str, float]] = []
+        all_tokens: set[str] = set()
         for e in entities_data:
-            eid = e.get("entity_id", "")
-            score = e.get("score", 0.0)
-            if eid:
-                entity_id_to_score[eid] = score
-                entity_ids_with_scores.append((eid, score))
+            raw_score = float(e.get("score", 0.0))
+            calibrated_score = _calibrate_bge_m3_score(raw_score)
+            ent_payload = e.get("payload", {}) or {}
+            item_id = str(e.get("id", "") or "")
+            payload_id = str(ent_payload.get("id", "") or "")
+            payload_entity_id = str(ent_payload.get("entity_id", "") or "")
+            name = str(ent_payload.get("name", "") or "")
+            name_lower = str(ent_payload.get("name_lower", "") or "")
+            seen: set[str] = set()
+            for identifier in (item_id, payload_id, payload_entity_id, name, name_lower):
+                normalized = identifier.strip().lower()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                if _INSTAGRAM_MEDIA_ID_PATTERN.match(normalized):
+                    continue
+                if normalized not in entity_id_to_score:
+                    entity_id_to_score[normalized] = calibrated_score
+                    entity_ids_with_scores.append((normalized, calibrated_score))
+                all_tokens.add(normalized)
+            if name_lower:
+                for token in _tokenize_entity_name(name_lower):
+                    if token not in all_tokens:
+                        all_tokens.add(token)
+                        if token not in entity_id_to_score:
+                            entity_id_to_score[token] = calibrated_score
+                            entity_ids_with_scores.append((token, calibrated_score))
 
         entity_ids_with_scores.sort(key=lambda x: x[1], reverse=True)
-        top_entity_ids = [eid for eid, _ in entity_ids_with_scores[:30]]
+        top_entity_ids = [eid for eid, _ in entity_ids_with_scores[:150]]
+        for ge in graph_entities:
+            ge_lower = ge.strip().lower()
+            if ge_lower and ge_lower not in all_tokens:
+                all_tokens.add(ge_lower)
+                top_entity_ids.append(ge_lower)
+        seen_top: set[str] = set()
+        deduped_top: list[str] = []
+        for eid in top_entity_ids:
+            if eid not in seen_top:
+                seen_top.add(eid)
+                deduped_top.append(eid)
+        top_entity_ids = deduped_top[:150]
 
-        graph_post_entities: dict[int, list[str]] = {}
-        graph_post_ers: dict[int, float] = {}
+        logger.info("top_entity_ids passed to graph search: %s", top_entity_ids)
+
+        graph_post_entity_weights: dict[int, list[tuple[str, str, float]]] = {}
 
         if top_entity_ids:
             try:
-                graph_post_entities, graph_post_ers = (
+                graph_post_entity_weights = (
                     await self._graph_search_repo.search_posts_by_entities(
                         top_entity_ids
                     )
                 )
                 logger.info(
                     "Graph search returned %d matched posts from %d entities",
-                    len(graph_post_entities),
+                    len(graph_post_entity_weights),
                     len(top_entity_ids),
                 )
             except Exception:
@@ -493,21 +567,64 @@ class SearchService:
                 continue
 
         graph_scores: dict[int, float] = {}
-        for pid, connected_entities in graph_post_entities.items():
+        graph_post_entities: dict[int, list[str]] = {}
+
+        doc_freq: dict[str, int] = {}
+        for pid, entity_matches in graph_post_entity_weights.items():
+            seen_entities: set[str] = set()
+            for eid, ename_lower, _ in entity_matches:
+                key = str(eid).strip().lower()
+                if key:
+                    seen_entities.add(key)
+                key2 = str(ename_lower).strip().lower()
+                if key2:
+                    seen_entities.add(key2)
+            for entity_key in seen_entities:
+                doc_freq[entity_key] = doc_freq.get(entity_key, 0) + 1
+
+        for pid, entity_matches in graph_post_entity_weights.items():
             try:
                 pid_int = int(pid)
             except (ValueError, TypeError):
                 continue
-            entity_scores = [entity_id_to_score.get(eid, 0.0) for eid in connected_entities]
-            graph_scores[pid_int] = max(entity_scores) if entity_scores else 0.0
+            entity_ids_for_post = [eid for eid, _, _ in entity_matches]
+            graph_post_entities[pid_int] = entity_ids_for_post
+            post_entity_scores: list[float] = []
+            for eid, ename_lower, rel_count in entity_matches:
+                eid_norm = str(eid).strip().lower()
+                ename_norm = str(ename_lower).strip().lower()
+                score = entity_id_to_score.get(eid_norm) or entity_id_to_score.get(ename_norm) or 0.0
+                if score > 0:
+                    base_score = score
+                else:
+                    base_score = 0.30
+                idf = 1.0 / math.log2(doc_freq.get(eid_norm, 1) + 1.0)
+                edge_factor = min(1.0, 0.70 + 0.30 * (rel_count / 2.0))
+                s_i = base_score * idf * edge_factor
+                post_entity_scores.append(s_i)
+            if post_entity_scores:
+                noisy_or = 1.0 - math.prod(1.0 - min(0.90, s) for s in post_entity_scores)
+                graph_scores[pid_int] = max(0.0, min(1.0, noisy_or))
+            else:
+                graph_scores[pid_int] = 0.0
 
-        all_post_ids: set[int] = set(vector_scores.keys()) | set(graph_scores.keys()) | set(topic_post_ids)
+        graph_matched_post_ids = list(graph_scores.keys())
+        logger.info(
+            "Graph search matched post IDs: %s", graph_matched_post_ids[:50]
+        )
+        logger.info(
+            "Graph scores for matched posts: %s",
+            {pid: round(gs, 4) for pid, gs in list(graph_scores.items())[:20]},
+        )
+
+        all_post_ids: set[int] = set(vector_scores.keys()) | set(graph_scores.keys()) | set(topic_post_weights.keys())
         has_specific_terms = any(
             term.lower() not in _SPECIFICITY_EXCLUDED and term.lower() not in _UNINFORMATIVE_WORDS_RU
             for term in graph_entities
         ) if graph_entities else False
-        for pid in topic_post_ids:
-            graph_scores[pid] = max(graph_scores.get(pid, 0.0), 0.75 if has_specific_terms else 0.25)
+        for pid, rel_count in topic_post_weights.items():
+            topic_score = min(0.50, (rel_count / (rel_count + 3.0)) * 0.50)
+            graph_scores[pid] = 1.0 - (1.0 - graph_scores.get(pid, 0.0)) * (1.0 - topic_score)
         safe_post_ids: list[int] = sorted(int(x) for x in all_post_ids)
         logger.info(
             "Unique post IDs in safe_post_ids before DB query: %d",
@@ -530,6 +647,13 @@ class SearchService:
         else:
             target_is_author_blog = None
 
+        pre_filter_graph_positive = sum(1 for gs in graph_scores.values() if gs > 0)
+        logger.info(
+            "Posts with graph_score > 0 before DB filtering: %d out of %d graph-scored posts, %d total post IDs",
+            pre_filter_graph_positive,
+            len(graph_scores),
+            len(safe_post_ids),
+        )
         logger.info(
             "DB candidate query params: location=%r min_followers=%r is_author_blog=%r",
             payload.location,
@@ -542,10 +666,29 @@ class SearchService:
             min_followers=payload.min_followers,
             is_author_blog=target_is_author_blog,
         )
-        logger.info(
-            "Raw candidates fetched from PostgreSQL: %d",
-            len(candidates_rows),
+        candidate_ids = {row["id"] for row in candidates_rows}
+        post_filter_graph_positive = sum(
+            1 for pid, gs in graph_scores.items() if pid in candidate_ids and gs > 0
         )
+        logger.info(
+            "Raw candidates fetched from PostgreSQL: %d (posts with graph_score > 0 after filtering: %d out of %d)",
+            len(candidates_rows),
+            post_filter_graph_positive,
+            pre_filter_graph_positive,
+        )
+
+        graph_matched_ids_in_candidates = set(graph_scores.keys()) & candidate_ids
+        missing_graph_ids = set(graph_scores.keys()) - graph_matched_ids_in_candidates
+        logger.info(
+            "Graph-matched post IDs present in candidates_rows: %d out of %d",
+            len(graph_matched_ids_in_candidates),
+            len(graph_scores),
+        )
+        if missing_graph_ids:
+            logger.warning(
+                "Graph-matched post IDs missing from candidates_rows: %s",
+                sorted(missing_graph_ids),
+            )
 
         if not candidates_rows:
             return SearchResponse(
@@ -561,6 +704,11 @@ class SearchService:
 
         for row in candidates_rows:
             if row.get("is_enriched") is False:
+                logger.warning(
+                    "Skipping candidate post_id=%s account_id=%s due to is_enriched is False",
+                    row.get("id"),
+                    row.get("account_id"),
+                )
                 continue
             post_id = row["id"]
             account_id = row["account_id"]
@@ -639,7 +787,12 @@ class SearchService:
             post_texts = [p["text"] for p in author["posts"]]
             all_text = f"{title} {description} {' '.join(post_texts)}"
             if _has_negative_signals(all_text):
-                logger.info("Author %d discarded due to negative signals", account_id)
+                has_graph_matched = any(gs > 0 for gs in author["graph_scores"])
+                logger.info(
+                    "Author %d discarded due to negative signals (had_graph_matched_posts=%s)",
+                    account_id,
+                    has_graph_matched,
+                )
                 continue
             safe_author_map[account_id] = author
         logger.info(
@@ -694,7 +847,12 @@ class SearchService:
 
             tax_score = self._calculate_taxonomy_match_score(reformulated.target_iab_ids, author.get("category_id"))
 
-            T_raw = 0.50 * max_vs + 0.30 * max_gs + 0.20 * tax_score
+            base_t_raw = 0.45 * max_vs + 0.35 * max_gs + 0.20 * tax_score
+            if max_gs > 0.0:
+                graph_boosted_t_raw = 0.70 * max_gs + 0.15 * max_vs + 0.15 * tax_score
+                T_raw = max(base_t_raw, graph_boosted_t_raw)
+            else:
+                T_raw = base_t_raw
 
             initial_topical_score = T_raw
 
@@ -736,30 +894,42 @@ class SearchService:
                 post_texts_lower = " ".join(
                     p.get("text", "") for p in author["posts"]
                 ).lower()
-                match_points = 0
+                match_count = 0
                 for term in key_specific_terms:
-                    if term in title_lower or term in desc_lower:
-                        match_points += 2
-                    elif term in post_texts_lower:
-                        match_points += 1
-                if match_points == 0:
-                    specificity_multiplier = 1.0
-                elif match_points == 1:
-                    specificity_multiplier = 1.10
-                elif match_points == 2:
-                    specificity_multiplier = 1.20
+                    if term in title_lower or term in desc_lower or term in post_texts_lower:
+                        match_count += 1
+                if match_count == 0:
+                    specificity_multiplier = 0.50
+                elif match_count == 1:
+                    specificity_multiplier = 0.90
+                elif match_count == 2:
+                    specificity_multiplier = 1.05
                 else:
-                    specificity_multiplier = 1.25
+                    specificity_multiplier = 1.15
+
+            if max_gs > 0.0 or author["matched_entities"]:
+                specificity_multiplier = max(1.0, specificity_multiplier)
 
             T = min(1.0, max(0.0, T_raw * specificity_multiplier * decay_factor))
 
-            E = author["static_avg_er"] / (15.0 + author["static_avg_er"])
+            E = author["static_avg_er"] / (20.0 + author["static_avg_er"])
 
             B = 0.70 * T + 0.15 * E + 0.15 * expertise_ratio
 
-            B_contact = B + (0.03 if author["has_contacts"] else 0.0)
+            B_contact = B + (0.02 if author["has_contacts"] else 0.0)
 
-            final_score = 0.90 * min(1.0, math.pow(max(0.0, B_contact), 0.85))
+            final_score = 0.92 * min(1.0, math.pow(max(0.0, B_contact), 0.90))
+
+            if max_gs > 0.0:
+                logger.info(
+                    "Score breakdown for author %d: vector_score=%.4f graph_score=%.4f tax_score=%.4f initial_topical_score=%.4f final_score=%.4f",
+                    account_id,
+                    max_vs,
+                    max_gs,
+                    tax_score,
+                    initial_topical_score,
+                    final_score,
+                )
 
             author["is_dormant"] = is_dormant
 
@@ -798,9 +968,11 @@ class SearchService:
         rerank_pool_size = min(60, max(30, payload.limit * 3))
         top_k_candidates = ranked_authors[:min(rerank_pool_size, len(ranked_authors))]
 
+        graph_pool_count = sum(1 for c in top_k_candidates if c.get("graph_score", 0.0) > 0.0)
         logger.info(
             "Candidates before flat MMR: %d (pool size cap: %d)", len(top_k_candidates), rerank_pool_size,
         )
+        logger.info("Top pool candidates with graph_score > 0: %d out of %d", graph_pool_count, len(top_k_candidates))
 
         final_candidates = self._apply_flat_mmr(top_k_candidates, payload.limit)
 

@@ -60,89 +60,86 @@ class GraphSearchRepository:
         return name
 
     @with_retry_on_deadlock()
-    async def search_posts_by_topics(self, topics: list[str]) -> list[int]:
+    async def search_posts_by_topics(self, topics: list[str]) -> dict[int, float]:
         if not topics:
-            return []
+            return {}
 
-        normalized_topics = [t.lower().strip() for t in topics if t]
-        normalized_topics = normalized_topics[:5]
+        normalized_topics = [t.lower().strip() for t in topics if t][:5]
         if not normalized_topics:
-            return []
+            return {}
 
         graph_name = self._resolve_graph_name()
         params = json.dumps({"topics": normalized_topics})
 
-        query = text(r"""
+        query = text(f"""
             SELECT * FROM ag_catalog.cypher('{graph_name}', $$
-                UNWIND $topics AS topic
-                MATCH (t\:Entity)
-                WHERE t.name_lower = topic
-                MATCH (p\:Event)-[r]->(t)
-                WHERE (type(r) = 'ABOUT' OR type(r) = 'MENTIONS') AND p.db_post_id IS NOT NULL
-                RETURN p.db_post_id, COALESCE(p.engagement_rate, 0.0) AS er
-                ORDER BY er DESC
-                LIMIT 150
+                MATCH (p:Event)-[r]->(t:Entity)
+                WHERE p.db_post_id IS NOT NULL AND (t.name_lower IN $topics OR t.name IN $topics)
+                RETURN p.db_post_id AS db_post_id, COUNT(DISTINCT r) AS rel_count
+                ORDER BY rel_count DESC
+                LIMIT 250
             $$, CAST(:params AS agtype))
-            AS (db_post_id agtype, engagement_rate agtype)
-        """.format(graph_name=graph_name))
+            AS (db_post_id agtype, rel_count agtype)
+        """)
 
         async with self.async_session() as session:
-            result: Result = await session.execute(query, {"params": params})
-            seen: set[int] = set()
-            post_ids: list[int] = []
-            for row in result:
-                pid = row.db_post_id
-                if pid is not None:
-                    raw = _clean_ag_string(pid)
-                    if raw.isdigit():
-                        pid_int = int(raw)
-                        if pid_int not in seen:
-                            seen.add(pid_int)
-                            post_ids.append(pid_int)
-            return post_ids
+            try:
+                result: Result = await session.execute(query, {"params": params})
+                post_weights: dict[int, float] = {}
+                for row in result:
+                    raw_id = _clean_ag_string(row.db_post_id)
+                    if raw_id.isdigit():
+                        post_weights[int(raw_id)] = _parse_ag_float(row.rel_count)
+                return post_weights
+            except Exception as e:
+                logger.warning("Direct SQL graph topic search skipped or failed: %s", e)
+                return {}
 
     @with_retry_on_deadlock()
     async def search_posts_by_entities(
         self, entity_ids: list[str]
-    ) -> tuple[dict[int, list[str]], dict[int, float]]:
+    ) -> dict[int, list[tuple[str, str, float]]]:
         if not entity_ids:
-            return {}, {}
+            return {}
 
         entity_ids = entity_ids[:30]
 
         graph_name = self._resolve_graph_name()
-        params = json.dumps({"ids": entity_ids})
+        params = json.dumps({
+            "ids": entity_ids,
+            "ids_lower": [x.lower().strip() for x in entity_ids],
+        })
 
-        query = text(r"""
+        query = text(f"""
             SELECT * FROM ag_catalog.cypher('{graph_name}', $$
-                UNWIND $ids AS eid
-                MATCH (e\:Entity)
-                WHERE e.id = eid
-                MATCH (p\:Event)-[r]->(e)
-                WHERE (type(r) = 'ABOUT' OR type(r) = 'MENTIONS') AND p.db_post_id IS NOT NULL
-                RETURN p.db_post_id, e.id, p.engagement_rate
-                LIMIT 300
+                MATCH (p:Event)-[r]->(t:Entity)
+                WHERE p.db_post_id IS NOT NULL AND (t.id IN $ids OR t.name_lower IN $ids_lower OR t.name IN $ids)
+                RETURN p.db_post_id AS db_post_id, coalesce(t.id, '') AS entity_id, coalesce(t.name_lower, '') AS entity_name_lower, COUNT(r) AS rel_count
+                ORDER BY rel_count DESC
+                LIMIT 400
             $$, CAST(:params AS agtype))
-            AS (db_post_id agtype, entity_id agtype, engagement_rate agtype)
-        """.format(graph_name=graph_name))
+            AS (db_post_id agtype, entity_id agtype, entity_name_lower agtype, rel_count agtype)
+        """)
 
         async with self.async_session() as session:
             result: Result = await session.execute(query, {"params": params})
-            matched: dict[int, list[str]] = {}
-            ers: dict[int, float] = {}
+            result_map: dict[int, list[tuple[str, str, float]]] = {}
             for row in result:
                 db_post_id = row.db_post_id
                 entity_id = row.entity_id
-                engagement_rate = row.engagement_rate
+                entity_name_lower = row.entity_name_lower
+                rel_count = row.rel_count
                 if db_post_id is not None and entity_id is not None:
                     raw = _clean_ag_string(db_post_id)
                     if raw.isdigit():
                         pid_int = int(raw)
-                        if pid_int not in matched:
-                            matched[pid_int] = []
-                        matched[pid_int].append(_clean_ag_string(entity_id))
-                        ers[pid_int] = _parse_ag_float(engagement_rate)
-            return matched, ers
+                        entity_str = _clean_ag_string(entity_id)
+                        name_lower_str = _clean_ag_string(entity_name_lower)
+                        weight = _parse_ag_float(rel_count)
+                        if pid_int not in result_map:
+                            result_map[pid_int] = []
+                        result_map[pid_int].append((entity_str, name_lower_str, weight))
+            return result_map
 
     @with_retry_on_deadlock()
     async def fetch_subgraph_edges(self, label_to_ids: dict[str, list[str]]) -> list[dict]:

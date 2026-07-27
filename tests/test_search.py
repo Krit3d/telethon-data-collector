@@ -99,10 +99,10 @@ async def test_happy_path_search_with_mmr_and_contact_enrichment(
         {"entity_id": "ent2", "score": 0.8, "label": "Brand"},
     ]
 
-    mock_graph_repo.search_posts_by_entities.return_value = (
-        {101: ["ent1", "ent2"], 102: ["ent1"]},
-        {101: 0.06, 102: 0.04},
-    )
+    mock_graph_repo.search_posts_by_entities.return_value = {
+        101: [("ent1", 1.0), ("ent2", 1.0)],
+        102: [("ent1", 1.0)],
+    }
 
     current_time = datetime.now(timezone.utc)
     five_days_ago = datetime.fromtimestamp(current_time.timestamp() - 5 * 24 * 3600, tz=timezone.utc)
@@ -185,7 +185,7 @@ async def test_safety_prefiltering_discards_gambling_authors(
     ]
     mock_qdrant.search_entities.return_value = []
 
-    mock_graph_repo.search_posts_by_entities.return_value = ({}, {})
+    mock_graph_repo.search_posts_by_entities.return_value = {}
 
     current_time = datetime.now(timezone.utc)
     one_day_ago = datetime.fromtimestamp(current_time.timestamp() - 1 * 24 * 3600, tz=timezone.utc)
@@ -229,7 +229,7 @@ async def test_dormant_accounts_filtering_active_author_only(
     ]
     mock_qdrant.search_entities.return_value = []
 
-    mock_graph_repo.search_posts_by_entities.return_value = ({}, {})
+    mock_graph_repo.search_posts_by_entities.return_value = {}
 
     current_time = datetime.now(timezone.utc)
     five_days_ago = datetime.fromtimestamp(current_time.timestamp() - 5 * 24 * 3600, tz=timezone.utc)
@@ -291,7 +291,7 @@ async def test_dormant_accounts_penalty_when_no_active_authors(
     ]
     mock_qdrant.search_entities.return_value = []
 
-    mock_graph_repo.search_posts_by_entities.return_value = ({}, {})
+    mock_graph_repo.search_posts_by_entities.return_value = {}
 
     current_time = datetime.now(timezone.utc)
     two_hundred_days_ago = datetime.fromtimestamp(current_time.timestamp() - 200 * 24 * 3600, tz=timezone.utc)
@@ -351,7 +351,7 @@ async def test_external_api_failure_graceful_fallback(
     ]
     mock_qdrant.search_entities.return_value = []
 
-    mock_graph_repo.search_posts_by_entities.return_value = ({}, {})
+    mock_graph_repo.search_posts_by_entities.return_value = {}
 
     current_time = datetime.now(timezone.utc)
     three_days_ago = datetime.fromtimestamp(current_time.timestamp() - 3 * 24 * 3600, tz=timezone.utc)
