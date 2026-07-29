@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 
 from src.api.dependencies import get_search_service
 from src.api.schemas import SearchRequest, SearchResponse
-from src.api.services.search_service import SearchService
+from src.api.services.search import SearchService
 
 router = APIRouter(prefix="/search", tags=["Search"])
 

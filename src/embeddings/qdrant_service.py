@@ -705,9 +705,10 @@ class QdrantService:
 
     async def search_posts(
         self,
-        query: str,
+        query: str | None = None,
+        dense_query: str | None = None,
         limit: int = 10,
-        score_threshold: float = 0.35,
+        score_threshold: float = 0.0,
         min_followers: int | None = None,
         min_engagement_rate: float | None = None,
         platform: str | None = None,
@@ -718,12 +719,13 @@ class QdrantService:
         if not self.collection_name:
             raise ValueError("QDRANT_COLLECTION_NAME is not configured")
 
-        if not query or not query.strip():
+        effective_query = (dense_query or query or "").strip()
+        if not effective_query:
             logger.warning("Empty query provided for search")
             return []
 
         try:
-            dense_list, _ = await self._generate_cloud_embeddings_batch([query])
+            dense_list, _ = await self._generate_cloud_embeddings_batch([effective_query])
 
             dense_emb = dense_list[0]
 
@@ -782,7 +784,7 @@ class QdrantService:
             logger.debug(
                 "Query successful",
                 extra={
-                    "query": query,
+                    "query": effective_query,
                     "results_count": len(results),
                     "limit": limit,
                     "score_threshold": score_threshold,
@@ -795,7 +797,7 @@ class QdrantService:
             logger.error(
                 "Error during Qdrant query_points",
                 exc_info=e,
-                extra={"query": query, "limit": limit},
+                extra={"query": effective_query, "limit": limit},
             )
             raise RuntimeError(f"Search failed: {e}") from e
 
