@@ -26,12 +26,12 @@ class QueryParser:
         system_prompt = (
             "You are an expert search query reformulator. Analyze the user query and extract key parameters. "
             "Return a valid JSON object matching this schema: "
-            '{"dense_query": "string", "graph_entities": ["string"], "target_iab_ids": [123], "profile_type_intent": "expert|business"}. '
+            '{"dense_query": "string", "graph_entities": ["string"], "target_topics": ["string"], "profile_type_intent": "expert|business"}. '
             "Instructions: "
-            "1. dense_query: remove conversational noise, expand acronyms, keep Russian/English domain context and core intent. "
-            "2. graph_entities: extract 1-5 key entity/topic terms strictly in lowercase, without special characters or quotes. "
-            "3. target_iab_ids: return 3-5 integer IAB category IDs most relevant to the intent. "
-            "4. profile_type_intent: \"expert\" or \"business\"."
+            "1. dense_query: Expand technical terms, acronyms (e.g. RAG -> Retrieval-Augmented Generation, vector embeddings; LLM -> Large Language Models, local LLMs), add contextually relevant Russian/English tech terms, and remove conversational filler. "
+            "2. graph_entities: Extract 1-5 core entities/topics in lowercase, without special characters. "
+            "3. target_topics: Extract 2-4 broad category/topic names in English matching the query intent (e.g. 'Artificial Intelligence', 'Software Development', 'Finance', 'Education'). "
+            "4. profile_type_intent: 'expert' or 'business'."
         )
 
         try:
@@ -65,6 +65,7 @@ class QueryParser:
             return ReformulatedQuery(
                 dense_query=cleaned_query,
                 graph_entities=[],
+                target_topics=[],
                 target_iab_ids=[],
                 profile_type_intent="expert",
             )

@@ -55,11 +55,72 @@ class TaxonomyLoader:
 
         return ancestors_map
 
+    def load_name_to_id_map(self, tsv_path: str) -> dict[str, int]:
+        try:
+            with open(tsv_path, encoding="utf-8") as f:
+                reader = csv.reader(f, delimiter="\t")
+                rows = list(reader)
+        except FileNotFoundError:
+            logger.warning("Taxonomy TSV not found at %s, returning empty name-to-id map", tsv_path)
+            return {}
+        except Exception:
+            logger.warning("Failed to read taxonomy TSV at %s, returning empty name-to-id map", tsv_path)
+            return {}
+
+        if len(rows) < 3:
+            logger.warning("Taxonomy TSV has insufficient rows (%d), returning empty name-to-id map", len(rows))
+            return {}
+
+        data_rows = rows[2:]
+        name_to_id: dict[str, int] = {}
+
+        for row in data_rows:
+            if len(row) < 3:
+                continue
+            raw_id = row[0].strip()
+            raw_name = row[2].strip()
+            if not raw_id or not raw_name:
+                continue
+            try:
+                category_id = int(raw_id)
+            except ValueError:
+                continue
+            name_to_id[raw_name.lower()] = category_id
+
+        return name_to_id
+
 
 class SearchRanker:
 
-    def __init__(self, ancestors_map: dict[str, list[str]] | None = None) -> None:
+    def __init__(
+        self,
+        ancestors_map: dict[str, list[str]] | None = None,
+        name_to_id_map: dict[str, int] | None = None,
+    ) -> None:
         self._ancestors_map = ancestors_map or {}
+        self._name_to_id_map = name_to_id_map or {}
+
+    def resolve_target_iab_ids(self, target_topics: list[str]) -> list[int]:
+        if not target_topics or not self._name_to_id_map:
+            return []
+
+        resolved: set[int] = set()
+
+        for topic in target_topics:
+            topic_lower = topic.lower().strip()
+            if not topic_lower:
+                continue
+
+            exact_id = self._name_to_id_map.get(topic_lower)
+            if exact_id is not None:
+                resolved.add(exact_id)
+                continue
+
+            for name, cid in self._name_to_id_map.items():
+                if topic_lower in name or name in topic_lower:
+                    resolved.add(cid)
+
+        return list(resolved)
 
     def calculate_tms(self, category_id: int | str | None, target_iab_ids: list[int]) -> float:
         if category_id is None or not target_iab_ids:
@@ -98,6 +159,9 @@ class SearchRanker:
         reformulated: ReformulatedQuery,
         execution_time_ms: float,
     ) -> SearchResponse:
+        if not reformulated.target_iab_ids:
+            reformulated.target_iab_ids = self.resolve_target_iab_ids(reformulated.target_topics)
+
         scored: list[tuple[float, CandidateAuthor, float, dict | None, str | None, str | None]] = []
 
         for candidate in candidates:

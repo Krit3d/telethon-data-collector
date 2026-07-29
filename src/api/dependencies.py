@@ -1,6 +1,8 @@
+from collections.abc import AsyncGenerator
 from functools import cache
 
-from fastapi import Request
+from fastapi import Depends, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.services.search import SearchService
 from src.api.services.search.query_parser import QueryParser
@@ -11,9 +13,17 @@ from src.graph.db.search_repo import GraphSearchRepository
 from src.embeddings.qdrant_service import QdrantService
 
 
+TAXONOMY_PATH = "src/config/Content Taxonomy 3.1.tsv"
+
+
 @cache
 def get_ancestors_map() -> dict[str, list[str]]:
-    return TaxonomyLoader().load_ancestors_map("src/config/Content Taxonomy 3.1.tsv")
+    return TaxonomyLoader().load_ancestors_map(TAXONOMY_PATH)
+
+
+@cache
+def get_name_to_id_map() -> dict[str, int]:
+    return TaxonomyLoader().load_name_to_id_map(TAXONOMY_PATH)
 
 
 def get_db(request: Request) -> Database:
@@ -24,13 +34,20 @@ def get_qdrant(request: Request) -> QdrantService:
     return request.app.state.qdrant
 
 
-def get_search_service(request: Request) -> SearchService:
+async def get_db_session(request: Request) -> AsyncGenerator[AsyncSession, None]:
+    db: Database = get_db(request)
+    async with db.async_session() as session:
+        yield session
+
+
+async def get_search_service(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> SearchService:
     settings = request.app.state.settings
     qdrant = get_qdrant(request)
-    db = get_db(request)
-    session = db.async_session()
-    graph_search_repo = GraphSearchRepository(session=session)
-    query_parser = QueryParser(settings=settings)
+    graph_search_repo = GraphSearchRepository(session)
+    query_parser = QueryParser(settings)
     retriever = SearchRetriever(session=session, qdrant_service=qdrant, graph_repo=graph_search_repo)
-    ranker = SearchRanker(ancestors_map=get_ancestors_map())
+    ranker = SearchRanker(ancestors_map=get_ancestors_map(), name_to_id_map=get_name_to_id_map())
     return SearchService(query_parser=query_parser, retriever=retriever, ranker=ranker)

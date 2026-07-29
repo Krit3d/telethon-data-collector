@@ -37,7 +37,8 @@ class SearchRequest(BaseModel):
 class ReformulatedQuery(BaseModel):
     dense_query: str = Field(description="Dense semantic text query for embedding generation")
     graph_entities: list[str] = Field(default_factory=list, description="Target entity names for graph traversal")
-    target_iab_ids: list[int] = Field(default_factory=list, description="Matched IAB category numeric IDs")
+    target_topics: list[str] = Field(default_factory=list, description="Extracted broad topic names matching query intent")
+    target_iab_ids: list[int] = Field(default_factory=list, description="IAB category IDs for backward compatibility")
     profile_type_intent: str = Field(default="expert", description="Inferred target profile type: expert, business, or all")
 
 
@@ -45,7 +46,8 @@ class QueryMetadata(BaseModel):
     original_query: str = Field(description="Original user search query")
     dense_query: str = Field(description="Reformulated dense query used for embedding search")
     graph_entities: list[str] = Field(default_factory=list, description="Entity names used for graph traversal")
-    target_iab_ids: list[int] = Field(default_factory=list, description="IAB category IDs used for filtering")
+    target_topics: list[str] = Field(default_factory=list, description="Extracted broad topic names matching query intent")
+    target_iab_ids: list[int] = Field(default_factory=list, description="IAB category IDs for backward compatibility")
     resolved_profile_type: str = Field(description="Final resolved profile type after normalization")
     execution_time_ms: float = Field(description="Total query execution time in milliseconds")
 
