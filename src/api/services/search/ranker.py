@@ -1,5 +1,6 @@
 import csv
 import logging
+import re
 
 from src.api.schemas import AuthorSearchResultItem, QueryMetadata, ReformulatedQuery, SearchRequest, SearchResponse
 from src.api.services.search.retriever import CandidateAuthor
@@ -92,6 +93,11 @@ class TaxonomyLoader:
 
 class SearchRanker:
 
+    _SAFETY_PATTERN = re.compile(
+        r"\b(1xbet|1win|casino|казино|вулкан|ставки\s+на\с+спорт|adult|18\+|порно|slots|слоты|scam|скам|криптосигналы|crypto\s*signals|betting|bet|online\s*casino|gambling|азартные\s+игры)\b",
+        re.IGNORECASE,
+    )
+
     def __init__(
         self,
         ancestors_map: dict[str, list[str]] | None = None,
@@ -152,6 +158,27 @@ class SearchRanker:
 
         return 0.0
 
+    def _calculate_engagement_score(self, static_avg_er: float | None) -> float:
+        er = static_avg_er if static_avg_er is not None else 0.0
+        return er / (20.0 + er)
+
+    def _calculate_topical_score(self, max_vector_score: float, max_graph_score: float, tms_score: float) -> float:
+        return (0.5 * max_vector_score) + (0.3 * max_graph_score) + (0.2 * tms_score)
+
+    def _calculate_final_score(self, topical_score: float, engagement_score: float) -> float:
+        return (0.85 * topical_score) + (0.15 * engagement_score)
+
+    def _is_safe(self, candidate: CandidateAuthor) -> bool:
+        fields_to_check: list[str] = []
+        if candidate.title:
+            fields_to_check.append(candidate.title)
+        if candidate.explanation:
+            fields_to_check.append(candidate.explanation)
+        for field in fields_to_check:
+            if self._SAFETY_PATTERN.search(field):
+                return False
+        return True
+
     def rank_and_format(
         self,
         candidates: list[CandidateAuthor],
@@ -162,11 +189,20 @@ class SearchRanker:
         if not reformulated.target_iab_ids:
             reformulated.target_iab_ids = self.resolve_target_iab_ids(reformulated.target_topics)
 
+        safe_candidates: list[CandidateAuthor] = []
+        for candidate in candidates:
+            if self._is_safe(candidate):
+                safe_candidates.append(candidate)
+            else:
+                logger.info("Discarded candidate %d due to safety filter", candidate.account_id)
+
         scored: list[tuple[float, CandidateAuthor, float, dict | None, str | None, str | None]] = []
 
-        for candidate in candidates:
+        for candidate in safe_candidates:
             tms = self.calculate_tms(candidate.category_id, reformulated.target_iab_ids)
-            final_score = (0.5 * candidate.max_vector_score) + (0.3 * candidate.max_graph_score) + (0.2 * tms)
+            engagement_score = self._calculate_engagement_score(candidate.static_avg_er)
+            topical_score = self._calculate_topical_score(candidate.max_vector_score, candidate.max_graph_score, tms)
+            final_score = self._calculate_final_score(topical_score, engagement_score)
 
             if request.include_contacts and candidate.raw_metadata:
                 contacts = candidate.raw_metadata.get("contacts") or {
