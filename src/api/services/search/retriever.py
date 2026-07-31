@@ -40,6 +40,16 @@ class SearchRetriever:
         self._qdrant_service = qdrant_service
         self._graph_search_repo = graph_search_repo
 
+    @staticmethod
+    def _extract_profile_url(raw_meta: dict | None) -> str | None:
+        if not raw_meta:
+            return None
+        for key in ("profile_url", "url", "link"):
+            val = raw_meta.get(key)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+
     async def retrieve_candidates(
         self, request: SearchRequest, reformulated: ReformulatedQuery
     ) -> tuple[list[CandidateAuthor], dict[str, float]]:
@@ -175,7 +185,7 @@ class SearchRetriever:
 
         for aid, group in account_groups.items():
             raw_meta = group["raw_metadata"] or {}
-            url = raw_meta.get("url") or raw_meta.get("link")
+            url = self._extract_profile_url(group["raw_metadata"])
 
             contacts_nested = raw_meta.get("contacts") or {}
             raw_payload = raw_meta.get("raw_profile_payload") or {}

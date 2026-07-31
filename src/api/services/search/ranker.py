@@ -7,6 +7,7 @@ from src.api.services.search.retriever import CandidateAuthor
 
 logger = logging.getLogger(__name__)
 
+
 class TaxonomyLoader:
 
     def load_ancestors_map(self, tsv_path: str) -> dict[str, list[str]]:
@@ -97,6 +98,8 @@ class SearchRanker:
         re.IGNORECASE,
     )
 
+    _GRAPH_NON_MATCH_PENALTY = 0.50
+
     @staticmethod
     def _scale_vector_score(raw_score: float) -> float:
         if raw_score <= 0.0:
@@ -136,7 +139,10 @@ class SearchRanker:
         return list(resolved)
 
     def calculate_tms(self, category_id: int | str | None, target_iab_ids: list[int]) -> float:
-        if category_id is None or not target_iab_ids:
+        if category_id is None:
+            return 0.10
+
+        if not target_iab_ids:
             return 0.10
 
         cat_str = str(category_id)
@@ -163,7 +169,7 @@ class SearchRanker:
             if cand_root == target_root:
                 return 0.50
 
-        return 0.10
+        return 0.0
 
     def _calculate_engagement_score(self, static_avg_er: float | None) -> float:
         er = static_avg_er if static_avg_er is not None else 0.0
@@ -171,9 +177,17 @@ class SearchRanker:
 
     def _calculate_topical_score(self, max_vector_score: float, max_graph_score: float, tms_score: float) -> float:
         scaled_vector = self._scale_vector_score(max_vector_score)
-        if max_graph_score > 0.0:
-            return (0.50 * scaled_vector) + (0.35 * max_graph_score) + (0.15 * tms_score)
-        return (0.75 * scaled_vector) + (0.25 * tms_score)
+        if scaled_vector > 0.0 and max_graph_score > 0.0:
+            signal_score = min(1.0, (0.55 * scaled_vector) + (0.45 * max_graph_score) + 0.10)
+        elif max_graph_score > 0.0:
+            if scaled_vector == 0.0 and tms_score <= 0.10:
+                signal_score = max_graph_score * 0.15
+            else:
+                signal_score = max_graph_score
+        else:
+            signal_score = scaled_vector * self._GRAPH_NON_MATCH_PENALTY
+        topical_score = (0.80 * signal_score) + (0.20 * tms_score)
+        return topical_score
 
     def _calculate_final_score(self, topical_score: float, engagement_score: float) -> float:
         return (0.85 * topical_score) + (0.15 * engagement_score)
@@ -252,6 +266,17 @@ class SearchRanker:
 
         items: list[AuthorSearchResultItem] = []
         for final_score, candidate, tms, contacts, url, category_path in truncated:
+            if request.include_analytics:
+                vector_score = candidate.max_vector_score
+                graph_score = candidate.max_graph_score
+                tms_score = tms
+                static_avg_er = candidate.static_avg_er
+            else:
+                vector_score = None
+                graph_score = None
+                tms_score = None
+                static_avg_er = None
+
             items.append(
                 AuthorSearchResultItem(
                     account_id=candidate.account_id,
@@ -260,10 +285,10 @@ class SearchRanker:
                     title=candidate.title,
                     url=url,
                     final_score=final_score,
-                    vector_score=candidate.max_vector_score,
-                    graph_score=candidate.max_graph_score,
-                    tms_score=tms,
-                    static_avg_er=candidate.static_avg_er,
+                    vector_score=vector_score,
+                    graph_score=graph_score,
+                    tms_score=tms_score,
+                    static_avg_er=static_avg_er,
                     category_path=category_path,
                     explanation=candidate.explanation,
                     contacts=contacts,
@@ -282,4 +307,5 @@ class SearchRanker:
             timings=timings or {},
         )
 
-        return SearchResponse(items=items, total=len(items), query_metadata=query_metadata)
+        message = "No relevant authors found matching your query criteria. Try broadening your filters or search terms." if len(items) == 0 else None
+        return SearchResponse(items=items, total=len(items), query_metadata=query_metadata, message=message)

@@ -13,24 +13,27 @@ class GraphSearchRepository:
         self.session = session
 
     async def search_posts_by_entities(self, entities: list[str], author_type: str, limit: int = 600) -> dict[int, float]:
-        patterns = [f"%{e.strip().lower()}%" for e in entities if e.strip()]
-        if not patterns:
+        clean_entities = [e.strip().lower() for e in entities if e.strip()]
+        if not clean_entities:
             return {}
 
-        query_str = """
+        if author_type == "expert":
+            apply_author_filter = True
+            target_is_author_blog = True
+        elif author_type == "business":
+            apply_author_filter = True
+            target_is_author_blog = False
+        else:
+            apply_author_filter = False
+            target_is_author_blog = True
+
+        sql = """
             SELECT
                 post_id,
                 SUM(weight)::float AS accumulative_raw_score
             FROM public.graph_entity_posts
-            WHERE entity_name_lower LIKE ANY(CAST(:patterns AS text[]))
-        """
-
-        if author_type == "expert":
-            query_str += " AND is_author_blog = TRUE"
-        elif author_type == "business":
-            query_str += " AND is_author_blog = FALSE"
-
-        query_str += """
+            WHERE entity_name_lower = ANY(:clean_entities)
+              AND (:apply_author_filter = False OR is_author_blog = :target_is_author_blog)
             GROUP BY post_id
             ORDER BY accumulative_raw_score DESC
             LIMIT :limit;
@@ -38,8 +41,13 @@ class GraphSearchRepository:
 
         try:
             result: Result = await self.session.execute(
-                text(query_str),
-                {"patterns": patterns, "limit": limit},
+                text(sql),
+                {
+                    "clean_entities": clean_entities,
+                    "apply_author_filter": apply_author_filter,
+                    "target_is_author_blog": target_is_author_blog,
+                    "limit": limit,
+                },
             )
 
             rows = result.fetchall()
