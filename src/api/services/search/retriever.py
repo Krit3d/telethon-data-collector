@@ -46,14 +46,16 @@ class SearchRetriever:
         timings: dict[str, float] = {}
 
         qdrant_limit = max(1500, request.limit * 10)
-        age_limit = min(600, max(200, int(request.limit * 2.5)))
+        age_limit = max(600, request.limit * 15)
 
-        async def _qdrant_task() -> tuple[dict[int, float], float, float]:
+        async def _embedding_task() -> tuple[list[float], float]:
             embedding_start = time.perf_counter()
             dense_list, _ = await self._qdrant_service._generate_cloud_embeddings_batch([reformulated.dense_query])
             dense_emb = dense_list[0]
             embedding_ms = (time.perf_counter() - embedding_start) * 1000.0
+            return dense_emb, embedding_ms
 
+        async def _qdrant_task(dense_emb: list[float]) -> tuple[dict[int, float], float]:
             if not self._qdrant_service._initialized:
                 await self._qdrant_service.initialize()
 
@@ -76,7 +78,7 @@ class SearchRetriever:
                 except (ValueError, TypeError):
                     continue
 
-            return qdrant_map, embedding_ms, qdrant_ms
+            return qdrant_map, qdrant_ms
 
         async def _graph_task() -> tuple[dict[int, float], float]:
             graph_start = time.perf_counter()
@@ -88,12 +90,16 @@ class SearchRetriever:
             graph_ms = (time.perf_counter() - graph_start) * 1000.0
             return age_map, graph_ms
 
-        (qdrant_map, embedding_ms, qdrant_ms), (age_map, graph_ms) = await asyncio.gather(
-            _qdrant_task(),
-            _graph_task(),
-        )
+        embedding_task = asyncio.create_task(_embedding_task())
+        graph_task = asyncio.create_task(_graph_task())
 
+        dense_emb, embedding_ms = await embedding_task
         timings["embedding_ms"] = embedding_ms
+
+        (qdrant_map, qdrant_ms), (age_map, graph_ms) = await asyncio.gather(
+            _qdrant_task(dense_emb),
+            graph_task,
+        )
         timings["qdrant_posts_ms"] = qdrant_ms
         timings["graph_index_ms"] = graph_ms
 
@@ -128,12 +134,24 @@ class SearchRetriever:
 
         account_groups: dict[int, dict[str, Any]] = {}
 
-        for content, account in rows:
+        for row in rows:
+            content = row.Content
+            account = row.Account
             aid = account.id
+            post_id = content.id
+            published_at = content.published_at
 
             if aid not in account_groups:
                 account_groups[aid] = {
-                    "account": account,
+                    "platform": account.platform,
+                    "username": account.username,
+                    "title": account.title,
+                    "category_id": account.category_id,
+                    "category_path": account.category_path,
+                    "static_avg_er": account.static_avg_er,
+                    "raw_metadata": account.raw_metadata,
+                    "explanation": account.explanation,
+                    "subscribers_count": account.subscribers_count,
                     "max_vector_score": 0.0,
                     "max_graph_score": 0.0,
                     "most_recent_post_date": None,
@@ -141,23 +159,22 @@ class SearchRetriever:
 
             group = account_groups[aid]
 
-            vector_score = qdrant_map.get(content.id, 0.0)
+            vector_score = qdrant_map.get(post_id, 0.0)
             if vector_score > group["max_vector_score"]:
                 group["max_vector_score"] = vector_score
 
-            graph_score = age_map.get(content.id, 0.0)
+            graph_score = age_map.get(post_id, 0.0)
             if graph_score > group["max_graph_score"]:
                 group["max_graph_score"] = graph_score
 
-            if content.published_at is not None:
-                if group["most_recent_post_date"] is None or content.published_at > group["most_recent_post_date"]:
-                    group["most_recent_post_date"] = content.published_at
+            if published_at is not None:
+                if group["most_recent_post_date"] is None or published_at > group["most_recent_post_date"]:
+                    group["most_recent_post_date"] = published_at
 
         candidates: list[CandidateAuthor] = []
 
         for aid, group in account_groups.items():
-            account: Account = group["account"]
-            raw_meta = account.raw_metadata or {}
+            raw_meta = group["raw_metadata"] or {}
             url = raw_meta.get("url") or raw_meta.get("link")
 
             contacts_nested = raw_meta.get("contacts") or {}
@@ -175,16 +192,16 @@ class SearchRetriever:
 
             candidates.append(CandidateAuthor(
                 account_id=aid,
-                platform=account.platform,
-                username=account.username,
-                title=account.title,
+                platform=group["platform"],
+                username=group["username"],
+                title=group["title"],
                 url=url,
-                category_id=account.category_id,
-                category_path=account.category_path,
-                static_avg_er=account.static_avg_er,
-                raw_metadata=account.raw_metadata,
-                explanation=account.explanation,
-                subscribers_count=account.subscribers_count,
+                category_id=group["category_id"],
+                category_path=group["category_path"],
+                static_avg_er=group["static_avg_er"],
+                raw_metadata=group["raw_metadata"],
+                explanation=group["explanation"],
+                subscribers_count=group["subscribers_count"],
                 max_vector_score=group["max_vector_score"],
                 max_graph_score=group["max_graph_score"],
                 most_recent_post_date=group["most_recent_post_date"],

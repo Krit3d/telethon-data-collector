@@ -1,4 +1,3 @@
-import json
 import logging
 
 from openai import AsyncOpenAI
@@ -28,9 +27,11 @@ class QueryParser:
             "Return a valid JSON object matching this schema: "
             '{"dense_query": "string", "graph_entities": ["string"], "target_topics": ["string"], "profile_type_intent": "expert|business"}. '
             "Instructions: "
-            "1. dense_query: Expand acronyms and technical terms, add contextually relevant synonyms and terms (Russian and English), and remove conversational noise. "
-            "2. graph_entities: Extract 3-7 canonical atomic lower-case key entities, lemmas, and root terms (e.g. for \"ищу детского стоматолога\" extract [\"стоматология\", \"стоматолог\", \"зубы\", \"клиника\"]). Avoid long complex phrases. "
-            "3. target_topics: Extract 2-4 broad category/topic names in English matching query intent. "
+            "1. dense_query: Expand query terms, resolve abbreviations, and enrich semantic context strictly in the primary language of the user query. "
+            "Do not introduce forced translations to other languages unless the user query explicitly uses them. "
+            "2. graph_entities: Extract 3-7 lowercase entities. Include both single atomic words and short composite key phrases. "
+            "Strip special punctuation characters |, /, # from extracted entities. "
+            "3. target_topics: MANDATORY. Extract 2-4 broad standard IAB content category names in English matching query intent (e.g., ['Personal Finance', 'Personal Investing', 'Stocks and Bonds', 'Financial Planning']). NEVER return an empty array for target_topics if query has identifiable intent. "
             "4. profile_type_intent: 'expert' or 'business'."
         )
 
@@ -54,7 +55,7 @@ class QueryParser:
                 raise ValueError(msg)
 
             parsed = ReformulatedQuery.model_validate_json(content)
-            parsed.graph_entities = [e.lower().strip() for e in parsed.graph_entities]
+            parsed.graph_entities = [e.lower().strip().translate(str.maketrans('', '', '|/#')) for e in parsed.graph_entities]
             return parsed
 
         except Exception:

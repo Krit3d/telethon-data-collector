@@ -7,10 +7,6 @@ from src.api.services.search.retriever import CandidateAuthor
 
 logger = logging.getLogger(__name__)
 
-_TMS_VECTOR_GATE: float = 0.52
-_TMS_PENALTY_FACTOR: float = 0.2
-
-
 class TaxonomyLoader:
 
     def load_ancestors_map(self, tsv_path: str) -> dict[str, list[str]]:
@@ -101,6 +97,14 @@ class SearchRanker:
         re.IGNORECASE,
     )
 
+    @staticmethod
+    def _scale_vector_score(raw_score: float) -> float:
+        if raw_score <= 0.0:
+            return 0.0
+        import math
+        scaled = 1.0 / (1.0 + math.exp(-10.0 * (raw_score - 0.45)))
+        return max(0.0, min(1.0, scaled))
+
     def __init__(
         self,
         ancestors_map: dict[str, list[str]] | None = None,
@@ -133,7 +137,7 @@ class SearchRanker:
 
     def calculate_tms(self, category_id: int | str | None, target_iab_ids: list[int]) -> float:
         if category_id is None or not target_iab_ids:
-            return 0.0
+            return 0.10
 
         cat_str = str(category_id)
         targets = [str(t) for t in target_iab_ids]
@@ -157,16 +161,19 @@ class SearchRanker:
             anc = self._ancestors_map.get(t, [])
             target_root = anc[-1] if anc else t
             if cand_root == target_root:
-                return 0.4
+                return 0.50
 
-        return 0.0
+        return 0.10
 
     def _calculate_engagement_score(self, static_avg_er: float | None) -> float:
         er = static_avg_er if static_avg_er is not None else 0.0
         return er / (20.0 + er)
 
     def _calculate_topical_score(self, max_vector_score: float, max_graph_score: float, tms_score: float) -> float:
-        return (0.60 * max_vector_score) + (0.25 * max_graph_score) + (0.15 * tms_score)
+        scaled_vector = self._scale_vector_score(max_vector_score)
+        if max_graph_score > 0.0:
+            return (0.50 * scaled_vector) + (0.35 * max_graph_score) + (0.15 * tms_score)
+        return (0.75 * scaled_vector) + (0.25 * tms_score)
 
     def _calculate_final_score(self, topical_score: float, engagement_score: float) -> float:
         return (0.85 * topical_score) + (0.15 * engagement_score)
@@ -205,11 +212,9 @@ class SearchRanker:
         for candidate in safe_candidates:
             tms = self.calculate_tms(candidate.category_id, reformulated.target_iab_ids)
 
-            if candidate.max_vector_score < _TMS_VECTOR_GATE:
-                tms = tms * _TMS_PENALTY_FACTOR
-
             engagement_score = self._calculate_engagement_score(candidate.static_avg_er)
             topical_score = self._calculate_topical_score(candidate.max_vector_score, candidate.max_graph_score, tms)
+
             final_score = self._calculate_final_score(topical_score, engagement_score)
 
             if request.include_contacts and candidate.raw_metadata:
@@ -225,10 +230,7 @@ class SearchRanker:
             else:
                 contacts = None
 
-            if candidate.platform.upper() == "TELEGRAM" and candidate.username:
-                url = f"https://t.me/{candidate.username}"
-            else:
-                url = candidate.url
+            url = candidate.url.strip() if candidate.url and candidate.url.strip() else None
 
             if candidate.category_path:
                 category_path = candidate.category_path
