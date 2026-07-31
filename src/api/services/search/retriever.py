@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -9,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas import ReformulatedQuery, SearchRequest
 from src.db.models import Account, Content
-from src.graph.db.search_repo import GraphSearchRepository
 
 logger = logging.getLogger(__name__)
 
@@ -35,61 +35,76 @@ class CandidateAuthor:
 
 class SearchRetriever:
 
-    def __init__(self, session: AsyncSession, qdrant_service: Any, graph_repo: GraphSearchRepository) -> None:
+    def __init__(self, session: AsyncSession, qdrant_service: Any, graph_search_repo: Any) -> None:
         self._session = session
         self._qdrant_service = qdrant_service
-        self._graph_repo = graph_repo
+        self._graph_search_repo = graph_search_repo
 
-    async def retrieve_candidates(self, request: SearchRequest, reformulated: ReformulatedQuery) -> list[CandidateAuthor]:
+    async def retrieve_candidates(
+        self, request: SearchRequest, reformulated: ReformulatedQuery
+    ) -> tuple[list[CandidateAuthor], dict[str, float]]:
+        timings: dict[str, float] = {}
+
         qdrant_limit = max(1500, request.limit * 10)
         age_limit = min(600, max(200, int(request.limit * 2.5)))
 
-        qdrant_task = self._qdrant_service.search_posts(
-            dense_query=reformulated.dense_query, limit=qdrant_limit, score_threshold=0.35
-        )
-        graph_task = self._graph_repo.search_posts_by_entities(
-            entities=reformulated.graph_entities,
-            author_type=request.author_type,
-            limit=age_limit,
-        )
+        async def _qdrant_task() -> tuple[dict[int, float], float, float]:
+            embedding_start = time.perf_counter()
+            dense_list, _ = await self._qdrant_service._generate_cloud_embeddings_batch([reformulated.dense_query])
+            dense_emb = dense_list[0]
+            embedding_ms = (time.perf_counter() - embedding_start) * 1000.0
 
-        qdrant_map: dict[int, float] = {}
-        age_map: dict[int, float] = {}
+            if not self._qdrant_service._initialized:
+                await self._qdrant_service.initialize()
 
-        try:
-            qdrant_results, graph_results = await asyncio.gather(qdrant_task, graph_task, return_exceptions=True)
-        except Exception:
-            logger.error("asyncio.gather failed for candidate retrieval, falling back to empty results")
-            qdrant_results = []
-            graph_results = {}
+            qdrant_start = time.perf_counter()
+            qdrant_response = await self._qdrant_service.client.query_points(
+                collection_name=self._qdrant_service.collection_name,
+                query=dense_emb,
+                using="text",
+                limit=qdrant_limit,
+                score_threshold=0.30,
+                with_payload=True,
+            )
+            qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
 
-        if isinstance(qdrant_results, BaseException):
-            logger.error("Qdrant search failed: %s", qdrant_results)
-            qdrant_results = []
-        if isinstance(graph_results, BaseException):
-            logger.error("Graph search failed: %s", graph_results)
-            await self._session.rollback()
-            graph_results = {}
-
-        if isinstance(qdrant_results, list):
-            for r in qdrant_results:
+            qdrant_map: dict[int, float] = {}
+            for hit in qdrant_response.points:
                 try:
-                    pid = int(r["post_id"])
-                    qdrant_map[pid] = float(r["score"])
-                except (KeyError, ValueError, TypeError):
+                    pid = int(hit.id)
+                    qdrant_map[pid] = float(hit.score)
+                except (ValueError, TypeError):
                     continue
 
-        if isinstance(graph_results, dict):
-            age_map = graph_results
+            return qdrant_map, embedding_ms, qdrant_ms
+
+        async def _graph_task() -> tuple[dict[int, float], float]:
+            graph_start = time.perf_counter()
+            age_map = await self._graph_search_repo.search_posts_by_entities(
+                entities=reformulated.graph_entities,
+                author_type=request.author_type,
+                limit=age_limit,
+            )
+            graph_ms = (time.perf_counter() - graph_start) * 1000.0
+            return age_map, graph_ms
+
+        (qdrant_map, embedding_ms, qdrant_ms), (age_map, graph_ms) = await asyncio.gather(
+            _qdrant_task(),
+            _graph_task(),
+        )
+
+        timings["embedding_ms"] = embedding_ms
+        timings["qdrant_posts_ms"] = qdrant_ms
+        timings["graph_index_ms"] = graph_ms
 
         all_post_ids = set(qdrant_map.keys()) | set(age_map.keys())
 
-        logger.info("Qdrant returned %d candidates", len(qdrant_map))
-        logger.info("Apache AGE returned %d candidates", len(age_map))
+        logger.info("Qdrant post search returned %d candidates", len(qdrant_map))
+        logger.info("Graph index search returned %d candidates", len(age_map))
         logger.info("Total unique post IDs after merge: %d", len(all_post_ids))
 
         if not all_post_ids:
-            return []
+            return [], timings
 
         query = (
             select(Content, Account)
@@ -106,8 +121,10 @@ class SearchRetriever:
         if request.min_followers is not None:
             query = query.where(Account.subscribers_count >= request.min_followers)
 
+        postgres_start = time.perf_counter()
         result = await self._session.execute(query)
         rows = result.fetchall()
+        timings["postgres_ms"] = (time.perf_counter() - postgres_start) * 1000.0
 
         account_groups: dict[int, dict[str, Any]] = {}
 
@@ -174,4 +191,4 @@ class SearchRetriever:
                 has_contacts=has_contacts,
             ))
 
-        return candidates
+        return candidates, timings

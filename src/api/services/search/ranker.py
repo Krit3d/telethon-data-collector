@@ -7,6 +7,9 @@ from src.api.services.search.retriever import CandidateAuthor
 
 logger = logging.getLogger(__name__)
 
+_TMS_VECTOR_GATE: float = 0.52
+_TMS_PENALTY_FACTOR: float = 0.2
+
 
 class TaxonomyLoader:
 
@@ -163,7 +166,7 @@ class SearchRanker:
         return er / (20.0 + er)
 
     def _calculate_topical_score(self, max_vector_score: float, max_graph_score: float, tms_score: float) -> float:
-        return (0.5 * max_vector_score) + (0.3 * max_graph_score) + (0.2 * tms_score)
+        return (0.60 * max_vector_score) + (0.25 * max_graph_score) + (0.15 * tms_score)
 
     def _calculate_final_score(self, topical_score: float, engagement_score: float) -> float:
         return (0.85 * topical_score) + (0.15 * engagement_score)
@@ -184,7 +187,8 @@ class SearchRanker:
         candidates: list[CandidateAuthor],
         request: SearchRequest,
         reformulated: ReformulatedQuery,
-        execution_time_ms: float,
+        execution_time_ms: float = 0.0,
+        timings: dict[str, float] | None = None,
     ) -> SearchResponse:
         if not reformulated.target_iab_ids:
             reformulated.target_iab_ids = self.resolve_target_iab_ids(reformulated.target_topics)
@@ -200,6 +204,10 @@ class SearchRanker:
 
         for candidate in safe_candidates:
             tms = self.calculate_tms(candidate.category_id, reformulated.target_iab_ids)
+
+            if candidate.max_vector_score < _TMS_VECTOR_GATE:
+                tms = tms * _TMS_PENALTY_FACTOR
+
             engagement_score = self._calculate_engagement_score(candidate.static_avg_er)
             topical_score = self._calculate_topical_score(candidate.max_vector_score, candidate.max_graph_score, tms)
             final_score = self._calculate_final_score(topical_score, engagement_score)
@@ -269,6 +277,7 @@ class SearchRanker:
             target_iab_ids=reformulated.target_iab_ids,
             resolved_profile_type=request.author_type,
             execution_time_ms=execution_time_ms,
+            timings=timings or {},
         )
 
         return SearchResponse(items=items, total=len(items), query_metadata=query_metadata)

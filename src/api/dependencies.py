@@ -9,8 +9,8 @@ from src.api.services.search.query_parser import QueryParser
 from src.api.services.search.ranker import SearchRanker, TaxonomyLoader
 from src.api.services.search.retriever import SearchRetriever
 from src.db.database import Database
-from src.graph.db.search_repo import GraphSearchRepository
 from src.embeddings.qdrant_service import QdrantService
+from src.graph.db.search_repo import GraphSearchRepository
 
 
 TAXONOMY_PATH = "src/config/Content Taxonomy 3.1.tsv"
@@ -46,8 +46,8 @@ async def get_search_service(
 ) -> SearchService:
     settings = request.app.state.settings
     qdrant = get_qdrant(request)
-    graph_search_repo = GraphSearchRepository(session)
     query_parser = QueryParser(settings)
-    retriever = SearchRetriever(session=session, qdrant_service=qdrant, graph_repo=graph_search_repo)
+    graph_search_repo = GraphSearchRepository(session=session)
+    retriever = SearchRetriever(session=session, qdrant_service=qdrant, graph_search_repo=graph_search_repo)
     ranker = SearchRanker(ancestors_map=get_ancestors_map(), name_to_id_map=get_name_to_id_map())
     return SearchService(query_parser=query_parser, retriever=retriever, ranker=ranker)

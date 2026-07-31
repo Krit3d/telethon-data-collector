@@ -50,6 +50,7 @@ class QueryMetadata(BaseModel):
     target_iab_ids: list[int] = Field(default_factory=list, description="IAB category IDs for backward compatibility")
     resolved_profile_type: str = Field(description="Final resolved profile type after normalization")
     execution_time_ms: float = Field(description="Total query execution time in milliseconds")
+    timings: dict[str, float] = Field(default_factory=dict, description="Phase-level execution timing breakdown in milliseconds")
 
 
 class AuthorSearchResultItem(BaseModel):

@@ -7,6 +7,7 @@ import logging
 import struct
 import asyncio
 import random
+import re
 import uuid
 import warnings
 from typing import Any, Final
@@ -800,6 +801,153 @@ class QdrantService:
                 extra={"query": effective_query, "limit": limit},
             )
             raise RuntimeError(f"Search failed: {e}") from e
+
+    async def search_entity_posts(self, graph_entities: list[str], limit: int = 300) -> dict[int, float]:
+        if not graph_entities:
+            return {}
+
+        if not self._initialized:
+            await self.initialize()
+
+        clean_entities = [e.strip().lower() for e in graph_entities if e.strip()]
+        if not clean_entities:
+            return {}
+
+        try:
+            filter_ = models.Filter(
+                should=[
+                    models.FieldCondition(
+                        key="name_lower",
+                        match=models.MatchAny(any=clean_entities),
+                    ),
+                    models.FieldCondition(
+                        key="name",
+                        match=models.MatchAny(any=clean_entities),
+                    ),
+                    models.FieldCondition(
+                        key="id",
+                        match=models.MatchAny(any=clean_entities),
+                    ),
+                ]
+            )
+
+            all_points: list[models.Record] = []
+            next_offset = None
+            while True:
+                response = await self.client.scroll(
+                    collection_name=ENTITIES_COLLECTION,
+                    scroll_filter=filter_,
+                    limit=limit,
+                    offset=next_offset,
+                    with_payload=True,
+                )
+                points, next_offset = response
+                if not points:
+                    break
+                all_points.extend(points)
+                if next_offset is None:
+                    break
+
+            post_entity_map: dict[int, set[str]] = {}
+            for hit in all_points:
+                if hit.payload is None:
+                    continue
+                payload = hit.payload
+
+                matched_entity: str | None = None
+                entity_name_lower = payload.get("name_lower", "")
+                if isinstance(entity_name_lower, str) and entity_name_lower in clean_entities:
+                    matched_entity = entity_name_lower
+                else:
+                    entity_name = payload.get("name", "")
+                    if isinstance(entity_name, str) and entity_name.lower() in clean_entities:
+                        matched_entity = entity_name.lower()
+                    else:
+                        entity_id = payload.get("id", "")
+                        if isinstance(entity_id, str) and entity_id.lower() in clean_entities:
+                            matched_entity = entity_id.lower()
+
+                if matched_entity is None:
+                    continue
+
+                post_ids = self._extract_post_ids(payload)
+                for pid in post_ids:
+                    if pid not in post_entity_map:
+                        post_entity_map[pid] = set()
+                    post_entity_map[pid].add(matched_entity)
+
+            if not post_entity_map:
+                logger.info("Qdrant entity search returned 0 candidate posts from %d entities", len(all_points))
+                return {}
+
+            total_entities = len(clean_entities)
+            scored = {pid: len(entities) / total_entities for pid, entities in post_entity_map.items()}
+            sorted_scores = sorted(scored.items(), key=lambda x: x[1], reverse=True)[:limit]
+
+            logger.info(
+                "Qdrant entity search returned %d candidate posts from %d matched entities",
+                len(sorted_scores),
+                len(all_points),
+            )
+            return dict(sorted_scores)
+
+        except Exception as e:
+            logger.error("Qdrant entity search failed: %s", e)
+            return {}
+
+    @staticmethod
+    def _extract_post_ids(payload: dict) -> list[int]:
+        post_ids: list[int] = []
+
+        raw_post_ids = payload.get("post_ids")
+        if isinstance(raw_post_ids, list):
+            for item in raw_post_ids:
+                pid = QdrantService._to_int(item)
+                if pid is not None:
+                    post_ids.append(pid)
+
+        if "post_id" in payload:
+            pid = QdrantService._to_int(payload["post_id"])
+            if pid is not None:
+                post_ids.append(pid)
+
+        if "db_post_id" in payload:
+            pid = QdrantService._to_int(payload["db_post_id"])
+            if pid is not None:
+                post_ids.append(pid)
+
+        raw_pub = payload.get("pub_node_id")
+        if isinstance(raw_pub, str):
+            pid = QdrantService._to_int(raw_pub)
+            if pid is not None:
+                post_ids.append(pid)
+
+        props = payload.get("properties")
+        if isinstance(props, dict):
+            for key in ("post_ids", "post_id", "db_post_id", "pub_node_id"):
+                if key in props:
+                    val = props[key]
+                    if key == "post_ids" and isinstance(val, list):
+                        for item in val:
+                            pid = QdrantService._to_int(item)
+                            if pid is not None:
+                                post_ids.append(pid)
+                    else:
+                        pid = QdrantService._to_int(val)
+                        if pid is not None:
+                            post_ids.append(pid)
+
+        return list(set(post_ids))
+
+    @staticmethod
+    def _to_int(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            digits = re.findall(r"\d+", value)
+            if digits:
+                return int("".join(digits))
+        return None
 
     async def close(self) -> None:
         try:

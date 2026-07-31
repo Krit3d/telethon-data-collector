@@ -13,96 +13,53 @@ class GraphSearchRepository:
         self.session = session
 
     async def search_posts_by_entities(self, entities: list[str], author_type: str, limit: int = 600) -> dict[int, float]:
-        entities_clean = [e.strip().lower() for e in entities if e.strip()]
-        entity_patterns = [f"%{e}%" for e in entities_clean if len(e) >= 2]
-        if not entity_patterns:
+        clean_entities = [e.strip().lower() for e in entities if e.strip()]
+        if not clean_entities:
             return {}
 
-        apply_author_filter = author_type in ("expert", "business")
-        is_author_blog = (author_type == "expert")
-
-        query = text("""
-            WITH matched_vertices AS (
-                SELECT id
-                FROM social_graph._ag_label_vertex
-                WHERE lower((properties::text::jsonb)->>'name') LIKE ANY(:entity_patterns)
-            ),
-            matched_edges AS (
-                SELECT
-                    e.start_id AS connected_vertex_id,
-                    (e.properties::text::jsonb)->>'db_post_id' AS edge_post_id
-                FROM matched_vertices v
-                JOIN social_graph._ag_label_edge e ON e.end_id = v.id
-                UNION ALL
-                SELECT
-                    e.end_id AS connected_vertex_id,
-                    (e.properties::text::jsonb)->>'db_post_id' AS edge_post_id
-                FROM matched_vertices v
-                JOIN social_graph._ag_label_edge e ON e.start_id = v.id
-            ),
-            candidate_posts AS (
-                SELECT
-                    coalesce(
-                        (other_v.properties::text::jsonb)->>'db_post_id',
-                        me.edge_post_id,
-                        (other_v.properties::text::jsonb)->>'id'
-                    ) AS raw_post_ref,
-                    COUNT(*)::float AS raw_graph_score
-                FROM matched_edges me
-                JOIN social_graph._ag_label_vertex other_v ON other_v.id = me.connected_vertex_id
-                GROUP BY 1
-            ),
-            valid_candidate_posts AS (
-                SELECT
-                    regexp_replace(raw_post_ref, '[^0-9]', '', 'g') AS clean_id_str,
-                    raw_graph_score
-                FROM candidate_posts
-                WHERE raw_post_ref IS NOT NULL
-                  AND length(regexp_replace(raw_post_ref, '[^0-9]', '', 'g')) BETWEEN 1 AND 18
-            )
+        query_str = """
             SELECT
-                c.id AS post_id,
-                vcp.raw_graph_score
-            FROM valid_candidate_posts vcp
-            JOIN public.content c ON c.id = vcp.clean_id_str::bigint
-            JOIN public.accounts a ON a.id = c.account_id
-            WHERE (:apply_author_filter = False OR a.is_author_blog = :is_author_blog)
-              AND c.is_enriched = True
-            ORDER BY vcp.raw_graph_score DESC
+                post_id,
+                SUM(weight)::float AS accumulative_raw_score
+            FROM public.graph_entity_posts
+            WHERE entity_name_lower = ANY(CAST(:clean_entities AS text[]))
+        """
+
+        if author_type == "expert":
+            query_str += " AND is_author_blog = TRUE"
+        elif author_type == "business":
+            query_str += " AND is_author_blog = FALSE"
+
+        query_str += """
+            GROUP BY post_id
+            ORDER BY accumulative_raw_score DESC
             LIMIT :limit;
-        """)
+        """
 
         try:
             result: Result = await self.session.execute(
-                query,
-                {
-                    "entity_patterns": entity_patterns,
-                    "apply_author_filter": apply_author_filter,
-                    "is_author_blog": is_author_blog,
-                    "limit": limit,
-                }
+                text(query_str),
+                {"clean_entities": clean_entities, "limit": limit},
             )
 
             rows = result.fetchall()
-            logger.info("Apache AGE returned %d candidate posts from graph using pattern matching", len(rows))
+            logger.info(
+                "Graph projection returned %d candidate posts from materialized index (author_type=%s)",
+                len(rows), author_type,
+            )
             if not rows:
-                count_result = await self.session.execute(
-                    text("SELECT COUNT(*) FROM social_graph._ag_label_vertex WHERE lower((properties::text::jsonb)->>'name') LIKE ANY(:entity_patterns)"),
-                    {"entity_patterns": entity_patterns}
-                )
-                vertex_count = count_result.scalar()
-                logger.info("No graph matches found for entities: %s (matched_vertices=%s)", entity_patterns, vertex_count)
                 return {}
 
-            max_score = max(row.raw_graph_score for row in rows)
-            if max_score == 0:
+            raw_scores = [float(row.accumulative_raw_score) for row in rows]
+            max_score = max(raw_scores)
+            if max_score == 0.0:
                 return {}
 
             return {
-                int(row.post_id): (row.raw_graph_score / max_score)
+                int(row.post_id): (float(row.accumulative_raw_score) / max_score)
                 for row in rows
             }
-        except Exception as e:
+        except Exception:
             await self.session.rollback()
-            logger.exception("Direct AGE SQL search query failed: %s", e)
+            logger.exception("Graph projection index query failed")
             return {}

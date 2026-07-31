@@ -1,9 +1,12 @@
+import logging
 import time
 
 from src.api.schemas import QueryMetadata, SearchRequest, SearchResponse
 from src.api.services.search.query_parser import QueryParser
 from src.api.services.search.ranker import SearchRanker
 from src.api.services.search.retriever import SearchRetriever
+
+logger = logging.getLogger(__name__)
 
 
 class SearchService:
@@ -19,7 +22,7 @@ class SearchService:
         reformulated = await self._query_parser.parse(request)
 
         if reformulated is None:
-            execution_time_ms = (time.perf_counter() - start_time) * 1000.0
+            total_ms = (time.perf_counter() - start_time) * 1000.0
             return SearchResponse(
                 items=[],
                 total=0,
@@ -27,14 +30,22 @@ class SearchService:
                     original_query=request.query,
                     dense_query="",
                     graph_entities=[],
+                    target_topics=[],
                     target_iab_ids=[],
                     resolved_profile_type=request.author_type,
-                    execution_time_ms=execution_time_ms,
+                    execution_time_ms=total_ms,
+                    timings={"total_ms": total_ms},
                 ),
             )
 
-        candidates = await self._retriever.retrieve_candidates(request, reformulated)
+        candidates, timings = await self._retriever.retrieve_candidates(request, reformulated)
 
-        execution_time_ms = (time.perf_counter() - start_time) * 1000.0
+        total_ms = (time.perf_counter() - start_time) * 1000.0
 
-        return self._ranker.rank_and_format(candidates, request, reformulated, execution_time_ms)
+        response = self._ranker.rank_and_format(
+            candidates, request, reformulated,
+            execution_time_ms=total_ms,
+            timings=timings,
+        )
+
+        return response
