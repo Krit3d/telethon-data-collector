@@ -13,8 +13,9 @@ class GraphSearchRepository:
         self.session = session
 
     async def search_posts_by_entities(self, entities: list[str], author_type: str, limit: int = 600) -> dict[int, float]:
-        clean_entities = [e.strip().lower() for e in entities if e.strip()]
-        if not clean_entities:
+        clean_entities = [e.strip().lower() for e in entities if e and e.strip()]
+        like_patterns = [f"%{e}%" for e in clean_entities if e]
+        if not like_patterns:
             return {}
 
         if author_type == "expert":
@@ -32,7 +33,7 @@ class GraphSearchRepository:
                 post_id,
                 SUM(weight)::float AS accumulative_raw_score
             FROM public.graph_entity_posts
-            WHERE entity_name_lower = ANY(:clean_entities)
+            WHERE entity_name_lower LIKE ANY(:like_patterns)
               AND (:apply_author_filter = False OR is_author_blog = :target_is_author_blog)
             GROUP BY post_id
             ORDER BY accumulative_raw_score DESC
@@ -43,7 +44,7 @@ class GraphSearchRepository:
             result: Result = await self.session.execute(
                 text(sql),
                 {
-                    "clean_entities": clean_entities,
+                    "like_patterns": like_patterns,
                     "apply_author_filter": apply_author_filter,
                     "target_is_author_blog": target_is_author_blog,
                     "limit": limit,

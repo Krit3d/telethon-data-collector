@@ -56,16 +56,19 @@ class QueryParser:
             return None
 
         system_prompt = (
-            "You are an expert search query reformulator. Analyze the user query and extract key parameters. "
-            "Return a valid JSON object matching this schema: "
-            '{"dense_query": "string", "graph_entities": ["string"], "target_topics": ["string"], "profile_type_intent": "expert|business"}. '
-            "Instructions: "
-            "1. dense_query: Expand query terms, resolve technical abbreviations (e.g. RAG -> retrieval augmented generation, LLM -> large language models), and enrich semantic context strictly in the native language of the query. "
-            "Do not introduce forced translations to other languages unless the user query explicitly uses them. "
-            "2. graph_entities: MANDATORY KEYRULE: Extract 5-10 lowercase entities. You MUST include both ATOMIC SINGLE WORDS (e.g., 'rag', 'llm', 'финтех', 'продакшен') AND short 2-word composite key terms (e.g., 'rag системы', 'локальные llm'). Single atomic words are mandatory to match isolated graph nodes extracted by LLMs. "
-            "Strip special punctuation characters | / # , \" ' ( ) from extracted entities. "
-            "3. target_topics: MANDATORY. Extract 2-4 standard IAB 3.1 category string names in English matching query intent (e.g., ['Personal Finance', 'Personal Investing', 'Stocks and Bonds', 'Financial Planning']). NEVER return an empty array for target_topics if query has identifiable intent. "
-            "4. profile_type_intent: 'expert' or 'business'."
+            "You are an expert search query analyzer for a hybrid semantic knowledge-graph search engine. "
+            "Analyze the user query and output a valid JSON object matching: "
+            '{"dense_query": "string", "graph_entities": ["string"], "target_topics": ["string"], "profile_type_intent": "expert|business"}.\n\n'
+            "Field Instructions:\n"
+            "1. dense_query: Reformulate and enrich the query for vector semantic search. Expand acronyms and clarify technical domain context in the query's native language.\n"
+            "2. graph_entities: Extract 3-7 core subject-matter entities representing Knowledge Graph nodes.\n"
+            "ONTOLOGICAL EXTRACTION RULE:\n"
+            "- EXTRACT: Domain entities, technologies, products, specific niche concepts, brands, platforms, proper nouns, and subject topics that define WHAT the content is about.\n"
+            "- OMIT: Meta-search modifiers, action verbs, and structural phrasing that define HOW the user is searching (e.g., requests for reviews, experiences, comparisons, or general seeking phrasing) UNLESS those words form an integral part of a recognized standard, proper term, or subject domain itself.\n"
+            "- RECALL & SPECIFICITY RULE: For multi-word domain concepts, extract BOTH the full multi-word phrase AND its primary unambiguous atomic domain word or acronym (e.g., for 'когнитивно-поведенческая терапия' include BOTH 'когнитивно-поведенческая терапия' and 'кпт'; for 'профессиональное выгорание' include BOTH 'профессиональное выгорание' and 'выгорание').\n"
+            "- PLATFORM & CONTAINER RULE (CRITICAL): Never extract standalone single words that represent media platforms (e.g., 'telegram', 'instagram'), content formats/containers (e.g., 'channels', 'posts', 'videos', 'blogs'), or ultra-generic process words (e.g., 'ways', 'methods', 'results', 'cases'). These words MUST ONLY exist as part of compound entities (e.g., 'telegram-каналы', 'экспертные каналы', 'контент-воронки'). Standalone single words are allowed ONLY if they denote a highly specific, narrow domain topic (e.g., 'тревожность', 'имплантация', 'криптография')."
+            "3. target_topics: Extract 2-4 standard IAB 3.1 category string names in English matching query intent.\n"
+            "4. profile_type_intent: Output 'expert' or 'business' based on query context."
         )
 
         try:
@@ -110,20 +113,11 @@ class QueryParser:
         seen: set[str] = set()
         strip_chars = "|/#,\"'()"
         for entity in entities:
+            if not isinstance(entity, str):
+                continue
             normalized = entity.lower().strip().translate(str.maketrans("", "", strip_chars))
-            if not normalized or normalized in seen:
+            if not normalized or len(normalized) < 2 or normalized in seen:
                 continue
             cleaned.append(normalized)
             seen.add(normalized)
-            if " " in normalized:
-                for token in normalized.split():
-                    token_stripped = token.strip().translate(str.maketrans("", "", strip_chars))
-                    if (
-                        token_stripped
-                        and len(token_stripped) > 2
-                        and token_stripped not in _STOPWORDS
-                        and token_stripped not in seen
-                    ):
-                        cleaned.append(token_stripped)
-                        seen.add(token_stripped)
         return cleaned[:10]
