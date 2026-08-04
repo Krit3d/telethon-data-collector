@@ -52,7 +52,7 @@ class SearchRetriever:
 
     async def retrieve_candidates(
         self, request: SearchRequest, reformulated: ReformulatedQuery
-    ) -> tuple[list[CandidateAuthor], dict[str, float]]:
+    ) -> tuple[list[CandidateAuthor], dict[str, float], dict[str, int]]:
         timings: dict[str, float] = {}
 
         qdrant_limit = max(1500, request.limit * 10)
@@ -115,12 +115,14 @@ class SearchRetriever:
 
         all_post_ids = set(qdrant_map.keys()) | set(age_map.keys())
 
+        counts = {"qdrant_candidates_count": len(qdrant_map), "graph_candidates_count": len(age_map), "total_unique_candidates_count": len(all_post_ids)}
+
         logger.info("Qdrant post search returned %d candidates", len(qdrant_map))
         logger.info("Graph index search returned %d candidates", len(age_map))
         logger.info("Total unique post IDs after merge: %d", len(all_post_ids))
 
         if not all_post_ids:
-            return [], timings
+            return [], timings, counts
 
         query = (
             select(Content, Account)
@@ -218,4 +220,4 @@ class SearchRetriever:
                 has_contacts=has_contacts,
             ))
 
-        return candidates, timings
+        return candidates, timings, counts

@@ -5,7 +5,6 @@ from typing import Any
 class SearchRequest(BaseModel):
     query: str = Field(description="User search query text")
     limit: int = Field(default=10, ge=1, le=50, description="Maximum number of results to return")
-    score_threshold: float = Field(default=0.20, description="Minimum relevance score threshold")
     location: str | None = Field(default="", description="Filter results by author location")
     min_followers: int | None = Field(default=None, description="Minimum follower count filter")
     author_type: str = Field(default="expert", description="Author type filter: expert, business, or all")
@@ -39,18 +38,20 @@ class ReformulatedQuery(BaseModel):
     graph_entities: list[str] = Field(default_factory=list, description="Target entity names for graph traversal")
     target_topics: list[str] = Field(default_factory=list, description="Extracted broad topic names matching query intent")
     target_iab_ids: list[int] = Field(default_factory=list, description="IAB category IDs for backward compatibility")
-    profile_type_intent: str = Field(default="expert", description="Inferred target profile type: expert, business, or all")
+    profile_type_intent: str = Field(default="expert", description="Inferred target profile type: expert or business")
 
 
 class QueryMetadata(BaseModel):
     original_query: str = Field(description="Original user search query")
     dense_query: str = Field(description="Reformulated dense query used for embedding search")
     graph_entities: list[str] = Field(default_factory=list, description="Entity names used for graph traversal")
-    target_topics: list[str] = Field(default_factory=list, description="Extracted broad topic names matching query intent")
     target_iab_ids: list[int] = Field(default_factory=list, description="IAB category IDs for backward compatibility")
     resolved_profile_type: str = Field(description="Final resolved profile type after normalization")
     execution_time_ms: float = Field(description="Total query execution time in milliseconds")
     timings: dict[str, float] = Field(default_factory=dict, description="Phase-level execution timing breakdown in milliseconds")
+    qdrant_candidates_count: int | None = Field(default=None, description="Number of candidate posts retrieved from Qdrant vector search")
+    graph_candidates_count: int | None = Field(default=None, description="Number of candidate posts retrieved from graph index search")
+    total_unique_candidates_count: int | None = Field(default=None, description="Total unique candidate posts after merging Qdrant and graph results")
 
 
 class AuthorSearchResultItem(BaseModel):
@@ -76,3 +77,5 @@ class SearchResponse(BaseModel):
     total: int = Field(default=0, description="Total number of results found")
     query_metadata: QueryMetadata | None = Field(default=None, description="Metadata about the executed query")
     message: str | None = Field(default=None, description="Response status or informational message")
+    confidence_level: str = Field(default="HIGH", description="Confidence level of returned search items: HIGH, LOW, or NONE")
+    warning_message: str | None = Field(default=None, description="Human-readable notification message explaining result relevance or domain coverage")

@@ -1,4 +1,5 @@
 import logging
+import re
 
 from sqlalchemy import text
 from sqlalchemy.engine import Result
@@ -14,9 +15,11 @@ class GraphSearchRepository:
 
     async def search_posts_by_entities(self, entities: list[str], author_type: str, limit: int = 600) -> dict[int, float]:
         clean_entities = [e.strip().lower() for e in entities if e and e.strip()]
-        like_patterns = [f"%{e}%" for e in clean_entities if e]
-        if not like_patterns:
+        escaped_entities = [re.escape(e) for e in clean_entities if e]
+        if not escaped_entities:
             return {}
+
+        regex_pattern = r"\y(" + "|".join(escaped_entities) + r")\y"
 
         if author_type == "expert":
             apply_author_filter = True
@@ -33,7 +36,7 @@ class GraphSearchRepository:
                 post_id,
                 SUM(weight)::float AS accumulative_raw_score
             FROM public.graph_entity_posts
-            WHERE entity_name_lower LIKE ANY(:like_patterns)
+            WHERE entity_name_lower ~* :regex_pattern
               AND (:apply_author_filter = False OR is_author_blog = :target_is_author_blog)
             GROUP BY post_id
             ORDER BY accumulative_raw_score DESC
@@ -44,7 +47,7 @@ class GraphSearchRepository:
             result: Result = await self.session.execute(
                 text(sql),
                 {
-                    "like_patterns": like_patterns,
+                    "regex_pattern": regex_pattern,
                     "apply_author_filter": apply_author_filter,
                     "target_is_author_blog": target_is_author_blog,
                     "limit": limit,

@@ -1,6 +1,7 @@
 import csv
 import logging
 import re
+from typing import Any
 
 from src.api.schemas import AuthorSearchResultItem, QueryMetadata, ReformulatedQuery, SearchRequest, SearchResponse
 from src.api.services.search.retriever import CandidateAuthor
@@ -98,8 +99,6 @@ class SearchRanker:
         re.IGNORECASE,
     )
 
-    _GRAPH_NON_MATCH_PENALTY = 0.50
-
     @staticmethod
     def _scale_vector_score(raw_score: float) -> float:
         if raw_score <= 0.0:
@@ -177,20 +176,18 @@ class SearchRanker:
 
     def _calculate_topical_score(self, max_vector_score: float, max_graph_score: float, tms_score: float) -> float:
         scaled_vector = self._scale_vector_score(max_vector_score)
-        if scaled_vector > 0.0 and max_graph_score > 0.0:
-            signal_score = min(1.0, (0.55 * scaled_vector) + (0.45 * max_graph_score) + 0.10)
-        elif max_graph_score > 0.0:
-            if scaled_vector == 0.0 and tms_score <= 0.10:
-                signal_score = max_graph_score * 0.15
-            else:
-                signal_score = max_graph_score
+        if tms_score > 0.0:
+            effective_graph = max_graph_score
         else:
-            signal_score = scaled_vector * self._GRAPH_NON_MATCH_PENALTY
-        topical_score = (0.80 * signal_score) + (0.20 * tms_score)
-        return topical_score
+            effective_graph = max_graph_score * 0.15
+        if effective_graph > 0.0:
+            topical_score = (0.50 * scaled_vector) + (0.30 * effective_graph) + (0.20 * tms_score)
+        else:
+            topical_score = (0.75 * scaled_vector) + (0.25 * tms_score)
+        return min(1.0, topical_score)
 
     def _calculate_final_score(self, topical_score: float, engagement_score: float) -> float:
-        return (0.85 * topical_score) + (0.15 * engagement_score)
+        return (0.88 * topical_score) + (0.12 * engagement_score)
 
     def _is_safe(self, candidate: CandidateAuthor) -> bool:
         fields_to_check: list[str] = []
@@ -210,6 +207,7 @@ class SearchRanker:
         reformulated: ReformulatedQuery,
         execution_time_ms: float = 0.0,
         timings: dict[str, float] | None = None,
+        counts: dict[str, int] | None = None,
     ) -> SearchResponse:
         if not reformulated.target_iab_ids:
             reformulated.target_iab_ids = self.resolve_target_iab_ids(reformulated.target_topics)
@@ -221,7 +219,7 @@ class SearchRanker:
             else:
                 logger.info("Discarded candidate %d due to safety filter", candidate.account_id)
 
-        scored: list[tuple[float, CandidateAuthor, float, dict | None, str | None, str | None]] = []
+        scored: list[tuple[float, CandidateAuthor, float, dict[str, Any] | None, str | None, str | None]] = []
 
         for candidate in safe_candidates:
             tms = self.calculate_tms(candidate.category_id, reformulated.target_iab_ids)
@@ -264,6 +262,9 @@ class SearchRanker:
 
         truncated = scored[: request.limit]
 
+        top_max_vector = max((cand.max_vector_score for _, cand, _, _, _, _ in truncated), default=0.0)
+        top_max_graph = max((cand.max_graph_score for _, cand, _, _, _, _ in truncated), default=0.0)
+
         items: list[AuthorSearchResultItem] = []
         for final_score, candidate, tms, contacts, url, category_path in truncated:
             if request.include_analytics:
@@ -297,6 +298,15 @@ class SearchRanker:
                 )
             )
 
+        if request.include_analytics and counts:
+            qdrant_candidates_count = counts.get("qdrant_candidates_count")
+            graph_candidates_count = counts.get("graph_candidates_count")
+            total_unique_candidates_count = counts.get("total_unique_candidates_count")
+        else:
+            qdrant_candidates_count = None
+            graph_candidates_count = None
+            total_unique_candidates_count = None
+
         query_metadata = QueryMetadata(
             original_query=request.query,
             dense_query=reformulated.dense_query,
@@ -305,7 +315,26 @@ class SearchRanker:
             resolved_profile_type=request.author_type,
             execution_time_ms=execution_time_ms,
             timings=timings or {},
+            qdrant_candidates_count=qdrant_candidates_count,
+            graph_candidates_count=graph_candidates_count,
+            total_unique_candidates_count=total_unique_candidates_count,
         )
 
-        message = "No relevant authors found matching your query criteria. Try broadening your filters or search terms." if len(items) == 0 else None
-        return SearchResponse(items=items, total=len(items), query_metadata=query_metadata, message=message)
+        if not truncated or (top_max_graph == 0.0 and top_max_vector < 0.62):
+            return SearchResponse(
+                items=items,
+                total=len(items),
+                query_metadata=query_metadata,
+                message=None,
+                confidence_level="NONE",
+                warning_message="No relevant authors found matching your query topic in the current database. Showing closest available profiles.",
+            )
+
+        return SearchResponse(
+            items=items,
+            total=len(items),
+            query_metadata=query_metadata,
+            message=None,
+            confidence_level="HIGH",
+            warning_message=None,
+        )

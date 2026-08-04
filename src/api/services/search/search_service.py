@@ -30,7 +30,6 @@ class SearchService:
                     original_query=request.query,
                     dense_query="",
                     graph_entities=[],
-                    target_topics=[],
                     target_iab_ids=[],
                     resolved_profile_type=request.author_type,
                     execution_time_ms=total_ms,
@@ -38,7 +37,7 @@ class SearchService:
                 ),
             )
 
-        candidates, timings = await self._retriever.retrieve_candidates(request, reformulated)
+        candidates, timings, counts = await self._retriever.retrieve_candidates(request, reformulated)
 
         total_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -46,6 +45,7 @@ class SearchService:
             candidates, request, reformulated,
             execution_time_ms=total_ms,
             timings=timings,
+            counts=counts,
         )
 
         return response
