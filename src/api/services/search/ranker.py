@@ -57,7 +57,7 @@ class TaxonomyLoader:
 
         return ancestors_map
 
-    def load_name_to_id_map(self, tsv_path: str) -> dict[str, int]:
+    def load_name_to_id_map(self, tsv_path: str) -> dict[str, str]:
         try:
             with open(tsv_path, encoding="utf-8") as f:
                 reader = csv.reader(f, delimiter="\t")
@@ -74,7 +74,7 @@ class TaxonomyLoader:
             return {}
 
         data_rows = rows[2:]
-        name_to_id: dict[str, int] = {}
+        name_to_id: dict[str, str] = {}
 
         for row in data_rows:
             if len(row) < 3:
@@ -83,11 +83,7 @@ class TaxonomyLoader:
             raw_name = row[2].strip()
             if not raw_id or not raw_name:
                 continue
-            try:
-                category_id = int(raw_id)
-            except ValueError:
-                continue
-            name_to_id[raw_name.lower()] = category_id
+            name_to_id[raw_name.lower()] = raw_id
 
         return name_to_id
 
@@ -110,16 +106,16 @@ class SearchRanker:
     def __init__(
         self,
         ancestors_map: dict[str, list[str]] | None = None,
-        name_to_id_map: dict[str, int] | None = None,
+        name_to_id_map: dict[str, str] | None = None,
     ) -> None:
         self._ancestors_map = ancestors_map or {}
         self._name_to_id_map = name_to_id_map or {}
 
-    def resolve_target_iab_ids(self, target_topics: list[str]) -> list[int]:
+    def resolve_target_iab_ids(self, target_topics: list[str]) -> list[str]:
         if not target_topics or not self._name_to_id_map:
             return []
 
-        resolved: set[int] = set()
+        resolved: set[str] = set()
 
         for topic in target_topics:
             topic_lower = topic.lower().strip()
@@ -137,32 +133,29 @@ class SearchRanker:
 
         return list(resolved)
 
-    def calculate_tms(self, category_id: int | str | None, target_iab_ids: list[int]) -> float:
+    def calculate_tms(self, category_id: str | None, target_iab_ids: list[str]) -> float:
         if category_id is None:
             return 0.10
 
         if not target_iab_ids:
             return 0.10
 
-        cat_str = str(category_id)
-        targets = [str(t) for t in target_iab_ids]
-
-        if cat_str in targets:
+        if category_id in target_iab_ids:
             return 1.0
 
-        cand_anc = self._ancestors_map.get(cat_str, [])
+        cand_anc = self._ancestors_map.get(category_id, [])
 
         if len(cand_anc) > 0:
             cand_parent = cand_anc[0]
-            for t in targets:
+            for t in target_iab_ids:
                 t_anc = self._ancestors_map.get(t, [])
                 if len(t_anc) > 0:
                     t_parent = t_anc[0]
                     if cand_parent == t_parent:
                         return 0.75
 
-        cand_root = cand_anc[-1] if cand_anc else cat_str
-        for t in targets:
+        cand_root = cand_anc[-1] if cand_anc else category_id
+        for t in target_iab_ids:
             anc = self._ancestors_map.get(t, [])
             target_root = anc[-1] if anc else t
             if cand_root == target_root:

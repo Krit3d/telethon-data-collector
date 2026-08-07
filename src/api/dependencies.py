@@ -10,7 +10,8 @@ from src.api.services.search.ranker import SearchRanker, TaxonomyLoader
 from src.api.services.search.retriever import SearchRetriever
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
-from src.graph.db.search_repo import GraphSearchRepository
+from src.graph.client import Neo4jClient
+from src.graph.search_repo import Neo4jSearchRepository
 
 
 TAXONOMY_PATH = "src/config/Content Taxonomy 3.1.tsv"
@@ -22,7 +23,7 @@ def get_ancestors_map() -> dict[str, list[str]]:
 
 
 @cache
-def get_name_to_id_map() -> dict[str, int]:
+def get_name_to_id_map() -> dict[str, str]:
     return TaxonomyLoader().load_name_to_id_map(TAXONOMY_PATH)
 
 
@@ -32,6 +33,10 @@ def get_db(request: Request) -> Database:
 
 def get_qdrant(request: Request) -> QdrantService:
     return request.app.state.qdrant
+
+
+def get_neo4j(request: Request) -> Neo4jClient:
+    return request.app.state.neo4j
 
 
 async def get_db_session(request: Request) -> AsyncGenerator[AsyncSession, None]:
@@ -46,8 +51,9 @@ async def get_search_service(
 ) -> SearchService:
     settings = request.app.state.settings
     qdrant = get_qdrant(request)
+    neo4j = get_neo4j(request)
     query_parser = QueryParser(settings)
-    graph_search_repo = GraphSearchRepository(session=session)
+    graph_search_repo = Neo4jSearchRepository(client=neo4j)
     retriever = SearchRetriever(session=session, qdrant_service=qdrant, graph_search_repo=graph_search_repo)
     ranker = SearchRanker(ancestors_map=get_ancestors_map(), name_to_id_map=get_name_to_id_map())
     return SearchService(query_parser=query_parser, retriever=retriever, ranker=ranker)

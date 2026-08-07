@@ -21,7 +21,7 @@ class CandidateAuthor:
     username: str | None
     title: str
     url: str | None
-    category_id: int | str | None
+    category_id: str | None
     category_path: str | None
     static_avg_er: float | None
     raw_metadata: dict | None
@@ -92,12 +92,13 @@ class SearchRetriever:
 
         async def _graph_task() -> tuple[dict[int, float], float]:
             graph_start = time.perf_counter()
-            age_map = await self._graph_search_repo.search_posts_by_entities(
+            post_ids = await self._graph_search_repo.find_candidate_post_ids(
                 entities=reformulated.graph_entities,
-                author_type=request.author_type,
+                target_topics=reformulated.target_topics,
                 limit=age_limit,
             )
             graph_ms = (time.perf_counter() - graph_start) * 1000.0
+            age_map = {pid: 1.0 for pid in post_ids}
             return age_map, graph_ms
 
         embedding_task = asyncio.create_task(_embedding_task())
@@ -154,11 +155,12 @@ class SearchRetriever:
             published_at = content.published_at
 
             if aid not in account_groups:
+                raw_cat_id = account.category_id
                 account_groups[aid] = {
                     "platform": account.platform,
                     "username": account.username,
                     "title": account.title,
-                    "category_id": account.category_id,
+                    "category_id": str(raw_cat_id) if raw_cat_id is not None else None,
                     "category_path": account.category_path,
                     "static_avg_er": account.static_avg_er,
                     "raw_metadata": account.raw_metadata,

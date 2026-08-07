@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config.config import load_settings
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
+from src.graph.client import Neo4jClient
+from src.graph.schema import init_neo4j_schema, import_iab_taxonomy
 from src.api.routers import search, health
 
 logger = logging.getLogger(__name__)
@@ -20,7 +22,8 @@ async def lifespan(app: FastAPI):
 
     db = Database(settings.db_url)
     qdrant = QdrantService(settings)
-    
+    neo4j = Neo4jClient(settings)
+
     # Initialize database with retry logic and timeout
     try:
         await db.init_db(max_retries=5, timeout=120.0)
@@ -31,13 +34,20 @@ async def lifespan(app: FastAPI):
 
     await qdrant.initialize()
 
+    # Initialize Neo4j connection, schema constraints, and IAB taxonomy
+    await neo4j.connect()
+    await init_neo4j_schema(neo4j)
+    await import_iab_taxonomy(neo4j, settings.taxonomy_path)
+
     app.state.db = db
     app.state.qdrant = qdrant
+    app.state.neo4j = neo4j
     app.state.settings = settings
 
     logger.info("FastAPI application started successfully.")
     yield
 
+    await neo4j.close()
     await db.close()
     await qdrant.close()
     logger.info("FastAPI application stopped.")

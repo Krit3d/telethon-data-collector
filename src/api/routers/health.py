@@ -9,12 +9,13 @@ from datetime import datetime, timezone
 from typing import TypedDict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.api.dependencies import get_db, get_qdrant
+from src.api.dependencies import get_db, get_neo4j, get_qdrant
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
+from src.graph.client import Neo4jClient
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Health"])
@@ -71,36 +72,19 @@ async def check_postgresql(db: Database) -> ServiceStatus:
         }
 
 
-async def check_apache_age(db: Database) -> ServiceStatus:
-    """Check Apache AGE status by verifying telegram_graph exists.
+async def check_neo4j(neo4j: Neo4jClient) -> ServiceStatus:
+    """Check Neo4j connection by executing RETURN 1.
 
     Args:
-        db: Database instance.
+        neo4j: Neo4jClient instance.
 
     Returns:
         ServiceStatus dictionary with check results.
     """
 
     start = time.time()
-
     try:
-        async with db.async_session() as session:
-            async with session.begin():
-                # Check if the telegram_graph exists in ag_catalog.ag_graph
-                result = await session.execute(
-                    text("SELECT count(*) FROM ag_catalog.ag_graph WHERE name = :graph_name"),
-                    {"graph_name": "telegram_graph"}
-                )
-                count = result.scalar_one()
-
-                if count == 0:
-                    return {
-                        "status": "unhealthy",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "latency_ms": None,
-                        "error": "Apache AGE graph 'telegram_graph' not found",
-                    }
-
+        await neo4j.execute_read("RETURN 1 AS result")
         latency = (time.time() - start) * 1000
         return {
             "status": "healthy",
@@ -108,13 +92,13 @@ async def check_apache_age(db: Database) -> ServiceStatus:
             "latency_ms": round(latency, 2),
             "error": None,
         }
-    except SQLAlchemyError as e:
-        logger.error("Apache AGE health check failed", exc_info=e)
+    except Exception as e:
+        logger.error("Neo4j health check failed", exc_info=e)
         return {
             "status": "unhealthy",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "latency_ms": None,
-            "error": f"Apache AGE query error: {str(e)}",
+            "error": f"Neo4j connection error: {str(e)}",
         }
 
 
@@ -161,13 +145,14 @@ async def check_qdrant(qdrant: QdrantService) -> ServiceStatus:
 async def health_check(
     request: Request,
     db: Database = Depends(get_db),
+    neo4j: Neo4jClient = Depends(get_neo4j),
     qdrant: QdrantService = Depends(get_qdrant),
 ) -> HealthResponse:
     """Comprehensive health check endpoint for monitoring cross-server link stability.
 
     This endpoint performs asynchronous checks on all critical services:
     - PostgreSQL: Executes SELECT 1 to verify database connectivity
-    - Apache AGE: Checks if the 'telegram_graph' exists and is accessible
+    - Neo4j: Executes RETURN 1 to verify graph database connectivity
     - Qdrant: Retrieves collections to verify vector database connectivity
 
     If any service is down, returns 503 Service Unavailable with details.
@@ -176,6 +161,7 @@ async def health_check(
     Args:
         request: FastAPI request object.
         db: Database instance (injected).
+        neo4j: Neo4jClient instance (injected).
         qdrant: Qdrant service instance (injected).
 
     Returns:
@@ -187,18 +173,18 @@ async def health_check(
 
     # Run all checks concurrently for efficiency
     postgres_task = asyncio.create_task(check_postgresql(db))
-    age_task = asyncio.create_task(check_apache_age(db))
+    neo4j_task = asyncio.create_task(check_neo4j(neo4j))
     qdrant_task = asyncio.create_task(check_qdrant(qdrant))
 
     # Wait for all checks to complete
-    postgres_status, age_status, qdrant_status = await asyncio.gather(
-        postgres_task, age_task, qdrant_task
+    postgres_status, neo4j_status, qdrant_status = await asyncio.gather(
+        postgres_task, neo4j_task, qdrant_task
     )
 
     # Build services dictionary
     services = {
         "postgresql": postgres_status,
-        "apache_age": age_status,
+        "neo4j": neo4j_status,
         "qdrant": qdrant_status,
     }
 

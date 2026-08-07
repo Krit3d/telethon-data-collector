@@ -92,7 +92,7 @@ class Account(Base):
         server_default="pending",
         nullable=False,
         index=True,
-        comment="Lifecycle status: pending, processing, parsed, rejected",
+        comment="Lifecycle status: pending, processing, parsed, rejected, verified",
     )
     is_author_blog: Mapped[bool | None] = mapped_column(
         Boolean,
@@ -374,41 +374,6 @@ class Comment(Base):
 
     def __repr__(self) -> str:
         return f"<Comment(content_id={self.content_id}, platform_comment_id={self.platform_comment_id})>"
-
-
-class GraphEntityPost(Base):
-    """Table storing graph entity-to-post projection for search."""
-
-    __tablename__ = "graph_entity_posts"
-    __table_args__ = (
-        Index("idx_gep_entity_author", "entity_name_lower", "is_author_blog"),
-        Index("idx_gep_post_id", "post_id"),
-        Index(
-            "idx_gep_trgm",
-            "entity_name_lower",
-            postgresql_using="gin",
-            postgresql_ops={"entity_name_lower": "gin_trgm_ops"},
-        ),
-    )
-
-    entity_name_lower: Mapped[str] = mapped_column(
-        Text, primary_key=True, comment="Lowercased entity name for case-insensitive matching and trigram search"
-    )
-    post_id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, comment="Post ID referencing the content table"
-    )
-    entity_type: Mapped[str | None] = mapped_column(
-        String(50), nullable=True, comment="Entity type label (e.g., Actor, Place, Entity)"
-    )
-    is_author_blog: Mapped[bool | None] = mapped_column(
-        Boolean, nullable=True, comment="Copied from accounts.is_author_blog"
-    )
-    distance: Mapped[int | None] = mapped_column(
-        Integer, nullable=True, comment="Graph distance (1-hop or 2-hop relations)"
-    )
-    weight: Mapped[float | None] = mapped_column(
-        Float, nullable=True, comment="Relevance weight of the entity-post association"
-    )
 
 
 # Backward compatibility alias for legacy Channel class references

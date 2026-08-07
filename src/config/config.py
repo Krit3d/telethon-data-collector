@@ -267,6 +267,32 @@ class Settings(BaseSettings):
         description="The Apache AGE graph name",
     )
 
+    # ---- Neo4j settings ----
+    neo4j_url: str = Field(
+        default="bolt://neo4j:7687",
+        description="Neo4j Bolt connection URL",
+    )
+    neo4j_user: str = Field(
+        default="neo4j",
+        description="Neo4j username",
+    )
+    neo4j_password: str = Field(
+        ...,
+        description="Neo4j password",
+    )
+    neo4j_database: str = Field(
+        default="neo4j",
+        description="Neo4j database name",
+    )
+    neo4j_max_connection_pool_size: int = Field(
+        default=50,
+        description="Max connection pool size",
+    )
+    taxonomy_path: Path = Field(
+        default=Path(__file__).parent / "Content Taxonomy 3.1.tsv",
+        description="Path to IAB 3.1 TSV file",
+    )
+
     process_language_data: bool = Field(
         default=False,
         description="Enable processing and storage of language metadata in the knowledge graph",

@@ -85,7 +85,10 @@ class EnrichmentWorker:
             all_rows = list(reader)
 
         for row in all_rows:
-            if not row or not row[0].strip() or not row[0].strip().isdigit():
+            if not row or not row[0].strip():
+                continue
+            header_check = row[0].strip().lower()
+            if header_check in ("unique id", "relational id system", "unique_id", "id"):
                 continue
             unique_id = row[0].strip()
             parent_id = row[1].strip() if len(row) > 1 and row[1].strip() else ""
@@ -133,7 +136,7 @@ class EnrichmentWorker:
             if not children:
                 return node_map[uid]["name"]
             result: dict[str, dict | str] = {}
-            for child_uid in sorted(children, key=lambda x: int(x) if x.isdigit() else x):
+            for child_uid in sorted(children, key=lambda x: (0, int(x)) if x.isdigit() else (1, str(x))):
                 result[child_uid] = _to_dict(child_uid)
             return result
 
@@ -265,7 +268,7 @@ class EnrichmentWorker:
                 "content": str(prompt_messages[0].get("content", "")) + (
                     "\n\nEXAMPLE JSON OUTPUT:\n"
                     '{\n'
-                    '  "category_id": "872"\n'
+                    '  "category_id": "EXACT_CATEGORY_ID"\n'
                     '}'
                 ),
             }
@@ -311,8 +314,8 @@ class EnrichmentWorker:
             "You are a deterministic IAB classification assistant. Map the provided Russian profile explanation "
             "to EXACTLY ONE best-fitting category ID from the provided YAML taxonomy.\n\n"
             "CRITICAL RULES:\n"
-            "1. 100% MANDATORY CLASSIFICATION: Every single profile MUST be assigned its single closest matching numeric category ID from the taxonomy. Never return an empty string or null category.\n"
-            "2. STRICT IDS ONLY: You are strictly restricted to numeric keys existing in the taxonomy. Never invent or hallucinate new IDs."
+            "1. 100% MANDATORY CLASSIFICATION: Every single profile MUST be assigned its single closest matching best-fitting category ID from the taxonomy. Never return an empty string or null category.\n"
+            "2. STRICT IDS ONLY: You are strictly restricted to exact category keys existing in the taxonomy. Never invent or hallucinate new IDs."
         )
 
         messages: list[ChatCompletionMessageParam] = [
@@ -343,7 +346,7 @@ class EnrichmentWorker:
                 messages.append({
                     "role": "user",
                     "content": (
-                        "WARNING: In your previous attempt, you returned an invalid category ID. This is a critical error. Choose STRICTLY from the existing numeric keys inside the provided YAML taxonomy. Do not invent new IDs, and do not write the category name instead of the numeric ID."
+                        "WARNING: In your previous attempt, you returned an invalid category ID. This is a critical error. Choose STRICTLY from the exact existing keys inside the provided YAML taxonomy. Do not invent new IDs, and do not write the category name instead of the exact ID key."
                     ),
                 })
                 continue

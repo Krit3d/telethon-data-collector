@@ -1,4 +1,26 @@
 services:
+  neo4j:
+    image: neo4j:latest
+    container_name: neo4j
+    restart: always
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_initial__size: 2g
+      NEO4J_server_memory_heap_max__size: 4g
+      NEO4J_server_memory_pagecache_size: 4g
+    networks:
+      - api_network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
@@ -50,6 +72,7 @@ services:
       ONNXRUNTIME_PROVIDER: ${ONNXRUNTIME_PROVIDER:-CPUExecutionProvider}
     depends_on:
       - qdrant
+      - neo4j
     networks:
       - api_network
     logging:
@@ -83,6 +106,7 @@ services:
       EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-64}
     depends_on:
       - qdrant
+      - neo4j
     networks:
       - api_network
     command: python -m src.api.workers.embedding_worker
@@ -116,6 +140,7 @@ services:
       GRAPH_BATCH_SIZE: ${GRAPH_BATCH_SIZE:-50}
     depends_on:
       - qdrant
+      - neo4j
     networks:
       - api_network
     command: python -m src.api.workers.graph_extractor_worker
@@ -159,3 +184,4 @@ networks:
 volumes:
   qdrant_data:
   fastembed_cache:
+  neo4j_data:
