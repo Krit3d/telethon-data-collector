@@ -149,6 +149,13 @@ else
         echo \"=== Last 20 lines of \$SERVICE_NAME logs ===\"
         docker compose -f $COMPOSE_FILE logs --tail=20 \$SERVICE_NAME
     done
+
+    echo \"Applying Neo4j schema migrations...\"
+    set -a
+    . /opt/telethon-api/.env
+    set +a
+    docker exec -i neo4j cypher-shell -u \"\$NEO4J_USER\" -p \"\$NEO4J_PASSWORD\" < docker/neo4j/v1_init_openspg_schema.cypher
+    echo \"Neo4j schema migrations applied successfully.\"
     '"
 
     echo ""

@@ -9,7 +9,6 @@ from src.config.config import load_settings
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.client import Neo4jClient
-from src.graph.schema import init_neo4j_schema, import_iab_taxonomy
 from src.api.routers import search, health
 
 logger = logging.getLogger(__name__)
@@ -33,11 +32,7 @@ async def lifespan(app: FastAPI):
         raise
 
     await qdrant.initialize()
-
-    # Initialize Neo4j connection, schema constraints, and IAB taxonomy
     await neo4j.connect()
-    await init_neo4j_schema(neo4j)
-    await import_iab_taxonomy(neo4j, settings.taxonomy_path)
 
     app.state.db = db
     app.state.qdrant = qdrant

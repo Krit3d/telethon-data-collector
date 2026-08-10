@@ -22,7 +22,7 @@ services:
         max-size: "50m"
         max-file: "3"
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.19.0
     container_name: qdrant
     restart: always
     ports:

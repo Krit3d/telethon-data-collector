@@ -11,6 +11,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    SmallInteger,
     String,
     Text,
     Integer,
@@ -216,11 +217,12 @@ class Content(Base):
         server_default="false",
         comment="True if vector embeddings are generated",
     )
-    is_graph_extracted: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        server_default="false",
-        comment="True if knowledge graph is extracted",
+    graph_status: Mapped[int] = mapped_column(
+        SmallInteger,
+        default=0,
+        server_default="0",
+        nullable=False,
+        comment="0=pending, 1=processing, 2=graphed, 3=failed",
     )
 
     is_enriched: Mapped[bool] = mapped_column(

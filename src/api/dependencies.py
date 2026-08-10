@@ -53,7 +53,6 @@ async def get_search_service(
     qdrant = get_qdrant(request)
     neo4j = get_neo4j(request)
     query_parser = QueryParser(settings)
-    graph_search_repo = Neo4jSearchRepository(client=neo4j)
-    retriever = SearchRetriever(session=session, qdrant_service=qdrant, graph_search_repo=graph_search_repo)
+    retriever = SearchRetriever(session=session, qdrant_service=qdrant, graph_search_repo=None)
     ranker = SearchRanker(ancestors_map=get_ancestors_map(), name_to_id_map=get_name_to_id_map())
     return SearchService(query_parser=query_parser, retriever=retriever, ranker=ranker)
