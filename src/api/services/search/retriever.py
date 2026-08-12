@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas import ReformulatedQuery, SearchRequest
 from src.db.models import Account, Content
+from src.embeddings.client import ENTITIES_COLLECTION
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ class CandidateAuthor:
     category_id: str | None
     category_path: str | None
     static_avg_er: float | None
-    raw_metadata: dict | None
+    raw_metadata: dict[str, Any] | None
     explanation: str | None
     subscribers_count: int | None
     max_vector_score: float
@@ -41,7 +42,7 @@ class SearchRetriever:
         self._graph_search_repo = graph_search_repo
 
     @staticmethod
-    def _extract_profile_url(raw_meta: dict | None) -> str | None:
+    def _extract_profile_url(raw_meta: dict[str, Any] | None) -> str | None:
         if not raw_meta:
             return None
         for key in ("profile_url", "url", "link"):
@@ -50,35 +51,64 @@ class SearchRetriever:
                 return val.strip()
         return None
 
+    async def _disambiguate_entities(self, entity_embeddings: list[list[float]]) -> list[str]:
+        if not entity_embeddings:
+            return []
+
+        if not self._qdrant_service._initialized:
+            await self._qdrant_service.initialize()
+
+        async def _resolve(emb: list[float]) -> str | None:
+            response = await self._qdrant_service.client.query_points(
+                collection_name=ENTITIES_COLLECTION,
+                query=emb,
+                using="text",
+                limit=1,
+                score_threshold=0.75,
+                with_payload=True,
+            )
+            if not response.points:
+                return None
+            hit = response.points[0]
+            payload = hit.payload or {}
+            canonical = payload.get("id") or str(hit.id)
+            return str(canonical).strip() or None
+
+        resolved = await asyncio.gather(*(_resolve(emb) for emb in entity_embeddings))
+        return [cid for cid in resolved if cid]
+
     async def retrieve_candidates(
         self, request: SearchRequest, reformulated: ReformulatedQuery
     ) -> tuple[list[CandidateAuthor], dict[str, float], dict[str, int]]:
         timings: dict[str, float] = {}
 
-        qdrant_limit = max(1500, request.limit * 10)
-        age_limit = max(600, request.limit * 15)
+        texts = [reformulated.dense_query] + reformulated.graph_entities
 
-        async def _embedding_task() -> tuple[list[float], float]:
-            embedding_start = time.perf_counter()
-            dense_list, _ = await self._qdrant_service._generate_cloud_embeddings_batch([reformulated.dense_query])
-            dense_emb = dense_list[0]
-            embedding_ms = (time.perf_counter() - embedding_start) * 1000.0
-            return dense_emb, embedding_ms
+        embed_start = time.perf_counter()
+        dense_list, _ = await self._qdrant_service._generate_cloud_embeddings_batch(texts)
+        timings["embedding_ms"] = (time.perf_counter() - embed_start) * 1000.0
 
-        async def _qdrant_task(dense_emb: list[float]) -> tuple[dict[int, float], float]:
-            if not self._qdrant_service._initialized:
-                await self._qdrant_service.initialize()
+        dense_query_emb = dense_list[0]
+        entity_embs = dense_list[1:]
 
+        disamb_start = time.perf_counter()
+        canonical_entity_ids = await self._disambiguate_entities(entity_embs)
+        timings["entity_disambiguation_ms"] = (time.perf_counter() - disamb_start) * 1000.0
+
+        if not self._qdrant_service._initialized:
+            await self._qdrant_service.initialize()
+
+        async def _qdrant_task() -> dict[int, float]:
             qdrant_start = time.perf_counter()
             qdrant_response = await self._qdrant_service.client.query_points(
                 collection_name=self._qdrant_service.collection_name,
-                query=dense_emb,
+                query=dense_query_emb,
                 using="text",
-                limit=qdrant_limit,
+                limit=1500,
                 score_threshold=0.30,
                 with_payload=True,
             )
-            qdrant_ms = (time.perf_counter() - qdrant_start) * 1000.0
+            timings["qdrant_posts_ms"] = (time.perf_counter() - qdrant_start) * 1000.0
 
             qdrant_map: dict[int, float] = {}
             for hit in qdrant_response.points:
@@ -87,39 +117,30 @@ class SearchRetriever:
                     qdrant_map[pid] = float(hit.score)
                 except (ValueError, TypeError):
                     continue
+            return qdrant_map
 
-            return qdrant_map, qdrant_ms
-
-        async def _graph_task() -> tuple[dict[int, float], float]:
+        async def _graph_task() -> dict[int, float]:
             graph_start = time.perf_counter()
-            post_ids = await self._graph_search_repo.find_candidate_post_ids(
-                entities=reformulated.graph_entities,
-                target_topics=reformulated.target_topics,
-                limit=age_limit,
+            graph_map = await self._graph_search_repo.find_candidate_posts_with_weights(
+                canonical_entity_ids,
+                reformulated.target_topics,
+                limit=600,
             )
-            graph_ms = (time.perf_counter() - graph_start) * 1000.0
-            age_map = {pid: 1.0 for pid in post_ids}
-            return age_map, graph_ms
+            timings["graph_index_ms"] = (time.perf_counter() - graph_start) * 1000.0
+            return graph_map
 
-        embedding_task = asyncio.create_task(_embedding_task())
-        graph_task = asyncio.create_task(_graph_task())
+        qdrant_map, graph_map = await asyncio.gather(_qdrant_task(), _graph_task())
 
-        dense_emb, embedding_ms = await embedding_task
-        timings["embedding_ms"] = embedding_ms
+        all_post_ids = set(qdrant_map.keys()) | set(graph_map.keys())
 
-        (qdrant_map, qdrant_ms), (age_map, graph_ms) = await asyncio.gather(
-            _qdrant_task(dense_emb),
-            graph_task,
-        )
-        timings["qdrant_posts_ms"] = qdrant_ms
-        timings["graph_index_ms"] = graph_ms
-
-        all_post_ids = set(qdrant_map.keys()) | set(age_map.keys())
-
-        counts = {"qdrant_candidates_count": len(qdrant_map), "graph_candidates_count": len(age_map), "total_unique_candidates_count": len(all_post_ids)}
+        counts = {
+            "qdrant_candidates_count": len(qdrant_map),
+            "graph_candidates_count": len(graph_map),
+            "total_unique_candidates_count": len(all_post_ids),
+        }
 
         logger.info("Qdrant post search returned %d candidates", len(qdrant_map))
-        logger.info("Graph index search returned %d candidates", len(age_map))
+        logger.info("Graph index search returned %d candidates", len(graph_map))
         logger.info("Total unique post IDs after merge: %d", len(all_post_ids))
 
         if not all_post_ids:
@@ -130,6 +151,7 @@ class SearchRetriever:
             .join(Account, Content.account_id == Account.id)
             .where(Content.id.in_(all_post_ids))
             .where(Content.is_enriched == True)
+            .where(Content.graph_status == 2)
         )
 
         if request.author_type == "expert":
@@ -177,7 +199,7 @@ class SearchRetriever:
             if vector_score > group["max_vector_score"]:
                 group["max_vector_score"] = vector_score
 
-            graph_score = age_map.get(post_id, 0.0)
+            graph_score = graph_map.get(post_id, 0.0)
             if graph_score > group["max_graph_score"]:
                 group["max_graph_score"] = graph_score
 

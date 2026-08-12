@@ -8,61 +8,73 @@ class Neo4jSearchRepository:
     def __init__(self, client: Neo4jClient) -> None:
         self._client = client
 
-    async def find_candidate_post_ids(
+    async def find_candidate_posts_with_weights(
         self,
-        entities: list[str],
+        canonical_entity_ids: list[str],
         target_topics: list[str],
-        limit: int = 300,
-    ) -> list[int]:
-        clean_entities = [e.strip().lower() for e in entities if e and e.strip()]
-        clean_topics = [t.strip().lower() for t in target_topics if t and t.strip()]
+        limit: int = 500,
+    ) -> dict[int, float]:
+        clean_entities = [e for e in canonical_entity_ids if e and e.strip()]
+        clean_topics = [t for t in target_topics if t and t.strip()]
 
         if not clean_entities and not clean_topics:
-            return []
+            return {}
 
         query = """
-            MATCH (p:Post)
-            WHERE EXISTS {
-                MATCH (p)-[:MENTIONS]->(e:Entity)
-                WHERE e.name IN $entities OR e.label IN $entities
+            CALL {
+                UNWIND $entity_ids AS eid
+                MATCH (e {id: eid})
+                MATCH (p:Post)-[r:MENTIONS|TAGGED_AT|TAGGED_WITH|ABOUT]->(e)
+                WITH p, r,
+                     CASE type(r)
+                         WHEN 'ABOUT' THEN 1.5
+                         WHEN 'TAGGED_AT' THEN 1.2
+                         WHEN 'TAGGED_WITH' THEN 1.1
+                         ELSE 1.0
+                     END AS w
+                RETURN p.content_id AS content_id, w AS weight
+                UNION ALL
+                UNWIND $topics AS top
+                MATCH (c:Concept)
+                WHERE c.code = top OR LOWER(c.name) = top OR LOWER(c.tier_1) = top
+                MATCH (p:Post)-[:ABOUT]->(target)
+                WHERE target = c OR (target:MicroConcept AND (target)-[:BELONGS_TO]->(c))
+                RETURN p.content_id AS content_id, 1.5 AS weight
             }
-            OR EXISTS {
-                MATCH (p)-[:BELONGS_TO]->(c:Concept)
-                WHERE c.name IN $topics OR c.tier_1 IN $topics OR c.tier_2 IN $topics
-            }
-            RETURN DISTINCT p.id AS id
+            WITH content_id, SUM(weight) AS total_weight
+            WHERE content_id IS NOT NULL
+            RETURN content_id, total_weight
+            ORDER BY total_weight DESC
             LIMIT $limit
         """
 
         results = await self._client.execute_read(query, {
-            "entities": clean_entities,
+            "entity_ids": clean_entities,
             "topics": clean_topics,
             "limit": limit,
         })
 
-        return [int(row["id"]) for row in results]
+        return {int(row["content_id"]): float(row["total_weight"]) for row in results}
 
     async def find_authors_by_concepts(
         self,
         category_ids: list[str],
-        min_followers: int | None = None,
-        limit: int = 100,
+        limit: int = 200,
     ) -> list[int]:
         if not category_ids:
             return []
 
         query = """
-            MATCH (a:Account)
-            WHERE a.category_id IN $category_ids
-            AND ($min_followers IS NULL OR a.subscribers_count >= $min_followers)
-            RETURN DISTINCT a.id AS id
+            MATCH (c:Concept)
+            WHERE c.code IN $category_ids OR c.id IN $category_ids
+            MATCH (a:Actor)-[:COVERS_TOPIC]->(c)
+            RETURN DISTINCT a.account_id AS account_id
             LIMIT $limit
         """
 
         results = await self._client.execute_read(query, {
             "category_ids": category_ids,
-            "min_followers": min_followers,
             "limit": limit,
         })
 
-        return [int(row["id"]) for row in results]
+        return [int(row["account_id"]) for row in results]

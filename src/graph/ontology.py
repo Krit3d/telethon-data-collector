@@ -323,6 +323,8 @@ class ExtractedRelation(BaseModel):
 
 
 class ExtractedPsychographics(BaseModel):
+    language: str = "ru"
+    sentiment: SentimentType = SentimentType.neutral
     primary_tone: ToneType
     secondary_tones: list[ToneType] = []
     primary_hormone: HormoneType

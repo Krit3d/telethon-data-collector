@@ -103,6 +103,13 @@ class SearchRanker:
         scaled = 1.0 / (1.0 + math.exp(-10.0 * (raw_score - 0.45)))
         return max(0.0, min(1.0, scaled))
 
+    @staticmethod
+    def _normalize_graph_score(weight: float) -> float:
+        if weight <= 0.0:
+            return 0.0
+        import math
+        return 1.0 / (1.0 + math.exp(-1.5 * (weight - 1.5)))
+
     def __init__(
         self,
         ancestors_map: dict[str, list[str]] | None = None,
@@ -169,14 +176,18 @@ class SearchRanker:
 
     def _calculate_topical_score(self, max_vector_score: float, max_graph_score: float, tms_score: float) -> float:
         scaled_vector = self._scale_vector_score(max_vector_score)
+        normalized_graph = self._normalize_graph_score(max_graph_score)
+
         if tms_score > 0.0:
-            effective_graph = max_graph_score
+            effective_graph = normalized_graph
         else:
-            effective_graph = max_graph_score * 0.15
+            effective_graph = normalized_graph * 0.15
+
         if effective_graph > 0.0:
             topical_score = (0.50 * scaled_vector) + (0.30 * effective_graph) + (0.20 * tms_score)
         else:
             topical_score = (0.75 * scaled_vector) + (0.25 * tms_score)
+
         return min(1.0, topical_score)
 
     def _calculate_final_score(self, topical_score: float, engagement_score: float) -> float:

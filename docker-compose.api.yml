@@ -109,7 +109,7 @@ services:
       - neo4j
     networks:
       - api_network
-    command: python -m src.api.workers.embedding_worker
+    command: python -m src.workers.embedding_worker
     logging:
       driver: json-file
       options:
@@ -143,7 +143,7 @@ services:
       - neo4j
     networks:
       - api_network
-    command: python -m src.api.workers.graph_extractor_worker
+    command: python -m src.workers.kag_builder_worker
     logging:
       driver: json-file
       options:
@@ -170,7 +170,7 @@ services:
       ENRICHMENT_CONCURRENCY: ${ENRICHMENT_CONCURRENCY:-15}
     networks:
       - api_network
-    command: python -m src.api.workers.enrichment_worker
+    command: python -m src.workers.enrichment_worker
     logging:
       driver: json-file
       options:
