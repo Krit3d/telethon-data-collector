@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 from typing import cast
 
 from src.db.database import Database
-from src.db.models import Content
+from src.db.models import Account, Content
 from src.graph.utils import build_node_id
 
 logger = logging.getLogger(__name__)
@@ -22,15 +22,38 @@ class PostBatchContext(BaseModel):
     pub_node_id: str
     author_node_id: str
     platform: str
+    platform_id: str
+    location_name: str | None
     content: str | None
     transcription: str | None
     published_at: datetime
     account_category_id: str | None
+    account_category_path: str | None
     author_title: str
     author_username: str | None
     post_type: str
     is_video: bool
     raw_metadata: dict[str, Any] | None
+
+
+def _extract_location_name(content_raw: dict[str, Any], account_raw: dict[str, Any]) -> str | None:
+    _cg = content_raw.get("geo_data")
+    content_geo = _cg if isinstance(_cg, dict) else {}
+    if content_geo.get("name"):
+        return str(content_geo["name"])
+    _ag = account_raw.get("geo_data")
+    account_geo = _ag if isinstance(_ag, dict) else {}
+    city = account_geo.get("city")
+    country = account_geo.get("country")
+    if city and country:
+        return f"{city}, {country}"
+    if city:
+        return str(city)
+    if country:
+        return str(country)
+    if account_raw.get("location"):
+        return str(account_raw["location"])
+    return None
 
 
 class Reader:
@@ -48,21 +71,25 @@ class Reader:
         now = datetime.now(timezone.utc)
         async with self._db.async_session() as session:
             async with session.begin():
-                candidate_authors = (
+                candidate_authors_stmt = (
                     select(Content.account_id)
-                    .where(Content.graph_status == 0)
-                    .group_by(Content.account_id)
+                    .join(Content.account)
+                    .where(
+                        Content.graph_status == 0,
+                        Account.status == "verified",
+                    )
                 )
                 if total_workers > 1:
-                    candidate_authors = candidate_authors.where(
+                    candidate_authors_stmt = candidate_authors_stmt.where(
                         func.mod(Content.account_id, total_workers) == worker_id
                     )
+                candidate_authors_subq = candidate_authors_stmt.distinct().limit(10).subquery()
 
                 order = Content.published_at.desc() if priority_mode else Content.published_at.asc()
                 inner = (
                     select(Content.id)
                     .where(Content.graph_status == 0)
-                    .where(Content.account_id.in_(candidate_authors))
+                    .where(Content.account_id.in_(select(candidate_authors_subq.c.account_id)))
                     .order_by(order)
                     .limit(batch_size)
                     .with_for_update(skip_locked=True)
@@ -81,14 +108,18 @@ class Reader:
                     stmt = (
                         select(Content)
                         .where(Content.id.in_(claimed_ids))
-                        .options(selectinload(Content.account))
                         .order_by(order)
+                        .options(selectinload(Content.account))
                     )
                     rows = list((await session.scalars(stmt)).all())
 
                     for row in rows:
                         account = row.account
                         platform = account.platform
+                        platform_id = account.platform_id
+                        content_raw = row.raw_metadata if isinstance(row.raw_metadata, dict) else {}
+                        account_raw = account.raw_metadata if isinstance(account.raw_metadata, dict) else {}
+                        location_name = _extract_location_name(content_raw, account_raw)
                         author_node_id = build_node_id(
                             "Actor", "", platform=platform, account_id=row.account_id
                         )
@@ -98,9 +129,8 @@ class Reader:
                             account_id=row.account_id,
                             content_id=row.id,
                         )
-                        raw_metadata = row.raw_metadata or {}
-                        post_type = raw_metadata.get("post_type", "post")
-                        is_video = bool(raw_metadata.get("is_video", False))
+                        post_type = str(content_raw.get("post_type") or "post").lower()
+                        is_video = post_type in ("reel", "video", "short", "tiktok") or bool(content_raw.get("video_url"))
                         contexts.append(
                             PostBatchContext(
                                 content_id=row.id,
@@ -108,11 +138,14 @@ class Reader:
                                 pub_node_id=pub_node_id,
                                 author_node_id=author_node_id,
                                 platform=platform,
+                                platform_id=platform_id,
+                                location_name=location_name,
                                 content=row.content,
                                 transcription=row.transcription,
                                 published_at=row.published_at,
                                 account_category_id=account.category_id,
-                                author_title=account.title,
+                                account_category_path=account.category_path,
+                                author_title=account.title or account.username or f"Account_{account.id}",
                                 author_username=account.username,
                                 post_type=post_type,
                                 is_video=is_video,

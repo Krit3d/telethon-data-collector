@@ -9,7 +9,7 @@ from neo4j.exceptions import SessionExpired, TransientError
 
 from src.config.config import Settings
 from src.graph.ontology import EntityType, RelationType
-
+from src.graph.utils import sanitize_properties
 
 class Neo4jClient:
 
@@ -47,6 +47,9 @@ class Neo4jClient:
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> None:
         await self.close()
+
+    async def verify_connectivity(self) -> None:
+        await self.driver.verify_connectivity()
 
     @property
     def driver(self) -> AsyncDriver:
@@ -113,14 +116,36 @@ class Neo4jClient:
     ) -> list[dict[str, Any]]:
         return await self._execute_transaction("write", query, parameters)
 
-    async def lookup_existing_ids(self, node_ids: list[str], batch_size: int = 1000) -> set[str]:
-        if not node_ids:
+    async def execute_unwind_batch(self, query: str, batch: list[dict[str, Any]], timeout: float = 30.0) -> None:
+        if not batch:
+            return
+        last_exc: TransientError | None = None
+        for attempt in range(5):
+            try:
+                async with self.driver.session(
+                    database=self._database,
+                    default_access_mode="write",
+                ) as session:
+                    tx: Any = await session.begin_transaction()
+                    async with tx:
+                        result = await tx.run(query, {"batch": batch}, timeout=timeout)
+                        await result.consume()
+                return
+            except TransientError as exc:
+                last_exc = exc
+                if attempt < 4:
+                    await asyncio.sleep(0.2 * (2 ** attempt))
+        if last_exc is not None:
+            raise last_exc
+
+    async def lookup_existing_ids(self, ids: list[str], batch_size: int = 1000) -> set[str]:
+        if not ids:
             return set()
         result: set[str] = set()
-        for i in range(0, len(node_ids), batch_size):
-            batch = node_ids[i:i + batch_size]
+        for i in range(0, len(ids), batch_size):
+            batch = ids[i:i + batch_size]
             rows = await self.execute_read(
-                "MATCH (n) WHERE n.id IN $ids RETURN DISTINCT n.id AS id",
+                "MATCH (n) WHERE n.id IN $ids RETURN n.id AS id",
                 {"ids": batch},
             )
             result.update(row["id"] for row in rows)
@@ -130,15 +155,21 @@ class Neo4jClient:
         if not nodes:
             return
         label_str = self._resolve_label(label)
+        domain_entity_values = frozenset({
+            EntityType.Entity.value,
+            EntityType.Organization.value,
+            EntityType.Product.value,
+            EntityType.Place.value,
+            EntityType.Event.value,
+        })
+        is_domain_entity = label_str in domain_entity_values
         for i in range(0, len(nodes), batch_size):
             batch = nodes[i:i + batch_size]
-            has_properties = any("properties" in row for row in batch)
-            if has_properties:
+            if is_domain_entity:
                 await self.execute_write(
-                    f"UNWIND $batch AS row "
-                    f"MERGE (n:{label_str} {{id: row.id}}) "
-                    f"ON CREATE SET n.name = row.name, n.name_lower = row.name_lower, n += row.properties "
-                    f"ON MATCH SET n += row.properties",
+                    f"UNWIND $batch AS row MERGE (n:{label_str} {{id: row.id}}) "
+                    f"ON CREATE SET n.mentions_count = 1, n += row "
+                    f"ON MATCH SET n.mentions_count = COALESCE(n.mentions_count, 0) + 1, n += row",
                     {"batch": batch},
                 )
             else:
@@ -163,13 +194,13 @@ class Neo4jClient:
         for i in range(0, len(relations), batch_size):
             batch = relations[i:i + batch_size]
             normalized = [
-                {"source_id": r["source_id"], "target_id": r["target_id"], "properties": r.get("properties", {})}
+                {"source_id": r["source_id"], "target_id": r["target_id"], "properties": sanitize_properties(r.get("properties", {}))}
                 for r in batch
             ]
             await self.execute_write(
                 f"UNWIND $batch AS row "
-                f"MATCH (s:{src_label_str} {{id: row.source_id}}) "
-                f"MATCH (t:{tgt_label_str} {{id: row.target_id}}) "
+                f"MATCH (s {{id: row.source_id}}) "
+                f"MATCH (t {{id: row.target_id}}) "
                 f"MERGE (s)-[r:{rel_type_str}]->(t) SET r += row.properties",
                 {"batch": normalized},
             )

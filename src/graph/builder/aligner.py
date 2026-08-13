@@ -19,7 +19,7 @@ from src.graph.ontology import (
     OpenSPGExtractionResult,
     RelationType,
 )
-from src.graph.utils import clean_name_lower, format_bge_representation
+from src.graph.utils import build_node_id, clean_name_lower, format_bge_representation
 
 logger = logging.getLogger(__name__)
 
@@ -143,12 +143,26 @@ class Aligner:
     ) -> None:
         if not microconcepts:
             return
-        names = [mc.name for mc in microconcepts]
+        candidates = [
+            mc for mc in microconcepts
+            if mc.id and mc.properties.get("is_classified") is not True
+        ]
+        if not candidates:
+            return
+        seen_ids: set[str] = set()
+        unique: list[ExtractedEntity] = []
+        for mc in candidates:
+            mc_id = mc.id
+            if not mc_id or mc_id in seen_ids:
+                continue
+            seen_ids.add(mc_id)
+            unique.append(mc)
+        names = [mc.name for mc in unique]
         try:
             embeddings = await self._get_embeddings_batch(names)
         except Exception:
             return
-        if len(embeddings) != len(microconcepts):
+        if len(embeddings) != len(unique):
             return
         t0 = time.perf_counter()
         try:
@@ -168,23 +182,22 @@ class Aligner:
             return
         qdrant_elapsed = (time.perf_counter() - t0) * 1000
         linked = 0
-        for mc, response in zip(microconcepts, batch_response):
-            if not mc.id:
+        for mc, response in zip(unique, batch_response):
+            mc_id = mc.id
+            if not mc_id or not response.points:
                 continue
-            if not response.points:
-                continue
-            candidates = [
+            hit_candidates = [
                 {"score": hit.score, "payload": hit.payload or {}}
                 for hit in response.points
             ]
-            chosen = candidates[0]
+            chosen = hit_candidates[0]
             if (
-                len(candidates) >= 2
-                and (candidates[0]["score"] - candidates[1]["score"]) < _CATEGORY_SCORE_GAP
+                len(hit_candidates) >= 2
+                and (hit_candidates[0]["score"] - hit_candidates[1]["score"]) < _CATEGORY_SCORE_GAP
                 and context.account_category_id
             ):
                 matched = next(
-                    (c for c in candidates if c["payload"].get("code") == context.account_category_id),
+                    (c for c in hit_candidates if str(c["payload"].get("code")) == str(context.account_category_id)),
                     None,
                 )
                 if matched is not None:
@@ -192,9 +205,13 @@ class Aligner:
             code = chosen["payload"].get("code")
             if not code:
                 continue
-            concept_node_id = f"concept_{code}"
+            concept_node_id = build_node_id(EntityType.Concept, code)
             concept_name = str(chosen["payload"].get("name") or code)
             tier_1 = chosen["payload"].get("tier_1")
+            tier_2 = chosen["payload"].get("tier_2")
+            tier_3 = chosen["payload"].get("tier_3")
+            tier_4 = chosen["payload"].get("tier_4")
+            extension = chosen["payload"].get("extension")
             entities.append(
                 ExtractedEntity(
                     id=concept_node_id,
@@ -204,13 +221,17 @@ class Aligner:
                     properties={
                         "code": code,
                         "tier_1": tier_1,
+                        "tier_2": tier_2,
+                        "tier_3": tier_3,
+                        "tier_4": tier_4,
+                        "extension": extension,
                     },
                 )
             )
             mc.properties["is_classified"] = True
             relations.append(
                 ExtractedRelation(
-                    source_id=mc.id,
+                    source_id=mc_id,
                     source_label=EntityType.MicroConcept,
                     target_id=concept_node_id,
                     target_label=EntityType.Concept,
@@ -220,7 +241,7 @@ class Aligner:
             linked += 1
         logger.debug(
             "Qdrant iab_categories search for %d microconcepts done in %.1fms, linked %d",
-            len(microconcepts), qdrant_elapsed, linked,
+            len(unique), qdrant_elapsed, linked,
         )
 
     async def align(
@@ -231,20 +252,17 @@ class Aligner:
         t0 = time.perf_counter()
         id_map: dict[str, str] = {}
 
-        non_micro = [
-            e for e in extraction_result.entities
-            if e.label != EntityType.MicroConcept
-        ]
-
         l1_hits = 0
         missed: list[ExtractedEntity] = []
-        for entity in non_micro:
+        for entity in extraction_result.entities:
             if not entity.id:
                 continue
             key = f"{entity.label.value}:{clean_name_lower(entity.name)}"
             cached = self._l1_cache.get(key)
             if cached is not None:
                 id_map[entity.id] = cached
+                if entity.label == EntityType.MicroConcept:
+                    entity.properties["is_classified"] = True
                 l1_hits += 1
             else:
                 missed.append(entity)
@@ -260,10 +278,12 @@ class Aligner:
                     key = f"{entity.label.value}:{clean_name_lower(entity.name)}"
                     self._cache_set(key, entity.id)
                     id_map[entity.id] = entity.id
+                    if entity.label == EntityType.MicroConcept:
+                        entity.properties["is_classified"] = True
 
         still_missed = [
             e for e in missed
-            if e.id and e.id not in id_map
+            if e.id and e.id not in id_map and e.label != EntityType.MicroConcept
         ]
         await self._disambiguate_entities(still_missed, id_map)
 
@@ -271,7 +291,25 @@ class Aligner:
             e for e in extraction_result.entities
             if e.label == EntityType.MicroConcept
         ]
-        await self._link_microconcepts(microconcepts, context, extraction_result.relations, extraction_result.entities)
+        unique_microconcepts: list[ExtractedEntity] = []
+        seen_microconcept_ids: set[str] = set()
+        for mc in microconcepts:
+            if not mc.id:
+                continue
+            canonical_id = id_map.get(mc.id, mc.id)
+            if canonical_id in seen_microconcept_ids:
+                continue
+            seen_microconcept_ids.add(canonical_id)
+            if mc.id in id_map:
+                mc.id = canonical_id
+            unique_microconcepts.append(mc)
+
+        await self._link_microconcepts(
+            unique_microconcepts,
+            context,
+            extraction_result.relations,
+            extraction_result.entities,
+        )
 
         if id_map:
             for entity in extraction_result.entities:

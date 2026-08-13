@@ -54,7 +54,7 @@ class EntityVectorizer:
             if entity.embedding is not None:
                 ready.append((
                     PointStruct(
-                        id=point_id,
+                        id=str(point_id),
                         vector={"text": entity.embedding},
                         payload={
                             "id": entity.id,
@@ -110,7 +110,7 @@ class EntityVectorizer:
                 point_id = uuid.uuid5(uuid.NAMESPACE_URL, entity.id)
                 ready.append((
                     PointStruct(
-                        id=point_id,
+                        id=str(point_id),
                         vector={"text": embedding},
                         payload={
                             "id": entity.id,

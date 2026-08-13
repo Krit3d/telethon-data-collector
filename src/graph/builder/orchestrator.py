@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 
 from sqlalchemy import update
 
@@ -79,7 +80,7 @@ class KagBuilderOrchestrator:
                     await session.execute(
                         update(Content)
                         .where(Content.id == context.content_id)
-                        .values(graph_status=3)
+                        .values(graph_status=3, updated_at=datetime.now(timezone.utc))
                     )
 
     async def _producer_loop(self, poll_interval: float = 3.0) -> None:

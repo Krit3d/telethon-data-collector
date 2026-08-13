@@ -6,7 +6,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-
 class EntityType(StrEnum):
     Actor = "Actor"
     Post = "Post"
@@ -262,22 +261,40 @@ class ConceptNode(BaseModel):
     id: str
     code: str
     name: str
+    name_lower: str | None = None
     tier_1: str
     tier_2: str | None = None
     tier_3: str | None = None
     tier_4: str | None = None
     extension: str | None = None
 
+    @model_validator(mode="after")
+    def _fill_name_lower(self) -> ConceptNode:
+        self.name_lower = _clean_name(self.name)
+        return self
+
 
 class ToneNode(BaseModel):
     id: str
     name: ToneType
+    name_lower: str | None = None
+
+    @model_validator(mode="after")
+    def _fill_name_lower(self) -> ToneNode:
+        self.name_lower = _clean_name(str(self.name))
+        return self
 
 
 class LanguageNode(BaseModel):
     id: str
     code: str
     name: str
+    name_lower: str | None = None
+
+    @model_validator(mode="after")
+    def _fill_name_lower(self) -> LanguageNode:
+        self.name_lower = _clean_name(self.name)
+        return self
 
 
 class HashtagNode(BaseModel):
@@ -334,6 +351,30 @@ class ExtractedPsychographics(BaseModel):
     intent: str = ""
 
 
+def is_author_entity(entity_name: str, author_title: str, author_handle: str) -> bool:
+    def _clean(value: str) -> str:
+        return re.sub(r"[^\w\s]", "", str(value or "")).strip().lower()
+
+    clean_entity = _clean(entity_name)
+    clean_title = _clean(author_title)
+    clean_handle = _clean(author_handle)
+    if not clean_entity or not clean_title:
+        return False
+    if clean_entity == clean_title:
+        return True
+    if clean_handle and (clean_entity == clean_handle or clean_handle in clean_entity):
+        return True
+    entity_tokens = [t for t in clean_entity.split() if len(t) >= 3]
+    title_tokens = [t for t in clean_title.split() if len(t) >= 3]
+    if not entity_tokens or not title_tokens:
+        return False
+    title_prefixes = {t[:3] for t in title_tokens}
+    if not title_prefixes:
+        return False
+    matched = sum(1 for t in entity_tokens if t[:3] in title_prefixes)
+    return matched / len(entity_tokens) >= 0.5 or matched / len(title_tokens) >= 0.5
+
+
 class OpenSPGExtractionResult(BaseModel):
     thinking: str = ""
     entities: list[ExtractedEntity] = []
@@ -341,13 +382,26 @@ class OpenSPGExtractionResult(BaseModel):
     psychographics: ExtractedPsychographics
     is_spam_or_gambling: bool = False
 
-    def sanitize_and_validate(self, allowed_ids: set[str] | None = None) -> OpenSPGExtractionResult:
+    def sanitize_and_validate(
+        self,
+        allowed_ids: set[str] | None = None,
+        forbidden_names: set[str] | None = None,
+        author_title: str | None = None,
+        author_handle: str | None = None,
+    ) -> OpenSPGExtractionResult:
+
         phantom_names = frozenset({"<name>", "unknown", "null", "none", "n/a", ""})
         valid_ids = set(allowed_ids) if allowed_ids else set()
         clean_entities: list[ExtractedEntity] = []
         for e in self.entities:
             if e.name.lower() in phantom_names or len(e.name.strip()) < 2:
                 continue
+            if forbidden_names and e.name_lower in forbidden_names:
+                continue
+            if author_title and is_author_entity(e.name, author_title, author_handle or ""):
+                continue
+            for key in ("role", "platform", "author", "post"):
+                e.properties.pop(key, None)
             clean_entities.append(e)
             if e.id:
                 valid_ids.add(e.id)

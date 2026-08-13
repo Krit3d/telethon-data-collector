@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from src.graph.ontology import EntityType
@@ -228,3 +230,31 @@ def format_bge_representation(label: str, name: str, properties: dict[str, Any] 
 
 def extract_hashtags(text: str) -> list[str]:
     return list({clean_identifier(h) for h in _HASHTAG_RE.findall(text)})
+
+
+_PRIMITIVE_TYPES: tuple[type, ...] = (int, float, str, bool)
+
+
+def sanitize_properties(props: dict[str, Any]) -> dict[str, Any]:
+    result = {}
+    for k, v in props.items():
+        if v is None:
+            continue
+        if isinstance(v, list | tuple):
+            if not v:
+                continue
+            if all(isinstance(x, _PRIMITIVE_TYPES) for x in v):
+                result[k] = list(v)
+            else:
+                result[k] = json.dumps(v, ensure_ascii=False)
+        elif isinstance(v, _PRIMITIVE_TYPES):
+            result[k] = v
+        elif isinstance(v, Mapping):
+            result[k] = json.dumps(dict(v), ensure_ascii=False)
+        elif hasattr(v, 'model_dump'):
+            result[k] = json.dumps(v.model_dump(), ensure_ascii=False)
+        elif hasattr(v, 'dict'):
+            result[k] = json.dumps(v.dict(), ensure_ascii=False)
+        else:
+            result[k] = str(v)
+    return result

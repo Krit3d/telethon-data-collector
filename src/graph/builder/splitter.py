@@ -16,9 +16,10 @@ class TextSplitter:
         r"(?:bot|бот)[^\n]*\n?",
     )
     _URL_RE = re.compile(r"https?://\S+|www\.\S+|t\.me/\S+")
-    _MARKUP_RE = re.compile(r"[*_`~>#|\[\]()]")
+    _MARKUP_RE = re.compile(r"[*_~`]")
     _MULTI_WS_RE = re.compile(r"[ \t]+")
     _MULTI_NL_RE = re.compile(r"\n{3,}")
+    _PARAGRAPH_RE = re.compile(r"\n\s*\n")
 
     @staticmethod
     def sanitize_text(text: str | None) -> str:
@@ -42,7 +43,7 @@ class TextSplitter:
         clean_transcription = self.sanitize_text(transcription)
 
         if clean_content and clean_transcription:
-            combined = f"{clean_content}\n\nTranscription:\n{clean_transcription}"
+            combined = f"{clean_content}\n\n[Audio Transcription]:\n{clean_transcription}"
         elif clean_content:
             combined = clean_content
         elif clean_transcription:
@@ -64,7 +65,7 @@ class TextSplitter:
         ]
 
     def _split_by_paragraphs(self, text: str, max_chars: int, overlap: int) -> list[str]:
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        paragraphs = [p.strip() for p in self._PARAGRAPH_RE.split(text) if p.strip()]
         if not paragraphs:
             paragraphs = [text]
 
@@ -102,7 +103,9 @@ class TextSplitter:
         while start < length:
             end = min(start + max_chars, length)
             if end < length:
-                boundary = text.rfind("\n", start, end)
+                nl_boundary = text.rfind("\n", start, end)
+                space_boundary = text.rfind(" ", start, end)
+                boundary = max(nl_boundary, space_boundary)
                 if boundary > start + max_chars // 2:
                     end = boundary
             parts.append(text[start:end].strip())
@@ -118,6 +121,20 @@ class TextSplitter:
                 result.append(chunk)
                 continue
             prev = result[-1]
-            tail = prev[-overlap:] if len(prev) >= overlap else prev
+            tail = self._overlap_tail(prev, overlap)
             result.append(f"{tail}\n{chunk}")
         return result
+
+    def _overlap_tail(self, text: str, overlap: int) -> str:
+        if len(text) <= overlap:
+            return text
+        start = len(text) - overlap
+        boundary = max(
+            text.rfind(" ", 0, start),
+            text.rfind("\n", 0, start),
+            text.rfind("\t", 0, start),
+            text.rfind("\r", 0, start),
+        )
+        if boundary > 0:
+            start = boundary + 1
+        return text[start:].strip()
