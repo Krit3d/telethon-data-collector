@@ -4,7 +4,7 @@ import re
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 class EntityType(StrEnum):
@@ -299,6 +299,7 @@ class ExtractedEntity(BaseModel):
     properties: dict[str, Any] = {}
     microconcept: str | None = None
     confidence: float = 1.0
+    embedding: list[float] | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> ExtractedEntity:

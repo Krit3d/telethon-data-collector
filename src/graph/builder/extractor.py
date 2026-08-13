@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import httpx
 import json
 import re
+import logging
+import time
 from typing import Any
 
+from evolution_openai import EvolutionAsyncOpenAI
 from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, RateLimitError
 
 from src.config.config import Settings
@@ -20,6 +24,8 @@ from src.graph.ontology import (
     ToneType,
 )
 from src.graph.utils import build_node_id, clean_name_lower, extract_hashtags
+
+logger = logging.getLogger(__name__)
 
 
 OPENSPG_EXTRACTION_SYSTEM_PROMPT = (
@@ -197,6 +203,7 @@ def _parse_microconcepts(raw_microconcepts: list[str] | None) -> tuple[list[Extr
         result.append(ExtractedEntity(
             id=entity_id,
             name=name,
+            name_lower=clean_name_lower(name),
             label=EntityType.MicroConcept,
             properties={"is_classified": False},
         ))
@@ -214,6 +221,8 @@ def _parse_relations(raw_relations: list[dict[str, Any]], global_id_map: dict[st
             continue
         source_id = global_id_map.get(raw_source_id, global_id_map.get(raw_source_id.lower(), raw_source_id))
         target_id = global_id_map.get(raw_target_id, global_id_map.get(raw_target_id.lower(), raw_target_id))
+        if source_id == target_id:
+            continue
         raw_source_label = str(raw.get("source_label", "Entity")).strip()
         raw_target_label = str(raw.get("target_label", "Entity")).strip()
         try:
@@ -230,14 +239,18 @@ def _parse_relations(raw_relations: list[dict[str, Any]], global_id_map: dict[st
         except ValueError:
             continue
         properties: dict[str, Any] = dict(raw.get("properties", {}) or {})
-        result.append(ExtractedRelation(
-            source_id=source_id,
-            source_label=source_label,
-            target_id=target_id,
-            target_label=target_label,
-            relation_type=relation_type,
-            properties=properties,
-        ))
+        try:
+            result.append(ExtractedRelation(
+                source_id=source_id,
+                source_label=source_label,
+                target_id=target_id,
+                target_label=target_label,
+                relation_type=relation_type,
+                properties=properties,
+            ))
+        except Exception:
+            logger.debug("Skipping invalid relation: source=%s target=%s type=%s", source_id, target_id, raw_rel_type)
+            continue
     return result
 
 
@@ -359,11 +372,31 @@ def _create_structural_relations(
 class GraphExtractor:
 
     def __init__(self, settings: Settings) -> None:
-        self._client = AsyncOpenAI(
-            base_url=settings.cloud_ru_base_url,
-            api_key=settings.cloud_ru_api_key,
+        http_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
+            verify=False,
         )
-        self._model = settings.cloud_ru_llm_model
+        if settings.ml_inference_key_id and settings.ml_inference_secret and settings.ml_inference_base_url:
+            self._client = EvolutionAsyncOpenAI(
+                key_id=settings.ml_inference_key_id,
+                secret=settings.ml_inference_secret,
+                base_url=settings.ml_inference_base_url,
+                http_client=http_client,
+                max_retries=0,
+            )
+            self._model = settings.ml_inference_model or settings.cloud_ru_llm_model
+        else:
+            self._client = AsyncOpenAI(
+                base_url=settings.cloud_ru_base_url,
+                api_key=settings.cloud_ru_api_key,
+                http_client=http_client,
+                max_retries=0,
+            )
+            self._model = settings.cloud_ru_llm_model
+
+    async def close(self) -> None:
+        await self._client.close()
 
     async def extract(
         self,
@@ -389,6 +422,7 @@ class GraphExtractor:
 
         last_error: Exception | None = None
         for attempt in range(retries):
+            t0 = time.perf_counter()
             try:
                 response = await self._client.chat.completions.create(
                     model=self._model,
@@ -402,24 +436,46 @@ class GraphExtractor:
                     timeout=45.0,
                 )
             except (APIError, APITimeoutError, APIConnectionError, RateLimitError) as e:
+                elapsed = (time.perf_counter() - t0) * 1000
+                delay = 2 ** attempt
+                logger.warning(
+                    "LLM call attempt %d/%d failed after %.1fms (model=%s): %s | retrying in %ds",
+                    attempt + 1, retries, elapsed, self._model, e, delay,
+                )
                 last_error = e
                 if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(delay)
                 continue
+
+            llm_elapsed = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                "LLM call attempt %d/%d completed in %.1fms (model=%s)",
+                attempt + 1, retries, llm_elapsed, self._model,
+            )
 
             raw_content = response.choices[0].message.content
             if not raw_content:
+                delay = 2 ** attempt
+                logger.warning(
+                    "Empty LLM response on attempt %d/%d | retrying in %ds",
+                    attempt + 1, retries, delay,
+                )
                 last_error = ValueError("Empty LLM response")
                 if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(delay)
                 continue
 
             try:
                 parsed = repair_and_load_json(raw_content)
             except ValueError as e:
+                delay = 2 ** attempt
+                logger.warning(
+                    "JSON parse error on attempt %d/%d: %s | retrying in %ds",
+                    attempt + 1, retries, e, delay,
+                )
                 last_error = e
                 if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(delay)
                 continue
 
             raw_entities = parsed.get("entities", [])
@@ -466,6 +522,11 @@ class GraphExtractor:
             )
 
             result.sanitize_and_validate(allowed_ids={context.pub_node_id, context.author_node_id})
+
+            logger.debug(
+                "Extraction done in %.1fms: %d entities, %d relations (model=%s)",
+                llm_elapsed, len(result.entities), len(result.relations), self._model,
+            )
             return result
 
         raise last_error or RuntimeError("Extraction failed after all retries")

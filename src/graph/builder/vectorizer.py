@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import random
+import time
 import uuid
 
 from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, RateLimitError
@@ -10,6 +13,8 @@ from qdrant_client.models import PointStruct
 from src.config.config import Settings
 from src.graph.ontology import EntityType, OpenSPGExtractionResult
 from src.graph.utils import format_bge_representation
+
+logger = logging.getLogger(__name__)
 
 
 _EMBEDDING_RETRIES = 3
@@ -39,50 +44,95 @@ class EntityVectorizer:
         if not entities:
             return
 
-        bge_texts = [
-            format_bge_representation(e.label.value, e.name, e.properties)
-            for e in entities
-        ]
+        ready: list[tuple[PointStruct, list[float]]] = []
+        missing_entities: list[tuple[int, str]] = []
 
-        last_error: Exception | None = None
-        for attempt in range(_EMBEDDING_RETRIES):
-            try:
-                response = await self._openai_client.embeddings.create(
-                    model=self._model,
-                    input=bge_texts,
-                )
-                ordered = sorted(response.data, key=lambda item: item.index)
-                embeddings = [item.embedding for item in ordered]
-                break
-            except (APIError, APITimeoutError, APIConnectionError, RateLimitError) as exc:
-                last_error = exc
-                if attempt < _EMBEDDING_RETRIES - 1:
-                    await asyncio.sleep(2 ** attempt)
-        else:
-            raise last_error or RuntimeError("Embedding generation failed after all retries")
-
-        if len(embeddings) != len(entities):
-            raise RuntimeError(f"Embedding count mismatch: {len(embeddings)} vs {len(entities)} entities")
-
-        points: list[PointStruct] = []
-        for entity, embedding in zip(entities, embeddings):
+        for entity in entities:
             if not entity.id:
                 continue
             point_id = uuid.uuid5(uuid.NAMESPACE_URL, entity.id)
-            points.append(PointStruct(
-                id=point_id,
-                vector={"text": embedding},
-                payload={
-                    "id": entity.id,
-                    "name": entity.name,
-                    "name_lower": entity.name_lower,
-                    "label": entity.label.value,
-                    "properties": entity.properties,
-                },
-            ))
+            if entity.embedding is not None:
+                ready.append((
+                    PointStruct(
+                        id=point_id,
+                        vector={"text": entity.embedding},
+                        payload={
+                            "id": entity.id,
+                            "name": entity.name,
+                            "name_lower": entity.name_lower,
+                            "label": entity.label.value,
+                            "properties": entity.properties,
+                        },
+                    ),
+                    entity.embedding,
+                ))
+            else:
+                missing_entities.append((
+                    len(ready) + len(missing_entities),
+                    format_bge_representation(entity.label.value, entity.name, entity.properties),
+                ))
 
+        if missing_entities:
+            missing_texts = [text for _, text in missing_entities]
+            t0 = time.perf_counter()
+            last_error: Exception | None = None
+            for attempt in range(_EMBEDDING_RETRIES):
+                try:
+                    response = await self._openai_client.embeddings.create(
+                        model=self._model,
+                        input=missing_texts,
+                    )
+                    ordered = sorted(response.data, key=lambda item: item.index)
+                    missing_embeddings = [item.embedding for item in ordered]
+                    break
+                except RateLimitError as exc:
+                    last_error = exc
+                    if attempt < _EMBEDDING_RETRIES - 1:
+                        delay = (2 ** attempt) + random.uniform(0.0, 1.0)
+                        await asyncio.sleep(delay)
+                except (APIError, APITimeoutError, APIConnectionError) as exc:
+                    last_error = exc
+                    if attempt < _EMBEDDING_RETRIES - 1:
+                        await asyncio.sleep(2 ** attempt)
+            else:
+                raise last_error or RuntimeError("Embedding generation failed after all retries")
+
+            embed_elapsed = (time.perf_counter() - t0) * 1000
+
+            if len(missing_embeddings) != len(missing_entities):
+                raise RuntimeError(f"Embedding count mismatch: {len(missing_embeddings)} vs {len(missing_entities)} entities")
+
+            for (orig_idx, _), embedding in zip(missing_entities, missing_embeddings):
+                entity = entities[orig_idx]
+                if not entity.id:
+                    continue
+                entity.embedding = embedding
+                point_id = uuid.uuid5(uuid.NAMESPACE_URL, entity.id)
+                ready.append((
+                    PointStruct(
+                        id=point_id,
+                        vector={"text": embedding},
+                        payload={
+                            "id": entity.id,
+                            "name": entity.name,
+                            "name_lower": entity.name_lower,
+                            "label": entity.label.value,
+                            "properties": entity.properties,
+                        },
+                    ),
+                    embedding,
+                ))
+
+        t1 = time.perf_counter()
+        points = [ps for ps, _ in ready]
         if points:
             await self._qdrant_client.upsert(
                 collection_name="social_entities",
                 points=points,
             )
+        upsert_elapsed = (time.perf_counter() - t1) * 1000
+
+        logger.debug(
+            "Vectorizer: %d entities (%d reused, %d new) upserted %d points in %.1fms",
+            len(entities), len(entities) - len(missing_entities), len(missing_entities), len(points), upsert_elapsed,
+        )

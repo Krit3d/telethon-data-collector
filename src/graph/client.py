@@ -132,10 +132,20 @@ class Neo4jClient:
         label_str = self._resolve_label(label)
         for i in range(0, len(nodes), batch_size):
             batch = nodes[i:i + batch_size]
-            await self.execute_write(
-                f"UNWIND $batch AS row MERGE (n:{label_str} {{id: row.id}}) SET n += row",
-                {"batch": batch},
-            )
+            has_properties = any("properties" in row for row in batch)
+            if has_properties:
+                await self.execute_write(
+                    f"UNWIND $batch AS row "
+                    f"MERGE (n:{label_str} {{id: row.id}}) "
+                    f"ON CREATE SET n.name = row.name, n.name_lower = row.name_lower, n += row.properties "
+                    f"ON MATCH SET n += row.properties",
+                    {"batch": batch},
+                )
+            else:
+                await self.execute_write(
+                    f"UNWIND $batch AS row MERGE (n:{label_str} {{id: row.id}}) SET n += row",
+                    {"batch": batch},
+                )
 
     async def batch_merge_relations(
         self,
@@ -158,8 +168,8 @@ class Neo4jClient:
             ]
             await self.execute_write(
                 f"UNWIND $batch AS row "
-                f"MATCH (s:{src_label_str} {{id: row.source_id}}), "
-                f"(t:{tgt_label_str} {{id: row.target_id}}) "
+                f"MATCH (s:{src_label_str} {{id: row.source_id}}) "
+                f"MATCH (t:{tgt_label_str} {{id: row.target_id}}) "
                 f"MERGE (s)-[r:{rel_type_str}]->(t) SET r += row.properties",
                 {"batch": normalized},
             )

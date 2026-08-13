@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,13 +14,11 @@ from src.db.models import Content
 from src.graph.client import Neo4jClient
 from src.graph.builder.reader import PostBatchContext
 from src.graph.ontology import (
-    EntityType,
-    ExtractedEntity,
-    ExtractedRelation,
     OpenSPGExtractionResult,
-    RelationType,
 )
 from src.graph.utils import clean_name_lower
+
+logger = logging.getLogger(__name__)
 
 
 class GraphWriter:
@@ -31,6 +32,7 @@ class GraphWriter:
         extraction_result: OpenSPGExtractionResult,
         context: PostBatchContext,
     ) -> None:
+        t0 = time.perf_counter()
         actor_node = {
             "id": context.author_node_id,
             "account_id": context.account_id,
@@ -73,16 +75,18 @@ class GraphWriter:
             label_str = entity.label.value
             if label_str not in nodes_by_label:
                 nodes_by_label[label_str] = []
-            node_dict: dict[str, Any] = {
+            nodes_by_label[label_str].append({
                 "id": entity.id,
                 "name": entity.name,
                 "name_lower": entity.name_lower,
-            }
-            node_dict.update(entity.properties)
-            nodes_by_label[label_str].append(node_dict)
+                "properties": entity.properties,
+            })
 
+        total_nodes = sum(len(v) for v in nodes_by_label.values())
+        t1 = time.perf_counter()
         for label_str, node_list in nodes_by_label.items():
             await self._neo4j_client.batch_merge_nodes(label_str, node_list)
+        node_elapsed = (time.perf_counter() - t1) * 1000
 
         rel_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for rel in extraction_result.relations:
@@ -95,9 +99,13 @@ class GraphWriter:
                 "properties": rel.properties,
             })
 
+        total_rels = sum(len(v) for v in rel_groups.values())
+        t2 = time.perf_counter()
         for (src_label, tgt_label, rel_type), rels in rel_groups.items():
             await self._neo4j_client.batch_merge_relations(src_label, tgt_label, rel_type, rels)
+        rel_elapsed = (time.perf_counter() - t2) * 1000
 
+        t3 = time.perf_counter()
         async with self._db.async_session() as session:
             async with session.begin():
                 await session.execute(
@@ -108,8 +116,16 @@ class GraphWriter:
                         updated_at=datetime.now(timezone.utc),
                     )
                 )
+        pg_elapsed = (time.perf_counter() - t3) * 1000
 
-        await self._run_post_aggregations(context)
+        total_elapsed = (time.perf_counter() - t0) * 1000
+        logger.debug(
+            "Writer done in %.1fms | nodes: %d (%d labels, %.1fms) | rels: %d (%d types, %.1fms) | PG status=2: %.1fms",
+            total_elapsed, total_nodes, len(nodes_by_label), node_elapsed,
+            total_rels, len(rel_groups), rel_elapsed, pg_elapsed,
+        )
+
+        asyncio.create_task(self._run_post_aggregations(context))
 
     async def _run_post_aggregations(self, context: PostBatchContext) -> None:
         covers_query = (
@@ -124,8 +140,8 @@ class GraphWriter:
         )
         try:
             await self._neo4j_client.execute_write(covers_query, {"author_id": context.author_node_id})
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("COVERS_TOPIC aggregation failed for author %s: %s", context.author_node_id, exc)
 
         profile_query = (
             "MATCH (a:Actor {id: $author_id})-[:PUBLISHED]->(p:Post) "
@@ -157,5 +173,5 @@ class GraphWriter:
         )
         try:
             await self._neo4j_client.execute_write(profile_query, {"author_id": context.author_node_id})
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Actor profile aggregation failed for author %s: %s", context.author_node_id, exc)

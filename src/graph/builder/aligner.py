@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections import OrderedDict
-from typing import Any
 
 from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, RateLimitError
 from qdrant_client import AsyncQdrantClient
+from qdrant_client.http import models
 
 from src.config.config import Settings
 from src.graph.builder.reader import PostBatchContext
@@ -18,6 +20,8 @@ from src.graph.ontology import (
     RelationType,
 )
 from src.graph.utils import clean_name_lower, format_bge_representation
+
+logger = logging.getLogger(__name__)
 
 _L1_CACHE_MAX = 50_000
 _EMBEDDING_RETRIES = 3
@@ -49,6 +53,7 @@ class Aligner:
     async def _get_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
+        t0 = time.perf_counter()
         last_error: Exception | None = None
         for attempt in range(_EMBEDDING_RETRIES):
             try:
@@ -57,39 +62,14 @@ class Aligner:
                     input=texts,
                 )
                 ordered = sorted(response.data, key=lambda item: item.index)
+                elapsed = (time.perf_counter() - t0) * 1000
+                logger.debug("BGE-M3 embedding batch of %d texts done in %.1fms", len(texts), elapsed)
                 return [item.embedding for item in ordered]
             except (APIError, APITimeoutError, APIConnectionError, RateLimitError) as exc:
                 last_error = exc
                 if attempt < _EMBEDDING_RETRIES - 1:
                     await asyncio.sleep(2 ** attempt)
         raise last_error or RuntimeError("Embedding generation failed after all retries")
-
-    async def _search_entities(self, embedding: list[float]) -> list[dict[str, Any]]:
-        response = await self._qdrant_client.query_points(
-            collection_name="social_entities",
-            query=embedding,
-            using="text",
-            limit=1,
-            score_threshold=_ENTITY_SCORE_THRESHOLD,
-            with_payload=True,
-        )
-        return [
-            {"score": hit.score, "id": hit.id, "payload": hit.payload or {}}
-            for hit in response.points
-        ]
-
-    async def _search_categories(self, embedding: list[float]) -> list[dict[str, Any]]:
-        response = await self._qdrant_client.query_points(
-            collection_name="categories",
-            query=embedding,
-            using="text",
-            limit=3,
-            with_payload=True,
-        )
-        return [
-            {"score": hit.score, "payload": hit.payload or {}}
-            for hit in response.points
-        ]
 
     async def _disambiguate_entities(
         self,
@@ -108,31 +88,51 @@ class Aligner:
             return
         if len(embeddings) != len(missed):
             return
+        for entity, emb in zip(missed, embeddings):
+            entity.embedding = emb
+        t0 = time.perf_counter()
         try:
-            results = await asyncio.gather(
-                *[self._search_entities(emb) for emb in embeddings]
+            batch_response = await self._qdrant_client.query_batch_points(
+                collection_name="social_entities",
+                requests=[
+                    models.QueryRequest(
+                        query=emb,
+                        using="text",
+                        limit=1,
+                        score_threshold=_ENTITY_SCORE_THRESHOLD,
+                        with_payload=True,
+                    )
+                    for emb in embeddings
+                ],
             )
         except Exception:
             return
-        for entity, hits in zip(missed, results):
+        qdrant_elapsed = (time.perf_counter() - t0) * 1000
+        resolved = 0
+        for entity, response in zip(missed, batch_response):
             if not entity.id or entity.id in id_map:
                 continue
-            if not hits:
+            if not response.points:
                 continue
-            hit = hits[0]
-            if hit["score"] < _ENTITY_SCORE_THRESHOLD:
+            hit = response.points[0]
+            if hit.score < _ENTITY_SCORE_THRESHOLD:
                 continue
-            payload = hit["payload"]
+            payload = hit.payload or {}
             canonical_id = (
                 payload.get("id")
                 or payload.get("original_id")
-                or str(hit["id"])
+                or str(hit.id)
             )
             if not canonical_id:
                 continue
             key = f"{entity.label.value}:{clean_name_lower(entity.name)}"
             self._cache_set(key, canonical_id)
             id_map[entity.id] = canonical_id
+            resolved += 1
+        logger.debug(
+            "Qdrant social_entities search for %d entities done in %.1fms, resolved %d",
+            len(missed), qdrant_elapsed, resolved,
+        )
 
     async def _link_microconcepts(
         self,
@@ -150,17 +150,33 @@ class Aligner:
             return
         if len(embeddings) != len(microconcepts):
             return
+        t0 = time.perf_counter()
         try:
-            results = await asyncio.gather(
-                *[self._search_categories(emb) for emb in embeddings]
+            batch_response = await self._qdrant_client.query_batch_points(
+                collection_name="iab_categories",
+                requests=[
+                    models.QueryRequest(
+                        query=emb,
+                        using="text",
+                        limit=3,
+                        with_payload=True,
+                    )
+                    for emb in embeddings
+                ],
             )
         except Exception:
             return
-        for mc, candidates in zip(microconcepts, results):
+        qdrant_elapsed = (time.perf_counter() - t0) * 1000
+        linked = 0
+        for mc, response in zip(microconcepts, batch_response):
             if not mc.id:
                 continue
-            if not candidates:
+            if not response.points:
                 continue
+            candidates = [
+                {"score": hit.score, "payload": hit.payload or {}}
+                for hit in response.points
+            ]
             chosen = candidates[0]
             if (
                 len(candidates) >= 2
@@ -201,12 +217,18 @@ class Aligner:
                     relation_type=RelationType.BELONGS_TO,
                 )
             )
+            linked += 1
+        logger.debug(
+            "Qdrant iab_categories search for %d microconcepts done in %.1fms, linked %d",
+            len(microconcepts), qdrant_elapsed, linked,
+        )
 
     async def align(
         self,
         extraction_result: OpenSPGExtractionResult,
         context: PostBatchContext,
     ) -> OpenSPGExtractionResult:
+        t0 = time.perf_counter()
         id_map: dict[str, str] = {}
 
         non_micro = [
@@ -214,6 +236,7 @@ class Aligner:
             if e.label != EntityType.MicroConcept
         ]
 
+        l1_hits = 0
         missed: list[ExtractedEntity] = []
         for entity in non_micro:
             if not entity.id:
@@ -222,12 +245,16 @@ class Aligner:
             cached = self._l1_cache.get(key)
             if cached is not None:
                 id_map[entity.id] = cached
+                l1_hits += 1
             else:
                 missed.append(entity)
 
+        neo4j_elapsed = 0.0
         if missed:
             missed_ids = [e.id for e in missed if e.id]
+            t1 = time.perf_counter()
             existing_ids = await self._neo4j_client.lookup_existing_ids(missed_ids)
+            neo4j_elapsed = (time.perf_counter() - t1) * 1000
             for entity in missed:
                 if entity.id and entity.id in existing_ids:
                     key = f"{entity.label.value}:{clean_name_lower(entity.name)}"
@@ -281,4 +308,11 @@ class Aligner:
             deduped_relations.append(relation)
         extraction_result.relations = deduped_relations
 
+        total_elapsed = (time.perf_counter() - t0) * 1000
+        l1_miss = len(missed)
+        logger.debug(
+            "Aligner done in %.1fms | L1 cache: %d hit, %d miss | Neo4j lookup: %.1fms | entities: %d, relations: %d",
+            total_elapsed, l1_hits, l1_miss, neo4j_elapsed,
+            len(extraction_result.entities), len(extraction_result.relations),
+        )
         return extraction_result
