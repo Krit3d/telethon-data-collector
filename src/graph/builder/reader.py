@@ -23,7 +23,6 @@ class PostBatchContext(BaseModel):
     author_node_id: str
     platform: str
     platform_id: str
-    location_name: str | None
     content: str | None
     transcription: str | None
     published_at: datetime
@@ -31,29 +30,10 @@ class PostBatchContext(BaseModel):
     account_category_path: str | None
     author_title: str
     author_username: str | None
+    author_biography: str | None = None
     post_type: str
     is_video: bool
     raw_metadata: dict[str, Any] | None
-
-
-def _extract_location_name(content_raw: dict[str, Any], account_raw: dict[str, Any]) -> str | None:
-    _cg = content_raw.get("geo_data")
-    content_geo = _cg if isinstance(_cg, dict) else {}
-    if content_geo.get("name"):
-        return str(content_geo["name"])
-    _ag = account_raw.get("geo_data")
-    account_geo = _ag if isinstance(_ag, dict) else {}
-    city = account_geo.get("city")
-    country = account_geo.get("country")
-    if city and country:
-        return f"{city}, {country}"
-    if city:
-        return str(city)
-    if country:
-        return str(country)
-    if account_raw.get("location"):
-        return str(account_raw["location"])
-    return None
 
 
 class Reader:
@@ -119,7 +99,6 @@ class Reader:
                         platform_id = account.platform_id
                         content_raw = row.raw_metadata if isinstance(row.raw_metadata, dict) else {}
                         account_raw = account.raw_metadata if isinstance(account.raw_metadata, dict) else {}
-                        location_name = _extract_location_name(content_raw, account_raw)
                         author_node_id = build_node_id(
                             "Actor", "", platform=platform, account_id=row.account_id
                         )
@@ -139,7 +118,6 @@ class Reader:
                                 author_node_id=author_node_id,
                                 platform=platform,
                                 platform_id=platform_id,
-                                location_name=location_name,
                                 content=row.content,
                                 transcription=row.transcription,
                                 published_at=row.published_at,
@@ -147,6 +125,7 @@ class Reader:
                                 account_category_path=account.category_path,
                                 author_title=account.title or account.username or f"Account_{account.id}",
                                 author_username=account.username,
+                                author_biography=account.description,
                                 post_type=post_type,
                                 is_video=is_video,
                                 raw_metadata=row.raw_metadata,

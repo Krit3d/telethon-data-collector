@@ -145,7 +145,7 @@ class Neo4jClient:
         for i in range(0, len(ids), batch_size):
             batch = ids[i:i + batch_size]
             rows = await self.execute_read(
-                "MATCH (n) WHERE n.id IN $ids RETURN n.id AS id",
+                "MATCH (n:Actor|Post|Entity|Organization|Product|Concept|Event|MicroConcept|Hashtag) WHERE n.id IN $ids RETURN n.id AS id",
                 {"ids": batch},
             )
             result.update(row["id"] for row in rows)
@@ -159,7 +159,6 @@ class Neo4jClient:
             EntityType.Entity.value,
             EntityType.Organization.value,
             EntityType.Product.value,
-            EntityType.Place.value,
             EntityType.Event.value,
         })
         is_domain_entity = label_str in domain_entity_values
@@ -168,8 +167,8 @@ class Neo4jClient:
             if is_domain_entity:
                 await self.execute_write(
                     f"UNWIND $batch AS row MERGE (n:{label_str} {{id: row.id}}) "
-                    f"ON CREATE SET n.mentions_count = 1, n += row "
-                    f"ON MATCH SET n.mentions_count = COALESCE(n.mentions_count, 0) + 1, n += row",
+                    f"ON CREATE SET n += row, n.mentions_count = coalesce(row.mentions_count, 1) "
+                    f"ON MATCH SET n += row, n.mentions_count = coalesce(n.mentions_count, 0) + 1",
                     {"batch": batch},
                 )
             else:
@@ -199,8 +198,8 @@ class Neo4jClient:
             ]
             await self.execute_write(
                 f"UNWIND $batch AS row "
-                f"MATCH (s {{id: row.source_id}}) "
-                f"MATCH (t {{id: row.target_id}}) "
+                f"MATCH (s:{src_label_str} {{id: row.source_id}}) "
+                f"MATCH (t:{tgt_label_str} {{id: row.target_id}}) "
                 f"MERGE (s)-[r:{rel_type_str}]->(t) SET r += row.properties",
                 {"batch": normalized},
             )

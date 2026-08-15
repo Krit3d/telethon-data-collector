@@ -9,10 +9,10 @@ from typing import Any
 
 from src.graph.ontology import EntityType
 
-
 _NON_ALNUM_WS_RE = re.compile(r"[^\w\s]")
 _MULTI_WS_RE = re.compile(r"\s+")
 _HASHTAG_RE = re.compile(r"#\w+")
+_HASHTAG_EXTRACT_RE = re.compile(r"#([\w_]+)")
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 
 _SYSTEM_GARBAGE: frozenset[str] = frozenset({
@@ -38,12 +38,6 @@ _POST_GARBAGE: frozenset[str] = frozenset({
 _ENTITY_GARBAGE: frozenset[str] = frozenset({
     "entity", "entities", "object", "term", "person",
     "сущность", "сущности", "объект", "термин", "понятие", "персоналия",
-})
-
-_PLACE_GARBAGE: frozenset[str] = frozenset({
-    "place", "places", "location", "city", "country", "region", "venue",
-    "место", "места", "локация", "локации", "город", "страна", "регион",
-    "геометка", "местоположение",
 })
 
 _ORGANIZATION_GARBAGE: frozenset[str] = frozenset({
@@ -74,16 +68,6 @@ _CONCEPT_GARBAGE: frozenset[str] = frozenset({
     "концепт", "категория", "категории", "рубрика", "таксономия",
 })
 
-_TONE_GARBAGE: frozenset[str] = frozenset({
-    "tone", "style", "sentiment",
-    "тон", "тональность", "стиль", "подача",
-})
-
-_LANGUAGE_GARBAGE: frozenset[str] = frozenset({
-    "language", "lang",
-    "язык", "язык контента",
-})
-
 _HASHTAG_GARBAGE: frozenset[str] = frozenset({
     "hashtag", "hashtags", "tag",
     "хештег", "хэштег", "метки",
@@ -94,14 +78,11 @@ _GARBAGE_WORDS: frozenset[str] = (
     | _ACTOR_GARBAGE
     | _POST_GARBAGE
     | _ENTITY_GARBAGE
-    | _PLACE_GARBAGE
     | _ORGANIZATION_GARBAGE
     | _PRODUCT_GARBAGE
     | _EVENT_GARBAGE
     | _MICROCONCEPT_GARBAGE
     | _CONCEPT_GARBAGE
-    | _TONE_GARBAGE
-    | _LANGUAGE_GARBAGE
     | _HASHTAG_GARBAGE
 )
 
@@ -109,14 +90,11 @@ _LABEL_GARBAGE_MAP: dict[EntityType, frozenset[str]] = {
     EntityType.Actor: _ACTOR_GARBAGE,
     EntityType.Post: _POST_GARBAGE,
     EntityType.Entity: _ENTITY_GARBAGE,
-    EntityType.Place: _PLACE_GARBAGE,
     EntityType.Organization: _ORGANIZATION_GARBAGE,
     EntityType.Product: _PRODUCT_GARBAGE,
     EntityType.Event: _EVENT_GARBAGE,
     EntityType.MicroConcept: _MICROCONCEPT_GARBAGE,
     EntityType.Concept: _CONCEPT_GARBAGE,
-    EntityType.Tone: _TONE_GARBAGE,
-    EntityType.Language: _LANGUAGE_GARBAGE,
     EntityType.Hashtag: _HASHTAG_GARBAGE,
 }
 
@@ -179,7 +157,6 @@ def build_node_id(
     platform: str | None = None,
     account_id: int | None = None,
     content_id: int | None = None,
-    country_code: str | None = None,
 ) -> str:
     label_str = _resolve_label(label)
     match label_str:
@@ -191,18 +168,8 @@ def build_node_id(
             if platform is None or account_id is None or content_id is None:
                 raise ValueError("platform, account_id, and content_id are required for Post")
             return f"event_publication_{platform}_{account_id}_{content_id}"
-        case "Place":
-            if country_code is not None:
-                place_key = f"{clean_name_lower(key)}_{country_code.strip().lower()}"
-            else:
-                place_key = clean_name_lower(key)
-            return f"place_{generate_uuid5('place', place_key)}"
         case "Concept":
             return f"concept_{key.strip()}"
-        case "Tone":
-            return f"tone_{clean_identifier(key)}"
-        case "Language":
-            return f"lang_{key.strip().lower()}"
         case "Hashtag":
             return f"hashtag_{clean_identifier(key)}"
         case "Entity":
@@ -218,18 +185,51 @@ def build_node_id(
     raise ValueError(f"Unsupported node label for ID generation: {label_str}")
 
 
-def format_bge_representation(label: str, name: str, properties: dict[str, Any] | None = None) -> str:
-    parts = [f"{label}: {name}"]
-    if properties:
-        for k in sorted(properties):
-            v = properties[k]
-            if v is not None and v != "":
-                parts.append(f"{k}: {v}")
-    return ", ".join(parts)
+def format_bge_representation(label: str, name: str, subtype: str | None = None) -> str:
+    if subtype:
+        return f"{label}: {name} ({subtype})"
+    return f"{label}: {name}"
 
 
 def extract_hashtags(text: str) -> list[str]:
-    return list({clean_identifier(h) for h in _HASHTAG_RE.findall(text)})
+    return _HASHTAG_RE.findall(text)
+
+
+def extract_raw_hashtags(
+    text: str | None,
+    raw_metadata_hashtags: list[str] | list[dict[str, Any]] | None = None,
+    author_bio: str | None = None,
+    author_title: str | None = None,
+) -> list[str]:
+    result: set[str] = set()
+
+    def _collect(source: str | None) -> None:
+        if not source:
+            return
+        for match in _HASHTAG_EXTRACT_RE.finditer(source):
+            raw = match.group(1)
+            cleaned = clean_identifier(raw)
+            if cleaned and not is_garbage_value(cleaned, EntityType.Hashtag):
+                result.add(cleaned)
+
+    _collect(text)
+    _collect(author_bio)
+    _collect(author_title)
+
+    if raw_metadata_hashtags:
+        for item in raw_metadata_hashtags:
+            if isinstance(item, str):
+                cleaned = clean_identifier(item)
+                if cleaned and not is_garbage_value(cleaned, EntityType.Hashtag):
+                    result.add(cleaned)
+            elif isinstance(item, dict):
+                for v in item.values():
+                    if isinstance(v, str):
+                        cleaned = clean_identifier(v)
+                        if cleaned and not is_garbage_value(cleaned, EntityType.Hashtag):
+                            result.add(cleaned)
+
+    return sorted(result)
 
 
 _PRIMITIVE_TYPES: tuple[type, ...] = (int, float, str, bool)
@@ -258,3 +258,4 @@ def sanitize_properties(props: dict[str, Any]) -> dict[str, Any]:
         else:
             result[k] = str(v)
     return result
+

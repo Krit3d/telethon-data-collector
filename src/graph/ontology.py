@@ -6,18 +6,18 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.graph.utils import is_garbage_value
+
+
 class EntityType(StrEnum):
     Actor = "Actor"
     Post = "Post"
     Entity = "Entity"
-    Place = "Place"
     Organization = "Organization"
     Product = "Product"
     Concept = "Concept"
     Event = "Event"
     MicroConcept = "MicroConcept"
-    Tone = "Tone"
-    Language = "Language"
     Hashtag = "Hashtag"
 
 
@@ -25,13 +25,9 @@ class RelationType(StrEnum):
     PUBLISHED = "PUBLISHED"
     MENTIONS = "MENTIONS"
     ABOUT = "ABOUT"
-    HAS_TONE = "HAS_TONE"
     BELONGS_TO = "BELONGS_TO"
     COVERS_TOPIC = "COVERS_TOPIC"
     COAUTHOR = "COAUTHOR"
-    TAGGED_AT = "TAGGED_AT"
-    HAS_CONTACT = "HAS_CONTACT"
-    BASED_IN = "BASED_IN"
     WORKS_AT = "WORKS_AT"
     TAGGED_WITH = "TAGGED_WITH"
     MAPS_TO = "MAPS_TO"
@@ -39,10 +35,7 @@ class RelationType(StrEnum):
     PARTICIPATED_IN = "PARTICIPATED_IN"
     USES_TECH = "USES_TECH"
     PRODUCES = "PRODUCES"
-    TARGETS = "TARGETS"
-    LOCATED_IN = "LOCATED_IN"
-    HAS_LANGUAGE = "HAS_LANGUAGE"
-    IS_A = "IS_A"
+    PARENT_OF = "PARENT_OF"
 
 
 class PlatformType(StrEnum):
@@ -55,21 +48,21 @@ class PlatformType(StrEnum):
 
 class PostType(StrEnum):
     post = "post"
-    reels = "reel"
+    reel = "reel"
     shorts = "short"
     tiktok = "tiktok"
     video = "video"
 
 
 class ToneType(StrEnum):
-    Analytical = "Analytical"
-    Provocative = "Provocative"
-    Expert = "Expert"
-    Hype_Train = "Hype_Train"
-    Sell_Courses = "Sell_Courses"
-    Educational = "Educational"
-    Entertainment = "Entertainment"
-    Casual = "Casual"
+    analytical = "analytical"
+    expert = "expert"
+    provocative = "provocative"
+    educational = "educational"
+    entertainment = "entertainment"
+    casual = "casual"
+    hype_train = "hype_train"
+    sell_courses = "sell_courses"
 
 
 class HormoneType(StrEnum):
@@ -120,11 +113,126 @@ class EventType(StrEnum):
     trend = "trend"
 
 
-class PlaceType(StrEnum):
-    city = "city"
-    country = "country"
-    region = "region"
-    venue = "venue"
+class RoleType(StrEnum):
+    founder = "founder"
+    executive = "executive"
+    employee = "employee"
+    ambassador = "ambassador"
+    advisor = "advisor"
+
+
+class RelationSubtype(StrEnum):
+    creator = "creator"
+    promoter = "promoter"
+    affiliate = "affiliate"
+    vendor = "vendor"
+    publisher = "publisher"
+    distributor = "distributor"
+    sponsor = "sponsor"
+
+
+RELATION_DOMAIN_RANGE_MAP: dict[RelationType, dict[str, set[EntityType]]] = {
+    RelationType.PARTICIPATED_IN: {
+        "sources": {EntityType.Actor, EntityType.Entity},
+        "targets": {EntityType.Event},
+    },
+    RelationType.WORKS_AT: {
+        "sources": {EntityType.Actor, EntityType.Entity},
+        "targets": {EntityType.Organization},
+    },
+    RelationType.PRODUCES: {
+        "sources": {EntityType.Organization, EntityType.Actor},
+        "targets": {EntityType.Product},
+    },
+    RelationType.USES_TECH: {
+        "sources": {EntityType.Actor, EntityType.Post},
+        "targets": {EntityType.Product, EntityType.Entity},
+    },
+    RelationType.MENTIONS: {
+        "sources": {EntityType.Post},
+        "targets": {
+            EntityType.Entity,
+            EntityType.Organization,
+            EntityType.Product,
+            EntityType.Event,
+        },
+    },
+    RelationType.ABOUT: {
+        "sources": {EntityType.Post},
+        "targets": {EntityType.MicroConcept},
+    },
+    RelationType.TAGGED_WITH: {
+        "sources": {EntityType.Post},
+        "targets": {EntityType.Hashtag},
+    },
+    RelationType.MAPS_TO: {
+        "sources": {EntityType.Hashtag},
+        "targets": {
+            EntityType.Product,
+            EntityType.Entity,
+            EntityType.Organization,
+            EntityType.Event,
+        },
+    },
+    RelationType.BELONGS_TO: {
+        "sources": {
+            EntityType.Actor,
+            EntityType.Entity,
+            EntityType.Product,
+            EntityType.Organization,
+            EntityType.Event,
+            EntityType.Hashtag,
+            EntityType.MicroConcept,
+        },
+        "targets": {EntityType.MicroConcept, EntityType.Concept},
+    },
+    RelationType.PARENT_OF: {
+        "sources": {EntityType.Concept},
+        "targets": {EntityType.Concept},
+    },
+    RelationType.COVERS_TOPIC: {
+        "sources": {EntityType.Actor},
+        "targets": {EntityType.Concept, EntityType.MicroConcept},
+    },
+    RelationType.COAUTHOR: {
+        "sources": {EntityType.Actor},
+        "targets": {EntityType.Actor},
+    },
+    RelationType.RELATED_TO: {
+        "sources": {EntityType.Entity},
+        "targets": {EntityType.Entity, EntityType.Organization, EntityType.Product},
+    },
+    RelationType.PUBLISHED: {
+        "sources": {EntityType.Actor},
+        "targets": {EntityType.Post},
+    },
+}
+
+def validate_and_repair_relation(
+    source_id: str,
+    source_label: EntityType,
+    target_id: str,
+    target_label: EntityType,
+    relation_type: RelationType,
+) -> tuple[str, EntityType, str, EntityType, RelationType] | None:
+    if source_id == target_id:
+        return None
+    rule = RELATION_DOMAIN_RANGE_MAP.get(relation_type)
+    if rule is None:
+        return (source_id, source_label, target_id, target_label, RelationType.RELATED_TO)
+    if source_label in rule["sources"] and target_label in rule["targets"]:
+        return (source_id, source_label, target_id, target_label, relation_type)
+    if (
+        relation_type == RelationType.PARTICIPATED_IN
+        and source_label == EntityType.Organization
+        and target_label in {EntityType.Actor, EntityType.Entity}
+    ):
+        return (target_id, target_label, source_id, source_label, RelationType.WORKS_AT)
+    if target_label in rule["sources"] and source_label in rule["targets"]:
+        return (target_id, target_label, source_id, source_label, relation_type)
+    if source_label == EntityType.Post:
+        return (source_id, source_label, target_id, target_label, RelationType.MENTIONS)
+    return (source_id, source_label, target_id, target_label, RelationType.RELATED_TO)
 
 
 def _clean_name(name: str) -> str:
@@ -132,6 +240,50 @@ def _clean_name(name: str) -> str:
     cleaned = cleaned.replace("_", " ")
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
+
+
+def is_author_entity(entity_name: str, author_title: str, author_handle: str) -> bool:
+    def _clean(value: str) -> str:
+        return re.sub(r"[^\w\s]", "", str(value or "")).strip().lower()
+
+    clean_entity = _clean(entity_name)
+    clean_title = _clean(author_title)
+    clean_handle = _clean(author_handle)
+    if not clean_entity or not clean_title:
+        return False
+    if clean_entity == clean_title:
+        return True
+    if clean_handle and (clean_entity == clean_handle or clean_handle in clean_entity):
+        return True
+    entity_tokens = [t for t in clean_entity.split() if len(t) >= 3]
+    title_tokens = [t for t in clean_title.split() if len(t) >= 3]
+    if not entity_tokens or not title_tokens:
+        return False
+    title_prefixes = {t[:3] for t in title_tokens}
+    if not title_prefixes:
+        return False
+    matched = sum(1 for t in entity_tokens if t[:3] in title_prefixes)
+    return matched / len(entity_tokens) >= 0.5 or matched / len(title_tokens) >= 0.5
+
+
+def extract_entity_subtype(label: EntityType | str, properties: dict[str, Any]) -> tuple[str | None, str | None]:
+    if label == EntityType.Entity:
+        val = properties.get("entity_type")
+        if val is not None:
+            return ("entity_type", str(val))
+    if label == EntityType.Organization:
+        val = properties.get("org_type")
+        if val is not None:
+            return ("org_type", str(val))
+    if label == EntityType.Product:
+        val = properties.get("product_type")
+        if val is not None:
+            return ("product_type", str(val))
+    if label == EntityType.Event:
+        val = properties.get("event_type")
+        if val is not None:
+            return ("event_type", str(val))
+    return (None, None)
 
 
 class ActorNode(BaseModel):
@@ -145,9 +297,10 @@ class ActorNode(BaseModel):
     platform_id: str
     primary_language: str = "ru"
     primary_sentiment: SentimentType = SentimentType.neutral
-    primary_tone: ToneType = ToneType.Casual
+    primary_tone: ToneType = ToneType.casual
     primary_hormone: HormoneType = HormoneType.dopamine
     secondary_hormone: HormoneType | None = None
+    secondary_tone: ToneType | None = None
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> ActorNode:
@@ -187,24 +340,6 @@ class EntityNode(BaseModel):
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> EntityNode:
-        self.name_lower = _clean_name(self.name)
-        return self
-
-
-class PlaceNode(BaseModel):
-    id: str | None = None
-    name: str
-    name_lower: str | None = None
-    city: str | None = None
-    country: str | None = None
-    country_code: str | None = None
-    latitude: float | None = None
-    longitude: float | None = None
-    place_type: PlaceType = PlaceType.venue
-    region: str | None = None
-
-    @model_validator(mode="after")
-    def _fill_name_lower(self) -> PlaceNode:
         self.name_lower = _clean_name(self.name)
         return self
 
@@ -274,29 +409,6 @@ class ConceptNode(BaseModel):
         return self
 
 
-class ToneNode(BaseModel):
-    id: str
-    name: ToneType
-    name_lower: str | None = None
-
-    @model_validator(mode="after")
-    def _fill_name_lower(self) -> ToneNode:
-        self.name_lower = _clean_name(str(self.name))
-        return self
-
-
-class LanguageNode(BaseModel):
-    id: str
-    code: str
-    name: str
-    name_lower: str | None = None
-
-    @model_validator(mode="after")
-    def _fill_name_lower(self) -> LanguageNode:
-        self.name_lower = _clean_name(self.name)
-        return self
-
-
 class HashtagNode(BaseModel):
     id: str
     name: str
@@ -306,6 +418,11 @@ class HashtagNode(BaseModel):
     def _fill_name_lower(self) -> HashtagNode:
         self.name_lower = _clean_name(self.name)
         return self
+
+
+class HashtagItem(BaseModel):
+    raw: str
+    normalized: str
 
 
 class ExtractedEntity(BaseModel):
@@ -334,14 +451,22 @@ class ExtractedRelation(BaseModel):
     confidence: float = 1.0
 
     @model_validator(mode="after")
-    def _reject_self_reference(self) -> ExtractedRelation:
-        if self.source_id == self.target_id:
+    def _validate_and_repair(self) -> ExtractedRelation:
+        repaired = validate_and_repair_relation(
+            self.source_id,
+            self.source_label,
+            self.target_id,
+            self.target_label,
+            self.relation_type,
+        )
+        if repaired is None:
             raise ValueError(f"Self-referencing relation rejected: {self.source_id} -> {self.target_id}")
+        self.source_id, self.source_label, self.target_id, self.target_label, self.relation_type = repaired
         return self
 
 
 class ExtractedPsychographics(BaseModel):
-    language: str = "ru"
+    language: str | None = None
     sentiment: SentimentType = SentimentType.neutral
     primary_tone: ToneType
     secondary_tones: list[ToneType] = []
@@ -351,36 +476,13 @@ class ExtractedPsychographics(BaseModel):
     intent: str = ""
 
 
-def is_author_entity(entity_name: str, author_title: str, author_handle: str) -> bool:
-    def _clean(value: str) -> str:
-        return re.sub(r"[^\w\s]", "", str(value or "")).strip().lower()
-
-    clean_entity = _clean(entity_name)
-    clean_title = _clean(author_title)
-    clean_handle = _clean(author_handle)
-    if not clean_entity or not clean_title:
-        return False
-    if clean_entity == clean_title:
-        return True
-    if clean_handle and (clean_entity == clean_handle or clean_handle in clean_entity):
-        return True
-    entity_tokens = [t for t in clean_entity.split() if len(t) >= 3]
-    title_tokens = [t for t in clean_title.split() if len(t) >= 3]
-    if not entity_tokens or not title_tokens:
-        return False
-    title_prefixes = {t[:3] for t in title_tokens}
-    if not title_prefixes:
-        return False
-    matched = sum(1 for t in entity_tokens if t[:3] in title_prefixes)
-    return matched / len(entity_tokens) >= 0.5 or matched / len(title_tokens) >= 0.5
-
-
 class OpenSPGExtractionResult(BaseModel):
     thinking: str = ""
     entities: list[ExtractedEntity] = []
     relations: list[ExtractedRelation] = []
     psychographics: ExtractedPsychographics
     is_spam_or_gambling: bool = False
+    hashtags: list[HashtagItem] = []
 
     def sanitize_and_validate(
         self,
@@ -406,5 +508,36 @@ class OpenSPGExtractionResult(BaseModel):
             if e.id:
                 valid_ids.add(e.id)
         self.entities = clean_entities
-        self.relations = [r for r in self.relations if r.source_id in valid_ids and r.target_id in valid_ids]
+        clean_relations: list[ExtractedRelation] = []
+        for r in self.relations:
+            if r.source_id not in valid_ids or r.target_id not in valid_ids:
+                continue
+            repaired = validate_and_repair_relation(
+                r.source_id,
+                r.source_label,
+                r.target_id,
+                r.target_label,
+                r.relation_type,
+            )
+            if repaired is None:
+                continue
+            r.source_id, r.source_label, r.target_id, r.target_label, r.relation_type = repaired
+            clean_relations.append(r)
+        self.relations = clean_relations
+        clean_hashtags: list[HashtagItem] = []
+        for h in self.hashtags:
+            if not h.raw or not h.normalized:
+                continue
+            if is_garbage_value(h.raw, EntityType.Hashtag) or is_garbage_value(h.normalized, EntityType.Hashtag):
+                continue
+            clean_hashtags.append(h)
+        self.hashtags = clean_hashtags
         return self
+
+
+VECTORIZABLE_ENTITY_LABELS: frozenset[EntityType] = frozenset({
+    EntityType.Entity,
+    EntityType.Organization,
+    EntityType.Product,
+    EntityType.Event,
+})

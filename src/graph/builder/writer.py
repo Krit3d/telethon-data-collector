@@ -14,7 +14,6 @@ from src.db.models import Content
 from src.graph.client import Neo4jClient
 from src.graph.builder.reader import PostBatchContext
 from src.graph.ontology import (
-    EntityType,
     OpenSPGExtractionResult,
 )
 from src.graph.utils import clean_name_lower, sanitize_properties
@@ -62,7 +61,6 @@ class GraphWriter:
                 "handle": context.author_username,
                 "platform": context.platform,
                 "platform_id": context.platform_id,
-                "location_name": context.location_name,
             })
 
             post_node = sanitize_properties({
@@ -72,8 +70,8 @@ class GraphWriter:
                 "published_at": int(context.published_at.timestamp()),
                 "platform": context.platform,
                 "post_type": context.post_type,
-                "language": extraction_result.psychographics.language or "ru",
-                "sentiment": extraction_result.psychographics.sentiment or "neutral",
+                "language": extraction_result.psychographics.language,
+                "sentiment": extraction_result.psychographics.sentiment.value if extraction_result.psychographics.sentiment else None,
                 "tone": extraction_result.psychographics.primary_tone.value,
                 "secondary_tone": extraction_result.psychographics.secondary_tones[0].value if extraction_result.psychographics.secondary_tones else None,
                 "primary_hormone": extraction_result.psychographics.primary_hormone.value,
@@ -96,10 +94,6 @@ class GraphWriter:
                     continue
                 label_str = entity.label.value
                 props = sanitize_properties(dict(entity.properties))
-                if label_str == EntityType.Entity.value:
-                    props.pop("mentions_count", None)
-                else:
-                    props.setdefault("mentions_count", 1)
                 node_dict = {"id": entity.id, "name": entity.name, "name_lower": entity.name_lower}
                 node_dict.update(props)
                 nodes_by_label.setdefault(label_str, []).append(node_dict)
@@ -152,13 +146,15 @@ class GraphWriter:
     async def _run_post_aggregations(self, author_id: str) -> None:
         covers_query = (
             "MATCH (a:Actor {id: $author_id})-[:PUBLISHED]->(p:Post) "
-            "OPTIONAL MATCH (p)-[:ABOUT]->(mc:MicroConcept)-[:BELONGS_TO]->(c:Concept) "
-            "OPTIONAL MATCH (p)-[:ABOUT]->(c2:Concept) "
-            "WITH a, p, COLLECT(DISTINCT c) + COLLECT(DISTINCT c2) AS concepts "
-            "UNWIND concepts AS concept "
-            "WITH a, concept, COUNT(DISTINCT p) AS post_count "
+            "WITH a, COUNT(p) AS total_posts "
+            "MATCH (a)-[:PUBLISHED]->(p:Post) "
+            "OPTIONAL MATCH (p)-[:ABOUT]->(:MicroConcept)-[:BELONGS_TO]->(concept:Concept) "
+            "WITH a, total_posts, concept, COUNT(DISTINCT p) AS post_count "
             "WHERE concept IS NOT NULL AND post_count >= 2 "
-            "MERGE (a)-[r:COVERS_TOPIC]->(concept)"
+            "MERGE (a)-[r:COVERS_TOPIC]->(concept) "
+            "SET r.posts_count = post_count, "
+            "    r.weight = toFloat(post_count) / total_posts, "
+            "    r.last_updated = timestamp()"
         )
         try:
             await self._neo4j_client.execute_write(covers_query, {"author_id": author_id})
@@ -166,41 +162,77 @@ class GraphWriter:
             logger.warning("COVERS_TOPIC aggregation failed for author %s: %s", author_id, exc)
 
         profile_query = (
-            "OPTIONAL MATCH (a:Actor {id: $author_id})-[:PUBLISHED]->(p:Post) "
-            "WITH a, p ORDER BY p.published_at DESC LIMIT 30 "
-            "WITH a, [x IN COLLECT(p) WHERE x IS NOT NULL] AS posts "
+            "MATCH (a:Actor {id: $author_id})-[:PUBLISHED]->(p:Post) "
+            "WITH a, COLLECT(p) AS posts "
             "WITH a, posts, "
-            "  [p IN posts WHERE p.language IS NOT NULL | p.language] AS languages, "
-            "  [p IN posts WHERE p.sentiment IS NOT NULL | p.sentiment] AS sentiments, "
-            "  [p IN posts WHERE p.tone IS NOT NULL | p.tone] AS tones, "
-            "  [p IN posts WHERE p.primary_hormone IS NOT NULL | p.primary_hormone] AS primary_hormones, "
-            "  [p IN posts WHERE p.secondary_hormone IS NOT NULL | p.secondary_hormone] AS secondary_hormones "
-            "WITH a, languages, sentiments, tones, primary_hormones, secondary_hormones, "
-            "  CASE WHEN SIZE(languages) > 0 "
-            "    THEN REDUCE(m = HEAD(languages), v IN TAIL(languages) | "
-            "      CASE WHEN SIZE([x IN languages WHERE x = v]) > SIZE([x IN languages WHERE x = m]) THEN v ELSE m END) "
-            "    ELSE NULL END AS dominant_language, "
-            "  CASE WHEN SIZE(sentiments) > 0 "
-            "    THEN REDUCE(m = HEAD(sentiments), v IN TAIL(sentiments) | "
-            "      CASE WHEN SIZE([x IN sentiments WHERE x = v]) > SIZE([x IN sentiments WHERE x = m]) THEN v ELSE m END) "
-            "    ELSE NULL END AS dominant_sentiment, "
-            "  CASE WHEN SIZE(tones) > 0 "
-            "    THEN REDUCE(m = HEAD(tones), v IN TAIL(tones) | "
-            "      CASE WHEN SIZE([x IN tones WHERE x = v]) > SIZE([x IN tones WHERE x = m]) THEN v ELSE m END) "
-            "    ELSE NULL END AS dominant_tone, "
-            "  CASE WHEN SIZE(primary_hormones) > 0 "
-            "    THEN REDUCE(m = HEAD(primary_hormones), v IN TAIL(primary_hormones) | "
-            "      CASE WHEN SIZE([x IN primary_hormones WHERE x = v]) > SIZE([x IN primary_hormones WHERE x = m]) THEN v ELSE m END) "
-            "    ELSE NULL END AS dominant_primary_hormone, "
-            "  CASE WHEN SIZE(secondary_hormones) > 0 "
-            "    THEN REDUCE(m = HEAD(secondary_hormones), v IN TAIL(secondary_hormones) | "
-            "      CASE WHEN SIZE([x IN secondary_hormones WHERE x = v]) > SIZE([x IN secondary_hormones WHERE x = m]) THEN v ELSE m END) "
-            "    ELSE NULL END AS dominant_secondary_hormone "
-            "SET a.primary_language = COALESCE(dominant_language, a.primary_language, 'ru'), "
-            "    a.primary_sentiment = COALESCE(dominant_sentiment, a.primary_sentiment, 'neutral'), "
-            "    a.primary_tone = COALESCE(dominant_tone, a.primary_tone, 'casual'), "
-            "    a.primary_hormone = COALESCE(dominant_primary_hormone, a.primary_hormone, 'dopamine'), "
-            "    a.secondary_hormone = COALESCE(dominant_secondary_hormone, a.secondary_hormone)"
+            "  [x IN posts WHERE x.language IS NOT NULL | x.language] AS langs, "
+            "  [x IN posts WHERE x.sentiment IS NOT NULL | x.sentiment] AS sents "
+            "WITH a, posts, langs, sents "
+            "UNWIND (CASE WHEN SIZE(langs) > 0 THEN langs ELSE [null] END) AS lang "
+            "WITH a, posts, sents, lang, COUNT(*) AS cnt "
+            "ORDER BY cnt DESC "
+            "WITH a, posts, sents, "
+            "  COLLECT(lang) AS lang_order, "
+            "  COLLECT(cnt) AS lang_counts, "
+            "  REDUCE(s = 0, c IN COLLECT(cnt) | s + c) AS total_lang_count "
+            "WITH a, posts, sents, "
+            "  CASE WHEN SIZE(lang_order) > 0 AND lang_counts[0] >= total_lang_count * 0.15 "
+            "    THEN lang_order[0] "
+            "    ELSE NULL END AS primary_language, "
+            "  CASE WHEN SIZE(sents) > 0 "
+            "    THEN REDUCE(m = HEAD(sents), v IN TAIL(sents) | "
+            "      CASE WHEN SIZE([x IN sents WHERE x = v]) > SIZE([x IN sents WHERE x = m]) THEN v ELSE m END) "
+            "    ELSE NULL END AS primary_sentiment, "
+            "  REDUCE(arr = [], p IN posts | "
+            "    arr + CASE WHEN p.tone IS NOT NULL THEN [{v: p.tone, w: 2}] ELSE [] END "
+            "       + CASE WHEN p.secondary_tone IS NOT NULL THEN [{v: p.secondary_tone, w: 1}] ELSE [] END "
+            "  ) AS tone_entries, "
+            "  REDUCE(arr = [], p IN posts | "
+            "    arr + CASE WHEN p.primary_hormone IS NOT NULL THEN [{v: p.primary_hormone, w: 2}] ELSE [] END "
+            "       + CASE WHEN p.secondary_hormone IS NOT NULL THEN [{v: p.secondary_hormone, w: 1}] ELSE [] END "
+            "  ) AS hormone_entries "
+            "UNWIND (CASE WHEN size(tone_entries) > 0 THEN tone_entries ELSE [{v: null, w: 0}] END) AS te "
+            "WITH a, primary_language, primary_sentiment, hormone_entries, te.v AS tone_val, SUM(te.w) AS tone_score "
+            "ORDER BY tone_score DESC "
+            "WITH a, primary_language, primary_sentiment, hormone_entries, "
+            "  COLLECT(tone_val) AS tone_order, COLLECT(tone_score) AS tone_scores "
+            "WITH a, primary_language, primary_sentiment, hormone_entries, tone_order, tone_scores, "
+            "  tone_order[0] AS primary_tone, "
+            "  tone_order[1] AS secondary_tone_candidate, "
+            "  tone_scores[0] AS primary_tone_score, "
+            "  tone_scores[1] AS secondary_tone_score, "
+            "  REDUCE(s = 0, sc IN tone_scores | s + sc) AS total_tone_score "
+            "WITH a, primary_language, primary_sentiment, hormone_entries, "
+            "  primary_tone, "
+            "  CASE WHEN secondary_tone_candidate IS NOT NULL AND total_tone_score > 0 "
+            "       AND toFloat(secondary_tone_score) / total_tone_score >= 0.15 "
+            "    THEN secondary_tone_candidate "
+            "    ELSE NULL END AS secondary_tone "
+            "UNWIND (CASE WHEN size(hormone_entries) > 0 THEN hormone_entries ELSE [{v: null, w: 0}] END) AS he "
+            "WITH a, primary_language, primary_sentiment, primary_tone, secondary_tone, "
+            "  he.v AS hormone_val, SUM(he.w) AS hormone_score "
+            "ORDER BY hormone_score DESC "
+            "WITH a, primary_language, primary_sentiment, primary_tone, secondary_tone, "
+            "  COLLECT(hormone_val) AS hormone_order, COLLECT(hormone_score) AS hormone_scores "
+            "WITH a, primary_language, primary_sentiment, primary_tone, secondary_tone, "
+            "  hormone_order, hormone_scores, "
+            "  hormone_order[0] AS primary_hormone, "
+            "  hormone_order[1] AS secondary_hormone_candidate, "
+            "  hormone_scores[0] AS primary_hormone_score, "
+            "  hormone_scores[1] AS secondary_hormone_score, "
+            "  REDUCE(s = 0, sc IN hormone_scores | s + sc) AS total_hormone_score "
+            "WITH a, primary_language, primary_sentiment, primary_tone, secondary_tone, "
+            "  primary_hormone, "
+            "  CASE WHEN secondary_hormone_candidate IS NOT NULL AND total_hormone_score > 0 "
+            "       AND toFloat(secondary_hormone_score) / total_hormone_score >= 0.15 "
+            "    THEN secondary_hormone_candidate "
+            "    ELSE NULL END AS secondary_hormone "
+            "SET a.primary_language = COALESCE(primary_language, a.primary_language, 'ru'), "
+            "    a.primary_sentiment = COALESCE(primary_sentiment, a.primary_sentiment), "
+            "    a.primary_tone = COALESCE(primary_tone, a.primary_tone), "
+            "    a.secondary_tone = secondary_tone, "
+            "    a.primary_hormone = COALESCE(primary_hormone, a.primary_hormone), "
+            "    a.secondary_hormone = secondary_hormone"
         )
         try:
             await self._neo4j_client.execute_write(profile_query, {"author_id": author_id})

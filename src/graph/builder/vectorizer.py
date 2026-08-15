@@ -11,19 +11,13 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import PointStruct
 
 from src.config.config import Settings
-from src.graph.ontology import EntityType, OpenSPGExtractionResult
+from src.graph.ontology import EntityType, OpenSPGExtractionResult, VECTORIZABLE_ENTITY_LABELS, extract_entity_subtype
 from src.graph.utils import format_bge_representation
 
 logger = logging.getLogger(__name__)
 
 
 _EMBEDDING_RETRIES = 3
-_EXCLUDED_LABELS: frozenset[EntityType] = frozenset({
-    EntityType.Concept,
-    EntityType.Tone,
-    EntityType.Language,
-    EntityType.Hashtag,
-})
 
 
 class EntityVectorizer:
@@ -40,36 +34,36 @@ class EntityVectorizer:
         self._model = settings.cloud_ru_embedding_model
 
     async def vectorize_and_upsert_entities(self, extraction_result: OpenSPGExtractionResult) -> None:
-        entities = [e for e in extraction_result.entities if e.label not in _EXCLUDED_LABELS]
+        entities = [e for e in extraction_result.entities if e.label in VECTORIZABLE_ENTITY_LABELS]
         if not entities:
             return
 
-        ready: list[tuple[PointStruct, list[float]]] = []
+        ready: list[PointStruct] = []
         missing_entities: list[tuple[int, str]] = []
 
-        for entity in entities:
+        for idx, entity in enumerate(entities):
             if not entity.id:
                 continue
             point_id = uuid.uuid5(uuid.NAMESPACE_URL, entity.id)
+            subtype_key, subtype_val = extract_entity_subtype(entity.label, entity.properties)
             if entity.embedding is not None:
-                ready.append((
-                    PointStruct(
-                        id=str(point_id),
-                        vector={"text": entity.embedding},
-                        payload={
-                            "id": entity.id,
-                            "name": entity.name,
-                            "name_lower": entity.name_lower,
-                            "label": entity.label.value,
-                            "properties": entity.properties,
-                        },
-                    ),
-                    entity.embedding,
+                payload: dict[str, str | None] = {
+                    "id": entity.id,
+                    "name": entity.name,
+                    "name_lower": entity.name_lower,
+                    "label": entity.label.value,
+                }
+                if subtype_key and subtype_val:
+                    payload[subtype_key] = subtype_val
+                ready.append(PointStruct(
+                    id=str(point_id),
+                    vector={"text": entity.embedding},
+                    payload=payload,
                 ))
             else:
                 missing_entities.append((
-                    len(ready) + len(missing_entities),
-                    format_bge_representation(entity.label.value, entity.name, entity.properties),
+                    idx,
+                    format_bge_representation(entity.label.value, entity.name, subtype_val),
                 ))
 
         if missing_entities:
@@ -108,31 +102,30 @@ class EntityVectorizer:
                     continue
                 entity.embedding = embedding
                 point_id = uuid.uuid5(uuid.NAMESPACE_URL, entity.id)
-                ready.append((
-                    PointStruct(
-                        id=str(point_id),
-                        vector={"text": embedding},
-                        payload={
-                            "id": entity.id,
-                            "name": entity.name,
-                            "name_lower": entity.name_lower,
-                            "label": entity.label.value,
-                            "properties": entity.properties,
-                        },
-                    ),
-                    embedding,
+                payload: dict[str, str | None] = {
+                    "id": entity.id,
+                    "name": entity.name,
+                    "name_lower": entity.name_lower,
+                    "label": entity.label.value,
+                }
+                subtype_key, subtype_val = extract_entity_subtype(entity.label, entity.properties)
+                if subtype_key and subtype_val:
+                    payload[subtype_key] = subtype_val
+                ready.append(PointStruct(
+                    id=str(point_id),
+                    vector={"text": embedding},
+                    payload=payload,
                 ))
 
         t1 = time.perf_counter()
-        points = [ps for ps, _ in ready]
-        if points:
+        if ready:
             await self._qdrant_client.upsert(
                 collection_name="social_entities",
-                points=points,
+                points=ready,
             )
         upsert_elapsed = (time.perf_counter() - t1) * 1000
 
         logger.debug(
             "Vectorizer: %d entities (%d reused, %d new) upserted %d points in %.1fms",
-            len(entities), len(entities) - len(missing_entities), len(missing_entities), len(points), upsert_elapsed,
+            len(entities), len(entities) - len(missing_entities), len(missing_entities), len(ready), upsert_elapsed,
         )

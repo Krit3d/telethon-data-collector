@@ -24,11 +24,10 @@ class Neo4jSearchRepository:
             CALL {
                 UNWIND $entity_ids AS eid
                 MATCH (e {id: eid})
-                MATCH (p:Post)-[r:MENTIONS|TAGGED_AT|TAGGED_WITH|ABOUT]->(e)
+                MATCH (p:Post)-[r:MENTIONS|TAGGED_WITH|ABOUT]->(e)
                 WITH p, r,
                      CASE type(r)
                          WHEN 'ABOUT' THEN 1.5
-                         WHEN 'TAGGED_AT' THEN 1.2
                          WHEN 'TAGGED_WITH' THEN 1.1
                          ELSE 1.0
                      END AS w

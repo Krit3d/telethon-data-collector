@@ -44,28 +44,55 @@ class KagBuilderOrchestrator:
             logger.info("Processing post %d (author: %s, platform: %s)...", context.content_id, context.author_title, context.platform)
 
             t0 = time.perf_counter()
-            chunks = self._splitter.prepare_and_split(context.content, context.transcription)
+            try:
+                chunks = self._splitter.prepare_and_split(context.content, context.transcription)
+            except Exception as e:
+                splitter_elapsed = time.perf_counter() - t0
+                logger.error("[Post %d] Splitter FAILED after %.2fs | error: %s", context.content_id, splitter_elapsed, e)
+                raise
             splitter_elapsed = time.perf_counter() - t0
+            logger.debug("[Post %d] Splitter done in %.2fs | chunks: %d", context.content_id, splitter_elapsed, len(chunks))
 
             total_extractor = 0.0
             total_aligner = 0.0
             total_writer = 0.0
 
-            for chunk in chunks:
+            for chunk_idx, chunk in enumerate(chunks):
                 t1 = time.perf_counter()
-                extraction_result = await self._extractor.extract(context, chunk.text)
-                total_extractor += time.perf_counter() - t1
+                try:
+                    extraction_result = await self._extractor.extract(context, chunk.text)
+                except Exception as e:
+                    extractor_elapsed = time.perf_counter() - t1
+                    logger.error("[Post %d] Extractor FAILED after %.2fs (chunk %d) | error: %s", context.content_id, extractor_elapsed, chunk_idx, e)
+                    raise
+                extractor_elapsed = time.perf_counter() - t1
+                total_extractor += extractor_elapsed
+                logger.debug("[Post %d] Extractor done in %.2fs (chunk %d)", context.content_id, extractor_elapsed, chunk_idx)
 
                 t2 = time.perf_counter()
-                aligned_result = await self._aligner.align(extraction_result, context)
-                total_aligner += time.perf_counter() - t2
+                try:
+                    aligned_result = await self._aligner.align(extraction_result, context)
+                except Exception as e:
+                    aligner_elapsed = time.perf_counter() - t2
+                    logger.error("[Post %d] Aligner FAILED after %.2fs (chunk %d) | error: %s", context.content_id, aligner_elapsed, chunk_idx, e)
+                    raise
+                aligner_elapsed = time.perf_counter() - t2
+                total_aligner += aligner_elapsed
+                logger.debug("[Post %d] Aligner done in %.2fs (chunk %d)", context.content_id, aligner_elapsed, chunk_idx)
 
                 t3 = time.perf_counter()
-                await asyncio.gather(
-                    self._vectorizer.vectorize_and_upsert_entities(aligned_result),
-                    self._writer.write_extraction_result(aligned_result, context),
-                )
-                total_writer += time.perf_counter() - t3
+                try:
+                    await asyncio.gather(
+                        self._vectorizer.vectorize_and_upsert_entities(aligned_result),
+                        self._writer.write_extraction_result(aligned_result, context),
+                    )
+                except Exception as e:
+                    writer_elapsed = time.perf_counter() - t3
+                    logger.error("[Post %d] Writer/Vectorizer FAILED after %.2fs (chunk %d) | error: %s", context.content_id, writer_elapsed, chunk_idx, e)
+                    raise
+                writer_elapsed = time.perf_counter() - t3
+                total_writer += writer_elapsed
+                logger.debug("[Post %d] Writer/Vectorizer done in %.2fs (chunk %d)", context.content_id, writer_elapsed, chunk_idx)
 
             total_elapsed = time.perf_counter() - t_post
             logger.debug(

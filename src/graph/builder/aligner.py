@@ -16,8 +16,11 @@ from src.graph.ontology import (
     EntityType,
     ExtractedEntity,
     ExtractedRelation,
+    HashtagItem,
     OpenSPGExtractionResult,
     RelationType,
+    VECTORIZABLE_ENTITY_LABELS,
+    extract_entity_subtype,
 )
 from src.graph.utils import build_node_id, clean_name_lower, format_bge_representation
 
@@ -27,6 +30,15 @@ _L1_CACHE_MAX = 50_000
 _EMBEDDING_RETRIES = 3
 _ENTITY_SCORE_THRESHOLD = 0.88
 _CATEGORY_SCORE_GAP = 0.03
+_CATEGORY_MIN_SCORE = 0.55
+_HASHTAG_ENTITY_SCORE_THRESHOLD = 0.85
+
+_CANONICAL_ENTITY_LABELS: frozenset[str] = frozenset({
+    EntityType.Product.value,
+    EntityType.Organization.value,
+    EntityType.Entity.value,
+    EntityType.Event.value,
+})
 
 
 class Aligner:
@@ -78,13 +90,14 @@ class Aligner:
     ) -> None:
         if not missed:
             return
-        bge_texts = [
-            format_bge_representation(e.label.value, e.name, e.properties)
-            for e in missed
-        ]
+        bge_texts: list[str] = []
+        for e in missed:
+            _, subtype = extract_entity_subtype(e.label, e.properties)
+            bge_texts.append(format_bge_representation(e.label.value, e.name, subtype))
         try:
             embeddings = await self._get_embeddings_batch(bge_texts)
         except Exception:
+            logger.warning("Embedding generation failed in _disambiguate_entities, skipping")
             return
         if len(embeddings) != len(missed):
             return
@@ -106,6 +119,7 @@ class Aligner:
                 ],
             )
         except Exception:
+            logger.warning("Qdrant query_batch_points failed in _disambiguate_entities, skipping")
             return
         qdrant_elapsed = (time.perf_counter() - t0) * 1000
         resolved = 0
@@ -118,6 +132,7 @@ class Aligner:
             if hit.score < _ENTITY_SCORE_THRESHOLD:
                 continue
             payload = hit.payload or {}
+            canonical_label = payload.get("label") or payload.get("Label")
             canonical_id = (
                 payload.get("id")
                 or payload.get("original_id")
@@ -161,13 +176,14 @@ class Aligner:
         try:
             embeddings = await self._get_embeddings_batch(names)
         except Exception:
+            logger.warning("Embedding generation failed in _link_microconcepts, skipping")
             return
         if len(embeddings) != len(unique):
             return
         t0 = time.perf_counter()
         try:
             batch_response = await self._qdrant_client.query_batch_points(
-                collection_name="iab_categories",
+                collection_name="categories",
                 requests=[
                     models.QueryRequest(
                         query=emb,
@@ -179,6 +195,7 @@ class Aligner:
                 ],
             )
         except Exception:
+            logger.warning("Qdrant query_batch_points failed in _link_microconcepts, skipping")
             return
         qdrant_elapsed = (time.perf_counter() - t0) * 1000
         linked = 0
@@ -191,13 +208,15 @@ class Aligner:
                 for hit in response.points
             ]
             chosen = hit_candidates[0]
+            if float(chosen["score"]) < _CATEGORY_MIN_SCORE:
+                continue
             if (
                 len(hit_candidates) >= 2
                 and (hit_candidates[0]["score"] - hit_candidates[1]["score"]) < _CATEGORY_SCORE_GAP
                 and context.account_category_id
             ):
                 matched = next(
-                    (c for c in hit_candidates if str(c["payload"].get("code")) == str(context.account_category_id)),
+                    (c for c in hit_candidates if str(c["payload"].get("code")).strip().lower() == str(context.account_category_id).strip().lower()),
                     None,
                 )
                 if matched is not None:
@@ -216,7 +235,6 @@ class Aligner:
                 ExtractedEntity(
                     id=concept_node_id,
                     name=concept_name,
-                    name_lower=clean_name_lower(concept_name),
                     label=EntityType.Concept,
                     properties={
                         "code": code,
@@ -229,6 +247,8 @@ class Aligner:
                 )
             )
             mc.properties["is_classified"] = True
+            key = f"{EntityType.MicroConcept.value}:{clean_name_lower(mc.name)}"
+            self._cache_set(key, mc_id)
             relations.append(
                 ExtractedRelation(
                     source_id=mc_id,
@@ -236,12 +256,255 @@ class Aligner:
                     target_id=concept_node_id,
                     target_label=EntityType.Concept,
                     relation_type=RelationType.BELONGS_TO,
+                    properties={"similarity": round(float(chosen["score"]), 4)},
                 )
             )
             linked += 1
         logger.debug(
             "Qdrant iab_categories search for %d microconcepts done in %.1fms, linked %d",
             len(unique), qdrant_elapsed, linked,
+        )
+
+    async def _link_author_category(
+        self,
+        extraction_result: OpenSPGExtractionResult,
+        context: PostBatchContext,
+    ) -> None:
+        if not context.account_category_id:
+            return
+        if context.account_category_path:
+            parts = [p.strip() for p in context.account_category_path.split(" > ")]
+        else:
+            parts = [context.account_category_id]
+        name = parts[-1]
+        concept_node_id = build_node_id(EntityType.Concept, context.account_category_id)
+        properties: dict[str, str] = {"code": context.account_category_id}
+        if len(parts) > 0:
+            properties["tier_1"] = parts[0]
+        if len(parts) > 1:
+            properties["tier_2"] = parts[1]
+        if len(parts) > 2:
+            properties["tier_3"] = parts[2]
+        if len(parts) > 3:
+            properties["tier_4"] = parts[3]
+        extraction_result.entities.append(
+            ExtractedEntity(
+                id=concept_node_id,
+                name=name,
+                label=EntityType.Concept,
+                properties=properties,
+            )
+        )
+        extraction_result.relations.append(
+            ExtractedRelation(
+                source_id=context.author_node_id,
+                source_label=EntityType.Actor,
+                target_id=concept_node_id,
+                target_label=EntityType.Concept,
+                relation_type=RelationType.BELONGS_TO,
+                properties={},
+            )
+        )
+
+    async def _link_hashtags(
+        self,
+        extraction_result: OpenSPGExtractionResult,
+        context: PostBatchContext,
+    ) -> None:
+        if not extraction_result.hashtags:
+            return
+
+        seen_raw: set[str] = set()
+        unique: list[HashtagItem] = []
+        for ht in extraction_result.hashtags:
+            if ht.raw in seen_raw:
+                continue
+            seen_raw.add(ht.raw)
+            unique.append(ht)
+
+        for ht in unique:
+            ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
+            extraction_result.entities.append(
+                ExtractedEntity(
+                    id=ht_node_id,
+                    name=f"#{ht.raw}",
+                    label=EntityType.Hashtag,
+                    properties={"raw": ht.raw, "normalized": ht.normalized},
+                )
+            )
+            if context.pub_node_id:
+                extraction_result.relations.append(
+                    ExtractedRelation(
+                        source_id=context.pub_node_id,
+                        source_label=EntityType.Post,
+                        target_id=ht_node_id,
+                        target_label=EntityType.Hashtag,
+                        relation_type=RelationType.TAGGED_WITH,
+                    )
+                )
+
+        normalized_texts = [ht.normalized for ht in unique]
+        try:
+            embeddings = await self._get_embeddings_batch(normalized_texts)
+        except Exception:
+            logger.warning("Embedding generation failed in _link_hashtags, skipping")
+            return
+
+        if len(embeddings) != len(unique):
+            return
+
+        t0 = time.perf_counter()
+
+        async def _query_social_entities() -> list[models.QueryResponse] | None:
+            try:
+                return await self._qdrant_client.query_batch_points(
+                    collection_name="social_entities",
+                    requests=[
+                        models.QueryRequest(
+                            query=emb,
+                            using="text",
+                            limit=1,
+                            score_threshold=_HASHTAG_ENTITY_SCORE_THRESHOLD,
+                            with_payload=True,
+                        )
+                        for emb in embeddings
+                    ],
+                )
+            except Exception:
+                logger.warning("Qdrant social_entities query failed in _link_hashtags, skipping")
+                return None
+
+        async def _query_categories() -> list[models.QueryResponse] | None:
+            try:
+                return await self._qdrant_client.query_batch_points(
+                    collection_name="categories",
+                    requests=[
+                        models.QueryRequest(
+                            query=emb,
+                            using="text",
+                            limit=1,
+                            score_threshold=_CATEGORY_MIN_SCORE,
+                            with_payload=True,
+                        )
+                        for emb in embeddings
+                    ],
+                )
+            except Exception:
+                logger.warning("Qdrant categories query failed in _link_hashtags, skipping")
+                return None
+
+        social_resp, cat_resp = await asyncio.gather(
+            _query_social_entities(),
+            _query_categories(),
+        )
+
+        qdrant_elapsed = (time.perf_counter() - t0) * 1000
+
+        existing_entity_ids: set[str] = {e.id for e in extraction_result.entities if e.id}
+        existing_concept_ids: set[str] = {
+            e.id for e in extraction_result.entities
+            if e.id and e.label == EntityType.Concept
+        }
+
+        maps_to_count = 0
+        belongs_to_count = 0
+
+        if social_resp is not None:
+            for ht, response in zip(unique, social_resp):
+                if not response.points:
+                    continue
+                hit = response.points[0]
+                if hit.score < _HASHTAG_ENTITY_SCORE_THRESHOLD:
+                    continue
+                payload = hit.payload or {}
+                canonical_label = payload.get("label") or payload.get("Label")
+                if not canonical_label or canonical_label not in _CANONICAL_ENTITY_LABELS:
+                    continue
+                canonical_id = (
+                    payload.get("id")
+                    or payload.get("original_id")
+                    or str(hit.id)
+                )
+                if not canonical_id:
+                    continue
+                try:
+                    target_label = EntityType(canonical_label)
+                except ValueError:
+                    continue
+                canonical_name = str(payload.get("name") or payload.get("title") or canonical_id)
+                ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
+                if canonical_id not in existing_entity_ids:
+                    extraction_result.entities.append(
+                        ExtractedEntity(
+                            id=canonical_id,
+                            name=canonical_name,
+                            label=target_label,
+                        )
+                    )
+                    existing_entity_ids.add(canonical_id)
+                extraction_result.relations.append(
+                    ExtractedRelation(
+                        source_id=ht_node_id,
+                        source_label=EntityType.Hashtag,
+                        target_id=canonical_id,
+                        target_label=target_label,
+                        relation_type=RelationType.MAPS_TO,
+                        properties={},
+                    )
+                )
+                maps_to_count += 1
+
+        if cat_resp is not None:
+            for ht, response in zip(unique, cat_resp):
+                if not response.points:
+                    continue
+                hit = response.points[0]
+                if hit.score < _CATEGORY_MIN_SCORE:
+                    continue
+                payload = hit.payload or {}
+                code = payload.get("code")
+                if not code:
+                    continue
+                concept_node_id = build_node_id(EntityType.Concept, code)
+                ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
+                if concept_node_id not in existing_concept_ids:
+                    concept_name = str(payload.get("name") or code)
+                    tier_1 = payload.get("tier_1")
+                    tier_2 = payload.get("tier_2")
+                    tier_3 = payload.get("tier_3")
+                    tier_4 = payload.get("tier_4")
+                    extension = payload.get("extension")
+                    extraction_result.entities.append(
+                        ExtractedEntity(
+                            id=concept_node_id,
+                            name=concept_name,
+                            label=EntityType.Concept,
+                            properties={
+                                "code": code,
+                                "tier_1": tier_1,
+                                "tier_2": tier_2,
+                                "tier_3": tier_3,
+                                "tier_4": tier_4,
+                                "extension": extension,
+                            },
+                        )
+                    )
+                    existing_concept_ids.add(concept_node_id)
+                extraction_result.relations.append(
+                    ExtractedRelation(
+                        source_id=ht_node_id,
+                        source_label=EntityType.Hashtag,
+                        target_id=concept_node_id,
+                        target_label=EntityType.Concept,
+                        relation_type=RelationType.BELONGS_TO,
+                        properties={"similarity": round(hit.score, 4)},
+                    )
+                )
+                belongs_to_count += 1
+
+        logger.debug(
+            "Qdrant hashtag search for %d hashtags done in %.1fms | MAPS_TO: %d, BELONGS_TO: %d",
+            len(unique), qdrant_elapsed, maps_to_count, belongs_to_count,
         )
 
     async def align(
@@ -261,6 +524,7 @@ class Aligner:
             cached = self._l1_cache.get(key)
             if cached is not None:
                 id_map[entity.id] = cached
+                self._l1_cache.move_to_end(key)
                 if entity.label == EntityType.MicroConcept:
                     entity.properties["is_classified"] = True
                 l1_hits += 1
@@ -283,9 +547,11 @@ class Aligner:
 
         still_missed = [
             e for e in missed
-            if e.id and e.id not in id_map and e.label != EntityType.MicroConcept
+            if e.id and e.id not in id_map and e.label in VECTORIZABLE_ENTITY_LABELS
         ]
+        t_qdrant_entities = time.perf_counter()
         await self._disambiguate_entities(still_missed, id_map)
+        qdrant_entities_elapsed = (time.perf_counter() - t_qdrant_entities) * 1000
 
         microconcepts = [
             e for e in extraction_result.entities
@@ -304,12 +570,18 @@ class Aligner:
                 mc.id = canonical_id
             unique_microconcepts.append(mc)
 
+        t_qdrant_categories = time.perf_counter()
         await self._link_microconcepts(
             unique_microconcepts,
             context,
             extraction_result.relations,
             extraction_result.entities,
         )
+        qdrant_categories_elapsed = (time.perf_counter() - t_qdrant_categories) * 1000
+
+        await self._link_author_category(extraction_result, context)
+
+        await self._link_hashtags(extraction_result, context)
 
         if id_map:
             for entity in extraction_result.entities:
@@ -349,8 +621,9 @@ class Aligner:
         total_elapsed = (time.perf_counter() - t0) * 1000
         l1_miss = len(missed)
         logger.debug(
-            "Aligner done in %.1fms | L1 cache: %d hit, %d miss | Neo4j lookup: %.1fms | entities: %d, relations: %d",
+            "Aligner done in %.1fms | L1 cache: %d hit, %d miss | Neo4j lookup: %.1fms | Qdrant social_entities: %.1fms | Qdrant categories: %.1fms | entities: %d, relations: %d",
             total_elapsed, l1_hits, l1_miss, neo4j_elapsed,
+            qdrant_entities_elapsed, qdrant_categories_elapsed,
             len(extraction_result.entities), len(extraction_result.relations),
         )
         return extraction_result
