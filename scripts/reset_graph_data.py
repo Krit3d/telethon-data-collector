@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from typing import Any, cast
 
 from neo4j import AsyncGraphDatabase
-from qdrant_client import AsyncQdrantClient
-from qdrant_client.http import models
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from src.config.config import load_settings
+from src.config.config import Settings, load_settings
+from src.embeddings.client import ENTITIES_COLLECTION, QdrantClientManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +34,7 @@ NEO4J_LABELS: list[str] = [
     "Hashtag",
 ]
 
-DELETE_ALL_QUERY: str = "MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS"
+DELETE_ALL_QUERY: str = "MATCH (n) CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS"
 
 
 async def reset_neo4j(neo4j_url: str, neo4j_user: str, neo4j_password: str, neo4j_database: str) -> None:
@@ -45,14 +45,14 @@ async def reset_neo4j(neo4j_url: str, neo4j_user: str, neo4j_password: str, neo4
 
         async with driver.session(database=neo4j_database) as session:
             logger.info("Deleting all nodes and relationships...")
-            await session.run(DELETE_ALL_QUERY)  # type: ignore[arg-type]
+            await session.run(cast(Any, DELETE_ALL_QUERY))
             logger.info("All nodes and relationships deleted")
 
         for label in NEO4J_LABELS:
             try:
                 async with driver.session(database=neo4j_database) as session:
                     cypher = f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE"
-                    await session.run(cypher)  # type: ignore[arg-type]
+                    await session.run(cast(Any, cypher))
                 logger.info("Constraint ensured for label: %s", label)
             except Exception as exc:
                 logger.warning("Failed to create constraint for label %s: %s", label, exc)
@@ -62,50 +62,25 @@ async def reset_neo4j(neo4j_url: str, neo4j_user: str, neo4j_password: str, neo4
         await driver.close()
 
 
-async def reset_qdrant(qdrant_url: str | None, qdrant_api_key: str | None) -> None:
-    if qdrant_url is None:
+async def reset_qdrant(settings: Settings) -> None:
+    if settings.qdrant_url is None:
         logger.warning("QDRANT_URL not configured, skipping Qdrant reset")
         return
 
-    client = AsyncQdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    client_manager = QdrantClientManager(settings)
     try:
-        existing = await client.get_collections()
-        existing_names = [c.name for c in existing.collections]
+        if await client_manager.client.collection_exists(ENTITIES_COLLECTION):
+            logger.info("Deleting existing collection: %s", ENTITIES_COLLECTION)
+            await client_manager.client.delete_collection(ENTITIES_COLLECTION)
 
-        if "social_entities" in existing_names:
-            logger.info("Deleting existing collection: social_entities")
-            await client.delete_collection(collection_name="social_entities")
-
-        logger.info("Creating collection: social_entities")
-        await client.create_collection(
-            collection_name="social_entities",
-            vectors_config={
-                "text": models.VectorParams(size=1024, distance=models.Distance.COSINE),
-            },
-            sparse_vectors_config={
-                "text_sparse": models.SparseVectorParams(
-                    index=models.SparseIndexParams(on_disk=True),
-                ),
-            },
-        )
-
-        await client.create_payload_index(
-            collection_name="social_entities",
-            field_name="label",
-            field_schema=models.PayloadSchemaType.KEYWORD,
-        )
-        await client.create_payload_index(
-            collection_name="social_entities",
-            field_name="name_lower",
-            field_schema=models.PayloadSchemaType.KEYWORD,
-        )
-
-        logger.info("Collection 'social_entities' created successfully with payload indexes")
+        await client_manager.initialize()
+        logger.info("Collection '%s' recreated with project settings", ENTITIES_COLLECTION)
     finally:
-        await client.close()
+        await client_manager.close()
 
 
 async def reset_postgres_graph_status(db_url: str) -> None:
+    db_url = db_url.replace("@localhost:", "@db:").replace("@127.0.0.1:", "@db:")
     engine = create_async_engine(db_url, pool_size=2, max_overflow=2)
     try:
         async with engine.begin() as conn:
@@ -113,9 +88,12 @@ async def reset_postgres_graph_status(db_url: str) -> None:
                 text(
                     "UPDATE content "
                     "SET graph_status = 0 "
+                    "WHERE graph_status != 0 "
+                    "AND account_id IN ("
+                    "SELECT id "
                     "FROM accounts "
-                    "WHERE content.account_id = accounts.id "
-                    "AND accounts.status = 'verified'"
+                    "WHERE LOWER(status) = 'verified'"
+                    ")"
                 )
             )
             updated_count = result.rowcount
@@ -127,21 +105,27 @@ async def reset_postgres_graph_status(db_url: str) -> None:
 async def main() -> None:
     settings = load_settings()
 
-    await reset_neo4j(
-        neo4j_url=settings.neo4j_url,
-        neo4j_user=settings.neo4j_user,
-        neo4j_password=settings.neo4j_password,
-        neo4j_database=settings.neo4j_database,
-    )
+    try:
+        await reset_neo4j(
+            neo4j_url=settings.neo4j_url,
+            neo4j_user=settings.neo4j_user,
+            neo4j_password=settings.neo4j_password,
+            neo4j_database=settings.neo4j_database,
+        )
+    except Exception as exc:
+        logger.error("Ошибка на этапе Neo4j: %s", exc, exc_info=True)
 
-    await reset_qdrant(
-        qdrant_url=settings.qdrant_url,
-        qdrant_api_key=settings.qdrant_api_key,
-    )
+    try:
+        await reset_qdrant(settings=settings)
+    except Exception as exc:
+        logger.error("Ошибка на этапе Qdrant: %s", exc, exc_info=True)
 
-    await reset_postgres_graph_status(db_url=settings.db_url)
+    try:
+        await reset_postgres_graph_status(db_url=settings.db_url)
+    except Exception as exc:
+        logger.error("Ошибка на этапе PostgreSQL: %s", exc, exc_info=True)
 
-    logger.info("Graph data reset completed successfully")
+    logger.info("=== Завершение процесса сброса ===")
 
 
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ class KagBuilderOrchestrator:
                 try:
                     await asyncio.gather(
                         self._vectorizer.vectorize_and_upsert_entities(aligned_result),
-                        self._writer.write_extraction_result(aligned_result, context),
+                        self._writer.write_extraction_chunk(aligned_result, context, is_first_chunk=chunk_idx == 0),
                     )
                 except Exception as e:
                     writer_elapsed = time.perf_counter() - t3

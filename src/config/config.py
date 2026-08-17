@@ -212,6 +212,14 @@ class Settings(BaseSettings):
         default=6,
         description="Maximum concurrent graph write transactions per worker (connection pool governor)",
     )
+    use_time_decay: bool = Field(
+        default=True,
+        description="If True, weight posts in author profile aggregation by exponential time decay",
+    )
+    time_decay_half_life_days: float = Field(
+        default=90.0,
+        description="Half-life in days for the exponential time decay used in author profile aggregation",
+    )
     worker_id: int = Field(
         default=0,
         description="Partition identifier for this worker instance (0-based). Used with total_workers for modulo-based DB partitioning.",

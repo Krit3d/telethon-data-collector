@@ -11,6 +11,7 @@ from typing import Any
 from json_repair import repair_json
 from evolution_openai import EvolutionAsyncOpenAI
 from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, RateLimitError
+from pydantic import ValidationError
 
 from src.config.config import Settings
 from src.graph.builder.reader import PostBatchContext
@@ -20,11 +21,10 @@ from src.graph.ontology import (
     ExtractedPsychographics,
     ExtractedRelation,
     HashtagItem,
-    HormoneType,
     OpenSPGExtractionResult,
     RelationType,
-    RelationSubtype,
     RoleType,
+    SentimentType,
     ToneType,
 )
 from src.graph.utils import build_node_id, clean_name_lower, extract_raw_hashtags, is_garbage_value
@@ -46,6 +46,8 @@ def _ensure_dict(val: Any) -> dict[str, Any]:
 def _sanitize_properties(props: dict[str, Any]) -> dict[str, Any]:
     sanitized: dict[str, Any] = {}
     for key, val in props.items():
+        if val is None:
+            continue
         if isinstance(val, dict):
             sanitized[key] = json.dumps(val, ensure_ascii=False)
         elif isinstance(val, list):
@@ -111,23 +113,29 @@ def _build_system_prompt(author_title: str) -> str:
         "USES_TECH, PRODUCES, RELATED_TO, COAUTHOR.\n"
         "Строгие сигнатуры связей (source -> relation -> target):\n"
         "  - MENTIONS: (Post) -> MENTIONS -> (Entity | Organization | Product | Event). "
-        "Упоминание сущности в посте.\n"
-        "  - ABOUT: (Post) -> ABOUT -> (MicroConcept). Тематическая связь поста с микроконцептом.\n"
+        "Упоминание сущности в посте. Поля в properties: sentiment (str | null: positive, negative, neutral — "
+        "указывается ТОЛЬКО если автор явно выражает отношение к сущности в посте) "
+        "и confidence (float от 0.0 до 1.0 | null — указывается только при явной оценке).\n"
+        "  - ABOUT: (Post) -> ABOUT -> (MicroConcept). Тематическая связь поста с микроконцептом. properties: weight (float от 0.0 до 1.0, по умолчанию 1.0). Калибровка weight: 1.0 — ключевая тема поста (основное содержание, >70% текста); 0.7 — вторичная тема (подробно обсуждается, 20-50% текста); 0.3 — косвенное или эпизодическое упоминание (<20% текста).\n"
         "  - WORKS_AT: (Actor) -> WORKS_AT -> (Organization). Строгое правило: properties.role принимает "
         "ОДНО значение строго из [founder, executive, employee, ambassador, advisor]. "
         "Любые другие значения запрещены.\n"
         "  - PARTICIPATED_IN: (Actor | Entity) -> PARTICIPATED_IN -> (Event). "
         "ЗАПРЕЩЕНО связывать Organization -> PARTICIPATED_IN -> Person. "
-        "Только Actor или Entity -> PARTICIPATED_IN -> Event.\n"
+        "Только Actor или Entity -> PARTICIPATED_IN -> Event. "
+        "Свойства (properties) ДОЛЖНЫ содержать поле \"role\" со строковым значением из списка: "
+        "[\"speaker\", \"organizer\", \"sponsor\", \"visitor\", \"mention\"].\n"
         "  - USES_TECH: (Actor | Post) -> USES_TECH -> (Product | Entity). "
-        "Использование технологии или продукта.\n"
+        "Использование технологии или продукта. "
+        "Свойства (properties) ДОЛЖНЫ содержать поле \"proficiency\" со строковым значением из списка: "
+        "[\"expert\", \"user\", \"reviewer\", \"mention\"].\n"
         "  - PRODUCES: (Organization | Actor) -> PRODUCES -> (Product). Строгое правило: "
-        "properties.relation_subtype принимает ОДНО значение строго из "
-        "[creator, promoter, affiliate, vendor, publisher, distributor, sponsor]. "
-        "Любые другие значения запрещены.\n"
+        "Поля в properties: relation_subtype (str). Для Actor подтипы строго из: [creator, promoter, affiliate]. "
+        "Для Organization подтипы строго из: [vendor, publisher, distributor, sponsor].\n"
         "  - RELATED_TO: (Entity) -> RELATED_TO -> (Entity | Organization | Product). "
-        "Обобщённая семантическая связь.\n"
-        "  - COAUTHOR: (Actor) -> COAUTHOR -> (Actor). Соавторство между авторами.\n"
+        "Обобщённая семантическая связь. properties: relation_name (str), weight (float от 0.0 до 1.0, по умолчанию 1.0). Калибровка weight: 1.0 — прямая жёсткая зависимость или эквивалентность; 0.7 — сильная тематическая связь в одном контексте; 0.3 — слабая или косвенная ассоциированность.\n"
+        "  - COAUTHOR: (Actor) -> COAUTHOR -> (Actor). Соавторство. Поля в properties: "
+        "platform (str: instagram, telegram), post_id (str: ID публикации).\n"
         "\n"
         "=== СЕКЦИЯ microconcepts ===\n"
         "Извлеки от 1 до 3 обобщающих тематических категорий поста. Категории — атомарные обобщения темы, "
@@ -142,28 +150,25 @@ def _build_system_prompt(author_title: str) -> str:
         "\n"
         "=== СЕКЦИЯ psychographics ===\n"
         "Объект со строгой структурой:\n"
-        "  - language (str | null): двухбуквенный ISO-код основного языка (ru, en, kz и т.д.).\n"
-        "    Строгие правила определения языка:\n"
-        "      ПРИОРИТЕТ 1: Если в подписи к посту есть осмысленный текст (более 3 слов) -> определяй "
-        "язык по тексту подписи.\n"
-        "      ПРИОРИТЕТ 2: Если подписи нет или менее 4 слов, но есть транскрипция с осмысленной речью "
-        "-> определяй язык по транскрипции.\n"
-        "      ПРИОРИТЕТ 3: Если подписи нет, а транскрипция содержит шум, музыку, пение или менее 4 "
-        "слов -> определяй язык по названию (author_title) и описанию профиля автора (author_biography).\n"
-        "      Если язык не удалось определить нигде -> возвращай null.\n"
-        "  - sentiment (str): строго из [positive, negative, neutral].\n"
-        "  - tone (str): строго из [analytical, expert, provocative, educational, entertainment, "
-        "casual, hype_train, sell_courses].\n"
-        "  - secondary_tone (str | null): один тон из того же списка или null.\n"
-        "  - primary_hormone (str): строго из [dopamine, oxytocin, serotonin, cortisol, adrenaline, endorphin].\n"
-        "  - secondary_hormone (str | null): один гормон из того же списка или null.\n"
-        "  - score_dopamine (float): от 0.0 до 1.0.\n"
-        "  - score_oxytocin (float): от 0.0 до 1.0.\n"
-        "  - score_serotonin (float): от 0.0 до 1.0.\n"
-        "  - score_cortisol (float): от 0.0 до 1.0.\n"
-        "  - score_adrenaline (float): от 0.0 до 1.0.\n"
-        "  - score_endorphin (float): от 0.0 до 1.0.\n"
-        "Все enum-поля принимают только перечисленные значения. Не выдумывай новых значений.\n"
+        "  - language (str | null): двухбуквенный ISO-код основного языка контента поста (ru, en, kz и т.д.).\n"
+        "    Правила определения:\n"
+        "      1. Если подпись к посту содержит 3 и более осмысленных слова -> определяй язык по подписи.\n"
+        "      2. Если подпись отсутствует или короче 3 слов, но есть транскрипция (от 3 слов) -> определяй язык по транскрипции.\n"
+        "      3. Если текста ни в подписи, ни в транскрипции нет (музыка, шумы, менее 3 слов) -> возвращай null.\n"
+        "  - sentiment (str | null): positive, negative, neutral (или null, если текст не содержит "
+        "выраженного эмоционального отношения автора).\n"
+        "  - tone (str): строго из [analytical, expert, provocative, educational, entertainment, casual, "
+        "hype_train, sell_courses]. Каждый текст имеет стиль передачи информации. Ты ОБЯЗАН выбрать один "
+        "наиболее близкий тон из этого списка.\n"
+        "  - secondary_tone (str | null): один второй по значимости тон из того же списка, или null если "
+        "выраженного второго тона нет.\n"
+        "  - tone_confidence (float от 0.0 до 1.0 | null): степень уверенности модели в определении основного тона (1.0 — высокая, 0.1 — очень сомнительная).\n"
+        "  - score_dopamine (float): балл от 0.0 до 1.0.\n"
+        "  - score_oxytocin (float): балл от 0.0 до 1.0.\n"
+        "  - score_serotonin (float): балл от 0.0 до 1.0.\n"
+        "  - score_cortisol (float): балл от 0.0 до 1.0.\n"
+        "  - score_adrenaline (float): балл от 0.0 до 1.0.\n"
+        "  - score_endorphin (float): балл от 0.0 до 1.0.\n"
         "\n"
         "=== СЕКЦИЯ hashtags ===\n"
         "Извлеки и нормализуй хэштеги поста. Формат: list of objects {{raw: str, normalized: str}}.\n"
@@ -362,43 +367,52 @@ def _build_entity_id(label: str, name: str, properties: dict[str, Any] | None = 
         return build_node_id(EntityType.Entity, name)
 
 
+def _safe_float_score(raw: Any) -> float:
+    try:
+        value = float(raw or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(max(value, 0.0), 1.0)
+
+
 def _parse_psychographics(data: Any) -> ExtractedPsychographics:
     dict_data = _ensure_dict(data)
-    raw_tone = str(dict_data.get("tone", "casual")).lower().strip()
-    primary_tone = _TONE_MAP.get(raw_tone, ToneType.casual)
+    raw_sentiment = dict_data.get("sentiment")
+    sentiment_str = raw_sentiment.strip().lower() if isinstance(raw_sentiment, str) else ""
+    sentiment = SentimentType(sentiment_str) if sentiment_str in ("positive", "negative", "neutral") else None
+    raw_tone = dict_data.get("tone")
+    primary_tone = _TONE_MAP.get(str(raw_tone).lower().strip()) if raw_tone else None
     raw_secondary = dict_data.get("secondary_tone")
-    secondary_tones: list[ToneType] = []
-    if raw_secondary:
-        mapped = _TONE_MAP.get(str(raw_secondary).lower().strip())
-        if mapped:
-            secondary_tones.append(mapped)
-    raw_hormone = str(dict_data.get("primary_hormone", "dopamine")).lower().strip()
-    try:
-        primary_hormone = HormoneType(raw_hormone)
-    except ValueError:
-        primary_hormone = HormoneType.dopamine
-    raw_secondary_hormone = dict_data.get("secondary_hormone")
-    secondary_hormone: HormoneType | None = None
-    if raw_secondary_hormone:
+    secondary_tone = _TONE_MAP.get(str(raw_secondary).lower().strip()) if raw_secondary else None
+    score_dopamine = _safe_float_score(dict_data.get("score_dopamine"))
+    score_oxytocin = _safe_float_score(dict_data.get("score_oxytocin"))
+    score_serotonin = _safe_float_score(dict_data.get("score_serotonin"))
+    score_cortisol = _safe_float_score(dict_data.get("score_cortisol"))
+    score_adrenaline = _safe_float_score(dict_data.get("score_adrenaline"))
+    score_endorphin = _safe_float_score(dict_data.get("score_endorphin"))
+    tone_confidence: float | None = None
+    raw_tone_confidence = dict_data.get("tone_confidence")
+    if raw_tone_confidence is not None:
         try:
-            secondary_hormone = HormoneType(str(raw_secondary_hormone).lower().strip())
-        except ValueError:
-            pass
-    scores: dict[str, float] = {}
-    for key in ("score_dopamine", "score_oxytocin", "score_serotonin", "score_cortisol", "score_adrenaline", "score_endorphin"):
-        val = dict_data.get(key)
-        if val is not None:
-            try:
-                scores[key] = float(val)
-            except (ValueError, TypeError):
-                scores[key] = 0.0
+            parsed_tone_confidence = float(raw_tone_confidence)
+        except (TypeError, ValueError):
+            parsed_tone_confidence = None
+        if parsed_tone_confidence is not None and 0.0 <= parsed_tone_confidence <= 1.0:
+            tone_confidence = parsed_tone_confidence
     return ExtractedPsychographics(
         language=_normalize_language_code(dict_data.get("language")),
+        sentiment=sentiment,
         primary_tone=primary_tone,
-        secondary_tones=secondary_tones,
-        primary_hormone=primary_hormone,
-        secondary_hormone=secondary_hormone,
-        scores=scores,
+        secondary_tone=secondary_tone,
+        tone_confidence=tone_confidence,
+        primary_hormone=None,
+        secondary_hormone=None,
+        score_dopamine=score_dopamine,
+        score_oxytocin=score_oxytocin,
+        score_serotonin=score_serotonin,
+        score_cortisol=score_cortisol,
+        score_adrenaline=score_adrenaline,
+        score_endorphin=score_endorphin,
     )
 
 
@@ -487,7 +501,13 @@ def _parse_microconcepts(raw_microconcepts: Any) -> tuple[list[ExtractedEntity],
     return result, id_map
 
 
-def _parse_relations(raw_relations: Any, global_id_map: dict[str, str]) -> list[ExtractedRelation]:
+def _parse_relations(
+    raw_relations: Any,
+    global_id_map: dict[str, str],
+    pub_node_id: str,
+    author_node_id: str,
+    context: PostBatchContext,
+) -> list[ExtractedRelation]:
     result: list[ExtractedRelation] = []
     raw_list = _ensure_list(raw_relations)
     for raw in raw_list:
@@ -501,16 +521,26 @@ def _parse_relations(raw_relations: Any, global_id_map: dict[str, str]) -> list[
         target_id = global_id_map.get(raw_target_id, global_id_map.get(raw_target_id.lower(), raw_target_id))
         if source_id == target_id:
             continue
-        raw_source_label = str(raw.get("source_label", "Entity")).strip()
-        raw_target_label = str(raw.get("target_label", "Entity")).strip()
-        try:
-            source_label = EntityType(raw_source_label)
-        except ValueError:
-            source_label = EntityType.Entity
-        try:
-            target_label = EntityType(raw_target_label)
-        except ValueError:
-            target_label = EntityType.Entity
+        if source_id == pub_node_id:
+            source_label = EntityType.Post
+        elif source_id == author_node_id:
+            source_label = EntityType.Actor
+        else:
+            raw_source_label = str(raw.get("source_label", "Entity")).strip()
+            try:
+                source_label = EntityType(raw_source_label)
+            except ValueError:
+                source_label = EntityType.Entity
+        if target_id == pub_node_id:
+            target_label = EntityType.Post
+        elif target_id == author_node_id:
+            target_label = EntityType.Actor
+        else:
+            raw_target_label = str(raw.get("target_label", "Entity")).strip()
+            try:
+                target_label = EntityType(raw_target_label)
+            except ValueError:
+                target_label = EntityType.Entity
         raw_rel_type = str(raw.get("relation_type", "")).strip().upper()
         try:
             relation_type = RelationType(raw_rel_type)
@@ -518,16 +548,62 @@ def _parse_relations(raw_relations: Any, global_id_map: dict[str, str]) -> list[
             continue
         raw_properties = raw.get("properties")
         properties: dict[str, Any] = _sanitize_properties(dict(raw_properties)) if isinstance(raw_properties, dict) else {}
+        if relation_type == RelationType.ABOUT:
+            raw_weight = properties.get("weight")
+            try:
+                weight_val = float(raw_weight) if raw_weight is not None else 1.0
+            except (TypeError, ValueError):
+                weight_val = 1.0
+            properties["weight"] = weight_val if weight_val > 0.0 else 1.0
+        elif relation_type == RelationType.RELATED_TO:
+            if "weight" not in properties:
+                properties["weight"] = 1.0
+            raw_relation_name = properties.get("relation_name")
+            if not isinstance(raw_relation_name, str) or not raw_relation_name.strip():
+                properties["relation_name"] = "related_to"
         if relation_type == RelationType.WORKS_AT and "role" in properties:
             try:
                 RoleType(properties["role"])
             except ValueError:
                 properties.pop("role", None)
-        if relation_type == RelationType.PRODUCES and "relation_subtype" in properties:
-            try:
-                RelationSubtype(properties["relation_subtype"])
-            except ValueError:
-                properties.pop("relation_subtype", None)
+        if relation_type == RelationType.PRODUCES:
+            actor_subtypes = {"creator", "promoter", "affiliate"}
+            org_subtypes = {"vendor", "publisher", "distributor", "sponsor"}
+            raw_subtype = properties.get("relation_subtype") or properties.get("subtype") or properties.get("type")
+            if isinstance(raw_subtype, str):
+                raw_subtype = raw_subtype.lower().strip()
+            else:
+                raw_subtype = None
+            if source_label == EntityType.Actor:
+                properties["relation_subtype"] = raw_subtype if raw_subtype in actor_subtypes else "creator"
+            elif source_label == EntityType.Organization:
+                properties["relation_subtype"] = raw_subtype if raw_subtype in org_subtypes else "vendor"
+            else:
+                properties["relation_subtype"] = "creator"
+            properties.pop("subtype", None)
+            properties.pop("type", None)
+        if relation_type == RelationType.COAUTHOR:
+            if "platform" not in properties:
+                properties["platform"] = context.platform
+            if "post_id" not in properties:
+                properties["post_id"] = pub_node_id
+        if relation_type == RelationType.USES_TECH:
+            proficiency = properties.get("proficiency")
+            if not isinstance(proficiency, str) or not proficiency.strip():
+                properties["proficiency"] = "user"
+        if relation_type == RelationType.PARTICIPATED_IN:
+            role = properties.get("role")
+            if not isinstance(role, str) or not role.strip():
+                properties["role"] = "participant"
+        if "sentiment" not in properties and raw.get("sentiment") is not None:
+            properties["sentiment"] = str(raw.get("sentiment")).strip()
+        if "confidence" not in properties and raw.get("confidence") is not None:
+            properties["confidence"] = raw.get("confidence")
+        raw_confidence = properties.get("confidence")
+        try:
+            confidence_float = float(raw_confidence) if raw_confidence is not None else 0.0
+        except (TypeError, ValueError):
+            confidence_float = 0.0
         try:
             result.append(ExtractedRelation(
                 source_id=source_id,
@@ -535,8 +611,11 @@ def _parse_relations(raw_relations: Any, global_id_map: dict[str, str]) -> list[
                 target_id=target_id,
                 target_label=target_label,
                 relation_type=relation_type,
+                confidence=confidence_float,
                 properties=properties,
             ))
+        except (ValidationError, ValueError):
+            raise
         except Exception:
             logger.debug("Skipping invalid relation: source=%s target=%s type=%s", source_id, target_id, raw_rel_type)
             continue
@@ -608,7 +687,6 @@ def _create_structural_relations(
     pub_node_id: str,
     author_node_id: str,
     context: PostBatchContext,
-    raw_psychographics: dict[str, Any],
 ) -> tuple[list[ExtractedEntity], list[ExtractedRelation]]:
     extra_entities: list[ExtractedEntity] = []
     relations: list[ExtractedRelation] = []
@@ -641,25 +719,6 @@ def _create_structural_relations(
             relation_type=RelationType.ABOUT,
             properties={"weight": 1.0},
         ))
-
-    sentiment = "neutral"
-    if isinstance(raw_psychographics, dict):
-        raw_sentiment = raw_psychographics.get("sentiment")
-        if raw_sentiment and str(raw_sentiment).strip() in ("positive", "negative", "neutral"):
-            sentiment = str(raw_sentiment).strip()
-
-    for ent in entities:
-        if ent.label == EntityType.MicroConcept:
-            continue
-        if ent.label in (EntityType.Entity, EntityType.Organization, EntityType.Product, EntityType.Event):
-            relations.append(ExtractedRelation(
-                source_id=pub_node_id,
-                source_label=post_label,
-                target_id=ent.id or "",
-                target_label=ent.label,
-                relation_type=RelationType.MENTIONS,
-                properties={"confidence": ent.confidence, "sentiment": sentiment},
-            ))
 
     seen_belongs_to: set[tuple[str, str]] = set()
     for ent in entities:
@@ -731,8 +790,8 @@ class GraphExtractor:
         if not chunk_text:
             return OpenSPGExtractionResult(
                 psychographics=ExtractedPsychographics(
-                    primary_tone=ToneType.casual,
-                    primary_hormone=HormoneType.dopamine,
+                    primary_tone=None,
+                    primary_hormone=None,
                 ),
             )
 
@@ -848,10 +907,28 @@ class GraphExtractor:
                 global_id_map["post"] = context.pub_node_id
                 global_id_map["publication"] = context.pub_node_id
                 global_id_map["this_post"] = context.pub_node_id
+                global_id_map["content"] = context.pub_node_id
+                global_id_map["publication_node"] = context.pub_node_id
+                global_id_map["post_node"] = context.pub_node_id
                 global_id_map["author"] = context.author_node_id
                 global_id_map["actor"] = context.author_node_id
+                global_id_map[clean_name_lower(context.author_title)] = context.author_node_id
+                global_id_map[clean_name_lower(getattr(context, 'author_username', '') or '')] = context.author_node_id
 
-                llm_relations = _parse_relations(raw_relations, global_id_map)
+                llm_relations = _parse_relations(raw_relations, global_id_map, context.pub_node_id, context.author_node_id, context)
+                mentions_targets = {
+                    r.target_id
+                    for r in llm_relations
+                    if r.relation_type == RelationType.MENTIONS and r.source_id == context.pub_node_id
+                }
+                for ent in entities:
+                    if (
+                        ent.label in (EntityType.Entity, EntityType.Organization, EntityType.Product, EntityType.Event)
+                        and ent.id not in mentions_targets
+                    ):
+                        raise ValueError(
+                            f"Extracted entity '{ent.name}' ({ent.id}) is missing a MENTIONS relation from the post"
+                        )
                 extra_entities, structural_relations = _create_structural_relations(
                     entities,
                     microconcept_entities,
@@ -859,7 +936,6 @@ class GraphExtractor:
                     context.pub_node_id,
                     context.author_node_id,
                     context,
-                    raw_psychographics,
                 )
                 all_relations = llm_relations + structural_relations
 

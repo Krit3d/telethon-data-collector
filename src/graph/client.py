@@ -100,7 +100,8 @@ class Neo4jClient:
                     delay = (0.1 * (2 ** attempt)) + random.uniform(0.05, 0.25)
                     await asyncio.sleep(delay)
 
-        raise last_exc  # type: ignore[misc]
+        assert last_exc is not None
+        raise last_exc
 
     async def execute_read(
         self,
@@ -192,10 +193,17 @@ class Neo4jClient:
         rel_type_str = self._resolve_rel_type(rel_type)
         for i in range(0, len(relations), batch_size):
             batch = relations[i:i + batch_size]
-            normalized = [
-                {"source_id": r["source_id"], "target_id": r["target_id"], "properties": sanitize_properties(r.get("properties", {}))}
-                for r in batch
-            ]
+            normalized = []
+            for r in batch:
+                props = dict(r.get("properties", {}))
+                for key, value in r.items():
+                    if key not in ("source_id", "target_id", "properties") and value is not None:
+                        props[key] = value
+                normalized.append({
+                    "source_id": r["source_id"],
+                    "target_id": r["target_id"],
+                    "properties": sanitize_properties(props),
+                })
             await self.execute_write(
                 f"UNWIND $batch AS row "
                 f"MATCH (s:{src_label_str} {{id: row.source_id}}) "

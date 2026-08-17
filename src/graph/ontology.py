@@ -6,8 +6,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from src.graph.utils import is_garbage_value
-
 
 class EntityType(StrEnum):
     Actor = "Actor"
@@ -78,6 +76,9 @@ class SentimentType(StrEnum):
     positive = "positive"
     negative = "negative"
     neutral = "neutral"
+
+
+_SENTIMENT_VALUES: frozenset[str] = frozenset({member.value for member in SentimentType})
 
 
 class EntityCategory(StrEnum):
@@ -295,10 +296,10 @@ class ActorNode(BaseModel):
     location_name: str | None = None
     platform: PlatformType
     platform_id: str
-    primary_language: str = "ru"
-    primary_sentiment: SentimentType = SentimentType.neutral
-    primary_tone: ToneType = ToneType.casual
-    primary_hormone: HormoneType = HormoneType.dopamine
+    primary_language: str | None = None
+    primary_sentiment: SentimentType | None = None
+    primary_tone: ToneType | None = None
+    primary_hormone: HormoneType | None = None
     secondary_hormone: HormoneType | None = None
     secondary_tone: ToneType | None = None
 
@@ -315,18 +316,19 @@ class PostNode(BaseModel):
     published_at: int
     platform: PlatformType
     post_type: PostType = PostType.post
-    language: str = "ru"
+    language: str | None = None
     sentiment: SentimentType | None = None
     tone: ToneType | None = None
     secondary_tone: ToneType | None = None
+    tone_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     primary_hormone: HormoneType | None = None
     secondary_hormone: HormoneType | None = None
-    score_dopamine: float = 0.0
-    score_oxytocin: float = 0.0
-    score_serotonin: float = 0.0
-    score_cortisol: float = 0.0
-    score_adrenaline: float = 0.0
-    score_endorphin: float = 0.0
+    score_dopamine: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_oxytocin: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_serotonin: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_cortisol: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_adrenaline: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_endorphin: float = Field(default=0.0, ge=0.0, le=1.0)
     is_video: bool = False
     is_spam_or_gambling: bool = False
 
@@ -432,7 +434,7 @@ class ExtractedEntity(BaseModel):
     label: EntityType
     properties: dict[str, Any] = {}
     microconcept: str | None = None
-    confidence: float = 1.0
+    confidence: float = 0.9
     embedding: list[float] | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
@@ -448,7 +450,7 @@ class ExtractedRelation(BaseModel):
     target_label: EntityType
     relation_type: RelationType
     properties: dict[str, Any] = {}
-    confidence: float = 1.0
+    confidence: float | None = None
 
     @model_validator(mode="after")
     def _validate_and_repair(self) -> ExtractedRelation:
@@ -462,18 +464,79 @@ class ExtractedRelation(BaseModel):
         if repaired is None:
             raise ValueError(f"Self-referencing relation rejected: {self.source_id} -> {self.target_id}")
         self.source_id, self.source_label, self.target_id, self.target_label, self.relation_type = repaired
+        props_conf = self.properties.get("confidence")
+        if props_conf is not None and not isinstance(props_conf, bool):
+            try:
+                parsed_conf = float(props_conf)
+            except (TypeError, ValueError):
+                parsed_conf = None
+            if parsed_conf is not None and parsed_conf > 0.0:
+                self.confidence = parsed_conf
+        if self.confidence is not None and self.confidence > 0.0 and "confidence" not in self.properties:
+            self.properties["confidence"] = float(self.confidence)
+        if self.relation_type == RelationType.MENTIONS:
+            sentiment = self.properties.get("sentiment")
+            if isinstance(sentiment, str) and sentiment.strip():
+                normalized_sentiment = sentiment.strip().lower()
+                if normalized_sentiment not in _SENTIMENT_VALUES:
+                    raise ValueError(
+                        f"MENTIONS relation from {self.source_id} ({self.source_label}) to {self.target_id} "
+                        f"({self.target_label}) requires properties['sentiment'] to be a string from "
+                        f"{sorted(_SENTIMENT_VALUES)}"
+                    )
+                self.properties["sentiment"] = normalized_sentiment
+            else:
+                self.properties.pop("sentiment", None)
+            if self.confidence is None or self.confidence <= 0.0:
+                raise ValueError(
+                    f"MENTIONS relation from {self.source_id} ({self.source_label}) to {self.target_id} "
+                    f"({self.target_label}) requires properties['confidence'] to be a float > 0.0"
+                )
+            self.properties["confidence"] = float(self.confidence)
         return self
 
 
 class ExtractedPsychographics(BaseModel):
     language: str | None = None
-    sentiment: SentimentType = SentimentType.neutral
-    primary_tone: ToneType
-    secondary_tones: list[ToneType] = []
-    primary_hormone: HormoneType
+    sentiment: SentimentType | None = None
+    primary_tone: ToneType | None = None
+    secondary_tone: ToneType | None = None
+    tone_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    primary_hormone: HormoneType | None = None
     secondary_hormone: HormoneType | None = None
-    scores: dict[str, float] = {}
-    intent: str = ""
+    score_dopamine: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_oxytocin: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_serotonin: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_cortisol: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_adrenaline: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_endorphin: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _derive_hormone_scores(self) -> ExtractedPsychographics:
+        if self.primary_tone is None and self.secondary_tone is not None:
+            self.primary_tone = self.secondary_tone
+            self.secondary_tone = None
+        elif self.secondary_tone is not None and self.secondary_tone == self.primary_tone:
+            self.secondary_tone = None
+        scores = (
+            (self.score_dopamine, HormoneType.dopamine),
+            (self.score_oxytocin, HormoneType.oxytocin),
+            (self.score_serotonin, HormoneType.serotonin),
+            (self.score_cortisol, HormoneType.cortisol),
+            (self.score_adrenaline, HormoneType.adrenaline),
+            (self.score_endorphin, HormoneType.endorphin),
+        )
+        sorted_scores = sorted(scores, key=lambda item: item[0], reverse=True)
+        if sorted_scores[0][0] >= 0.05:
+            self.primary_hormone = sorted_scores[0][1]
+            if sorted_scores[1][0] >= 0.05:
+                self.secondary_hormone = sorted_scores[1][1]
+            else:
+                self.secondary_hormone = None
+        else:
+            self.primary_hormone = None
+            self.secondary_hormone = None
+        return self
 
 
 class OpenSPGExtractionResult(BaseModel):
@@ -491,6 +554,8 @@ class OpenSPGExtractionResult(BaseModel):
         author_title: str | None = None,
         author_handle: str | None = None,
     ) -> OpenSPGExtractionResult:
+
+        from src.graph.utils import is_garbage_value
 
         phantom_names = frozenset({"<name>", "unknown", "null", "none", "n/a", ""})
         valid_ids = set(allowed_ids) if allowed_ids else set()
