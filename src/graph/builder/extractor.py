@@ -113,9 +113,9 @@ def _build_system_prompt(author_title: str) -> str:
         "USES_TECH, PRODUCES, RELATED_TO, COAUTHOR.\n"
         "Строгие сигнатуры связей (source -> relation -> target):\n"
         "  - MENTIONS: (Post) -> MENTIONS -> (Entity | Organization | Product | Event). "
-        "Упоминание сущности в посте. Поля в properties: sentiment (str | null: positive, negative, neutral — "
+        "Упоминание сущности в посте. Поля в properties: sentiment (str | null: positive, `negative, neutral — "
         "указывается ТОЛЬКО если автор явно выражает отношение к сущности в посте) "
-        "и confidence (float от 0.0 до 1.0 | null — указывается только при явной оценке).\n"
+        "и confidence (float от 0.1 до 1.0, по умолчанию 1.0).\n"
         "  - ABOUT: (Post) -> ABOUT -> (MicroConcept). Тематическая связь поста с микроконцептом. properties: weight (float от 0.0 до 1.0, по умолчанию 1.0). Калибровка weight: 1.0 — ключевая тема поста (основное содержание, >70% текста); 0.7 — вторичная тема (подробно обсуждается, 20-50% текста); 0.3 — косвенное или эпизодическое упоминание (<20% текста).\n"
         "  - WORKS_AT: (Actor) -> WORKS_AT -> (Organization). Строгое правило: properties.role принимает "
         "ОДНО значение строго из [founder, executive, employee, ambassador, advisor]. "
@@ -595,15 +595,23 @@ def _parse_relations(
             role = properties.get("role")
             if not isinstance(role, str) or not role.strip():
                 properties["role"] = "participant"
+        if relation_type == RelationType.MENTIONS:
+            if "weight" in properties and "confidence" not in properties:
+                properties["confidence"] = properties.pop("weight")
+            properties.pop("weight", None)
         if "sentiment" not in properties and raw.get("sentiment") is not None:
             properties["sentiment"] = str(raw.get("sentiment")).strip()
         if "confidence" not in properties and raw.get("confidence") is not None:
             properties["confidence"] = raw.get("confidence")
         raw_confidence = properties.get("confidence")
         try:
-            confidence_float = float(raw_confidence) if raw_confidence is not None else 0.0
+            confidence_float = float(raw_confidence) if raw_confidence is not None else None
         except (TypeError, ValueError):
-            confidence_float = 0.0
+            confidence_float = None
+        if relation_type == RelationType.MENTIONS:
+            if confidence_float is None or confidence_float <= 0.0:
+                confidence_float = 1.0
+                properties["confidence"] = 1.0
         try:
             result.append(ExtractedRelation(
                 source_id=source_id,
@@ -711,10 +719,12 @@ def _create_structural_relations(
     ))
 
     for mc in microconcepts:
+        if mc.id is None or mc.id == "":
+            continue
         relations.append(ExtractedRelation(
             source_id=pub_node_id,
             source_label=post_label,
-            target_id=mc.id or "",
+            target_id=mc.id,
             target_label=EntityType.MicroConcept,
             relation_type=RelationType.ABOUT,
             properties={"weight": 1.0},
@@ -724,27 +734,31 @@ def _create_structural_relations(
     for ent in entities:
         if ent.label not in (EntityType.Entity, EntityType.Product, EntityType.Organization, EntityType.Event):
             continue
+        if ent.id is None or ent.id == "":
+            continue
         for mc in microconcepts:
-            src_id = ent.id or ""
-            tgt_id = mc.id or ""
-            key = (src_id, tgt_id)
+            if mc.id is None or mc.id == "":
+                continue
+            key = (ent.id, mc.id)
             if key in seen_belongs_to:
                 continue
             seen_belongs_to.add(key)
             relations.append(ExtractedRelation(
-                source_id=src_id,
+                source_id=ent.id,
                 source_label=ent.label,
-                target_id=tgt_id,
+                target_id=mc.id,
                 target_label=EntityType.MicroConcept,
                 relation_type=RelationType.BELONGS_TO,
                 properties={},
             ))
 
     for ht in hashtag_entities:
+        if ht.id is None or ht.id == "":
+            continue
         relations.append(ExtractedRelation(
             source_id=pub_node_id,
             source_label=post_label,
-            target_id=ht.id or "",
+            target_id=ht.id,
             target_label=EntityType.Hashtag,
             relation_type=RelationType.TAGGED_WITH,
         ))
@@ -924,11 +938,18 @@ class GraphExtractor:
                 for ent in entities:
                     if (
                         ent.label in (EntityType.Entity, EntityType.Organization, EntityType.Product, EntityType.Event)
+                        and ent.id is not None
                         and ent.id not in mentions_targets
                     ):
-                        raise ValueError(
-                            f"Extracted entity '{ent.name}' ({ent.id}) is missing a MENTIONS relation from the post"
-                        )
+                        llm_relations.append(ExtractedRelation(
+                            source_id=context.pub_node_id,
+                            source_label=EntityType.Post,
+                            target_id=ent.id,
+                            target_label=ent.label,
+                            relation_type=RelationType.MENTIONS,
+                            confidence=1.0,
+                            properties={"confidence": 1.0, "sentiment": None},
+                        ))
                 extra_entities, structural_relations = _create_structural_relations(
                     entities,
                     microconcept_entities,

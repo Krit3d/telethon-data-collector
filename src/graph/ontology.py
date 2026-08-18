@@ -476,23 +476,18 @@ class ExtractedRelation(BaseModel):
             self.properties["confidence"] = float(self.confidence)
         if self.relation_type == RelationType.MENTIONS:
             sentiment = self.properties.get("sentiment")
-            if isinstance(sentiment, str) and sentiment.strip():
+            if isinstance(sentiment, str):
                 normalized_sentiment = sentiment.strip().lower()
-                if normalized_sentiment not in _SENTIMENT_VALUES:
-                    raise ValueError(
-                        f"MENTIONS relation from {self.source_id} ({self.source_label}) to {self.target_id} "
-                        f"({self.target_label}) requires properties['sentiment'] to be a string from "
-                        f"{sorted(_SENTIMENT_VALUES)}"
-                    )
-                self.properties["sentiment"] = normalized_sentiment
+                if normalized_sentiment in _SENTIMENT_VALUES:
+                    self.properties["sentiment"] = normalized_sentiment
+                else:
+                    self.properties["sentiment"] = None
             else:
-                self.properties.pop("sentiment", None)
+                self.properties["sentiment"] = None
             if self.confidence is None or self.confidence <= 0.0:
-                raise ValueError(
-                    f"MENTIONS relation from {self.source_id} ({self.source_label}) to {self.target_id} "
-                    f"({self.target_label}) requires properties['confidence'] to be a float > 0.0"
-                )
+                self.confidence = 1.0
             self.properties["confidence"] = float(self.confidence)
+            self.properties.pop("weight", None)
         return self
 
 

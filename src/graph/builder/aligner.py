@@ -11,6 +11,7 @@ from qdrant_client.http import models
 
 from src.config.config import Settings
 from src.graph.builder.reader import PostBatchContext
+from src.embeddings.client import CATEGORIES_COLLECTION, ENTITIES_COLLECTION
 from src.graph.client import Neo4jClient
 from src.graph.ontology import (
     EntityType,
@@ -96,8 +97,8 @@ class Aligner:
             bge_texts.append(format_bge_representation(e.label.value, e.name, subtype))
         try:
             embeddings = await self._get_embeddings_batch(bge_texts)
-        except Exception:
-            logger.warning("Embedding generation failed in _disambiguate_entities, skipping")
+        except Exception as exc:
+            logger.warning("Embedding generation failed in _disambiguate_entities: %s", exc)
             return
         if len(embeddings) != len(missed):
             return
@@ -106,7 +107,7 @@ class Aligner:
         t0 = time.perf_counter()
         try:
             batch_response = await self._qdrant_client.query_batch_points(
-                collection_name="social_entities",
+                collection_name=ENTITIES_COLLECTION,
                 requests=[
                     models.QueryRequest(
                         query=emb,
@@ -118,8 +119,8 @@ class Aligner:
                     for emb in embeddings
                 ],
             )
-        except Exception:
-            logger.warning("Qdrant query_batch_points failed in _disambiguate_entities, skipping")
+        except Exception as exc:
+            logger.warning("Qdrant query_batch_points failed in _disambiguate_entities: %s", exc)
             return
         qdrant_elapsed = (time.perf_counter() - t0) * 1000
         resolved = 0
@@ -175,15 +176,15 @@ class Aligner:
         names = [mc.name for mc in unique]
         try:
             embeddings = await self._get_embeddings_batch(names)
-        except Exception:
-            logger.warning("Embedding generation failed in _link_microconcepts, skipping")
+        except Exception as exc:
+            logger.warning("Embedding generation failed in _link_microconcepts: %s", exc)
             return
         if len(embeddings) != len(unique):
             return
         t0 = time.perf_counter()
         try:
             batch_response = await self._qdrant_client.query_batch_points(
-                collection_name="categories",
+                collection_name=CATEGORIES_COLLECTION,
                 requests=[
                     models.QueryRequest(
                         query=emb,
@@ -194,8 +195,8 @@ class Aligner:
                     for emb in embeddings
                 ],
             )
-        except Exception:
-            logger.warning("Qdrant query_batch_points failed in _link_microconcepts, skipping")
+        except Exception as exc:
+            logger.warning("Qdrant query_batch_points failed in _link_microconcepts: %s", exc)
             return
         qdrant_elapsed = (time.perf_counter() - t0) * 1000
         linked = 0
@@ -346,8 +347,8 @@ class Aligner:
         normalized_texts = [ht.normalized for ht in unique]
         try:
             embeddings = await self._get_embeddings_batch(normalized_texts)
-        except Exception:
-            logger.warning("Embedding generation failed in _link_hashtags, skipping")
+        except Exception as exc:
+            logger.warning("Embedding generation failed in _link_hashtags: %s", exc)
             return
 
         if len(embeddings) != len(unique):
@@ -358,7 +359,7 @@ class Aligner:
         async def _query_social_entities() -> list[models.QueryResponse] | None:
             try:
                 return await self._qdrant_client.query_batch_points(
-                    collection_name="social_entities",
+                    collection_name=ENTITIES_COLLECTION,
                     requests=[
                         models.QueryRequest(
                             query=emb,
@@ -370,14 +371,14 @@ class Aligner:
                         for emb in embeddings
                     ],
                 )
-            except Exception:
-                logger.warning("Qdrant social_entities query failed in _link_hashtags, skipping")
+            except Exception as exc:
+                logger.warning("Qdrant social_entities query failed in _link_hashtags: %s", exc)
                 return None
 
         async def _query_categories() -> list[models.QueryResponse] | None:
             try:
                 return await self._qdrant_client.query_batch_points(
-                    collection_name="categories",
+                    collection_name=CATEGORIES_COLLECTION,
                     requests=[
                         models.QueryRequest(
                             query=emb,
@@ -389,8 +390,8 @@ class Aligner:
                         for emb in embeddings
                     ],
                 )
-            except Exception:
-                logger.warning("Qdrant categories query failed in _link_hashtags, skipping")
+            except Exception as exc:
+                logger.warning("Qdrant categories query failed in _link_hashtags: %s", exc)
                 return None
 
         social_resp, cat_resp = await asyncio.gather(
