@@ -6,7 +6,9 @@ import re
 import signal
 from typing import Any
 
+from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import selectinload
 
 try:
     import asyncpg.exceptions
@@ -17,8 +19,7 @@ except ImportError:
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
-from src.graph.db.extractor_repo import ExtractorRepository
-from src.db.models import Content
+from src.db.models import Account, Content
 from src.embeddings.qdrant_service import QdrantService
 from src.embeddings.visual_service import VisualEmbeddingService
 from src.parser.creators.core.schemas import ContentMetadata
@@ -129,7 +130,6 @@ class EmbeddingWorker:
     def __init__(
         self,
         db: Database,
-        extractor_repo: ExtractorRepository,
         qdrant: QdrantService,
         visual_service: VisualEmbeddingService,
         settings: Settings,
@@ -137,7 +137,6 @@ class EmbeddingWorker:
         poll_interval: int = 5,
     ) -> None:
         self.db = db
-        self.extractor_repo = extractor_repo
         self.qdrant = qdrant
         self.visual_service = visual_service
         self.settings = settings
@@ -145,6 +144,28 @@ class EmbeddingWorker:
         self.poll_interval = poll_interval
         self.priority_mode: bool = False
         self._shutdown_event = asyncio.Event()
+
+    async def _fetch_unembedded_content(self, limit: int) -> list[Content]:
+        async with self.db.async_session() as session:
+            result = await session.execute(
+                select(Content)
+                .options(selectinload(Content.account))
+                .join(Content.account)
+                .where(
+                    Content.is_embedded.is_(False),
+                    Account.status == "verified",
+                )
+                .order_by(Content.id.desc() if self.priority_mode else Content.id.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def _mark_content_embedded(self, content_ids: list[int]) -> None:
+        async with self.db.async_session() as session:
+            await session.execute(
+                update(Content).where(Content.id.in_(content_ids)).values(is_embedded=True)
+            )
+            await session.commit()
 
     def handle_shutdown(self, *args: object) -> None:
         logger.info("Shutdown signal received, finishing current sub-batch before exit")
@@ -265,6 +286,7 @@ class EmbeddingWorker:
 
             account = post.account
             subscribers_count: int = account.subscribers_count if account and account.subscribers_count else 0
+            is_author_blog: bool | None = account.is_author_blog if (account and account.is_author_blog is not None) else None
             views: int = post.views or 0
             comments_count: int = post.comments_count or 0
             shares_count: int = post.shares_count or 0
@@ -280,6 +302,7 @@ class EmbeddingWorker:
                 "account_id": post.account_id,
                 "platform": account.platform if account else "UNKNOWN",
                 "subscribers_count": subscribers_count,
+                "is_author_blog": is_author_blog,
                 "views": views,
                 "comments_count": comments_count,
                 "shares_count": shares_count,
@@ -292,7 +315,7 @@ class EmbeddingWorker:
             valid_posts.append(post)
 
         if skip_ids:
-            await self.extractor_repo.mark_content_embedded(skip_ids)
+            await self._mark_content_embedded(skip_ids)
             logger.debug(
                 "Marked %d posts as embedded (skipped due to insufficient text)",
                 len(skip_ids),
@@ -329,7 +352,7 @@ class EmbeddingWorker:
                 visual_embeddings = await asyncio.gather(*visual_tasks)
                 await self.qdrant.upsert_batch(sub_batch, list(visual_embeddings))
                 sub_ids = [p["post_id"] for p in sub_batch]
-                await self.extractor_repo.mark_content_embedded(sub_ids)
+                await self._mark_content_embedded(sub_ids)
                 total_embedded += len(sub_ids)
                 logger.debug(
                     "Embedded sub-batch of %d items (%d/%d total)",
@@ -374,8 +397,8 @@ class EmbeddingWorker:
         while not self._shutdown_event.is_set():
             try:
                 try:
-                    posts = await self.extractor_repo.get_unembedded_content(
-                        limit=self.batch_size, priority_mode=self.priority_mode
+                    posts = await self._fetch_unembedded_content(
+                        limit=self.batch_size
                     )
                 except (OperationalError, PostgresError) as e:
                     consecutive_errors += 1
@@ -453,13 +476,10 @@ async def run_embedding_worker() -> None:
         await db.close()
         return
 
-    extractor_repo = ExtractorRepository(db.async_session, settings)
-
     visual_service = VisualEmbeddingService(settings)
 
     worker = EmbeddingWorker(
         db=db,
-        extractor_repo=extractor_repo,
         qdrant=qdrant,
         visual_service=visual_service,
         settings=settings,

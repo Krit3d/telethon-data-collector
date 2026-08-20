@@ -23,7 +23,7 @@ from src.graph.ontology import (
     VECTORIZABLE_ENTITY_LABELS,
     extract_entity_subtype,
 )
-from src.graph.utils import build_node_id, clean_name_lower, format_bge_representation
+from src.graph.utils import build_node_id, clean_name_lower, format_bge_representation, format_display_name
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ _CANONICAL_ENTITY_LABELS: frozenset[str] = frozenset({
     EntityType.Organization.value,
     EntityType.Entity.value,
     EntityType.Event.value,
+    EntityType.Hashtag.value,
 })
 
 
@@ -56,6 +57,7 @@ class Aligner:
         )
         self._neo4j_client = neo4j_client
         self._l1_cache: OrderedDict[str, str] = OrderedDict()
+        self._classified_mc_ids: set[str] = set()
 
     def _cache_set(self, key: str, value: str) -> None:
         self._l1_cache[key] = value
@@ -134,6 +136,12 @@ class Aligner:
                 continue
             payload = hit.payload or {}
             canonical_label = payload.get("label") or payload.get("Label")
+            if canonical_label and canonical_label in _CANONICAL_ENTITY_LABELS:
+                entity.label = EntityType(canonical_label)
+            canonical_name = payload.get("name") or payload.get("title")
+            if canonical_name:
+                entity.name = format_display_name(canonical_name, entity.label)
+                entity.name_lower = clean_name_lower(entity.name)
             canonical_id = (
                 payload.get("id")
                 or payload.get("original_id")
@@ -150,12 +158,104 @@ class Aligner:
             len(missed), qdrant_elapsed, resolved,
         )
 
+    async def _resolve_actor_mentions(
+        self,
+        extraction_result: OpenSPGExtractionResult,
+        context: PostBatchContext,
+        id_map: dict[str, str],
+    ) -> None:
+        candidates: list[ExtractedEntity] = []
+        for entity in extraction_result.entities:
+            if not entity.id or entity.id in id_map:
+                continue
+            if entity.label == EntityType.Entity and entity.properties.get("entity_type") == "person":
+                candidates.append(entity)
+            elif "@" in entity.name:
+                candidates.append(entity)
+        if not candidates:
+            return
+
+        resolved_ids: set[str] = set()
+        resolved_count = 0
+        for entity in candidates:
+            entity_id = entity.id
+            if not entity_id:
+                continue
+            actor_id: str | None = None
+            name_lower = clean_name_lower(entity.name)
+            cache_key = f"Actor:{name_lower}"
+            cached = self._l1_cache.get(cache_key)
+            if cached is not None:
+                actor_id = cached
+                self._l1_cache.move_to_end(cache_key)
+            else:
+                handle: str | None = None
+                if "@" in entity.name:
+                    raw = entity.name.strip()
+                    if raw.startswith("@"):
+                        handle = raw[1:].strip()
+                    else:
+                        at_idx = raw.find("@")
+                        if at_idx >= 0:
+                            handle = raw[at_idx + 1:].strip().split()[0]
+                try:
+                    if handle:
+                        rows = await self._neo4j_client.execute_read(
+                            "MATCH (a:Actor) WHERE a.handle = $handle RETURN a.id AS id LIMIT 1",
+                            {"handle": handle},
+                        )
+                        if rows:
+                            raw_id = rows[0].get("id")
+                            if isinstance(raw_id, str):
+                                actor_id = raw_id
+                                self._cache_set(cache_key, actor_id)
+                    if not actor_id:
+                        rows = await self._neo4j_client.execute_read(
+                            "MATCH (a:Actor) WHERE a.name_lower = $name_lower RETURN a.id AS id LIMIT 1",
+                            {"name_lower": name_lower},
+                        )
+                        if rows:
+                            raw_id = rows[0].get("id")
+                            if isinstance(raw_id, str):
+                                actor_id = raw_id
+                                self._cache_set(cache_key, actor_id)
+                except Exception as exc:
+                    logger.warning("Neo4j Actor lookup failed for %s: %s", entity.name, exc)
+                    continue
+            if not actor_id:
+                continue
+            resolved_id: str = actor_id
+            id_map[entity_id] = resolved_id
+            entity.id = resolved_id
+            entity.label = EntityType.Actor
+            resolved_ids.add(entity_id)
+            if context.pub_node_id:
+                extraction_result.relations.append(
+                    ExtractedRelation(
+                        source_id=context.pub_node_id,
+                        source_label=EntityType.Post,
+                        target_id=actor_id,
+                        target_label=EntityType.Actor,
+                        relation_type=RelationType.MENTIONS,
+                        properties={},
+                    )
+                )
+            resolved_count += 1
+
+        if resolved_ids:
+            extraction_result.entities = [
+                e for e in extraction_result.entities
+                if e.id not in resolved_ids
+            ]
+
+        if resolved_count:
+            logger.debug("Actor mention resolution: resolved %d entities to Actor nodes", resolved_count)
+
     async def _link_microconcepts(
         self,
         microconcepts: list[ExtractedEntity],
         context: PostBatchContext,
         relations: list[ExtractedRelation],
-        entities: list[ExtractedEntity],
     ) -> None:
         if not microconcepts:
             return
@@ -226,28 +326,8 @@ class Aligner:
             if not code:
                 continue
             concept_node_id = build_node_id(EntityType.Concept, code)
-            concept_name = str(chosen["payload"].get("name") or code)
-            tier_1 = chosen["payload"].get("tier_1")
-            tier_2 = chosen["payload"].get("tier_2")
-            tier_3 = chosen["payload"].get("tier_3")
-            tier_4 = chosen["payload"].get("tier_4")
-            extension = chosen["payload"].get("extension")
-            entities.append(
-                ExtractedEntity(
-                    id=concept_node_id,
-                    name=concept_name,
-                    label=EntityType.Concept,
-                    properties={
-                        "code": code,
-                        "tier_1": tier_1,
-                        "tier_2": tier_2,
-                        "tier_3": tier_3,
-                        "tier_4": tier_4,
-                        "extension": extension,
-                    },
-                )
-            )
             mc.properties["is_classified"] = True
+            self._classified_mc_ids.add(mc_id)
             key = f"{EntityType.MicroConcept.value}:{clean_name_lower(mc.name)}"
             self._cache_set(key, mc_id)
             relations.append(
@@ -264,47 +344,6 @@ class Aligner:
         logger.debug(
             "Qdrant iab_categories search for %d microconcepts done in %.1fms, linked %d",
             len(unique), qdrant_elapsed, linked,
-        )
-
-    async def _link_author_category(
-        self,
-        extraction_result: OpenSPGExtractionResult,
-        context: PostBatchContext,
-    ) -> None:
-        if not context.account_category_id:
-            return
-        if context.account_category_path:
-            parts = [p.strip() for p in context.account_category_path.split(" > ")]
-        else:
-            parts = [context.account_category_id]
-        name = parts[-1]
-        concept_node_id = build_node_id(EntityType.Concept, context.account_category_id)
-        properties: dict[str, str] = {"code": context.account_category_id}
-        if len(parts) > 0:
-            properties["tier_1"] = parts[0]
-        if len(parts) > 1:
-            properties["tier_2"] = parts[1]
-        if len(parts) > 2:
-            properties["tier_3"] = parts[2]
-        if len(parts) > 3:
-            properties["tier_4"] = parts[3]
-        extraction_result.entities.append(
-            ExtractedEntity(
-                id=concept_node_id,
-                name=name,
-                label=EntityType.Concept,
-                properties=properties,
-            )
-        )
-        extraction_result.relations.append(
-            ExtractedRelation(
-                source_id=context.author_node_id,
-                source_label=EntityType.Actor,
-                target_id=concept_node_id,
-                target_label=EntityType.Concept,
-                relation_type=RelationType.BELONGS_TO,
-                properties={},
-            )
         )
 
     async def _link_hashtags(
@@ -402,10 +441,6 @@ class Aligner:
         qdrant_elapsed = (time.perf_counter() - t0) * 1000
 
         existing_entity_ids: set[str] = {e.id for e in extraction_result.entities if e.id}
-        existing_concept_ids: set[str] = {
-            e.id for e in extraction_result.entities
-            if e.id and e.label == EntityType.Concept
-        }
 
         maps_to_count = 0
         belongs_to_count = 0
@@ -432,7 +467,7 @@ class Aligner:
                     target_label = EntityType(canonical_label)
                 except ValueError:
                     continue
-                canonical_name = str(payload.get("name") or payload.get("title") or canonical_id)
+                canonical_name = format_display_name(str(payload.get("name") or payload.get("title") or canonical_id), target_label)
                 ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
                 if canonical_id not in existing_entity_ids:
                     extraction_result.entities.append(
@@ -468,29 +503,6 @@ class Aligner:
                     continue
                 concept_node_id = build_node_id(EntityType.Concept, code)
                 ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
-                if concept_node_id not in existing_concept_ids:
-                    concept_name = str(payload.get("name") or code)
-                    tier_1 = payload.get("tier_1")
-                    tier_2 = payload.get("tier_2")
-                    tier_3 = payload.get("tier_3")
-                    tier_4 = payload.get("tier_4")
-                    extension = payload.get("extension")
-                    extraction_result.entities.append(
-                        ExtractedEntity(
-                            id=concept_node_id,
-                            name=concept_name,
-                            label=EntityType.Concept,
-                            properties={
-                                "code": code,
-                                "tier_1": tier_1,
-                                "tier_2": tier_2,
-                                "tier_3": tier_3,
-                                "tier_4": tier_4,
-                                "extension": extension,
-                            },
-                        )
-                    )
-                    existing_concept_ids.add(concept_node_id)
                 extraction_result.relations.append(
                     ExtractedRelation(
                         source_id=ht_node_id,
@@ -526,8 +538,6 @@ class Aligner:
             if cached is not None:
                 id_map[entity.id] = cached
                 self._l1_cache.move_to_end(key)
-                if entity.label == EntityType.MicroConcept:
-                    entity.properties["is_classified"] = True
                 l1_hits += 1
             else:
                 missed.append(entity)
@@ -543,8 +553,10 @@ class Aligner:
                     key = f"{entity.label.value}:{clean_name_lower(entity.name)}"
                     self._cache_set(key, entity.id)
                     id_map[entity.id] = entity.id
-                    if entity.label == EntityType.MicroConcept:
-                        entity.properties["is_classified"] = True
+
+        t_actor_resolve = time.perf_counter()
+        await self._resolve_actor_mentions(extraction_result, context, id_map)
+        actor_resolve_elapsed = (time.perf_counter() - t_actor_resolve) * 1000
 
         still_missed = [
             e for e in missed
@@ -569,6 +581,8 @@ class Aligner:
             seen_microconcept_ids.add(canonical_id)
             if mc.id in id_map:
                 mc.id = canonical_id
+            if canonical_id in self._classified_mc_ids:
+                mc.properties["is_classified"] = True
             unique_microconcepts.append(mc)
 
         t_qdrant_categories = time.perf_counter()
@@ -576,11 +590,8 @@ class Aligner:
             unique_microconcepts,
             context,
             extraction_result.relations,
-            extraction_result.entities,
         )
         qdrant_categories_elapsed = (time.perf_counter() - t_qdrant_categories) * 1000
-
-        await self._link_author_category(extraction_result, context)
 
         await self._link_hashtags(extraction_result, context)
 
@@ -607,24 +618,44 @@ class Aligner:
                 if relation.target_id in id_map:
                     relation.target_id = id_map[relation.target_id]
 
+        id_to_label: dict[str, EntityType] = {}
+        for entity in extraction_result.entities:
+            if entity.id:
+                id_to_label[entity.id] = entity.label
+        if context.author_node_id:
+            id_to_label[context.author_node_id] = EntityType.Actor
+        if context.pub_node_id:
+            id_to_label[context.pub_node_id] = EntityType.Post
+        for relation in extraction_result.relations:
+            resolved_source = id_to_label.get(relation.source_id)
+            if resolved_source is not None:
+                relation.source_label = resolved_source
+            resolved_target = id_to_label.get(relation.target_id)
+            if resolved_target is not None:
+                relation.target_label = resolved_target
+
         deduped_relations: list[ExtractedRelation] = []
-        seen_relation_keys: set[tuple[str, str, str]] = set()
+        seen_relation_keys: dict[tuple[str, str, str], ExtractedRelation] = {}
         for relation in extraction_result.relations:
             if relation.source_id == relation.target_id:
                 continue
             key = (relation.source_id, relation.target_id, relation.relation_type.value)
-            if key in seen_relation_keys:
+            existing = seen_relation_keys.get(key)
+            if existing is not None:
+                for k, v in relation.properties.items():
+                    if v not in (None, "", {}, []) and k not in existing.properties:
+                        existing.properties[k] = v
                 continue
-            seen_relation_keys.add(key)
+            seen_relation_keys[key] = relation
             deduped_relations.append(relation)
         extraction_result.relations = deduped_relations
 
         total_elapsed = (time.perf_counter() - t0) * 1000
         l1_miss = len(missed)
         logger.debug(
-            "Aligner done in %.1fms | L1 cache: %d hit, %d miss | Neo4j lookup: %.1fms | Qdrant social_entities: %.1fms | Qdrant categories: %.1fms | entities: %d, relations: %d",
+            "Aligner done in %.1fms | L1 cache: %d hit, %d miss | Neo4j lookup: %.1fms | Qdrant social_entities: %.1fms | Actor resolve: %.1fms | Qdrant categories: %.1fms | entities: %d, relations: %d",
             total_elapsed, l1_hits, l1_miss, neo4j_elapsed,
-            qdrant_entities_elapsed, qdrant_categories_elapsed,
+            qdrant_entities_elapsed, actor_resolve_elapsed, qdrant_categories_elapsed,
             len(extraction_result.entities), len(extraction_result.relations),
         )
         return extraction_result

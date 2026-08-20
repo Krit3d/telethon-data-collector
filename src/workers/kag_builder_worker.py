@@ -4,6 +4,7 @@ import signal
 
 from src.config.config import load_settings
 from src.db.database import Database
+from src.graph.bootstrap import bootstrap_graph
 from src.graph.client import Neo4jClient
 from src.graph.builder.orchestrator import KagBuilderOrchestrator
 from src.utils.logger import setup_logging
@@ -13,7 +14,7 @@ async def main() -> None:
     settings = load_settings()
     setup_logging(settings.log_level)
 
-    for logger_name in ("httpx", "httpcore", "openai", "qdrant_client", "urllib3"):
+    for logger_name in ("httpx", "httpcore", "openai", "qdrant_client", "urllib3", "neo4j"):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     pool_size = max(settings.graph_write_concurrency + 2, 5)
@@ -23,6 +24,7 @@ async def main() -> None:
     neo4j_client = Neo4jClient(settings)
 
     await neo4j_client.connect()
+    await bootstrap_graph(settings, db, neo4j_client)
 
     orchestrator = KagBuilderOrchestrator(settings, db, neo4j_client)
 

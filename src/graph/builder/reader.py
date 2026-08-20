@@ -30,10 +30,11 @@ class PostBatchContext(BaseModel):
     account_category_path: str | None
     author_title: str
     author_username: str | None
-    author_biography: str | None = None
+    author_biography: str | None
     post_type: str
     is_video: bool
-    raw_metadata: dict[str, Any] | None
+    post_coauthors: list[str]
+    post_hashtags: list[str]
 
 
 class Reader:
@@ -98,7 +99,6 @@ class Reader:
                         platform = account.platform
                         platform_id = account.platform_id
                         content_raw = row.raw_metadata if isinstance(row.raw_metadata, dict) else {}
-                        account_raw = account.raw_metadata if isinstance(account.raw_metadata, dict) else {}
                         author_node_id = build_node_id(
                             "Actor", "", platform=platform, account_id=row.account_id
                         )
@@ -109,7 +109,8 @@ class Reader:
                             content_id=row.id,
                         )
                         post_type = str(content_raw.get("post_type") or "post").lower()
-                        is_video = post_type in ("reel", "video", "short", "tiktok") or bool(content_raw.get("video_url"))
+                        is_video = post_type in ("reel", "video", "short", "tiktok") or bool(content_raw.get("video_url")) or bool(row.transcription)
+
                         contexts.append(
                             PostBatchContext(
                                 content_id=row.id,
@@ -128,7 +129,8 @@ class Reader:
                                 author_biography=account.description,
                                 post_type=post_type,
                                 is_video=is_video,
-                                raw_metadata=row.raw_metadata,
+                                post_coauthors=content_raw.get("coauthors") or [],
+                                post_hashtags=content_raw.get("hashtags") or [],
                             )
                         )
 

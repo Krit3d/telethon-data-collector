@@ -6,16 +6,18 @@ from pydantic import BaseModel
 class TextChunk(BaseModel):
     chunk_index: int
     total_chunks: int
-    text: str
+    caption_text: str
+    transcription_text: str
+    combined_text: str
     is_chunked: bool
 
 
 class TextSplitter:
     _BOT_DISCLAIMER_RE = re.compile(
-        r"(?i)(?:^|\n)\s*(?:@\w+|t\.me/\w+)[^\n]*"
-        r"(?:bot|бот)[^\n]*\n?",
+        r"(?i)(?:^|\n)\s*(?:@\w+|t\.me/\w+)[^\n]*(?:bot|бот)[^\n]*\n?",
     )
-    _URL_RE = re.compile(r"https?://\S+|www\.\S+|t\.me/\S+")
+    _UTM_RE = re.compile(r"\?[a-zA-Z0-9_=&%-]+")
+    _TME_NORMALIZE_RE = re.compile(r"https?://t\.me/(\w+)")
     _MARKUP_RE = re.compile(r"[*_~`]")
     _MULTI_WS_RE = re.compile(r"[ \t]+")
     _MULTI_NL_RE = re.compile(r"\n{3,}")
@@ -26,7 +28,8 @@ class TextSplitter:
         if not text:
             return ""
         cleaned = TextSplitter._BOT_DISCLAIMER_RE.sub("", text)
-        cleaned = TextSplitter._URL_RE.sub("", cleaned)
+        cleaned = TextSplitter._UTM_RE.sub("", cleaned)
+        cleaned = TextSplitter._TME_NORMALIZE_RE.sub(r"@\1", cleaned)
         cleaned = TextSplitter._MARKUP_RE.sub("", cleaned)
         cleaned = TextSplitter._MULTI_WS_RE.sub(" ", cleaned)
         cleaned = TextSplitter._MULTI_NL_RE.sub("\n\n", cleaned)
@@ -34,37 +37,62 @@ class TextSplitter:
 
     def prepare_and_split(
         self,
-        content: str | None,
+        caption: str | None,
         transcription: str | None,
         max_chars: int = 4000,
         overlap: int = 200,
     ) -> list[TextChunk]:
-        clean_content = self.sanitize_text(content)
+        clean_caption = self.sanitize_text(caption)
         clean_transcription = self.sanitize_text(transcription)
 
-        if clean_content and clean_transcription:
-            combined = f"{clean_content}\n\n[Audio Transcription]:\n{clean_transcription}"
-        elif clean_content:
-            combined = clean_content
-        elif clean_transcription:
-            combined = clean_transcription
-        else:
-            combined = ""
+        total_len = len(clean_caption) + len(clean_transcription)
 
-        if not combined:
-            return [TextChunk(chunk_index=0, total_chunks=1, text="", is_chunked=False)]
+        if total_len <= max_chars:
+            combined = f"{clean_caption}\n\n{clean_transcription}".strip()
+            return [
+                TextChunk(
+                    chunk_index=0,
+                    total_chunks=1,
+                    caption_text=clean_caption,
+                    transcription_text=clean_transcription,
+                    combined_text=combined,
+                    is_chunked=False,
+                )
+            ]
 
-        if len(combined) <= max_chars:
-            return [TextChunk(chunk_index=0, total_chunks=1, text=combined, is_chunked=False)]
+        if clean_caption and len(clean_caption) < max_chars // 2:
+            chunks = self._split_text(clean_transcription, max_chars, overlap)
+            total = len(chunks)
+            return [
+                TextChunk(
+                    chunk_index=i,
+                    total_chunks=total,
+                    caption_text=clean_caption,
+                    transcription_text=chunk,
+                    combined_text=f"{clean_caption}\n\n{chunk}".strip(),
+                    is_chunked=True,
+                )
+                for i, chunk in enumerate(chunks)
+            ]
 
-        chunks = self._split_by_paragraphs(combined, max_chars, overlap)
+        combined = f"{clean_caption}\n\n{clean_transcription}".strip()
+        chunks = self._split_text(combined, max_chars, overlap)
         total = len(chunks)
         return [
-            TextChunk(chunk_index=i, total_chunks=total, text=chunk, is_chunked=True)
+            TextChunk(
+                chunk_index=i,
+                total_chunks=total,
+                caption_text=chunk,
+                transcription_text="",
+                combined_text=chunk,
+                is_chunked=True,
+            )
             for i, chunk in enumerate(chunks)
         ]
 
-    def _split_by_paragraphs(self, text: str, max_chars: int, overlap: int) -> list[str]:
+    def _split_text(self, text: str, max_chars: int, overlap: int) -> list[str]:
+        if not text:
+            return [""]
         paragraphs = [p.strip() for p in self._PARAGRAPH_RE.split(text) if p.strip()]
         if not paragraphs:
             paragraphs = [text]

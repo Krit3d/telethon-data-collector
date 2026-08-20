@@ -161,6 +161,7 @@ class Neo4jClient:
             EntityType.Organization.value,
             EntityType.Product.value,
             EntityType.Event.value,
+            EntityType.Hashtag.value,
         })
         is_domain_entity = label_str in domain_entity_values
         for i in range(0, len(nodes), batch_size):

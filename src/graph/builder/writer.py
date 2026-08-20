@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import re
@@ -16,9 +15,11 @@ from src.db.models import Account, Content
 from src.graph.client import Neo4jClient
 from src.graph.builder.reader import PostBatchContext
 from src.graph.ontology import (
+    EntityType,
     OpenSPGExtractionResult,
+    RelationType,
 )
-from src.graph.utils import clean_name_lower, sanitize_properties
+from src.graph.utils import sanitize_properties
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,6 @@ class GraphWriter:
         self._settings = settings
         self._neo4j_client = neo4j_client
         self._db = db
-        self._background_tasks: set[asyncio.Task] = set()
 
     async def write_extraction_result(
         self,
@@ -57,18 +57,10 @@ class GraphWriter:
 
         t0 = time.perf_counter()
 
-        nodes_by_label: dict[str, list[dict[str, Any]]] = {}
-        rel_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        nodes_by_label: dict[str, dict[str, dict[str, Any]]] = {}
+        rel_groups: dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]] = {}
 
-        actor_node = sanitize_properties({
-            "id": context.author_node_id,
-            "account_id": context.account_id,
-            "name": context.author_title,
-            "name_lower": clean_name_lower(context.author_title),
-            "handle": context.author_username,
-            "platform": context.platform,
-            "platform_id": context.platform_id,
-        })
+        psychographics = extraction_result.psychographics
 
         post_node = sanitize_properties({
             "id": context.pub_node_id,
@@ -77,40 +69,81 @@ class GraphWriter:
             "published_at": int(context.published_at.timestamp()),
             "platform": context.platform,
             "post_type": context.post_type,
+            "language": psychographics.language,
+            "tone": _to_val(psychographics.primary_tone, None),
+            "secondary_tone": _to_val(psychographics.secondary_tone, None),
+            "tone_confidence": psychographics.tone_confidence,
+            "primary_hormone": _to_val(psychographics.primary_hormone, None),
+            "secondary_hormone": _to_val(psychographics.secondary_hormone, None),
+            "score_dopamine": psychographics.score_dopamine,
+            "score_oxytocin": psychographics.score_oxytocin,
+            "score_serotonin": psychographics.score_serotonin,
+            "score_cortisol": psychographics.score_cortisol,
+            "score_adrenaline": psychographics.score_adrenaline,
+            "score_endorphin": psychographics.score_endorphin,
             "is_video": context.is_video,
             "is_spam_or_gambling": extraction_result.is_spam_or_gambling,
         })
 
-        nodes_by_label.setdefault("Actor", []).append(actor_node)
-        nodes_by_label.setdefault("Post", []).append(post_node)
+        nodes_by_label.setdefault("Post", {})[post_node["id"]] = post_node
+
+        published_key = (EntityType.Actor.value, EntityType.Post.value, RelationType.PUBLISHED.value)
+        published_rel_dict = rel_groups.setdefault(published_key, {})
+        published_pair_key = (context.author_node_id, context.pub_node_id)
+        published_rel_dict[published_pair_key] = {
+            "source_id": context.author_node_id,
+            "target_id": context.pub_node_id,
+            "properties": sanitize_properties({"published_at": int(context.published_at.timestamp())}),
+        }
 
         for entity in extraction_result.entities:
             if not entity.id:
                 continue
+            if entity.label == EntityType.Actor:
+                continue
             label_str = entity.label.value
             props = sanitize_properties(dict(entity.properties))
-            node_dict = {"id": entity.id, "name": entity.name, "name_lower": entity.name_lower}
+            node_dict = {"id": entity.id, "name": entity.name, "name_lower": entity.name_lower, "mentions_count": 1}
             node_dict.update(props)
-            nodes_by_label.setdefault(label_str, []).append(node_dict)
+            label_dict = nodes_by_label.setdefault(label_str, {})
+            existing = label_dict.get(node_dict["id"])
+            if existing:
+                existing.update(node_dict)
+            else:
+                label_dict[node_dict["id"]] = node_dict
 
         for rel in extraction_result.relations:
             key = (rel.source_label.value, rel.target_label.value, rel.relation_type.value)
-            rel_groups.setdefault(key, []).append({
+            rel_dict = rel_groups.setdefault(key, {})
+            pair_key = (rel.source_id, rel.target_id)
+            rel_props = {
                 "source_id": rel.source_id,
                 "target_id": rel.target_id,
                 "properties": sanitize_properties(rel.properties),
-            })
+            }
+            if rel.relation_type == RelationType.BELONGS_TO:
+                sim = rel.properties.get("similarity")
+                if sim is not None:
+                    rel_props["properties"]["similarity"] = float(sim)
+            existing = rel_dict.get(pair_key)
+            if existing:
+                existing["properties"].update(rel_props["properties"])
+            else:
+                rel_dict[pair_key] = rel_props
 
         total_nodes = sum(len(v) for v in nodes_by_label.values())
         t1 = time.perf_counter()
-        for label_str, node_list in nodes_by_label.items():
-            await self._neo4j_client.batch_merge_nodes(label_str, node_list)
+        for label_str in sorted(nodes_by_label.keys()):
+            node_dict = nodes_by_label[label_str]
+            await self._neo4j_client.batch_merge_nodes(label_str, sorted(node_dict.values(), key=lambda x: str(x["id"])))
         node_elapsed = (time.perf_counter() - t1) * 1000
 
         total_rels = sum(len(v) for v in rel_groups.values())
         t2 = time.perf_counter()
-        for (src_label, tgt_label, rel_type), rels in rel_groups.items():
-            await self._neo4j_client.batch_merge_relations(src_label, tgt_label, rel_type, rels)
+        for rel_key in sorted(rel_groups.keys()):
+            src_label, tgt_label, rel_type = rel_key
+            rel_dict = rel_groups[rel_key]
+            await self._neo4j_client.batch_merge_relations(src_label, tgt_label, rel_type, sorted(rel_dict.values(), key=lambda x: (str(x["source_id"]), str(x["target_id"]))))
         rel_elapsed = (time.perf_counter() - t2) * 1000
 
         total_elapsed = (time.perf_counter() - t0) * 1000
@@ -130,24 +163,14 @@ class GraphWriter:
 
         t0 = time.perf_counter()
 
-        nodes_by_label: dict[str, list[dict[str, Any]]] = {}
-        rel_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        nodes_by_label: dict[str, dict[str, dict[str, Any]]] = {}
+        rel_groups: dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]] = {}
         claimed_ids: list[int] = []
         unique_author_ids: set[str] = set()
 
         for extraction_result, context in items:
             claimed_ids.append(context.content_id)
             unique_author_ids.add(context.author_node_id)
-
-            actor_node = sanitize_properties({
-                "id": context.author_node_id,
-                "account_id": context.account_id,
-                "name": context.author_title,
-                "name_lower": clean_name_lower(context.author_title),
-                "handle": context.author_username,
-                "platform": context.platform,
-                "platform_id": context.platform_id,
-            })
 
             psychographics = extraction_result.psychographics
 
@@ -159,7 +182,6 @@ class GraphWriter:
                 "platform": context.platform,
                 "post_type": context.post_type,
                 "language": psychographics.language,
-                "sentiment": _to_val(psychographics.sentiment, None),
                 "tone": _to_val(psychographics.primary_tone, None),
                 "secondary_tone": _to_val(psychographics.secondary_tone, None),
                 "tone_confidence": psychographics.tone_confidence,
@@ -175,37 +197,70 @@ class GraphWriter:
                 "is_spam_or_gambling": extraction_result.is_spam_or_gambling,
             })
 
-            nodes_by_label.setdefault("Actor", []).append(actor_node)
-            if is_first_chunk:
-                nodes_by_label.setdefault("Post", []).append(post_node)
+            post_dict = nodes_by_label.setdefault("Post", {})
+            existing_post = post_dict.get(post_node["id"])
+            if existing_post:
+                existing_post.update(post_node)
+            else:
+                post_dict[post_node["id"]] = post_node
+
+            published_key = (EntityType.Actor.value, EntityType.Post.value, RelationType.PUBLISHED.value)
+            published_rel_dict = rel_groups.setdefault(published_key, {})
+            published_pair_key = (context.author_node_id, context.pub_node_id)
+            published_rel_dict[published_pair_key] = {
+                "source_id": context.author_node_id,
+                "target_id": context.pub_node_id,
+                "properties": sanitize_properties({"published_at": int(context.published_at.timestamp())}),
+            }
 
             for entity in extraction_result.entities:
                 if not entity.id:
                     continue
+                if entity.label == EntityType.Actor:
+                    continue
                 label_str = entity.label.value
                 props = sanitize_properties(dict(entity.properties))
-                node_dict = {"id": entity.id, "name": entity.name, "name_lower": entity.name_lower}
+                node_dict = {"id": entity.id, "name": entity.name, "name_lower": entity.name_lower, "mentions_count": 1}
                 node_dict.update(props)
-                nodes_by_label.setdefault(label_str, []).append(node_dict)
+                label_dict = nodes_by_label.setdefault(label_str, {})
+                existing = label_dict.get(node_dict["id"])
+                if existing:
+                    existing.update(node_dict)
+                else:
+                    label_dict[node_dict["id"]] = node_dict
 
             for rel in extraction_result.relations:
                 key = (rel.source_label.value, rel.target_label.value, rel.relation_type.value)
-                rel_groups.setdefault(key, []).append({
+                rel_dict = rel_groups.setdefault(key, {})
+                pair_key = (rel.source_id, rel.target_id)
+                rel_props = {
                     "source_id": rel.source_id,
                     "target_id": rel.target_id,
                     "properties": sanitize_properties(rel.properties),
-                })
+                }
+                if rel.relation_type == RelationType.BELONGS_TO:
+                    sim = rel.properties.get("similarity")
+                    if sim is not None:
+                        rel_props["properties"]["similarity"] = float(sim)
+                existing = rel_dict.get(pair_key)
+                if existing:
+                    existing["properties"].update(rel_props["properties"])
+                else:
+                    rel_dict[pair_key] = rel_props
 
         total_nodes = sum(len(v) for v in nodes_by_label.values())
         t1 = time.perf_counter()
-        for label_str, node_list in nodes_by_label.items():
-            await self._neo4j_client.batch_merge_nodes(label_str, node_list)
+        for label_str in sorted(nodes_by_label.keys()):
+            node_dict = nodes_by_label[label_str]
+            await self._neo4j_client.batch_merge_nodes(label_str, sorted(node_dict.values(), key=lambda x: str(x["id"])))
         node_elapsed = (time.perf_counter() - t1) * 1000
 
         total_rels = sum(len(v) for v in rel_groups.values())
         t2 = time.perf_counter()
-        for (src_label, tgt_label, rel_type), rels in rel_groups.items():
-            await self._neo4j_client.batch_merge_relations(src_label, tgt_label, rel_type, rels)
+        for rel_key in sorted(rel_groups.keys()):
+            src_label, tgt_label, rel_type = rel_key
+            rel_dict = rel_groups[rel_key]
+            await self._neo4j_client.batch_merge_relations(src_label, tgt_label, rel_type, sorted(rel_dict.values(), key=lambda x: (str(x["source_id"]), str(x["target_id"]))))
         rel_elapsed = (time.perf_counter() - t2) * 1000
 
         t3 = time.perf_counter()
@@ -229,9 +284,7 @@ class GraphWriter:
         )
 
         for author_id in unique_author_ids:
-            task = asyncio.create_task(self._run_post_aggregations(author_id))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            await self._run_post_aggregations(author_id)
 
     async def _run_post_aggregations(self, author_id: str) -> None:
         covers_query = (
@@ -241,6 +294,8 @@ class GraphWriter:
             "OPTIONAL MATCH (p)-[:ABOUT]->(:MicroConcept)-[:BELONGS_TO]->(concept:Concept) "
             "WITH a, total_posts, concept, COUNT(DISTINCT p) AS post_count "
             "WHERE concept IS NOT NULL AND post_count >= 2 "
+            "WITH a, total_posts, concept, post_count "
+            "ORDER BY concept.id "
             "MERGE (a)-[r:COVERS_TOPIC]->(concept) "
             "SET r.posts_count = post_count, "
             "    r.weight = toFloat(post_count) / total_posts, "
@@ -252,6 +307,8 @@ class GraphWriter:
             "MATCH (a)-[:PUBLISHED]->(p:Post)-[:ABOUT]->(mc:MicroConcept) "
             "WITH a, total_posts, mc, COUNT(DISTINCT p) AS post_count "
             "WHERE post_count >= 2 "
+            "WITH a, total_posts, mc, post_count "
+            "ORDER BY mc.id "
             "MERGE (a)-[r:COVERS_TOPIC]->(mc) "
             "SET r.posts_count = post_count, "
             "    r.weight = toFloat(post_count) / total_posts, "
@@ -286,7 +343,6 @@ class GraphWriter:
             "       p.tone AS tone, "
             "       p.secondary_tone AS secondary_tone, "
             "       p.tone_confidence AS tone_confidence, "
-            "       p.sentiment AS sentiment, "
             "       p.language AS language"
         )
         rows = await self._neo4j_client.execute_read(posts_query, {"author_id": author_id})
@@ -308,7 +364,6 @@ class GraphWriter:
 
         tone_counter: dict[str, float] = {}
         secondary_tone_counter: dict[str, float] = {}
-        sentiment_counter: dict[str, float] = {}
         language_counter: dict[str, float] = {}
 
         for row in rows:
@@ -339,10 +394,6 @@ class GraphWriter:
             secondary_tone = row.get("secondary_tone")
             if secondary_tone is not None:
                 secondary_tone_counter[secondary_tone] = secondary_tone_counter.get(secondary_tone, 0.0) + 0.5 * effective_tone_weight
-
-            sentiment = row.get("sentiment")
-            if sentiment is not None:
-                sentiment_counter[sentiment] = sentiment_counter.get(sentiment, 0.0) + w
 
             language = row.get("language")
             if language is not None:
@@ -398,7 +449,6 @@ class GraphWriter:
             if candidate_score / total_tone_mass >= 0.15:
                 secondary_tone = candidate
 
-        primary_sentiment = max(sentiment_counter, key=lambda k: sentiment_counter[k]) if sentiment_counter else None
         primary_language = max(language_counter, key=lambda k: language_counter[k]) if language_counter else None
 
         if primary_language is None and account_id is not None:
@@ -423,7 +473,6 @@ class GraphWriter:
         update_query = (
             "MATCH (a:Actor {id: $author_id}) "
             "SET a.primary_language = $primary_language, "
-            "    a.primary_sentiment = $primary_sentiment, "
             "    a.primary_tone = $primary_tone, "
             "    a.secondary_tone = $secondary_tone, "
             "    a.primary_hormone = $primary_hormone, "
@@ -435,7 +484,6 @@ class GraphWriter:
             {
                 "author_id": author_id,
                 "primary_language": _to_val(primary_language, None),
-                "primary_sentiment": _to_val(primary_sentiment, None),
                 "primary_tone": _to_val(primary_tone, None),
                 "secondary_tone": _to_val(secondary_tone, None),
                 "primary_hormone": _to_val(primary_hormone, None),

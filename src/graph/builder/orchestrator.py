@@ -60,7 +60,11 @@ class KagBuilderOrchestrator:
             for chunk_idx, chunk in enumerate(chunks):
                 t1 = time.perf_counter()
                 try:
-                    extraction_result = await self._extractor.extract(context, chunk.text)
+                    extraction_result = await self._extractor.extract(
+                        context,
+                        caption_text=chunk.caption_text,
+                        transcription_text=chunk.transcription_text,
+                    )
                 except Exception as e:
                     extractor_elapsed = time.perf_counter() - t1
                     logger.error("[Post %d] Extractor FAILED after %.2fs (chunk %d) | error: %s", context.content_id, extractor_elapsed, chunk_idx, e)

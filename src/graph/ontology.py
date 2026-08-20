@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.graph.utils import clean_name_lower, is_author_entity
+
 
 class EntityType(StrEnum):
     Actor = "Actor"
@@ -59,8 +61,6 @@ class ToneType(StrEnum):
     educational = "educational"
     entertainment = "entertainment"
     casual = "casual"
-    hype_train = "hype_train"
-    sell_courses = "sell_courses"
 
 
 class HormoneType(StrEnum):
@@ -177,7 +177,6 @@ RELATION_DOMAIN_RANGE_MAP: dict[RelationType, dict[str, set[EntityType]]] = {
     },
     RelationType.BELONGS_TO: {
         "sources": {
-            EntityType.Actor,
             EntityType.Entity,
             EntityType.Product,
             EntityType.Organization,
@@ -218,9 +217,15 @@ def validate_and_repair_relation(
 ) -> tuple[str, EntityType, str, EntityType, RelationType] | None:
     if source_id == target_id:
         return None
+    if source_label == EntityType.Actor and relation_type == RelationType.RELATED_TO:
+        return None
+    if target_label == EntityType.Event and relation_type == RelationType.RELATED_TO:
+        return None
     rule = RELATION_DOMAIN_RANGE_MAP.get(relation_type)
     if rule is None:
-        return (source_id, source_label, target_id, target_label, RelationType.RELATED_TO)
+        if source_label == EntityType.Entity and target_label in {EntityType.Entity, EntityType.Organization, EntityType.Product}:
+            return (source_id, source_label, target_id, target_label, RelationType.RELATED_TO)
+        return None
     if source_label in rule["sources"] and target_label in rule["targets"]:
         return (source_id, source_label, target_id, target_label, relation_type)
     if (
@@ -231,40 +236,24 @@ def validate_and_repair_relation(
         return (target_id, target_label, source_id, source_label, RelationType.WORKS_AT)
     if target_label in rule["sources"] and source_label in rule["targets"]:
         return (target_id, target_label, source_id, source_label, relation_type)
+    if source_label == EntityType.Actor and target_label == EntityType.Product:
+        rel = RelationType.PRODUCES if relation_type != RelationType.USES_TECH else RelationType.USES_TECH
+        return (source_id, source_label, target_id, target_label, rel)
+    if source_label == EntityType.Actor and target_label == EntityType.Organization:
+        return (source_id, source_label, target_id, target_label, RelationType.WORKS_AT)
+    if source_label == EntityType.Actor and target_label == EntityType.Event:
+        return (source_id, source_label, target_id, target_label, RelationType.PARTICIPATED_IN)
+    if source_label == EntityType.Actor and target_label in {EntityType.MicroConcept, EntityType.Concept}:
+        return (source_id, source_label, target_id, target_label, RelationType.COVERS_TOPIC)
+    if source_label == EntityType.Post and target_label in {EntityType.Entity, EntityType.Organization, EntityType.Product, EntityType.Event}:
+        return (source_id, source_label, target_id, target_label, RelationType.MENTIONS)
     if source_label == EntityType.Post:
         return (source_id, source_label, target_id, target_label, RelationType.MENTIONS)
-    return (source_id, source_label, target_id, target_label, RelationType.RELATED_TO)
+    if source_label == EntityType.Entity and target_label in {EntityType.Entity, EntityType.Organization, EntityType.Product}:
+        return (source_id, source_label, target_id, target_label, RelationType.RELATED_TO)
+    return None
 
 
-def _clean_name(name: str) -> str:
-    cleaned = re.sub(r"[^\w\s]", "", name.lower(), flags=re.UNICODE)
-    cleaned = cleaned.replace("_", " ")
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
-
-
-def is_author_entity(entity_name: str, author_title: str, author_handle: str) -> bool:
-    def _clean(value: str) -> str:
-        return re.sub(r"[^\w\s]", "", str(value or "")).strip().lower()
-
-    clean_entity = _clean(entity_name)
-    clean_title = _clean(author_title)
-    clean_handle = _clean(author_handle)
-    if not clean_entity or not clean_title:
-        return False
-    if clean_entity == clean_title:
-        return True
-    if clean_handle and (clean_entity == clean_handle or clean_handle in clean_entity):
-        return True
-    entity_tokens = [t for t in clean_entity.split() if len(t) >= 3]
-    title_tokens = [t for t in clean_title.split() if len(t) >= 3]
-    if not entity_tokens or not title_tokens:
-        return False
-    title_prefixes = {t[:3] for t in title_tokens}
-    if not title_prefixes:
-        return False
-    matched = sum(1 for t in entity_tokens if t[:3] in title_prefixes)
-    return matched / len(entity_tokens) >= 0.5 or matched / len(title_tokens) >= 0.5
 
 
 def extract_entity_subtype(label: EntityType | str, properties: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -297,7 +286,6 @@ class ActorNode(BaseModel):
     platform: PlatformType
     platform_id: str
     primary_language: str | None = None
-    primary_sentiment: SentimentType | None = None
     primary_tone: ToneType | None = None
     primary_hormone: HormoneType | None = None
     secondary_hormone: HormoneType | None = None
@@ -305,7 +293,7 @@ class ActorNode(BaseModel):
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> ActorNode:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -317,7 +305,6 @@ class PostNode(BaseModel):
     platform: PlatformType
     post_type: PostType = PostType.post
     language: str | None = None
-    sentiment: SentimentType | None = None
     tone: ToneType | None = None
     secondary_tone: ToneType | None = None
     tone_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -342,7 +329,7 @@ class EntityNode(BaseModel):
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> EntityNode:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -351,10 +338,11 @@ class OrganizationNode(BaseModel):
     name: str
     name_lower: str | None = None
     org_type: OrgType = OrgType.company
+    mentions_count: int = 1
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> OrganizationNode:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -363,10 +351,11 @@ class ProductNode(BaseModel):
     name: str
     name_lower: str | None = None
     product_type: ProductType | None = None
+    mentions_count: int = 1
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> ProductNode:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -375,10 +364,11 @@ class EventNode(BaseModel):
     name: str
     name_lower: str | None = None
     event_type: EventType | None = None
+    mentions_count: int = 1
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> EventNode:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -390,7 +380,7 @@ class MicroConceptNode(BaseModel):
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> MicroConceptNode:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -407,7 +397,7 @@ class ConceptNode(BaseModel):
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> ConceptNode:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -415,10 +405,11 @@ class HashtagNode(BaseModel):
     id: str
     name: str
     name_lower: str | None = None
+    mentions_count: int = 1
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> HashtagNode:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -439,7 +430,7 @@ class ExtractedEntity(BaseModel):
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> ExtractedEntity:
-        self.name_lower = _clean_name(self.name)
+        self.name_lower = clean_name_lower(self.name)
         return self
 
 
@@ -462,7 +453,7 @@ class ExtractedRelation(BaseModel):
             self.relation_type,
         )
         if repaired is None:
-            raise ValueError(f"Self-referencing relation rejected: {self.source_id} -> {self.target_id}")
+            raise ValueError(f"Invalid relation schema: {self.source_id} ({self.source_label}) -[{self.relation_type}]-> {self.target_id} ({self.target_label})")
         self.source_id, self.source_label, self.target_id, self.target_label, self.relation_type = repaired
         props_conf = self.properties.get("confidence")
         if props_conf is not None and not isinstance(props_conf, bool):
@@ -474,26 +465,11 @@ class ExtractedRelation(BaseModel):
                 self.confidence = parsed_conf
         if self.confidence is not None and self.confidence > 0.0 and "confidence" not in self.properties:
             self.properties["confidence"] = float(self.confidence)
-        if self.relation_type == RelationType.MENTIONS:
-            sentiment = self.properties.get("sentiment")
-            if isinstance(sentiment, str):
-                normalized_sentiment = sentiment.strip().lower()
-                if normalized_sentiment in _SENTIMENT_VALUES:
-                    self.properties["sentiment"] = normalized_sentiment
-                else:
-                    self.properties["sentiment"] = None
-            else:
-                self.properties["sentiment"] = None
-            if self.confidence is None or self.confidence <= 0.0:
-                self.confidence = 1.0
-            self.properties["confidence"] = float(self.confidence)
-            self.properties.pop("weight", None)
         return self
 
 
 class ExtractedPsychographics(BaseModel):
     language: str | None = None
-    sentiment: SentimentType | None = None
     primary_tone: ToneType | None = None
     secondary_tone: ToneType | None = None
     tone_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -550,11 +526,13 @@ class OpenSPGExtractionResult(BaseModel):
         author_handle: str | None = None,
     ) -> OpenSPGExtractionResult:
 
-        from src.graph.utils import is_garbage_value
+        from src.graph.utils import build_node_id, is_garbage_value, is_regulatory_entity, is_false_event_toponym
 
         phantom_names = frozenset({"<name>", "unknown", "null", "none", "n/a", ""})
         valid_ids = set(allowed_ids) if allowed_ids else set()
         clean_entities: list[ExtractedEntity] = []
+        removed_event_ids: set[str] = set()
+
         for e in self.entities:
             if e.name.lower() in phantom_names or len(e.name.strip()) < 2:
                 continue
@@ -562,15 +540,42 @@ class OpenSPGExtractionResult(BaseModel):
                 continue
             if author_title and is_author_entity(e.name, author_title, author_handle or ""):
                 continue
-            for key in ("role", "platform", "author", "post"):
+            if is_garbage_value(e.name, e.label):
+                continue
+
+            if e.label == EntityType.Event:
+                if is_regulatory_entity(e.name):
+                    old_id = e.id
+                    e.label = EntityType.Entity
+                    e.properties["entity_type"] = "term"
+                    e.properties.pop("event_type", None)
+                    e.id = build_node_id(EntityType.Entity, e.name)
+                    if old_id and old_id != e.id:
+                        for r in self.relations:
+                            if r.source_id == old_id:
+                                r.source_id = e.id
+                                r.source_label = EntityType.Entity
+                            if r.target_id == old_id:
+                                r.target_id = e.id
+                                r.target_label = EntityType.Entity
+                elif is_false_event_toponym(e.name):
+                    if e.id:
+                        removed_event_ids.add(e.id)
+                    continue
+
+            for key in ("role", "platform", "author", "post", "sentiment", "confidence"):
                 e.properties.pop(key, None)
             clean_entities.append(e)
             if e.id:
                 valid_ids.add(e.id)
+
         self.entities = clean_entities
+
         clean_relations: list[ExtractedRelation] = []
         for r in self.relations:
             if r.source_id not in valid_ids or r.target_id not in valid_ids:
+                continue
+            if r.source_id in removed_event_ids or r.target_id in removed_event_ids:
                 continue
             repaired = validate_and_repair_relation(
                 r.source_id,
@@ -584,6 +589,7 @@ class OpenSPGExtractionResult(BaseModel):
             r.source_id, r.source_label, r.target_id, r.target_label, r.relation_type = repaired
             clean_relations.append(r)
         self.relations = clean_relations
+
         clean_hashtags: list[HashtagItem] = []
         for h in self.hashtags:
             if not h.raw or not h.normalized:

@@ -35,7 +35,7 @@ async def main() -> None:
         extracted_verified = (await session.scalar(
             select(func.count(Content.id))
             .join(Content.account)
-            .where(Account.status == 'verified', Content.is_graph_extracted == True)
+            .where(Account.status == 'verified', Content.graph_status == 2)
         )) or 0
 
         pct = (extracted_verified / total_verified * 100) if total_verified > 0 else 0.0

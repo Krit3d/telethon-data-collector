@@ -145,6 +145,11 @@ class QdrantClientManager:
                     field_name="platform",
                     field_schema=models.PayloadSchemaType.KEYWORD,
                 )
+                await self.client.create_payload_index(
+                    collection_name=posts_collection,
+                    field_name="is_author_blog",
+                    field_schema=models.PayloadSchemaType.BOOL,
+                )
                 logger.info(
                     "Qdrant posts collection created successfully",
                     extra={"collection": posts_collection},
@@ -236,6 +241,27 @@ class QdrantClientManager:
             raise
 
     async def ensure_payload_indexes(self) -> None:
+        posts_indexes: list[tuple[str, models.PayloadSchemaType]] = [
+            ("account_id", models.PayloadSchemaType.INTEGER),
+            ("is_author_blog", models.PayloadSchemaType.BOOL),
+            ("subscribers_count", models.PayloadSchemaType.INTEGER),
+            ("engagement_rate", models.PayloadSchemaType.FLOAT),
+            ("platform", models.PayloadSchemaType.KEYWORD),
+        ]
+        if await self.client.collection_exists(self.collection_name):
+            for field_name, field_schema in posts_indexes:
+                try:
+                    await self.client.create_payload_index(
+                        collection_name=self.collection_name,
+                        field_name=field_name,
+                        field_schema=field_schema,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Payload index %s on %s may already exist: %s",
+                        field_name, self.collection_name, e,
+                    )
+
         categories_indexes = ["code", "tier_1", "tier_2", "tier_3", "tier_4"]
         if await self.client.collection_exists(CATEGORIES_COLLECTION):
             for field in categories_indexes:
@@ -266,7 +292,7 @@ class QdrantClientManager:
                         field, ENTITIES_COLLECTION, e,
                     )
 
-        logger.info("Payload indexes registered on categories and social_entities collections")
+        logger.info("Payload indexes registered on categories, social_entities and social_posts collections")
 
     async def close(self) -> None:
         try:

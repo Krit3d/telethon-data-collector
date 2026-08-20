@@ -14,6 +14,7 @@ from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, R
 from pydantic import ValidationError
 
 from src.config.config import Settings
+from src.graph.builder.prompts import build_system_prompt, build_user_prompt
 from src.graph.builder.reader import PostBatchContext
 from src.graph.ontology import (
     EntityType,
@@ -21,19 +22,45 @@ from src.graph.ontology import (
     ExtractedPsychographics,
     ExtractedRelation,
     HashtagItem,
+    HormoneType,
     OpenSPGExtractionResult,
     RelationType,
     RoleType,
     SentimentType,
     ToneType,
+    _SENTIMENT_VALUES,
 )
-from src.graph.utils import build_node_id, clean_name_lower, extract_raw_hashtags, is_garbage_value
+from src.graph.utils import build_node_id, clean_identifier, clean_name_lower, extract_raw_hashtags, format_display_name, is_garbage_value, sanitize_properties
 
 logger = logging.getLogger(__name__)
 
 _TRUNCATED_TAG_RE = re.compile(r"(?:\.{2,}|…|\.$|[\-\—]$)")
 _INVALID_TAG_CHARS_RE = re.compile(r"[^A-Za-z0-9\s'\-&/]")
 
+_GARBAGE_HASHTAGS: frozenset[str] = frozenset({
+    "fyp", "foryou", "foryoupage", "fypシ", "fy",
+    "reels", "reel", "reelsinstagram",
+    "viral", "virals",
+    "рек", "рекомендации",
+    "топ", "топчик",
+    "лайк", "лайки",
+    "хочувтоп", "хочу в топ",
+    "follow", "followme", "followers",
+    "подпишись", "подписка",
+    "explore", "explorepage",
+})
+
+_PREFIX_LABEL_MAP: dict[str, EntityType] = {
+    "actor_": EntityType.Actor,
+    "event_publication_": EntityType.Post,
+    "microconcept_": EntityType.MicroConcept,
+    "concept_": EntityType.Concept,
+    "hashtag_": EntityType.Hashtag,
+    "organization_": EntityType.Organization,
+    "product_": EntityType.Product,
+    "entity_": EntityType.Entity,
+    "event_": EntityType.Event,
+}
 
 def _ensure_dict(val: Any) -> dict[str, Any]:
     if isinstance(val, dict):
@@ -41,28 +68,6 @@ def _ensure_dict(val: Any) -> dict[str, Any]:
     if isinstance(val, list) and val and isinstance(val[0], dict):
         return val[0]
     return {}
-
-
-def _sanitize_properties(props: dict[str, Any]) -> dict[str, Any]:
-    sanitized: dict[str, Any] = {}
-    for key, val in props.items():
-        if val is None:
-            continue
-        if isinstance(val, dict):
-            sanitized[key] = json.dumps(val, ensure_ascii=False)
-        elif isinstance(val, list):
-            cleaned: list[Any] = []
-            for item in val:
-                if isinstance(item, (str, int, float, bool)):
-                    cleaned.append(item)
-                else:
-                    cleaned.append(json.dumps(item, ensure_ascii=False))
-            sanitized[key] = cleaned
-        elif isinstance(val, (str, int, float, bool)):
-            sanitized[key] = val
-        else:
-            sanitized[key] = str(val)
-    return sanitized
 
 
 def _ensure_list(val: Any) -> list[Any]:
@@ -75,110 +80,6 @@ def _ensure_list(val: Any) -> list[Any]:
     return []
 
 
-def _build_system_prompt(author_title: str) -> str:
-    return (
-        "Ты — строгий и детерминированный графовый экстрактор знаний (архитектура OpenSPG/KAG). "
-        "Твоя задача — извлечь структурированное представление знаний из текста поста социальной сети. "
-        "Отвечай ТОЛЬКО одним валидным JSON-объектом. Любой дополнительный текст, пояснения, "
-        "markdown-разметка и код до или после JSON строго запрещены. Если данных недостаточно — "
-        "не выдумывай, извлекай только то, что явно присутствует в тексте.\n"
-        "JSON обязан содержать РОВНО следующие ключи (все обязательны):\n"
-        "  - thinking (str): краткое пошаговое рассуждение на русском языке о том, что извлечено.\n"
-        "  - entities (list[dict]): извлечённые сущности.\n"
-        "  - relations (list[dict]): извлечённые связи.\n"
-        "  - microconcepts (list[str]): обобщающие тематические категории.\n"
-        "  - psychographics (dict): психографические характеристики.\n"
-        "  - is_spam_or_gambling (bool): true, если пост содержит спам, скам, гемблинг, ставки или "
-        "предложения лёгкого заработка, иначе false.\n"
-        "  - hashtags (list[dict]): нормализованные хэштеги.\n"
-        "\n"
-        "=== СЕКЦИЯ entities ===\n"
-        "Каждая сущность — объект строгой формы {{name: str, label: str, entity_type: str, properties: dict}}.\n"
-        "Допустимые label и строго допустимые значения enum-поля:\n"
-        "  - label=Entity: entity_type строго из [technology, method, person, term, general].\n"
-        "  - label=Organization: org_type строго из [company, brand, agency, media, non_profit].\n"
-        "  - label=Product: product_type строго из [software, gadget, course, app, physical_good, service].\n"
-        "  - label=Event: event_type строго из [conference, release, incident, festival, trend].\n"
-        "Используй ТОЛЬКО перечисленные значения enum. Любое другое значение недопустимо.\n"
-        f"КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать в entities:\n"
-        f"  - самого автора поста '{author_title}' (в любых падежах, склонениях, формах и транслитах);\n"
-        "  - саму публикацию (пост);\n"
-        "  - сущности с label=Hashtag (они извлекаются автоматически). Однако если каноническая сущность, бренд, продукт, организация или событие упомянуты в тексте через хэштег (например, #iphone16 или #tesla), ты ОБЯЗАН извлечь её как каноническую сущность (Product, Organization, Entity, Event и т.д.) с нормализованным человекочитаемым именем (например, 'iPhone 16' или 'Tesla').\n"
-        "  - любые служебные свойства: role, platform, author, post.\n"
-        "\n"
-        "=== СЕКЦИЯ relations ===\n"
-        "Каждая связь — объект строгой формы {{source_id: str, source_label: str, target_id: str, "
-        "target_label: str, relation_type: str, properties: dict}}.\n"
-        "Допустимые relation_type: MENTIONS, ABOUT, WORKS_AT, PARTICIPATED_IN, "
-        "USES_TECH, PRODUCES, RELATED_TO, COAUTHOR.\n"
-        "Строгие сигнатуры связей (source -> relation -> target):\n"
-        "  - MENTIONS: (Post) -> MENTIONS -> (Entity | Organization | Product | Event). "
-        "Упоминание сущности в посте. Поля в properties: sentiment (str | null: positive, `negative, neutral — "
-        "указывается ТОЛЬКО если автор явно выражает отношение к сущности в посте) "
-        "и confidence (float от 0.1 до 1.0, по умолчанию 1.0).\n"
-        "  - ABOUT: (Post) -> ABOUT -> (MicroConcept). Тематическая связь поста с микроконцептом. properties: weight (float от 0.0 до 1.0, по умолчанию 1.0). Калибровка weight: 1.0 — ключевая тема поста (основное содержание, >70% текста); 0.7 — вторичная тема (подробно обсуждается, 20-50% текста); 0.3 — косвенное или эпизодическое упоминание (<20% текста).\n"
-        "  - WORKS_AT: (Actor) -> WORKS_AT -> (Organization). Строгое правило: properties.role принимает "
-        "ОДНО значение строго из [founder, executive, employee, ambassador, advisor]. "
-        "Любые другие значения запрещены.\n"
-        "  - PARTICIPATED_IN: (Actor | Entity) -> PARTICIPATED_IN -> (Event). "
-        "ЗАПРЕЩЕНО связывать Organization -> PARTICIPATED_IN -> Person. "
-        "Только Actor или Entity -> PARTICIPATED_IN -> Event. "
-        "Свойства (properties) ДОЛЖНЫ содержать поле \"role\" со строковым значением из списка: "
-        "[\"speaker\", \"organizer\", \"sponsor\", \"visitor\", \"mention\"].\n"
-        "  - USES_TECH: (Actor | Post) -> USES_TECH -> (Product | Entity). "
-        "Использование технологии или продукта. "
-        "Свойства (properties) ДОЛЖНЫ содержать поле \"proficiency\" со строковым значением из списка: "
-        "[\"expert\", \"user\", \"reviewer\", \"mention\"].\n"
-        "  - PRODUCES: (Organization | Actor) -> PRODUCES -> (Product). Строгое правило: "
-        "Поля в properties: relation_subtype (str). Для Actor подтипы строго из: [creator, promoter, affiliate]. "
-        "Для Organization подтипы строго из: [vendor, publisher, distributor, sponsor].\n"
-        "  - RELATED_TO: (Entity) -> RELATED_TO -> (Entity | Organization | Product). "
-        "Обобщённая семантическая связь. properties: relation_name (str), weight (float от 0.0 до 1.0, по умолчанию 1.0). Калибровка weight: 1.0 — прямая жёсткая зависимость или эквивалентность; 0.7 — сильная тематическая связь в одном контексте; 0.3 — слабая или косвенная ассоциированность.\n"
-        "  - COAUTHOR: (Actor) -> COAUTHOR -> (Actor). Соавторство. Поля в properties: "
-        "platform (str: instagram, telegram), post_id (str: ID публикации).\n"
-        "\n"
-        "=== СЕКЦИЯ microconcepts ===\n"
-        "Извлеки от 1 до 3 обобщающих тематических категорий поста. Категории — атомарные обобщения темы, "
-        "а не упоминания конкретных сущностей.\n"
-        "Строгие правила:\n"
-        "  - Каждая категория СТРОГО на английском языке.\n"
-        "  - Формат: Title Case (например, Fashion, Sports Nutrition, Automotive Tuning, Self Improvement).\n"
-        "  - Длина: 1-3 слова максимум.\n"
-        "  - Только целые осмысленные существительные или устойчивые именные словосочетания.\n"
-        "  - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: обрезки слов, глагольные формы, предлоги, хештеги, вёрстка "
-        "и служебные знаки.\n"
-        "\n"
-        "=== СЕКЦИЯ psychographics ===\n"
-        "Объект со строгой структурой:\n"
-        "  - language (str | null): двухбуквенный ISO-код основного языка контента поста (ru, en, kz и т.д.).\n"
-        "    Правила определения:\n"
-        "      1. Если подпись к посту содержит 3 и более осмысленных слова -> определяй язык по подписи.\n"
-        "      2. Если подпись отсутствует или короче 3 слов, но есть транскрипция (от 3 слов) -> определяй язык по транскрипции.\n"
-        "      3. Если текста ни в подписи, ни в транскрипции нет (музыка, шумы, менее 3 слов) -> возвращай null.\n"
-        "  - sentiment (str | null): positive, negative, neutral (или null, если текст не содержит "
-        "выраженного эмоционального отношения автора).\n"
-        "  - tone (str): строго из [analytical, expert, provocative, educational, entertainment, casual, "
-        "hype_train, sell_courses]. Каждый текст имеет стиль передачи информации. Ты ОБЯЗАН выбрать один "
-        "наиболее близкий тон из этого списка.\n"
-        "  - secondary_tone (str | null): один второй по значимости тон из того же списка, или null если "
-        "выраженного второго тона нет.\n"
-        "  - tone_confidence (float от 0.0 до 1.0 | null): степень уверенности модели в определении основного тона (1.0 — высокая, 0.1 — очень сомнительная).\n"
-        "  - score_dopamine (float): балл от 0.0 до 1.0.\n"
-        "  - score_oxytocin (float): балл от 0.0 до 1.0.\n"
-        "  - score_serotonin (float): балл от 0.0 до 1.0.\n"
-        "  - score_cortisol (float): балл от 0.0 до 1.0.\n"
-        "  - score_adrenaline (float): балл от 0.0 до 1.0.\n"
-        "  - score_endorphin (float): балл от 0.0 до 1.0.\n"
-        "\n"
-        "=== СЕКЦИЯ hashtags ===\n"
-        "Извлеки и нормализуй хэштеги поста. Формат: list of objects {{raw: str, normalized: str}}.\n"
-        "- raw: сырой хэштег без символа # (например, 'нейросетидлябизнеса').\n"
-        "- normalized: нормализованная строка с разделенными пробелами словами в человекочитаемом виде "
-        "(например, 'нейросети для бизнеса').\n"
-        "- Если хэштегов нет — возвращай пустой список []."
-    )
-
-
 _TONE_MAP: dict[str, ToneType] = {
     "analytical": ToneType.analytical,
     "expert": ToneType.expert,
@@ -186,8 +87,6 @@ _TONE_MAP: dict[str, ToneType] = {
     "educational": ToneType.educational,
     "entertainment": ToneType.entertainment,
     "casual": ToneType.casual,
-    "hype_train": ToneType.hype_train,
-    "sell_courses": ToneType.sell_courses,
 }
 
 _ENTITY_TYPE_PROP_KEY: dict[str, str] = {
@@ -377,9 +276,6 @@ def _safe_float_score(raw: Any) -> float:
 
 def _parse_psychographics(data: Any) -> ExtractedPsychographics:
     dict_data = _ensure_dict(data)
-    raw_sentiment = dict_data.get("sentiment")
-    sentiment_str = raw_sentiment.strip().lower() if isinstance(raw_sentiment, str) else ""
-    sentiment = SentimentType(sentiment_str) if sentiment_str in ("positive", "negative", "neutral") else None
     raw_tone = dict_data.get("tone")
     primary_tone = _TONE_MAP.get(str(raw_tone).lower().strip()) if raw_tone else None
     raw_secondary = dict_data.get("secondary_tone")
@@ -399,14 +295,22 @@ def _parse_psychographics(data: Any) -> ExtractedPsychographics:
             parsed_tone_confidence = None
         if parsed_tone_confidence is not None and 0.0 <= parsed_tone_confidence <= 1.0:
             tone_confidence = parsed_tone_confidence
+    scores = {"dopamine": score_dopamine, "oxytocin": score_oxytocin, "serotonin": score_serotonin, "cortisol": score_cortisol, "adrenaline": score_adrenaline, "endorphin": score_endorphin}
+    max_score = max(scores.values())
+    if max_score <= 0.0:
+        primary_hormone = None
+        secondary_hormone = None
+    else:
+        sorted_hormones = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        primary_hormone = HormoneType(sorted_hormones[0][0])
+        secondary_hormone = HormoneType(sorted_hormones[1][0]) if sorted_hormones[1][1] > 0.0 else None
     return ExtractedPsychographics(
         language=_normalize_language_code(dict_data.get("language")),
-        sentiment=sentiment,
         primary_tone=primary_tone,
         secondary_tone=secondary_tone,
         tone_confidence=tone_confidence,
-        primary_hormone=None,
-        secondary_hormone=None,
+        primary_hormone=primary_hormone,
+        secondary_hormone=secondary_hormone,
         score_dopamine=score_dopamine,
         score_oxytocin=score_oxytocin,
         score_serotonin=score_serotonin,
@@ -416,9 +320,11 @@ def _parse_psychographics(data: Any) -> ExtractedPsychographics:
     )
 
 
-def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str, str]]:
+def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str, str], list[ExtractedRelation]]:
     result: list[ExtractedEntity] = []
     id_map: dict[str, str] = {}
+    relations: list[ExtractedRelation] = []
+    microconcept_cache: dict[str, str] = {}
     raw_list = _ensure_list(raw_entities)
     for raw in raw_list:
         if isinstance(raw, str):
@@ -439,27 +345,106 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
             label = EntityType.Entity
         if raw_label == "Hashtag" or label == EntityType.Hashtag:
             continue
+        if is_garbage_value(name, label):
+            continue
         raw_properties = raw.get("properties")
-        properties: dict[str, Any] = _sanitize_properties(dict(raw_properties)) if isinstance(raw_properties, dict) else {}
-        entity_id = _build_entity_id(label.value, name, properties)
+        properties: dict[str, Any] = sanitize_properties(dict(raw_properties)) if isinstance(raw_properties, dict) else {}
+        raw_sentiment = str(raw.get("sentiment", "neutral")).strip().lower()
+        if raw_sentiment in _SENTIMENT_VALUES:
+            properties["sentiment"] = raw_sentiment
+        else:
+            properties["sentiment"] = "neutral"
+        raw_confidence = raw.get("confidence")
+        if raw_confidence is not None:
+            try:
+                confidence_val = float(raw_confidence)
+            except (TypeError, ValueError):
+                confidence_val = 1.0
+            if confidence_val < 0.5:
+                confidence_val = 0.5
+            elif confidence_val > 1.0:
+                confidence_val = 1.0
+        else:
+            confidence_val = 1.0
+        is_reclassified_regulatory = False
+        if label == EntityType.Event:
+            from src.graph.utils import is_regulatory_entity
+            if is_regulatory_entity(name):
+                is_reclassified_regulatory = True
+                label = EntityType.Entity
+                properties["entity_type"] = "term"
+                properties.pop("event_type", None)
+                raw_entity_type = raw.get("type") or raw.get("entity_type") or properties.get("type") or properties.get("entity_type")
+                name = format_display_name(name, label, is_person=(raw_entity_type == "person"))
+                entity_id = build_node_id(label, name)
+            else:
+                entity_id = _build_entity_id(label.value, name, properties)
+        else:
+            entity_id = _build_entity_id(label.value, name, properties)
         prop_key = _ENTITY_TYPE_PROP_KEY.get(label.value, "entity_type")
-        raw_entity_type = raw.get("entity_type") or raw.get(prop_key)
-        if raw_entity_type is None:
-            raw_entity_type = properties.get("entity_type") or properties.get(prop_key)
+        raw_entity_type = raw.get("type") or raw.get("entity_type") or raw.get(prop_key) or properties.get("type") or properties.get("entity_type") or properties.get(prop_key)
+        name = format_display_name(name, label, is_person=(raw_entity_type == "person"))
         if raw_entity_type:
-            if "entity_type" in properties and prop_key != "entity_type":
-                del properties["entity_type"]
-            properties[prop_key] = str(raw_entity_type).lower().strip()
+            if is_reclassified_regulatory:
+                properties["entity_type"] = "term"
+            else:
+                properties[prop_key] = str(raw_entity_type).lower().strip()
+        properties.pop("type", None)
         result.append(ExtractedEntity(
             id=entity_id,
             name=name,
             name_lower=clean_name_lower(name),
             label=label,
             properties=properties,
+            confidence=confidence_val,
         ))
         id_map[name] = entity_id
         id_map[name.lower()] = entity_id
-    return result, id_map
+        raw_mc_list = raw.get("micro_concepts")
+        if raw_mc_list and isinstance(raw_mc_list, list):
+            for mc_item in raw_mc_list:
+                if isinstance(mc_item, str):
+                    mc_name = mc_item.strip()
+                elif isinstance(mc_item, dict):
+                    mc_name = str(mc_item.get("name") or mc_item.get("tag") or "").strip()
+                else:
+                    continue
+                if not mc_name:
+                    continue
+                if _TRUNCATED_TAG_RE.search(mc_name):
+                    continue
+                if _INVALID_TAG_CHARS_RE.search(mc_name):
+                    continue
+                if is_garbage_value(mc_name, EntityType.MicroConcept):
+                    continue
+                mc_name = format_display_name(mc_name, EntityType.MicroConcept)
+                mc_name_lower = clean_name_lower(mc_name)
+                if mc_name_lower not in microconcept_cache:
+                    mc_id = build_node_id(EntityType.MicroConcept, mc_name_lower)
+                    microconcept_cache[mc_name_lower] = mc_id
+                    result.append(ExtractedEntity(
+                        id=mc_id,
+                        name=mc_name,
+                        name_lower=mc_name_lower,
+                        label=EntityType.MicroConcept,
+                        properties={"is_classified": False},
+                    ))
+                    id_map[mc_name] = mc_id
+                    id_map[mc_name_lower] = mc_id
+                else:
+                    mc_id = microconcept_cache[mc_name_lower]
+                try:
+                    relations.append(ExtractedRelation(
+                        source_id=entity_id,
+                        source_label=label,
+                        target_id=mc_id,
+                        target_label=EntityType.MicroConcept,
+                        relation_type=RelationType.BELONGS_TO,
+                        properties={},
+                    ))
+                except (ValidationError, ValueError):
+                    continue
+    return result, id_map, relations
 
 
 def _parse_microconcepts(raw_microconcepts: Any) -> tuple[list[ExtractedEntity], dict[str, str]]:
@@ -483,9 +468,11 @@ def _parse_microconcepts(raw_microconcepts: Any) -> tuple[list[ExtractedEntity],
             continue
         if _INVALID_TAG_CHARS_RE.search(name):
             continue
-        name = name.title()
+        name = format_display_name(name, EntityType.MicroConcept)
         name_lower = clean_name_lower(name)
         if not name_lower or name_lower in seen_name_lower:
+            continue
+        if is_garbage_value(name, EntityType.MicroConcept):
             continue
         seen_name_lower.add(name_lower)
         entity_id = build_node_id(EntityType.MicroConcept, name_lower)
@@ -510,16 +497,19 @@ def _parse_relations(
 ) -> list[ExtractedRelation]:
     result: list[ExtractedRelation] = []
     raw_list = _ensure_list(raw_relations)
+    known_ids: set[str] = set(global_id_map.values())
     for raw in raw_list:
         if not isinstance(raw, dict):
             continue
-        raw_source_id = str(raw.get("source_id", "")).strip()
-        raw_target_id = str(raw.get("target_id", "")).strip()
+        raw_source_id = str(raw.get("source") or raw.get("source_id") or "").strip()
+        raw_target_id = str(raw.get("target") or raw.get("target_id") or "").strip()
         if not raw_source_id or not raw_target_id:
             continue
         source_id = global_id_map.get(raw_source_id, global_id_map.get(raw_source_id.lower(), raw_source_id))
         target_id = global_id_map.get(raw_target_id, global_id_map.get(raw_target_id.lower(), raw_target_id))
         if source_id == target_id:
+            continue
+        if source_id not in known_ids or target_id not in known_ids:
             continue
         if source_id == pub_node_id:
             source_label = EntityType.Post
@@ -527,27 +517,39 @@ def _parse_relations(
             source_label = EntityType.Actor
         else:
             raw_source_label = str(raw.get("source_label", "Entity")).strip()
-            try:
-                source_label = EntityType(raw_source_label)
-            except ValueError:
-                source_label = EntityType.Entity
+            source_label = None
+            for prefix, etype in _PREFIX_LABEL_MAP.items():
+                if source_id.startswith(prefix):
+                    source_label = etype
+                    break
+            if source_label is None:
+                try:
+                    source_label = EntityType(raw_source_label)
+                except ValueError:
+                    source_label = EntityType.Entity
         if target_id == pub_node_id:
             target_label = EntityType.Post
         elif target_id == author_node_id:
             target_label = EntityType.Actor
         else:
             raw_target_label = str(raw.get("target_label", "Entity")).strip()
-            try:
-                target_label = EntityType(raw_target_label)
-            except ValueError:
-                target_label = EntityType.Entity
+            target_label = None
+            for prefix, etype in _PREFIX_LABEL_MAP.items():
+                if target_id.startswith(prefix):
+                    target_label = etype
+                    break
+            if target_label is None:
+                try:
+                    target_label = EntityType(raw_target_label)
+                except ValueError:
+                    target_label = EntityType.Entity
         raw_rel_type = str(raw.get("relation_type", "")).strip().upper()
         try:
             relation_type = RelationType(raw_rel_type)
         except ValueError:
             continue
         raw_properties = raw.get("properties")
-        properties: dict[str, Any] = _sanitize_properties(dict(raw_properties)) if isinstance(raw_properties, dict) else {}
+        properties: dict[str, Any] = sanitize_properties(dict(raw_properties)) if isinstance(raw_properties, dict) else {}
         if relation_type == RelationType.ABOUT:
             raw_weight = properties.get("weight")
             try:
@@ -594,24 +596,7 @@ def _parse_relations(
         if relation_type == RelationType.PARTICIPATED_IN:
             role = properties.get("role")
             if not isinstance(role, str) or not role.strip():
-                properties["role"] = "participant"
-        if relation_type == RelationType.MENTIONS:
-            if "weight" in properties and "confidence" not in properties:
-                properties["confidence"] = properties.pop("weight")
-            properties.pop("weight", None)
-        if "sentiment" not in properties and raw.get("sentiment") is not None:
-            properties["sentiment"] = str(raw.get("sentiment")).strip()
-        if "confidence" not in properties and raw.get("confidence") is not None:
-            properties["confidence"] = raw.get("confidence")
-        raw_confidence = properties.get("confidence")
-        try:
-            confidence_float = float(raw_confidence) if raw_confidence is not None else None
-        except (TypeError, ValueError):
-            confidence_float = None
-        if relation_type == RelationType.MENTIONS:
-            if confidence_float is None or confidence_float <= 0.0:
-                confidence_float = 1.0
-                properties["confidence"] = 1.0
+                properties["role"] = "visitor"
         try:
             result.append(ExtractedRelation(
                 source_id=source_id,
@@ -619,12 +604,9 @@ def _parse_relations(
                 target_id=target_id,
                 target_label=target_label,
                 relation_type=relation_type,
-                confidence=confidence_float,
                 properties=properties,
             ))
-        except (ValidationError, ValueError):
-            raise
-        except Exception:
+        except (ValidationError, ValueError, Exception):
             logger.debug("Skipping invalid relation: source=%s target=%s type=%s", source_id, target_id, raw_rel_type)
             continue
     return result
@@ -635,9 +617,20 @@ def _parse_hashtags(raw_hashtags_llm: Any, input_raw_tags: list[str]) -> tuple[l
     entities: list[ExtractedEntity] = []
     id_map: dict[str, str] = {}
     seen_raw_lower: set[str] = set()
+    MAX_HASHTAGS = 7
+
+    def _is_garbage_hashtag(tag: str) -> bool:
+        tag_lower = tag.lower().strip()
+        if tag_lower in _GARBAGE_HASHTAGS:
+            return True
+        if is_garbage_value(tag, EntityType.Hashtag):
+            return True
+        return False
 
     raw_list = _ensure_list(raw_hashtags_llm)
     for item in raw_list:
+        if len(hashtag_items) >= MAX_HASHTAGS:
+            break
         if not isinstance(item, dict):
             continue
         raw = str(item.get("raw", "")).strip()
@@ -645,7 +638,7 @@ def _parse_hashtags(raw_hashtags_llm: Any, input_raw_tags: list[str]) -> tuple[l
         if not raw or not normalized:
             continue
         raw_lower = raw.lower()
-        if is_garbage_value(raw, EntityType.Hashtag):
+        if _is_garbage_hashtag(raw):
             continue
         if raw_lower in seen_raw_lower:
             continue
@@ -665,10 +658,12 @@ def _parse_hashtags(raw_hashtags_llm: Any, input_raw_tags: list[str]) -> tuple[l
         id_map[raw_lower] = entity_id
 
     for tag in input_raw_tags:
+        if len(hashtag_items) >= MAX_HASHTAGS:
+            break
         tag_lower = tag.lower()
         if tag_lower in seen_raw_lower:
             continue
-        if is_garbage_value(tag, EntityType.Hashtag):
+        if _is_garbage_hashtag(tag):
             continue
         seen_raw_lower.add(tag_lower)
 
@@ -730,28 +725,6 @@ def _create_structural_relations(
             properties={"weight": 1.0},
         ))
 
-    seen_belongs_to: set[tuple[str, str]] = set()
-    for ent in entities:
-        if ent.label not in (EntityType.Entity, EntityType.Product, EntityType.Organization, EntityType.Event):
-            continue
-        if ent.id is None or ent.id == "":
-            continue
-        for mc in microconcepts:
-            if mc.id is None or mc.id == "":
-                continue
-            key = (ent.id, mc.id)
-            if key in seen_belongs_to:
-                continue
-            seen_belongs_to.add(key)
-            relations.append(ExtractedRelation(
-                source_id=ent.id,
-                source_label=ent.label,
-                target_id=mc.id,
-                target_label=EntityType.MicroConcept,
-                relation_type=RelationType.BELONGS_TO,
-                properties={},
-            ))
-
     for ht in hashtag_entities:
         if ht.id is None or ht.id == "":
             continue
@@ -762,6 +735,19 @@ def _create_structural_relations(
             target_label=EntityType.Hashtag,
             relation_type=RelationType.TAGGED_WITH,
         ))
+
+    for coauthor in context.post_coauthors:
+        clean_ca = clean_identifier(coauthor)
+        if clean_ca:
+            coauthor_id = f"actor_{context.platform.lower()}_{clean_ca}"
+            relations.append(ExtractedRelation(
+                source_id=context.author_node_id,
+                source_label=EntityType.Actor,
+                target_id=coauthor_id,
+                target_label=EntityType.Actor,
+                relation_type=RelationType.COAUTHOR,
+                properties={"platform": context.platform, "post_id": pub_node_id},
+            ))
 
     return extra_entities, relations
 
@@ -798,10 +784,14 @@ class GraphExtractor:
     async def extract(
         self,
         context: PostBatchContext,
-        chunk_text: str,
+        caption_text: str = "",
+        transcription_text: str = "",
         retries: int = 3,
     ) -> OpenSPGExtractionResult:
-        if not chunk_text:
+        if not caption_text and not transcription_text:
+            caption_text = context.content or ""
+            transcription_text = context.transcription or ""
+        if not caption_text and not transcription_text:
             return OpenSPGExtractionResult(
                 psychographics=ExtractedPsychographics(
                     primary_tone=None,
@@ -809,35 +799,26 @@ class GraphExtractor:
                 ),
             )
 
-        raw_metadata = context.raw_metadata or {}
-        if isinstance(raw_metadata, str):
-            try:
-                raw_metadata = json.loads(raw_metadata)
-            except (json.JSONDecodeError, TypeError):
-                raw_metadata = {}
-        if not isinstance(raw_metadata, dict):
-            raw_metadata = {}
-        metadata_hashtags = raw_metadata.get("hashtags", [])
-
         input_raw_tags = extract_raw_hashtags(
-            text=chunk_text,
-            raw_metadata_hashtags=metadata_hashtags,
+            text=f"{caption_text} {transcription_text}".strip(),
+            raw_metadata_hashtags=context.post_hashtags,
             author_bio=context.author_biography,
             author_title=context.author_title,
         )
 
+        author_handle = (getattr(context, 'author_handle', '') or getattr(context, 'author_username', '') or '').strip()
         messages: Any = [
-            {"role": "system", "content": _build_system_prompt(context.author_title)},
-            {"role": "user", "content": (
-                f"Проанализируй следующий пост и извлеки граф знаний.\n\n"
-                f"Текст поста: {chunk_text}\n"
-                f"Автор: {context.author_title}\n"
-                f"Язык профиля автора: {getattr(context, 'author_language', None) or 'Не указан'}\n"
-                f"Описание профиля автора: {getattr(context, 'author_biography', '') or 'Отсутствует'}\n"
-                f"Имеется только транскрипция (без подписи): {getattr(context, 'is_transcription_only', False)}\n"
-                f"Платформа: {context.platform}\n"
-                f"Тип поста: {context.post_type}\n"
-                f"Сырые хэштеги поста: {json.dumps(input_raw_tags, ensure_ascii=False)}"
+            {"role": "system", "content": build_system_prompt(context.author_title, author_handle)},
+            {"role": "user", "content": build_user_prompt(
+                caption_text=caption_text,
+                transcription_text=transcription_text,
+                author_title=context.author_title,
+                author_handle=author_handle,
+                platform=context.platform,
+                post_type=context.post_type,
+                author_biography=context.author_biography,
+                coauthors=context.post_coauthors,
+                raw_hashtags=input_raw_tags,
             )},
         ]
 
@@ -907,7 +888,7 @@ class GraphExtractor:
                 raw_psychographics = parsed.get("psychographics", {})
                 raw_microconcepts = parsed.get("microconcepts")
 
-                entities, entity_id_map = _parse_entities(raw_entities)
+                entities, entity_id_map, entity_belongs_to_relations = _parse_entities(raw_entities)
                 microconcept_entities, microconcept_id_map = _parse_microconcepts(raw_microconcepts)
                 entities.extend(microconcept_entities)
 
@@ -918,38 +899,39 @@ class GraphExtractor:
                 global_id_map.update(entity_id_map)
                 global_id_map.update(microconcept_id_map)
                 global_id_map.update(hashtag_id_map)
-                global_id_map["post"] = context.pub_node_id
-                global_id_map["publication"] = context.pub_node_id
-                global_id_map["this_post"] = context.pub_node_id
-                global_id_map["content"] = context.pub_node_id
-                global_id_map["publication_node"] = context.pub_node_id
-                global_id_map["post_node"] = context.pub_node_id
+                global_id_map["$author"] = context.author_node_id
+                global_id_map["$post"] = context.pub_node_id
                 global_id_map["author"] = context.author_node_id
                 global_id_map["actor"] = context.author_node_id
-                global_id_map[clean_name_lower(context.author_title)] = context.author_node_id
-                global_id_map[clean_name_lower(getattr(context, 'author_username', '') or '')] = context.author_node_id
+                global_id_map["post"] = context.pub_node_id
+                global_id_map["publication"] = context.pub_node_id
+                if author_handle:
+                    clean_handle = clean_name_lower(author_handle)
+                    global_id_map[clean_handle] = context.author_node_id
+                    global_id_map[f"@{clean_handle}"] = context.author_node_id
+                    global_id_map[author_handle.lower()] = context.author_node_id
+                    global_id_map[f"@{author_handle.lower()}"] = context.author_node_id
 
                 llm_relations = _parse_relations(raw_relations, global_id_map, context.pub_node_id, context.author_node_id, context)
-                mentions_targets = {
-                    r.target_id
-                    for r in llm_relations
-                    if r.relation_type == RelationType.MENTIONS and r.source_id == context.pub_node_id
-                }
                 for ent in entities:
                     if (
                         ent.label in (EntityType.Entity, EntityType.Organization, EntityType.Product, EntityType.Event)
                         and ent.id is not None
-                        and ent.id not in mentions_targets
                     ):
-                        llm_relations.append(ExtractedRelation(
-                            source_id=context.pub_node_id,
-                            source_label=EntityType.Post,
-                            target_id=ent.id,
-                            target_label=ent.label,
-                            relation_type=RelationType.MENTIONS,
-                            confidence=1.0,
-                            properties={"confidence": 1.0, "sentiment": None},
-                        ))
+                        ent_sentiment = ent.properties.pop("sentiment", "neutral")
+                        ent_confidence = ent.confidence if ent.confidence > 0.0 else 1.0
+                        try:
+                            llm_relations.append(ExtractedRelation(
+                                source_id=context.pub_node_id,
+                                source_label=EntityType.Post,
+                                target_id=ent.id,
+                                target_label=ent.label,
+                                relation_type=RelationType.MENTIONS,
+                                confidence=ent_confidence,
+                                properties={"confidence": ent_confidence, "sentiment": ent_sentiment},
+                            ))
+                        except (ValidationError, ValueError):
+                            continue
                 extra_entities, structural_relations = _create_structural_relations(
                     entities,
                     microconcept_entities,
@@ -958,7 +940,7 @@ class GraphExtractor:
                     context.author_node_id,
                     context,
                 )
-                all_relations = llm_relations + structural_relations
+                all_relations = llm_relations + entity_belongs_to_relations + structural_relations
 
                 psychographics = _parse_psychographics(raw_psychographics)
                 is_spam = bool(parsed.get("is_spam_or_gambling", False))
@@ -966,6 +948,16 @@ class GraphExtractor:
 
                 entities.extend(hashtag_entities)
                 entities.extend(extra_entities)
+
+                seen_entity_ids: set[str] = set()
+                deduped_entities: list[ExtractedEntity] = []
+                for ent in entities:
+                    eid = ent.id
+                    if not eid or eid in seen_entity_ids:
+                        continue
+                    seen_entity_ids.add(eid)
+                    deduped_entities.append(ent)
+                entities = deduped_entities
 
                 result = OpenSPGExtractionResult(
                     thinking=thinking,
@@ -976,16 +968,19 @@ class GraphExtractor:
                     hashtags=hashtag_items,
                 )
 
-                forbidden_names = {
-                    clean_name_lower(context.author_title),
-                    clean_name_lower(getattr(context, 'author_username', '') or ''),
-                    clean_name_lower(getattr(context, 'author_handle', '') or ''),
+                forbidden_names = {clean_name_lower(context.author_title)}
+                if author_handle:
+                    forbidden_names.add(clean_name_lower(author_handle))
+                coauthor_ids = {
+                    f"actor_{context.platform.lower()}_{clean_identifier(ca)}"
+                    for ca in context.post_coauthors
+                    if clean_identifier(ca)
                 }
                 result.sanitize_and_validate(
-                    allowed_ids={context.pub_node_id, context.author_node_id},
+                    allowed_ids={context.pub_node_id, context.author_node_id} | coauthor_ids,
                     forbidden_names=forbidden_names,
                     author_title=context.author_title,
-                    author_handle=getattr(context, 'author_username', '') or getattr(context, 'author_handle', ''),
+                    author_handle=author_handle,
                 )
             except Exception as e:
                 delay = 2 ** attempt

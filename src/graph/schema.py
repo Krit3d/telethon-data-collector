@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import csv
-from pathlib import Path
-from typing import Any
-
 from src.graph.client import Neo4jClient
 
 
@@ -26,6 +22,7 @@ SCHEMA_QUERIES: list[str] = [
     "CREATE INDEX idx_microconcept_name_lower IF NOT EXISTS FOR (n:MicroConcept) ON (n.name_lower)",
     "CREATE INDEX idx_hashtag_name_lower IF NOT EXISTS FOR (n:Hashtag) ON (n.name_lower)",
     "CREATE INDEX idx_concept_name_lower IF NOT EXISTS FOR (n:Concept) ON (n.name_lower)",
+    "CREATE INDEX idx_actor_handle IF NOT EXISTS FOR (a:Actor) ON (a.handle)",
     "CREATE INDEX idx_post_published IF NOT EXISTS FOR (p:Post) ON (p.published_at)",
     "CREATE INDEX idx_post_account_id IF NOT EXISTS FOR (p:Post) ON (p.account_id)",
     "CREATE FULLTEXT INDEX entity_name_ft IF NOT EXISTS FOR (n:Entity|Actor|Organization|Product|Event|MicroConcept|Concept|Hashtag) ON EACH [n.name]",
@@ -35,50 +32,3 @@ SCHEMA_QUERIES: list[str] = [
 async def init_neo4j_schema(client: Neo4jClient) -> None:
     for query in SCHEMA_QUERIES:
         await client.execute_write(query)
-
-
-BATCH_SIZE = 500
-
-BATCH_UNWIND_CONCEPT = """
-UNWIND $rows AS row
-MERGE (c:Concept {id: row.id})
-SET c.code = row.code,
-    c.name = row.name,
-    c.tier_1 = row.tier_1,
-    c.tier_2 = row.tier_2,
-    c.tier_3 = row.tier_3,
-    c.tier_4 = row.tier_4,
-    c.extension = row.extension
-WITH c, row
-WHERE row.parent_id IS NOT NULL AND row.parent_id <> ''
-MATCH (p:Concept {id: row.parent_id})
-MERGE (p)-[:PARENT_OF]->(c)
-"""
-
-
-def _chunked(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
-    return [items[i : i + size] for i in range(0, len(items), size)]
-
-
-async def import_iab_taxonomy(client: Neo4jClient, taxonomy_path: Path) -> None:
-    rows: list[dict[str, Any]] = []
-    with taxonomy_path.open(encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for record in reader:
-            unique_id = record.get("Unique ID", "").strip()
-            if not unique_id:
-                continue
-            parent = record.get("Parent", "").strip()
-            rows.append({
-                "id": f"concept_{unique_id}",
-                "parent_id": f"concept_{parent}" if parent else None,
-                "code": unique_id,
-                "name": record.get("Name", "").strip(),
-                "tier_1": record.get("Tier 1", "").strip(),
-                "tier_2": record.get("Tier 2", "").strip(),
-                "tier_3": record.get("Tier 3", "").strip(),
-                "tier_4": record.get("Tier 4", "").strip(),
-                "extension": record.get("Extension", "").strip(),
-            })
-    for batch in _chunked(rows, BATCH_SIZE):
-        await client.execute_write(BATCH_UNWIND_CONCEPT, {"rows": batch})

@@ -7,8 +7,6 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
-from src.graph.ontology import EntityType
-
 _NON_ALNUM_WS_RE = re.compile(r"[^\w\s]")
 _MULTI_WS_RE = re.compile(r"\s+")
 _HASHTAG_RE = re.compile(r"#\w+")
@@ -86,26 +84,88 @@ _GARBAGE_WORDS: frozenset[str] = (
     | _HASHTAG_GARBAGE
 )
 
-_LABEL_GARBAGE_MAP: dict[EntityType, frozenset[str]] = {
-    EntityType.Actor: _ACTOR_GARBAGE,
-    EntityType.Post: _POST_GARBAGE,
-    EntityType.Entity: _ENTITY_GARBAGE,
-    EntityType.Organization: _ORGANIZATION_GARBAGE,
-    EntityType.Product: _PRODUCT_GARBAGE,
-    EntityType.Event: _EVENT_GARBAGE,
-    EntityType.MicroConcept: _MICROCONCEPT_GARBAGE,
-    EntityType.Concept: _CONCEPT_GARBAGE,
-    EntityType.Hashtag: _HASHTAG_GARBAGE,
+_LABEL_GARBAGE_MAP: dict[str, frozenset[str]] = {
+    "Actor": _ACTOR_GARBAGE,
+    "Post": _POST_GARBAGE,
+    "Entity": _ENTITY_GARBAGE,
+    "Organization": _ORGANIZATION_GARBAGE,
+    "Product": _PRODUCT_GARBAGE,
+    "Event": _EVENT_GARBAGE,
+    "MicroConcept": _MICROCONCEPT_GARBAGE,
+    "Concept": _CONCEPT_GARBAGE,
+    "Hashtag": _HASHTAG_GARBAGE,
 }
 
-_ENTITY_TYPE_LABELS: dict[str, str] = {v.value.lower(): v.value for v in EntityType}
+_REGULATORY_MARKERS: re.Pattern[str] = re.compile(
+    r"\b(?:\d+[- ]?фз|фз[- ]?\d+|закон(?:\s+о\b|\s+об\b|\s+рф|\s+№|\s+\d+)?|статья\s+\d+|ст\.\s*\d+|кодекс|постановление|гост(?:\s+\d+)?|iso(?:\s+\d+)?|gdpr|санпин|снип|регламент|указ(?:\s+президента|\s+№|\s+\d+)?)\b",
+    re.IGNORECASE,
+)
+
+_EVENT_TOPONYM_MARKERS: re.Pattern[str] = re.compile(
+    r"(?:conf|fest|summit|forum|meetup|conference|съезд|форум|фестиваль|саммит|выставка|чемпионат|кубок|релиз)",
+    re.IGNORECASE,
+)
+
+_FALSE_EVENT_TOPONYMS: frozenset[str] = frozenset({
+    "россия", "russia", "сша", "usa", "германия", "germany", "франция", "france",
+    "великобритания", "united kingdom", "uk", "италия", "italy", "испания", "spain",
+    "китай", "china", "япония", "japan", "индия", "india", "бразилия", "brazil",
+    "канада", "canada", "австралия", "australia", "южная корея", "south korea",
+    "вьетнам", "vietnam", "тайланд", "thailand", "турция", "turkey", "оаэ", "uae",
+    "дубай", "dubai", "москва", "moscow", "санкт-петербург", "st petersburg",
+    "лондон", "london", "нью-йорк", "new york", "париж", "paris", "берлин", "berlin",
+    "пекин", "beijing", "токио", "tokyo", "сингапур", "singapore", "гонконг", "hong kong",
+    "шанхай", "shanghai", "абу-даби", "abu dhabi", "доха", "doha", "рим", "rome",
+    "милан", "milan", "барселона", "barcelona", "мадрид", "madrid", "амстердам", "amsterdam",
+    "шереметьево", "sheremetyevo", "домодедово", "domodedovo", "внуково", "vnukovo",
+    "пулково", "pulkovo", "хитроу", "heathrow", "аэропорт", "airport",
+    "казахстан", "kazakhstan", "узбекистан", "uzbekistan", "беларусь", "belarus",
+    "украина", "ukraine", "польша", "poland", "чехия", "czech", "австрия", "austria",
+    "швейцария", "switzerland", "швеция", "sweden", "норвегия", "norway", "дания", "denmark",
+    "финляндия", "finland", "нидерланды", "netherlands", "бельгия", "belgium",
+    "португалия", "portugal", "греция", "greece", "египет", "egypt", "израиль", "israel",
+    "саудовская аравия", "saudi arabia", "катар", "qatar", "кувейт", "kuwait",
+    "оман", "oman", "бахрейн", "bahrain", "индонезия", "indonesia", "малайзия", "malaysia",
+    "филиппины", "philippines", "мексика", "mexico", "аргентина", "argentina",
+    "чили", "chile", "колумбия", "colombia", "юар", "south africa", "нигерия", "nigeria",
+    "кения", "kenya", "марокко", "morocco", "алжир", "algeria", "тунис", "tunisia",
+    "сербия", "serbia", "хорватия", "croatia", "болгария", "bulgaria", "румыния", "romania",
+    "венгрия", "hungary", "словакия", "slovakia", "словения", "slovenia", "литва", "lithuania",
+    "латвия", "latvia", "эстония", "estonia", "азербайджан", "azerbaijan", "армения", "armenia",
+    "грузия", "georgia", "монголия", "mongolia", "туркменистан", "turkmenistan",
+    "кыргызстан", "kyrgyzstan", "таджикистан", "tajikistan",
+})
 
 
-def _resolve_label(label: EntityType | str) -> str:
-    if isinstance(label, EntityType):
-        return label.value
-    stripped = str(label).strip()
-    return _ENTITY_TYPE_LABELS.get(stripped.lower(), stripped)
+def is_regulatory_entity(name: str) -> bool:
+    return bool(_REGULATORY_MARKERS.search(name))
+
+
+_GENERIC_EVENT_WORDS: frozenset[str] = frozenset({
+    "конференция", "митап", "форум", "фестиваль", "саммит", "выставка",
+    "вебинар", "съезд", "лекция", "conference", "meetup", "forum", "summit",
+    "festival", "webinar", "trip", "travel", "поездка", "путешествие",
+})
+
+
+def is_false_event_toponym(name: str) -> bool:
+    name_lower = name.lower().strip()
+    cleaned = clean_name_lower(name)
+    words = cleaned.split()
+    if len(words) == 1 and words[0] in _GENERIC_EVENT_WORDS:
+        return True
+    if name_lower in _FALSE_EVENT_TOPONYMS:
+        return True
+    if _EVENT_TOPONYM_MARKERS.search(name_lower):
+        return False
+    for t in _FALSE_EVENT_TOPONYMS:
+        if name_lower.startswith(t) or name_lower.endswith(t):
+            return True
+    return False
+
+
+def _resolve_label(label: str | Any) -> str:
+    return getattr(label, "value", str(label)).strip()
 
 
 def clean_name_lower(name: str) -> str:
@@ -116,6 +176,85 @@ def clean_name_lower(name: str) -> str:
     return name.strip().lower()
 
 
+def is_author_entity(name: str, author_title: str, author_handle: str | None = None) -> bool:
+    name_clean = clean_name_lower(name)
+    title_clean = clean_name_lower(author_title) if author_title else ''
+    handle_clean = clean_name_lower(author_handle) if author_handle else ''
+    if not name_clean:
+        return False
+    if name_clean == title_clean or (handle_clean and name_clean == handle_clean):
+        return True
+    if handle_clean and len(name_clean) >= 4 and name_clean == handle_clean.replace('_', ''):
+        return True
+    if title_clean:
+        name_tokens = name_clean.split()
+        title_tokens = set(title_clean.split())
+        if len(name_tokens) >= 2 and set(name_tokens) <= title_tokens:
+            return True
+    return False
+
+
+_LOWER_BRANDS: dict[str, str] = {
+    "iphone": "iPhone",
+    "ipad": "iPad",
+    "ios": "iOS",
+    "macos": "macOS",
+    "ebay": "eBay",
+    "imac": "iMac",
+    "chatgpt": "ChatGPT",
+    "openai": "OpenAI",
+    "youtube": "YouTube",
+    "github": "GitHub",
+    "playstation": "PlayStation",
+    "postgresql": "PostgreSQL",
+    "graphql": "GraphQL",
+    "mysql": "MySQL",
+    "mongodb": "MongoDB",
+    "tiktok": "TikTok",
+    "linkedin": "LinkedIn",
+    "javascript": "JavaScript",
+    "typescript": "TypeScript",
+}
+
+_PROPER_NOUN_LABELS: frozenset[str] = frozenset({"Actor", "Organization", "Event"})
+
+
+def format_display_name(name: str, label: str | Any | None = None, is_person: bool = False) -> str:
+    name = name.strip().strip("\"'«»„“”‘’`")
+    if not name:
+        return name
+
+    has_upper = any(char.isupper() for char in name)
+    has_lower = any(char.islower() for char in name)
+
+    if has_upper and has_lower:
+        return name
+
+    if has_upper and not has_lower:
+        if len(name) <= 4:
+            return name
+        name = name.title()
+
+    words = name.split()
+
+    for i, word in enumerate(words):
+        lower_word = word.lower()
+        if lower_word in _LOWER_BRANDS:
+            words[i] = _LOWER_BRANDS[lower_word]
+
+    if not has_upper:
+        first_lower = words[0].lower()
+        if first_lower in _LOWER_BRANDS:
+            if len(words) > 1:
+                words[1:] = map(str.title, words[1:])
+            return " ".join(words)
+        if is_person or (label is not None and _resolve_label(label) in _PROPER_NOUN_LABELS):
+            return " ".join(words).title()
+        return name[0].upper() + name[1:]
+
+    return " ".join(words)
+
+
 def clean_identifier(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("#", "").replace("@", "")
@@ -124,7 +263,7 @@ def clean_identifier(text: str) -> str:
     return text.lower()
 
 
-def is_garbage_value(val: str | None, label: EntityType | str | None = None) -> bool:
+def is_garbage_value(val: str | None, label: str | Any | None = None) -> bool:
     if val is None:
         return True
     stripped = val.strip()
@@ -137,13 +276,9 @@ def is_garbage_value(val: str | None, label: EntityType | str | None = None) -> 
         return True
     if label is not None:
         resolved = _resolve_label(label)
-        try:
-            entity_type = EntityType(resolved)
-            label_garbage = _LABEL_GARBAGE_MAP.get(entity_type)
-            if label_garbage is not None and cleaned in label_garbage:
-                return True
-        except ValueError:
-            pass
+        label_garbage = _LABEL_GARBAGE_MAP.get(resolved)
+        if label_garbage is not None and cleaned in label_garbage:
+            return True
     return False
 
 
@@ -152,7 +287,7 @@ def generate_uuid5(namespace_str: str, cleaned_key: str) -> str:
 
 
 def build_node_id(
-    label: EntityType | str,
+    label: str | Any,
     key: str,
     platform: str | None = None,
     account_id: int | None = None,
@@ -163,11 +298,11 @@ def build_node_id(
         case "Actor":
             if platform is None or account_id is None:
                 raise ValueError("platform and account_id are required for Actor")
-            return f"actor_{platform}_{account_id}"
+            return f"actor_{platform.strip().lower()}_{account_id}"
         case "Post":
             if platform is None or account_id is None or content_id is None:
                 raise ValueError("platform, account_id, and content_id are required for Post")
-            return f"event_publication_{platform}_{account_id}_{content_id}"
+            return f"event_publication_{platform.strip().lower()}_{account_id}_{content_id}"
         case "Concept":
             return f"concept_{key.strip()}"
         case "Hashtag":
@@ -209,7 +344,7 @@ def extract_raw_hashtags(
         for match in _HASHTAG_EXTRACT_RE.finditer(source):
             raw = match.group(1)
             cleaned = clean_identifier(raw)
-            if cleaned and not is_garbage_value(cleaned, EntityType.Hashtag):
+            if cleaned and not is_garbage_value(cleaned, "Hashtag"):
                 result.add(cleaned)
 
     _collect(text)
@@ -220,13 +355,13 @@ def extract_raw_hashtags(
         for item in raw_metadata_hashtags:
             if isinstance(item, str):
                 cleaned = clean_identifier(item)
-                if cleaned and not is_garbage_value(cleaned, EntityType.Hashtag):
+                if cleaned and not is_garbage_value(cleaned, "Hashtag"):
                     result.add(cleaned)
             elif isinstance(item, dict):
                 for v in item.values():
                     if isinstance(v, str):
                         cleaned = clean_identifier(v)
-                        if cleaned and not is_garbage_value(cleaned, EntityType.Hashtag):
+                        if cleaned and not is_garbage_value(cleaned, "Hashtag"):
                             result.add(cleaned)
 
     return sorted(result)
@@ -258,4 +393,3 @@ def sanitize_properties(props: dict[str, Any]) -> dict[str, Any]:
         else:
             result[k] = str(v)
     return result
-
