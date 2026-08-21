@@ -356,11 +356,6 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
                 label = EntityType.Product
             elif raw_type_lower in {member.value for member in EventType} and label != EntityType.Event:
                 label = EntityType.Event
-        if label == EntityType.Event:
-            from src.graph.utils import is_regulatory_entity
-            if is_regulatory_entity(name):
-                label = EntityType.Entity
-                raw_entity_type = "term"
         raw_sentiment = str(raw.get("sentiment", "neutral")).strip().lower()
         if raw_sentiment not in _SENTIMENT_VALUES:
             raw_sentiment = "neutral"

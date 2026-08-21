@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 from typing import Any
 
@@ -497,13 +496,11 @@ class OpenSPGExtractionResult(BaseModel):
         author_handle: str | None = None,
     ) -> OpenSPGExtractionResult:
 
-        from src.graph.utils import build_node_id, is_garbage_value, is_regulatory_entity, is_false_event_toponym, is_false_event_temporal
+        from src.graph.utils import build_node_id, is_garbage_value
 
         phantom_names = frozenset({"<name>", "unknown", "null", "none", "n/a", ""})
         valid_ids = set(allowed_ids) if allowed_ids else set()
         clean_entities: list[ExtractedEntity] = []
-        removed_event_ids: set[str] = set()
-
         for e in self.entities:
             if e.name.lower() in phantom_names or len(e.name.strip()) < 2:
                 continue
@@ -514,30 +511,6 @@ class OpenSPGExtractionResult(BaseModel):
             if is_garbage_value(e.name, e.label):
                 continue
 
-            if e.label == EntityType.Event:
-                if is_regulatory_entity(e.name):
-                    old_id = e.id
-                    e.label = EntityType.Entity
-                    e.properties["entity_type"] = "term"
-                    e.properties.pop("event_type", None)
-                    e.id = build_node_id(EntityType.Entity, e.name)
-                    if old_id and old_id != e.id:
-                        for r in self.relations:
-                            if r.source_id == old_id:
-                                r.source_id = e.id
-                                r.source_label = EntityType.Entity
-                            if r.target_id == old_id:
-                                r.target_id = e.id
-                                r.target_label = EntityType.Entity
-                elif is_false_event_toponym(e.name):
-                    if e.id:
-                        removed_event_ids.add(e.id)
-                    continue
-                elif is_false_event_temporal(e.name):
-                    if e.id:
-                        removed_event_ids.add(e.id)
-                    continue
-
             for key in ("role", "platform", "author", "post", "sentiment", "confidence", "type", "label", "name"):
                 e.properties.pop(key, None)
 
@@ -545,7 +518,7 @@ class OpenSPGExtractionResult(BaseModel):
                 val = e.properties.get("product_type")
                 if val is not None:
                     try:
-                        e.properties["product_type"] = ProductType(val)
+                        e.properties["product_type"] = ProductType(str(val).lower().strip())
                     except ValueError:
                         e.properties.pop("product_type", None)
                 e.properties = {k: v for k, v in e.properties.items() if k == "product_type"}
@@ -553,7 +526,7 @@ class OpenSPGExtractionResult(BaseModel):
                 val = e.properties.get("org_type")
                 if val is not None:
                     try:
-                        e.properties["org_type"] = OrgType(val)
+                        e.properties["org_type"] = OrgType(str(val).lower().strip())
                     except ValueError:
                         e.properties.pop("org_type", None)
                 e.properties = {k: v for k, v in e.properties.items() if k == "org_type"}
@@ -561,7 +534,7 @@ class OpenSPGExtractionResult(BaseModel):
                 val = e.properties.get("entity_type")
                 if val is not None:
                     try:
-                        e.properties["entity_type"] = EntityCategory(val)
+                        e.properties["entity_type"] = EntityCategory(str(val).lower().strip())
                     except ValueError:
                         e.properties.pop("entity_type", None)
                 if "entity_type" not in e.properties:
@@ -571,10 +544,14 @@ class OpenSPGExtractionResult(BaseModel):
                 val = e.properties.get("event_type")
                 if val is not None:
                     try:
-                        e.properties["event_type"] = EventType(val)
+                        e.properties["event_type"] = EventType(str(val).lower().strip())
                     except ValueError:
                         e.properties.pop("event_type", None)
                 e.properties = {k: v for k, v in e.properties.items() if k == "event_type"}
+            elif e.label == EntityType.MicroConcept:
+                e.properties = {"is_classified": bool(e.properties.get("is_classified", False))}
+            elif e.label == EntityType.Hashtag:
+                e.properties = {k: v for k, v in e.properties.items() if k in ("raw", "normalized")}
             else:
                 e.properties.clear()
 
@@ -587,8 +564,6 @@ class OpenSPGExtractionResult(BaseModel):
         clean_relations: list[ExtractedRelation] = []
         for r in self.relations:
             if r.source_id not in valid_ids or r.target_id not in valid_ids:
-                continue
-            if r.source_id in removed_event_ids or r.target_id in removed_event_ids:
                 continue
             repaired = validate_and_repair_relation(
                 r.source_id,

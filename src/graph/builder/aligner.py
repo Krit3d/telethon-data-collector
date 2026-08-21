@@ -23,7 +23,7 @@ from src.graph.ontology import (
     VECTORIZABLE_ENTITY_LABELS,
     extract_entity_subtype,
 )
-from src.graph.utils import build_node_id, clean_name_lower, format_bge_representation, format_display_name
+from src.graph.utils import build_node_id, clean_identifier, clean_name_lower, format_bge_representation, format_display_name
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +351,7 @@ class Aligner:
                 ExtractedEntity(
                     id=ht_node_id,
                     name=f"#{ht.raw}",
+                    name_lower=clean_name_lower(ht.raw),
                     label=EntityType.Hashtag,
                     properties={"raw": ht.raw, "normalized": ht.normalized},
                 )
@@ -462,6 +463,7 @@ class Aligner:
                         ExtractedEntity(
                             id=canonical_id,
                             name=canonical_name,
+                            name_lower=clean_name_lower(canonical_name),
                             label=target_label,
                             properties=props,
                         )
@@ -639,11 +641,20 @@ class Aligner:
             deduped_relations.append(relation)
         extraction_result.relations = deduped_relations
 
+        coauthor_ids = {
+            f"actor_{context.platform.lower()}_{clean_identifier(ca)}"
+            for ca in context.post_coauthors
+            if clean_identifier(ca)
+        }
+        author_handle = (getattr(context, "author_handle", "") or getattr(context, "author_username", "") or "").strip()
+        forbidden_names = {clean_name_lower(context.author_title)}
+        if author_handle:
+            forbidden_names.add(clean_name_lower(author_handle))
         extraction_result.sanitize_and_validate(
-            allowed_ids={context.pub_node_id, context.author_node_id},
-            forbidden_names={clean_name_lower(context.author_title)},
+            allowed_ids={context.pub_node_id, context.author_node_id} | coauthor_ids,
+            forbidden_names=forbidden_names,
             author_title=context.author_title,
-            author_handle=context.author_username,
+            author_handle=author_handle,
         )
 
         total_elapsed = (time.perf_counter() - t0) * 1000
