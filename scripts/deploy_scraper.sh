@@ -52,6 +52,9 @@ set -e
 cd /opt/telethon-scraper
 COMPOSE_FILE="docker-compose.scraper.yml"
 
+echo "Cleaning up stale mount artifacts..."
+rm -rf /opt/telethon-scraper/docker/init-db.sql
+
 echo "Building crawler Docker image..."
 docker compose -f $COMPOSE_FILE build crawler
 
@@ -139,7 +142,6 @@ docker compose -f $COMPOSE_FILE logs --tail=20 db crawler parser
 echo "Performing post-deployment cleanup of unused Docker images and build cache..."
 docker image prune -f || true
 docker builder prune -f || true
-docker volume prune -f || true
 
 EOF
 

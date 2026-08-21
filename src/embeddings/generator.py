@@ -6,7 +6,7 @@ import hashlib
 import logging
 import random
 import struct
-from typing import Any, Final
+from typing import Final
 
 import httpx
 from openai import AsyncOpenAI, RateLimitError

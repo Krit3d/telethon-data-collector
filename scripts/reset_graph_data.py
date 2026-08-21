@@ -80,24 +80,37 @@ async def reset_qdrant(settings: Settings) -> None:
 
 
 async def reset_postgres_graph_status(db_url: str) -> None:
-    db_url = db_url.replace("@localhost:", "@db:").replace("@127.0.0.1:", "@db:")
-    engine = create_async_engine(db_url, pool_size=2, max_overflow=2)
+    engine = create_async_engine(
+        db_url,
+        pool_size=2,
+        max_overflow=2,
+        connect_args={"command_timeout": 60, "server_settings": {"jit": "off"}},
+        pool_pre_ping=True,
+    )
     try:
+        total_updated = 0
+        batch_size = 50000
         async with engine.begin() as conn:
-            result = await conn.execute(
-                text(
-                    "UPDATE content "
-                    "SET graph_status = 0 "
-                    "WHERE graph_status != 0 "
-                    "AND account_id IN ("
-                    "SELECT id "
-                    "FROM accounts "
-                    "WHERE LOWER(status) = 'verified'"
-                    ")"
+            while True:
+                result = await conn.execute(
+                    text(
+                        "WITH target_posts AS ("
+                        "SELECT c.id "
+                        "FROM content c "
+                        "WHERE c.graph_status != 0 "
+                        "LIMIT :batch_size"
+                        ") "
+                        "UPDATE content "
+                        "SET graph_status = 0 "
+                        "WHERE id IN (SELECT id FROM target_posts)"
+                    ),
+                    {"batch_size": batch_size},
                 )
-            )
-            updated_count = result.rowcount
-            logger.info("Reset graph_status to 0 for %d posts from verified accounts", updated_count)
+                if result.rowcount == 0:
+                    break
+                total_updated += result.rowcount
+                logger.info("Reset graph_status to 0 for %d posts (batch)", result.rowcount)
+        logger.info("Total reset graph_status to 0 for %d posts", total_updated)
     finally:
         await engine.dispose()
 

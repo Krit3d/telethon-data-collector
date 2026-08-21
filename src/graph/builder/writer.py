@@ -30,6 +30,16 @@ def _to_val(val: Any, default: Any = None) -> Any:
     return val.value if hasattr(val, "value") else val
 
 
+_RELATION_PROPERTY_KEYS: dict[RelationType, frozenset[str]] = {
+    RelationType.BELONGS_TO: frozenset({"similarity"}),
+    RelationType.MENTIONS: frozenset({"confidence", "sentiment"}),
+    RelationType.PRODUCES: frozenset({"relation_subtype"}),
+    RelationType.WORKS_AT: frozenset({"role"}),
+    RelationType.USES_TECH: frozenset({"proficiency"}),
+    RelationType.PARTICIPATED_IN: frozenset({"role"}),
+}
+
+
 class GraphWriter:
 
     def __init__(self, settings: Settings, neo4j_client: Neo4jClient, db: Database) -> None:
@@ -57,79 +67,7 @@ class GraphWriter:
 
         t0 = time.perf_counter()
 
-        nodes_by_label: dict[str, dict[str, dict[str, Any]]] = {}
-        rel_groups: dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]] = {}
-
-        psychographics = extraction_result.psychographics
-
-        post_node = sanitize_properties({
-            "id": context.pub_node_id,
-            "account_id": context.account_id,
-            "content_id": context.content_id,
-            "published_at": int(context.published_at.timestamp()),
-            "platform": context.platform,
-            "post_type": context.post_type,
-            "language": psychographics.language,
-            "tone": _to_val(psychographics.primary_tone, None),
-            "secondary_tone": _to_val(psychographics.secondary_tone, None),
-            "tone_confidence": psychographics.tone_confidence,
-            "primary_hormone": _to_val(psychographics.primary_hormone, None),
-            "secondary_hormone": _to_val(psychographics.secondary_hormone, None),
-            "score_dopamine": psychographics.score_dopamine,
-            "score_oxytocin": psychographics.score_oxytocin,
-            "score_serotonin": psychographics.score_serotonin,
-            "score_cortisol": psychographics.score_cortisol,
-            "score_adrenaline": psychographics.score_adrenaline,
-            "score_endorphin": psychographics.score_endorphin,
-            "is_video": context.is_video,
-            "is_spam_or_gambling": extraction_result.is_spam_or_gambling,
-        })
-
-        nodes_by_label.setdefault("Post", {})[post_node["id"]] = post_node
-
-        published_key = (EntityType.Actor.value, EntityType.Post.value, RelationType.PUBLISHED.value)
-        published_rel_dict = rel_groups.setdefault(published_key, {})
-        published_pair_key = (context.author_node_id, context.pub_node_id)
-        published_rel_dict[published_pair_key] = {
-            "source_id": context.author_node_id,
-            "target_id": context.pub_node_id,
-            "properties": sanitize_properties({"published_at": int(context.published_at.timestamp())}),
-        }
-
-        for entity in extraction_result.entities:
-            if not entity.id:
-                continue
-            if entity.label == EntityType.Actor:
-                continue
-            label_str = entity.label.value
-            props = sanitize_properties(dict(entity.properties))
-            node_dict = {"id": entity.id, "name": entity.name, "name_lower": entity.name_lower, "mentions_count": 1}
-            node_dict.update(props)
-            label_dict = nodes_by_label.setdefault(label_str, {})
-            existing = label_dict.get(node_dict["id"])
-            if existing:
-                existing.update(node_dict)
-            else:
-                label_dict[node_dict["id"]] = node_dict
-
-        for rel in extraction_result.relations:
-            key = (rel.source_label.value, rel.target_label.value, rel.relation_type.value)
-            rel_dict = rel_groups.setdefault(key, {})
-            pair_key = (rel.source_id, rel.target_id)
-            rel_props = {
-                "source_id": rel.source_id,
-                "target_id": rel.target_id,
-                "properties": sanitize_properties(rel.properties),
-            }
-            if rel.relation_type == RelationType.BELONGS_TO:
-                sim = rel.properties.get("similarity")
-                if sim is not None:
-                    rel_props["properties"]["similarity"] = float(sim)
-            existing = rel_dict.get(pair_key)
-            if existing:
-                existing["properties"].update(rel_props["properties"])
-            else:
-                rel_dict[pair_key] = rel_props
+        nodes_by_label, rel_groups = self._build_graph_payload([(extraction_result, context)])
 
         total_nodes = sum(len(v) for v in nodes_by_label.values())
         t1 = time.perf_counter()
@@ -163,90 +101,13 @@ class GraphWriter:
 
         t0 = time.perf_counter()
 
-        nodes_by_label: dict[str, dict[str, dict[str, Any]]] = {}
-        rel_groups: dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]] = {}
+        nodes_by_label, rel_groups = self._build_graph_payload(items)
         claimed_ids: list[int] = []
         unique_author_ids: set[str] = set()
 
-        for extraction_result, context in items:
+        for _, context in items:
             claimed_ids.append(context.content_id)
             unique_author_ids.add(context.author_node_id)
-
-            psychographics = extraction_result.psychographics
-
-            post_node = sanitize_properties({
-                "id": context.pub_node_id,
-                "account_id": context.account_id,
-                "content_id": context.content_id,
-                "published_at": int(context.published_at.timestamp()),
-                "platform": context.platform,
-                "post_type": context.post_type,
-                "language": psychographics.language,
-                "tone": _to_val(psychographics.primary_tone, None),
-                "secondary_tone": _to_val(psychographics.secondary_tone, None),
-                "tone_confidence": psychographics.tone_confidence,
-                "primary_hormone": _to_val(psychographics.primary_hormone, None),
-                "secondary_hormone": _to_val(psychographics.secondary_hormone, None),
-                "score_dopamine": psychographics.score_dopamine,
-                "score_oxytocin": psychographics.score_oxytocin,
-                "score_serotonin": psychographics.score_serotonin,
-                "score_cortisol": psychographics.score_cortisol,
-                "score_adrenaline": psychographics.score_adrenaline,
-                "score_endorphin": psychographics.score_endorphin,
-                "is_video": context.is_video,
-                "is_spam_or_gambling": extraction_result.is_spam_or_gambling,
-            })
-
-            post_dict = nodes_by_label.setdefault("Post", {})
-            existing_post = post_dict.get(post_node["id"])
-            if existing_post:
-                existing_post.update(post_node)
-            else:
-                post_dict[post_node["id"]] = post_node
-
-            published_key = (EntityType.Actor.value, EntityType.Post.value, RelationType.PUBLISHED.value)
-            published_rel_dict = rel_groups.setdefault(published_key, {})
-            published_pair_key = (context.author_node_id, context.pub_node_id)
-            published_rel_dict[published_pair_key] = {
-                "source_id": context.author_node_id,
-                "target_id": context.pub_node_id,
-                "properties": sanitize_properties({"published_at": int(context.published_at.timestamp())}),
-            }
-
-            for entity in extraction_result.entities:
-                if not entity.id:
-                    continue
-                if entity.label == EntityType.Actor:
-                    continue
-                label_str = entity.label.value
-                props = sanitize_properties(dict(entity.properties))
-                node_dict = {"id": entity.id, "name": entity.name, "name_lower": entity.name_lower, "mentions_count": 1}
-                node_dict.update(props)
-                label_dict = nodes_by_label.setdefault(label_str, {})
-                existing = label_dict.get(node_dict["id"])
-                if existing:
-                    existing.update(node_dict)
-                else:
-                    label_dict[node_dict["id"]] = node_dict
-
-            for rel in extraction_result.relations:
-                key = (rel.source_label.value, rel.target_label.value, rel.relation_type.value)
-                rel_dict = rel_groups.setdefault(key, {})
-                pair_key = (rel.source_id, rel.target_id)
-                rel_props = {
-                    "source_id": rel.source_id,
-                    "target_id": rel.target_id,
-                    "properties": sanitize_properties(rel.properties),
-                }
-                if rel.relation_type == RelationType.BELONGS_TO:
-                    sim = rel.properties.get("similarity")
-                    if sim is not None:
-                        rel_props["properties"]["similarity"] = float(sim)
-                existing = rel_dict.get(pair_key)
-                if existing:
-                    existing["properties"].update(rel_props["properties"])
-                else:
-                    rel_dict[pair_key] = rel_props
 
         total_nodes = sum(len(v) for v in nodes_by_label.values())
         t1 = time.perf_counter()
@@ -286,6 +147,98 @@ class GraphWriter:
         for author_id in unique_author_ids:
             await self._run_post_aggregations(author_id)
 
+    @staticmethod
+    def _build_graph_payload(items: list[tuple[OpenSPGExtractionResult, PostBatchContext]]) -> tuple[dict[str, dict[str, dict[str, Any]]], dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]]]:
+        nodes_by_label: dict[str, dict[str, dict[str, Any]]] = {}
+        rel_groups: dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]] = {}
+
+        for extraction_result, context in items:
+            psychographics = extraction_result.psychographics
+
+            post_node = sanitize_properties({
+                "id": context.pub_node_id,
+                "account_id": context.account_id,
+                "content_id": context.content_id,
+                "published_at": int(context.published_at.timestamp()),
+                "platform": context.platform,
+                "post_type": context.post_type,
+                "language": psychographics.language,
+                "tone": _to_val(psychographics.primary_tone, None),
+                "secondary_tone": _to_val(psychographics.secondary_tone, None),
+                "primary_hormone": _to_val(psychographics.primary_hormone, None),
+                "secondary_hormone": _to_val(psychographics.secondary_hormone, None),
+                "score_dopamine": psychographics.score_dopamine,
+                "score_oxytocin": psychographics.score_oxytocin,
+                "score_serotonin": psychographics.score_serotonin,
+                "score_cortisol": psychographics.score_cortisol,
+                "score_adrenaline": psychographics.score_adrenaline,
+                "score_endorphin": psychographics.score_endorphin,
+                "is_video": context.is_video,
+                "is_spam_or_gambling": extraction_result.is_spam_or_gambling,
+            })
+
+            post_dict = nodes_by_label.setdefault("Post", {})
+            existing_post = post_dict.get(post_node["id"])
+            if existing_post:
+                existing_post.update(post_node)
+            else:
+                post_dict[post_node["id"]] = post_node
+
+            published_key = (EntityType.Actor.value, EntityType.Post.value, RelationType.PUBLISHED.value)
+            published_rel_dict = rel_groups.setdefault(published_key, {})
+            published_pair_key = (context.author_node_id, context.pub_node_id)
+            published_rel_dict[published_pair_key] = {
+                "source_id": context.author_node_id,
+                "target_id": context.pub_node_id,
+                "properties": sanitize_properties({"published_at": int(context.published_at.timestamp())}),
+            }
+
+            for entity in extraction_result.entities:
+                if not entity.id:
+                    continue
+                if entity.label == EntityType.Actor:
+                    continue
+                label_str = entity.label.value
+                props = sanitize_properties(dict(entity.properties))
+                node_dict = {"id": entity.id, "name": entity.name, "name_lower": entity.name_lower}
+                node_dict.update(props)
+                label_dict = nodes_by_label.setdefault(label_str, {})
+                existing = label_dict.get(node_dict["id"])
+                if existing:
+                    existing.update(node_dict)
+                else:
+                    label_dict[node_dict["id"]] = node_dict
+
+            for rel in extraction_result.relations:
+                key = (rel.source_label.value, rel.target_label.value, rel.relation_type.value)
+                rel_dict = rel_groups.setdefault(key, {})
+                pair_key = (rel.source_id, rel.target_id)
+
+                allowed_keys = _RELATION_PROPERTY_KEYS.get(rel.relation_type)
+                if allowed_keys is not None:
+                    filtered_props = {k: v for k, v in rel.properties.items() if k in allowed_keys and v is not None}
+                else:
+                    filtered_props = dict(rel.properties)
+
+                if rel.relation_type == RelationType.BELONGS_TO:
+                    sim = filtered_props.get("similarity")
+                    if sim is not None:
+                        filtered_props["similarity"] = float(sim)
+
+                rel_props = {
+                    "source_id": rel.source_id,
+                    "target_id": rel.target_id,
+                    "properties": sanitize_properties(filtered_props),
+                }
+
+                existing = rel_dict.get(pair_key)
+                if existing:
+                    existing["properties"].update(rel_props["properties"])
+                else:
+                    rel_dict[pair_key] = rel_props
+
+        return nodes_by_label, rel_groups
+
     async def _run_post_aggregations(self, author_id: str) -> None:
         covers_query = (
             "MATCH (a:Actor {id: $author_id})-[:PUBLISHED]->(p:Post) "
@@ -295,7 +248,7 @@ class GraphWriter:
             "WITH a, total_posts, concept, COUNT(DISTINCT p) AS post_count "
             "WHERE concept IS NOT NULL AND post_count >= 2 "
             "WITH a, total_posts, concept, post_count "
-            "ORDER BY concept.id "
+            "ORDER BY a.id, concept.id "
             "MERGE (a)-[r:COVERS_TOPIC]->(concept) "
             "SET r.posts_count = post_count, "
             "    r.weight = toFloat(post_count) / total_posts, "
@@ -308,7 +261,7 @@ class GraphWriter:
             "WITH a, total_posts, mc, COUNT(DISTINCT p) AS post_count "
             "WHERE post_count >= 2 "
             "WITH a, total_posts, mc, post_count "
-            "ORDER BY mc.id "
+            "ORDER BY a.id, mc.id "
             "MERGE (a)-[r:COVERS_TOPIC]->(mc) "
             "SET r.posts_count = post_count, "
             "    r.weight = toFloat(post_count) / total_posts, "
@@ -342,7 +295,6 @@ class GraphWriter:
             "       p.score_endorphin AS score_endorphin, "
             "       p.tone AS tone, "
             "       p.secondary_tone AS secondary_tone, "
-            "       p.tone_confidence AS tone_confidence, "
             "       p.language AS language"
         )
         rows = await self._neo4j_client.execute_read(posts_query, {"author_id": author_id})
@@ -383,17 +335,13 @@ class GraphWriter:
             sum_adrenaline += (row.get("score_adrenaline") or 0.0) * w
             sum_endorphin += (row.get("score_endorphin") or 0.0) * w
 
-            tone_conf = row.get("tone_confidence")
-            tone_weight_factor = float(tone_conf) if tone_conf is not None else 1.0
-            effective_tone_weight = w * tone_weight_factor
-
             tone = row.get("tone")
             if tone is not None:
-                tone_counter[tone] = tone_counter.get(tone, 0.0) + effective_tone_weight
+                tone_counter[tone] = tone_counter.get(tone, 0.0) + w
 
             secondary_tone = row.get("secondary_tone")
             if secondary_tone is not None:
-                secondary_tone_counter[secondary_tone] = secondary_tone_counter.get(secondary_tone, 0.0) + 0.5 * effective_tone_weight
+                secondary_tone_counter[secondary_tone] = secondary_tone_counter.get(secondary_tone, 0.0) + 0.5 * w
 
             language = row.get("language")
             if language is not None:

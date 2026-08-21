@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import logging
-import re
-import uuid
 import warnings
-from typing import Any, Final
+from typing import Any
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
@@ -12,10 +10,6 @@ from qdrant_client.http import models
 from src.config.config import Settings
 from src.embeddings.categories_repo import CategoriesVectorRepository
 from src.embeddings.client import (
-    CATEGORIES_COLLECTION,
-    EMBEDDING_DIM,
-    EMBEDDING_METRIC,
-    ENTITIES_COLLECTION,
     POSTS_COLLECTION,
     QdrantClientManager,
 )

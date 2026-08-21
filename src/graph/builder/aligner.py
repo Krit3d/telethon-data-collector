@@ -114,11 +114,12 @@ class Aligner:
                     models.QueryRequest(
                         query=emb,
                         using="text",
+                        filter=models.Filter(must=[models.FieldCondition(key="label", match=models.MatchValue(value=entity.label.value))]),
                         limit=1,
                         score_threshold=_ENTITY_SCORE_THRESHOLD,
                         with_payload=True,
                     )
-                    for emb in embeddings
+                    for entity, emb in zip(missed, embeddings)
                 ],
             )
         except Exception as exc:
@@ -135,21 +136,14 @@ class Aligner:
             if hit.score < _ENTITY_SCORE_THRESHOLD:
                 continue
             payload = hit.payload or {}
-            canonical_label = payload.get("label") or payload.get("Label")
-            if canonical_label and canonical_label in _CANONICAL_ENTITY_LABELS:
-                entity.label = EntityType(canonical_label)
             canonical_name = payload.get("name") or payload.get("title")
-            if canonical_name:
-                entity.name = format_display_name(canonical_name, entity.label)
-                entity.name_lower = clean_name_lower(entity.name)
-            canonical_id = (
-                payload.get("id")
-                or payload.get("original_id")
-                or str(hit.id)
-            )
-            if not canonical_id:
+            if not canonical_name:
                 continue
-            key = f"{entity.label.value}:{clean_name_lower(entity.name)}"
+            canonical_name = format_display_name(canonical_name, entity.label)
+            canonical_id = build_node_id(entity.label, canonical_name)
+            entity.name = canonical_name
+            entity.name_lower = clean_name_lower(canonical_name)
+            key = f"{entity.label.value}:{clean_name_lower(canonical_name)}"
             self._cache_set(key, canonical_id)
             id_map[entity.id] = canonical_id
             resolved += 1
@@ -229,17 +223,6 @@ class Aligner:
             entity.id = resolved_id
             entity.label = EntityType.Actor
             resolved_ids.add(entity_id)
-            if context.pub_node_id:
-                extraction_result.relations.append(
-                    ExtractedRelation(
-                        source_id=context.pub_node_id,
-                        source_label=EntityType.Post,
-                        target_id=actor_id,
-                        target_label=EntityType.Actor,
-                        relation_type=RelationType.MENTIONS,
-                        properties={},
-                    )
-                )
             resolved_count += 1
 
         if resolved_ids:
@@ -456,25 +439,31 @@ class Aligner:
                 canonical_label = payload.get("label") or payload.get("Label")
                 if not canonical_label or canonical_label not in _CANONICAL_ENTITY_LABELS:
                     continue
-                canonical_id = (
-                    payload.get("id")
-                    or payload.get("original_id")
-                    or str(hit.id)
-                )
-                if not canonical_id:
-                    continue
                 try:
                     target_label = EntityType(canonical_label)
                 except ValueError:
                     continue
-                canonical_name = format_display_name(str(payload.get("name") or payload.get("title") or canonical_id), target_label)
+                canonical_name = format_display_name(str(payload.get("name") or payload.get("title") or canonical_label), target_label)
+                canonical_id = build_node_id(target_label, canonical_name)
                 ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
                 if canonical_id not in existing_entity_ids:
+                    match target_label:
+                        case EntityType.Entity:
+                            props: dict[str, object] = {"entity_type": "general"}
+                        case EntityType.Organization:
+                            props = {"org_type": "company"}
+                        case EntityType.Product:
+                            props = {"product_type": None}
+                        case EntityType.Event:
+                            props = {"event_type": None}
+                        case _:
+                            props = {}
                     extraction_result.entities.append(
                         ExtractedEntity(
                             id=canonical_id,
                             name=canonical_name,
                             label=target_label,
+                            properties=props,
                         )
                     )
                     existing_entity_ids.add(canonical_id)
@@ -649,6 +638,13 @@ class Aligner:
             seen_relation_keys[key] = relation
             deduped_relations.append(relation)
         extraction_result.relations = deduped_relations
+
+        extraction_result.sanitize_and_validate(
+            allowed_ids={context.pub_node_id, context.author_node_id},
+            forbidden_names={clean_name_lower(context.author_title)},
+            author_title=context.author_title,
+            author_handle=context.author_username,
+        )
 
         total_elapsed = (time.perf_counter() - t0) * 1000
         l1_miss = len(missed)

@@ -17,16 +17,20 @@ from src.config.config import Settings
 from src.graph.builder.prompts import build_system_prompt, build_user_prompt
 from src.graph.builder.reader import PostBatchContext
 from src.graph.ontology import (
+    EntityCategory,
     EntityType,
+    EventType,
     ExtractedEntity,
     ExtractedPsychographics,
     ExtractedRelation,
     HashtagItem,
     HormoneType,
     OpenSPGExtractionResult,
+    OrgType,
+    ProductType,
+    RelationSubtype,
     RelationType,
     RoleType,
-    SentimentType,
     ToneType,
     _SENTIMENT_VALUES,
 )
@@ -87,13 +91,6 @@ _TONE_MAP: dict[str, ToneType] = {
     "educational": ToneType.educational,
     "entertainment": ToneType.entertainment,
     "casual": ToneType.casual,
-}
-
-_ENTITY_TYPE_PROP_KEY: dict[str, str] = {
-    "Entity": "entity_type",
-    "Organization": "org_type",
-    "Product": "product_type",
-    "Event": "event_type",
 }
 
 _LANGUAGE_NAMES: dict[str, str] = {
@@ -258,14 +255,6 @@ def repair_and_load_json(raw_text: str) -> dict[str, Any]:
     raise ValueError("Failed to parse LLM response as JSON after all repair attempts")
 
 
-def _build_entity_id(label: str, name: str, properties: dict[str, Any] | None = None) -> str:
-    try:
-        entity_type = EntityType(label)
-        return build_node_id(entity_type, name)
-    except (ValueError, KeyError):
-        return build_node_id(EntityType.Entity, name)
-
-
 def _safe_float_score(raw: Any) -> float:
     try:
         value = float(raw or 0.0)
@@ -320,10 +309,11 @@ def _parse_psychographics(data: Any) -> ExtractedPsychographics:
     )
 
 
-def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str, str], list[ExtractedRelation]]:
+def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str, str], list[ExtractedRelation], dict[str, tuple[str, float]]]:
     result: list[ExtractedEntity] = []
     id_map: dict[str, str] = {}
     relations: list[ExtractedRelation] = []
+    entity_sentiment_map: dict[str, tuple[str, float]] = {}
     microconcept_cache: dict[str, str] = {}
     raw_list = _ensure_list(raw_entities)
     for raw in raw_list:
@@ -347,49 +337,76 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
             continue
         if is_garbage_value(name, label):
             continue
-        raw_properties = raw.get("properties")
-        properties: dict[str, Any] = sanitize_properties(dict(raw_properties)) if isinstance(raw_properties, dict) else {}
-        raw_sentiment = str(raw.get("sentiment", "neutral")).strip().lower()
-        if raw_sentiment in _SENTIMENT_VALUES:
-            properties["sentiment"] = raw_sentiment
-        else:
-            properties["sentiment"] = "neutral"
-        raw_confidence = raw.get("confidence")
-        if raw_confidence is not None:
-            try:
-                confidence_val = float(raw_confidence)
-            except (TypeError, ValueError):
-                confidence_val = 1.0
-            if confidence_val < 0.5:
-                confidence_val = 0.5
-            elif confidence_val > 1.0:
-                confidence_val = 1.0
-        else:
-            confidence_val = 1.0
-        is_reclassified_regulatory = False
+        raw_entity_type = (
+            raw.get("type")
+            or raw.get("entity_type")
+            or raw.get("org_type")
+            or raw.get("product_type")
+            or raw.get("event_type")
+        )
+        if raw_entity_type is not None:
+            raw_entity_type = str(raw_entity_type).lower().strip()
+        if raw_entity_type:
+            raw_type_lower = raw_entity_type.lower()
+            if raw_type_lower in {member.value for member in EntityCategory} and label != EntityType.Entity:
+                label = EntityType.Entity
+            elif raw_type_lower in {member.value for member in OrgType} and label != EntityType.Organization:
+                label = EntityType.Organization
+            elif raw_type_lower in {member.value for member in ProductType} and label != EntityType.Product:
+                label = EntityType.Product
+            elif raw_type_lower in {member.value for member in EventType} and label != EntityType.Event:
+                label = EntityType.Event
         if label == EntityType.Event:
             from src.graph.utils import is_regulatory_entity
             if is_regulatory_entity(name):
-                is_reclassified_regulatory = True
                 label = EntityType.Entity
-                properties["entity_type"] = "term"
-                properties.pop("event_type", None)
-                raw_entity_type = raw.get("type") or raw.get("entity_type") or properties.get("type") or properties.get("entity_type")
-                name = format_display_name(name, label, is_person=(raw_entity_type == "person"))
-                entity_id = build_node_id(label, name)
-            else:
-                entity_id = _build_entity_id(label.value, name, properties)
+                raw_entity_type = "term"
+        raw_sentiment = str(raw.get("sentiment", "neutral")).strip().lower()
+        if raw_sentiment not in _SENTIMENT_VALUES:
+            raw_sentiment = "neutral"
+        raw_confidence = raw.get("confidence")
+        if raw_confidence is not None:
+            try:
+                confidence_val = 1.0 if float(raw_confidence) >= 0.9 else 0.8
+            except (TypeError, ValueError):
+                confidence_val = 0.8
         else:
-            entity_id = _build_entity_id(label.value, name, properties)
-        prop_key = _ENTITY_TYPE_PROP_KEY.get(label.value, "entity_type")
-        raw_entity_type = raw.get("type") or raw.get("entity_type") or raw.get(prop_key) or properties.get("type") or properties.get("entity_type") or properties.get(prop_key)
+            confidence_val = 0.8
         name = format_display_name(name, label, is_person=(raw_entity_type == "person"))
-        if raw_entity_type:
-            if is_reclassified_regulatory:
-                properties["entity_type"] = "term"
+        entity_id = build_node_id(label, name)
+        properties: dict[str, Any] = {}
+        if label == EntityType.Product:
+            if raw_entity_type:
+                try:
+                    properties["product_type"] = ProductType(raw_entity_type).value
+                except ValueError:
+                    properties["product_type"] = None
             else:
-                properties[prop_key] = str(raw_entity_type).lower().strip()
-        properties.pop("type", None)
+                properties["product_type"] = None
+        elif label == EntityType.Organization:
+            if raw_entity_type:
+                try:
+                    properties["org_type"] = OrgType(raw_entity_type).value
+                except ValueError:
+                    properties["org_type"] = OrgType.company.value
+            else:
+                properties["org_type"] = OrgType.company.value
+        elif label == EntityType.Entity:
+            if raw_entity_type:
+                try:
+                    properties["entity_type"] = EntityCategory(raw_entity_type).value
+                except ValueError:
+                    properties["entity_type"] = EntityCategory.general.value
+            else:
+                properties["entity_type"] = EntityCategory.general.value
+        elif label == EntityType.Event:
+            if raw_entity_type:
+                try:
+                    properties["event_type"] = EventType(raw_entity_type).value
+                except ValueError:
+                    properties["event_type"] = None
+            else:
+                properties["event_type"] = None
         result.append(ExtractedEntity(
             id=entity_id,
             name=name,
@@ -398,6 +415,7 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
             properties=properties,
             confidence=confidence_val,
         ))
+        entity_sentiment_map[entity_id] = (raw_sentiment, confidence_val)
         id_map[name] = entity_id
         id_map[name.lower()] = entity_id
         raw_mc_list = raw.get("micro_concepts")
@@ -444,7 +462,7 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
                     ))
                 except (ValidationError, ValueError):
                     continue
-    return result, id_map, relations
+    return result, id_map, relations, entity_sentiment_map
 
 
 def _parse_microconcepts(raw_microconcepts: Any) -> tuple[list[ExtractedEntity], dict[str, str]]:
@@ -569,19 +587,19 @@ def _parse_relations(
             except ValueError:
                 properties.pop("role", None)
         if relation_type == RelationType.PRODUCES:
-            actor_subtypes = {"creator", "promoter", "affiliate"}
-            org_subtypes = {"vendor", "publisher", "distributor", "sponsor"}
             raw_subtype = properties.get("relation_subtype") or properties.get("subtype") or properties.get("type")
             if isinstance(raw_subtype, str):
                 raw_subtype = raw_subtype.lower().strip()
             else:
                 raw_subtype = None
-            if source_label == EntityType.Actor:
-                properties["relation_subtype"] = raw_subtype if raw_subtype in actor_subtypes else "creator"
-            elif source_label == EntityType.Organization:
-                properties["relation_subtype"] = raw_subtype if raw_subtype in org_subtypes else "vendor"
-            else:
-                properties["relation_subtype"] = "creator"
+            if raw_subtype is not None:
+                try:
+                    RelationSubtype(raw_subtype)
+                except ValueError:
+                    raw_subtype = None
+            if raw_subtype is None:
+                raw_subtype = "creator" if source_label == EntityType.Actor else "vendor"
+            properties["relation_subtype"] = raw_subtype
             properties.pop("subtype", None)
             properties.pop("type", None)
         if relation_type == RelationType.COAUTHOR:
@@ -597,6 +615,15 @@ def _parse_relations(
             role = properties.get("role")
             if not isinstance(role, str) or not role.strip():
                 properties["role"] = "visitor"
+        raw_conf = raw.get("confidence") or properties.get("confidence")
+        if raw_conf is not None:
+            try:
+                confidence = 1.0 if float(raw_conf) >= 0.9 else 0.8
+            except (TypeError, ValueError):
+                confidence = 0.8
+        else:
+            confidence = 0.8
+        properties["confidence"] = confidence
         try:
             result.append(ExtractedRelation(
                 source_id=source_id,
@@ -888,7 +915,7 @@ class GraphExtractor:
                 raw_psychographics = parsed.get("psychographics", {})
                 raw_microconcepts = parsed.get("microconcepts")
 
-                entities, entity_id_map, entity_belongs_to_relations = _parse_entities(raw_entities)
+                entities, entity_id_map, entity_belongs_to_relations, entity_sentiment_map = _parse_entities(raw_entities)
                 microconcept_entities, microconcept_id_map = _parse_microconcepts(raw_microconcepts)
                 entities.extend(microconcept_entities)
 
@@ -918,8 +945,7 @@ class GraphExtractor:
                         ent.label in (EntityType.Entity, EntityType.Organization, EntityType.Product, EntityType.Event)
                         and ent.id is not None
                     ):
-                        ent_sentiment = ent.properties.pop("sentiment", "neutral")
-                        ent_confidence = ent.confidence if ent.confidence > 0.0 else 1.0
+                        ent_sentiment, ent_confidence = entity_sentiment_map.get(ent.id, ("neutral", 0.8))
                         try:
                             llm_relations.append(ExtractedRelation(
                                 source_id=context.pub_node_id,

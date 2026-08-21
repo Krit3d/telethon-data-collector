@@ -70,7 +70,7 @@ def _chunked(items: list[dict[str, Any]], size: int):
 async def ensure_iab_taxonomy(client: Neo4jClient, taxonomy_path: Path | str) -> int:
     taxonomy_path = Path(taxonomy_path)
     rows = await client.execute_read("MATCH (c:Concept) RETURN count(c) AS cnt")
-    if rows and rows[0]["cnt"] > 0:
+    if rows and rows[0]["cnt"] >= 500:
         return 0
 
     if not taxonomy_path.exists():
@@ -81,46 +81,49 @@ async def ensure_iab_taxonomy(client: Neo4jClient, taxonomy_path: Path | str) ->
     relations: list[dict[str, Any]] = []
 
     with taxonomy_path.open(encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for record in reader:
-            unique_id = record.get("Unique ID", "").strip()
-            if not unique_id:
-                continue
-            parent = record.get("Parent", "").strip()
-            name = record.get("Name", "").strip()
+        reader = csv.reader(f, delimiter="\t")
+        all_rows = list(reader)
 
-            tier_4 = record.get("Tier 4", "").strip()
-            tier_3 = record.get("Tier 3", "").strip()
-            tier_2 = record.get("Tier 2", "").strip()
+    for line in all_rows[2:]:
+        if not line or not line[0].strip():
+            continue
+        unique_id = line[0].strip()
+        parent = line[1].strip() if len(line) > 1 else ""
+        name = line[2].strip() if len(line) > 2 else ""
+        tier_1 = line[3].strip() if len(line) > 3 else ""
+        tier_2 = line[4].strip() if len(line) > 4 else ""
+        tier_3 = line[5].strip() if len(line) > 5 else ""
+        tier_4 = line[6].strip() if len(line) > 6 else ""
+        extension = line[7].strip() if len(line) > 7 else ""
 
-            if tier_4:
-                depth = 4
-            elif tier_3:
-                depth = 3
-            elif tier_2:
-                depth = 2
-            else:
-                depth = 1
+        if tier_4:
+            depth = 4
+        elif tier_3:
+            depth = 3
+        elif tier_2:
+            depth = 2
+        else:
+            depth = 1
 
-            concepts.append({
+        concepts.append({
+            "id": f"concept_{unique_id}",
+            "parent_id": f"concept_{parent}" if parent else None,
+            "code": unique_id,
+            "name": name,
+            "name_lower": clean_name_lower(name),
+            "tier_1": tier_1,
+            "tier_2": tier_2 or None,
+            "tier_3": tier_3 or None,
+            "tier_4": tier_4 or None,
+            "extension": extension or None,
+        })
+
+        if parent:
+            relations.append({
                 "id": f"concept_{unique_id}",
-                "parent_id": f"concept_{parent}" if parent else None,
-                "code": unique_id,
-                "name": name,
-                "name_lower": clean_name_lower(name),
-                "tier_1": record.get("Tier 1", "").strip(),
-                "tier_2": tier_2,
-                "tier_3": tier_3,
-                "tier_4": tier_4,
-                "extension": record.get("Extension", "").strip(),
+                "parent_id": f"concept_{parent}",
+                "depth": depth,
             })
-
-            if parent:
-                relations.append({
-                    "id": f"concept_{unique_id}",
-                    "parent_id": f"concept_{parent}",
-                    "depth": depth,
-                })
 
     for batch in _chunked(concepts, BATCH_SIZE):
         await client.execute_write(BATCH_UNWIND_CONCEPT_NODES, {"rows": batch})
@@ -196,18 +199,18 @@ async def sync_verified_actors(db: Database, client: Neo4jClient, batch_size: in
 
 
 async def bootstrap_graph(settings: Settings, db: Database, client: Neo4jClient) -> dict[str, Any]:
-    async with db.async_session() as session:
-        async with session.begin():
-            result = await session.execute(
-                text("SELECT pg_try_advisory_xact_lock(:lock_id) AS acquired"),
-                {"lock_id": GRAPH_BOOTSTRAP_LOCK_ID},
-            )
-            row = result.one()
-            acquired: bool = row.acquired
+    async with db.engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT pg_try_advisory_lock(:lock_id) AS acquired"),
+            {"lock_id": GRAPH_BOOTSTRAP_LOCK_ID},
+        )
+        row = result.one()
+        acquired: bool = row.acquired
 
-            if acquired:
-                start = time.monotonic()
+        if acquired:
+            start = time.monotonic()
 
+            try:
                 t0 = time.monotonic()
                 await init_neo4j_schema(client)
                 schema_elapsed = time.monotonic() - t0
@@ -242,18 +245,26 @@ async def bootstrap_graph(settings: Settings, db: Database, client: Neo4jClient)
                     "verified_actors_synced": actor_count,
                     "actor_elapsed_s": round(actor_elapsed, 2),
                 }
+            finally:
+                await conn.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": GRAPH_BOOTSTRAP_LOCK_ID},
+                )
 
     for _ in range(120):
         await asyncio.sleep(1.0)
-        async with db.async_session() as session:
-            async with session.begin():
-                result = await session.execute(
-                    text("SELECT pg_try_advisory_xact_lock(:lock_id) AS acquired"),
+        async with db.engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT pg_try_advisory_lock(:lock_id) AS acquired"),
+                {"lock_id": GRAPH_BOOTSTRAP_LOCK_ID},
+            )
+            row = result.one()
+            if row.acquired:
+                await conn.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
                     {"lock_id": GRAPH_BOOTSTRAP_LOCK_ID},
                 )
-                row = result.one()
-                if row.acquired:
-                    return {"status": "skipped", "message": "Bootstrap completed by leader worker"}
+                return {"status": "skipped", "message": "Bootstrap completed by leader worker"}
 
     raise TimeoutError("Graph bootstrap timed out waiting for leader worker")
 

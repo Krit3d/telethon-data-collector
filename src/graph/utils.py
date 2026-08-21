@@ -51,9 +51,11 @@ _PRODUCT_GARBAGE: frozenset[str] = frozenset({
 })
 
 _EVENT_GARBAGE: frozenset[str] = frozenset({
-    "event", "events", "incident", "conference", "festival", "release", "trend",
+    "event", "events", "incident", "conference", "festival",
     "событие", "события", "мероприятие", "мероприятия",
-    "инфоповод", "конференция", "фестиваль", "релиз", "тренд", "ивент",
+    "инфоповод", "конференция", "фестиваль", "ивент",
+    "соревнование", "турнир", "конкурс", "хакатон", "премия",
+    "competition", "contest", "tournament", "hackathon", "award",
 })
 
 _MICROCONCEPT_GARBAGE: frozenset[str] = frozenset({
@@ -102,7 +104,7 @@ _REGULATORY_MARKERS: re.Pattern[str] = re.compile(
 )
 
 _EVENT_TOPONYM_MARKERS: re.Pattern[str] = re.compile(
-    r"(?:conf|fest|summit|forum|meetup|conference|съезд|форум|фестиваль|саммит|выставка|чемпионат|кубок|релиз)",
+    r"(?:conf|fest|summit|forum|meetup|conference|съезд|форум|фестиваль|саммит|выставка|чемпионат|кубок|турнир|хакатон|премия|марафон|интенсив|конкурс|tournament|hackathon|award|webinar|marathon|contest)",
     re.IGNORECASE,
 )
 
@@ -112,10 +114,10 @@ _FALSE_EVENT_TOPONYMS: frozenset[str] = frozenset({
     "китай", "china", "япония", "japan", "индия", "india", "бразилия", "brazil",
     "канада", "canada", "австралия", "australia", "южная корея", "south korea",
     "вьетнам", "vietnam", "тайланд", "thailand", "турция", "turkey", "оаэ", "uae",
-    "дубай", "dubai", "москва", "moscow", "санкт-петербург", "st petersburg",
-    "лондон", "london", "нью-йорк", "new york", "париж", "paris", "берлин", "berlin",
+    "дубай", "dubai", "москва", "moscow", "санкт петербург", "санкт-петербург", "st petersburg",
+    "лондон", "london", "нью йорк", "нью-йорк", "new york", "париж", "paris", "берлин", "berlin",
     "пекин", "beijing", "токио", "tokyo", "сингапур", "singapore", "гонконг", "hong kong",
-    "шанхай", "shanghai", "абу-даби", "abu dhabi", "доха", "doha", "рим", "rome",
+    "шанхай", "shanghai", "абу даби", "абу-даби", "abu dhabi", "доха", "doha", "рим", "rome",
     "милан", "milan", "барселона", "barcelona", "мадрид", "madrid", "амстердам", "amsterdam",
     "шереметьево", "sheremetyevo", "домодедово", "domodedovo", "внуково", "vnukovo",
     "пулково", "pulkovo", "хитроу", "heathrow", "аэропорт", "airport",
@@ -145,23 +147,66 @@ _GENERIC_EVENT_WORDS: frozenset[str] = frozenset({
     "конференция", "митап", "форум", "фестиваль", "саммит", "выставка",
     "вебинар", "съезд", "лекция", "conference", "meetup", "forum", "summit",
     "festival", "webinar", "trip", "travel", "поездка", "путешествие",
+    "мастер класс", "мастер-класс", "воркшоп", "workshop",
+    "интенсив", "тренинг", "training", "семинар", "seminar",
+    "сходка", "музсходка",
 })
 
 
 def is_false_event_toponym(name: str) -> bool:
-    name_lower = name.lower().strip()
     cleaned = clean_name_lower(name)
     words = cleaned.split()
-    if len(words) == 1 and words[0] in _GENERIC_EVENT_WORDS:
+    if cleaned in _GENERIC_EVENT_WORDS:
         return True
-    if name_lower in _FALSE_EVENT_TOPONYMS:
+    if cleaned in _FALSE_EVENT_TOPONYMS:
         return True
-    if _EVENT_TOPONYM_MARKERS.search(name_lower):
-        return False
-    for t in _FALSE_EVENT_TOPONYMS:
-        if name_lower.startswith(t) or name_lower.endswith(t):
+    if cleaned.startswith("г ") or cleaned.startswith("город ") or cleaned.startswith("гор "):
+        space = cleaned.index(" ", 1) + 1
+        rest = cleaned[space:]
+        if rest in _FALSE_EVENT_TOPONYMS:
             return True
-    return False
+    if cleaned.startswith("в ") and len(cleaned) > 2:
+        rest = cleaned[2:]
+        if rest in _FALSE_EVENT_TOPONYMS:
+            return True
+        if rest.endswith("е"):
+            base = rest[:-1]
+            if base in _FALSE_EVENT_TOPONYMS:
+                return True
+            if base + "а" in _FALSE_EVENT_TOPONYMS:
+                return True
+    if _EVENT_TOPONYM_MARKERS.search(cleaned):
+        return False
+    if len(words) > 1 and cleaned not in _FALSE_EVENT_TOPONYMS:
+        return False
+    return True
+
+
+_TEMPORAL_EVENT_MARKERS: re.Pattern[str] = re.compile(
+    r"^(?:"
+    r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|"
+    r"\d{4}[./-]\d{2}[./-]\d{2}|"
+    r"\d{4}\s*[-–]\s*\d{4}|"
+    r"\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+\d{4})?|"
+    r"(?:январь|февраль|март|апрель|май|июнь|июль|август|сентябрь|октябрь|ноябрь|декабрь)(?:\s+\d{4})?|"
+    r"(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:,?\s+\d{4})?|"
+    r"\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)(?:,?\s+\d{4})?|"
+    r"\d{4}\s+год(?:а|у)?|"
+    r"в\s+\d{4}\s+году|"
+    r"(?:весн[ау]|лет[оа]|осень[ю]?|зим[ау])(?:\s+\d{4})?|"
+    r"(?:spring|summer|autumn|fall|winter)(?:\s+\d{4})?|"
+    r"понедельник|вторник|среда|четверг|пятница|суббота|воскресенье|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"вчера|сегодня|завтра|позавчера|послезавтра|"
+    r"yesterday|today|tomorrow|"
+    r"(?:19|20)\d{2}"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def is_false_event_temporal(name: str) -> bool:
+    return bool(_TEMPORAL_EVENT_MARKERS.match(name.strip()))
 
 
 def _resolve_label(label: str | Any) -> str:

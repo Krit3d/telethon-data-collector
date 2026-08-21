@@ -108,10 +108,9 @@ class ProductType(StrEnum):
 
 class EventType(StrEnum):
     conference = "conference"
-    release = "release"
-    incident = "incident"
     festival = "festival"
-    trend = "trend"
+    competition = "competition"
+    incident = "incident"
 
 
 class RoleType(StrEnum):
@@ -208,6 +207,7 @@ RELATION_DOMAIN_RANGE_MAP: dict[RelationType, dict[str, set[EntityType]]] = {
     },
 }
 
+
 def validate_and_repair_relation(
     source_id: str,
     source_label: EntityType,
@@ -217,43 +217,14 @@ def validate_and_repair_relation(
 ) -> tuple[str, EntityType, str, EntityType, RelationType] | None:
     if source_id == target_id:
         return None
-    if source_label == EntityType.Actor and relation_type == RelationType.RELATED_TO:
-        return None
-    if target_label == EntityType.Event and relation_type == RelationType.RELATED_TO:
-        return None
     rule = RELATION_DOMAIN_RANGE_MAP.get(relation_type)
     if rule is None:
-        if source_label == EntityType.Entity and target_label in {EntityType.Entity, EntityType.Organization, EntityType.Product}:
-            return (source_id, source_label, target_id, target_label, RelationType.RELATED_TO)
         return None
     if source_label in rule["sources"] and target_label in rule["targets"]:
         return (source_id, source_label, target_id, target_label, relation_type)
-    if (
-        relation_type == RelationType.PARTICIPATED_IN
-        and source_label == EntityType.Organization
-        and target_label in {EntityType.Actor, EntityType.Entity}
-    ):
-        return (target_id, target_label, source_id, source_label, RelationType.WORKS_AT)
     if target_label in rule["sources"] and source_label in rule["targets"]:
         return (target_id, target_label, source_id, source_label, relation_type)
-    if source_label == EntityType.Actor and target_label == EntityType.Product:
-        rel = RelationType.PRODUCES if relation_type != RelationType.USES_TECH else RelationType.USES_TECH
-        return (source_id, source_label, target_id, target_label, rel)
-    if source_label == EntityType.Actor and target_label == EntityType.Organization:
-        return (source_id, source_label, target_id, target_label, RelationType.WORKS_AT)
-    if source_label == EntityType.Actor and target_label == EntityType.Event:
-        return (source_id, source_label, target_id, target_label, RelationType.PARTICIPATED_IN)
-    if source_label == EntityType.Actor and target_label in {EntityType.MicroConcept, EntityType.Concept}:
-        return (source_id, source_label, target_id, target_label, RelationType.COVERS_TOPIC)
-    if source_label == EntityType.Post and target_label in {EntityType.Entity, EntityType.Organization, EntityType.Product, EntityType.Event}:
-        return (source_id, source_label, target_id, target_label, RelationType.MENTIONS)
-    if source_label == EntityType.Post:
-        return (source_id, source_label, target_id, target_label, RelationType.MENTIONS)
-    if source_label == EntityType.Entity and target_label in {EntityType.Entity, EntityType.Organization, EntityType.Product}:
-        return (source_id, source_label, target_id, target_label, RelationType.RELATED_TO)
     return None
-
-
 
 
 def extract_entity_subtype(label: EntityType | str, properties: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -425,7 +396,7 @@ class ExtractedEntity(BaseModel):
     label: EntityType
     properties: dict[str, Any] = {}
     microconcept: str | None = None
-    confidence: float = 0.9
+    confidence: float = 0.8
     embedding: list[float] | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
@@ -461,10 +432,10 @@ class ExtractedRelation(BaseModel):
                 parsed_conf = float(props_conf)
             except (TypeError, ValueError):
                 parsed_conf = None
-            if parsed_conf is not None and parsed_conf > 0.0:
-                self.confidence = parsed_conf
-        if self.confidence is not None and self.confidence > 0.0 and "confidence" not in self.properties:
-            self.properties["confidence"] = float(self.confidence)
+            if parsed_conf is not None:
+                self.confidence = 1.0 if parsed_conf >= 0.9 else 0.8
+        if self.confidence is not None:
+            self.properties["confidence"] = self.confidence
         return self
 
 
@@ -526,7 +497,7 @@ class OpenSPGExtractionResult(BaseModel):
         author_handle: str | None = None,
     ) -> OpenSPGExtractionResult:
 
-        from src.graph.utils import build_node_id, is_garbage_value, is_regulatory_entity, is_false_event_toponym
+        from src.graph.utils import build_node_id, is_garbage_value, is_regulatory_entity, is_false_event_toponym, is_false_event_temporal
 
         phantom_names = frozenset({"<name>", "unknown", "null", "none", "n/a", ""})
         valid_ids = set(allowed_ids) if allowed_ids else set()
@@ -562,9 +533,51 @@ class OpenSPGExtractionResult(BaseModel):
                     if e.id:
                         removed_event_ids.add(e.id)
                     continue
+                elif is_false_event_temporal(e.name):
+                    if e.id:
+                        removed_event_ids.add(e.id)
+                    continue
 
-            for key in ("role", "platform", "author", "post", "sentiment", "confidence"):
+            for key in ("role", "platform", "author", "post", "sentiment", "confidence", "type", "label", "name"):
                 e.properties.pop(key, None)
+
+            if e.label == EntityType.Product:
+                val = e.properties.get("product_type")
+                if val is not None:
+                    try:
+                        e.properties["product_type"] = ProductType(val)
+                    except ValueError:
+                        e.properties.pop("product_type", None)
+                e.properties = {k: v for k, v in e.properties.items() if k == "product_type"}
+            elif e.label == EntityType.Organization:
+                val = e.properties.get("org_type")
+                if val is not None:
+                    try:
+                        e.properties["org_type"] = OrgType(val)
+                    except ValueError:
+                        e.properties.pop("org_type", None)
+                e.properties = {k: v for k, v in e.properties.items() if k == "org_type"}
+            elif e.label == EntityType.Entity:
+                val = e.properties.get("entity_type")
+                if val is not None:
+                    try:
+                        e.properties["entity_type"] = EntityCategory(val)
+                    except ValueError:
+                        e.properties.pop("entity_type", None)
+                if "entity_type" not in e.properties:
+                    e.properties["entity_type"] = EntityCategory.general
+                e.properties = {k: v for k, v in e.properties.items() if k == "entity_type"}
+            elif e.label == EntityType.Event:
+                val = e.properties.get("event_type")
+                if val is not None:
+                    try:
+                        e.properties["event_type"] = EventType(val)
+                    except ValueError:
+                        e.properties.pop("event_type", None)
+                e.properties = {k: v for k, v in e.properties.items() if k == "event_type"}
+            else:
+                e.properties.clear()
+
             clean_entities.append(e)
             if e.id:
                 valid_ids.add(e.id)

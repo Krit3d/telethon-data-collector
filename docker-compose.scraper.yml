@@ -1,6 +1,6 @@
 services:
   db:
-    image: apache/age@sha256:4241e2d8bb86a6b2ea44e9ad06c73856e12b209de295124603a599dd7feb70eb
+    image: postgres:18-alpine
     container_name: tg_parser_db
     restart: always
     shm_size: 1gb
@@ -11,11 +11,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-tg_parser}
       POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
-    command: >
-      postgres -c shared_preload_libraries=age -c listen_addresses='*' -c max_connections=300
+    command: postgres -c listen_addresses='*' -c max_connections=300
     volumes:
       - postgres_data:/var/lib/postgresql
-      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     ports:
       - "${TS_IP_SCRAPER}:5432:5432"
     healthcheck:

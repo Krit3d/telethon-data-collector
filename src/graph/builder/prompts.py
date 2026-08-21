@@ -44,31 +44,33 @@ def build_system_prompt(author_title: str, author_handle: str = "") -> str:
    - label="Entity" -> type: "technology" | "method" | "person" | "term" | "general"
    - label="Organization" -> type: "company" | "brand" | "agency" | "media" | "non_profit"
    - label="Product" -> type: "software" | "gadget" | "course" | "app" | "physical_good" | "service"
-   - label="Event" -> type: "conference" | "release" | "incident" | "festival" | "trend"
+   - label="Event" -> type: "conference" | "festival" | "competition" | "incident"
      
 3. Правила извлечения label="Event":
-   - Event извлекается ТОЛЬКО при наличии конкретного собственного наименования события, привязанного к дате или инфоповоду (например, "WWDC 2024", "VK Fest", "DevOps Conf 2025").
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Event любые законы, нормативные акты, стандарты, термины и алгоритмы. Они обязаны маркироваться как Entity с type="term" или type="method".
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать географические названия, страны, города, локации (Германия, Вьетнам, Шереметьево, Москва) в качестве Event. Если в тексте упоминается абстрактная "конференция в Германии" без официального имени собственного -> узел Event создавать ЗАПРЕЩЕНО.
-   - Примеры (Negative Few-Shot):
-     * "Федеральный закон 353" -> Entity (term), НЕ Event.
-     * "Поездка в Японию" / "Japan" -> НЕ Event.
-     * "Митап в Шереметьево" -> НЕ Event (если нет официального бренда митапа).
-     * "Закон о рекламе" -> Entity (term), НЕ Event.
-     * "Стандарт ISO 27001" -> Entity (term), НЕ Event.
-     * "GDPR" -> Entity (term), НЕ Event.
-   - Примеры (Positive Few-Shot):
-     * "Web3 Summit Dubai 2024" -> Event (conference).
-     * "WWDC 2025" -> Event (conference).
-     * "Релиз iOS 19" -> Event (release).
-     * "VK Fest 2025" -> Event (festival).
+   - Определение Event: Именованное событие, инфоповод, мероприятие или праздник, ограниченный во времени.
+   - Допустимые типы:
+     * "conference": деловые, образовательные и отраслевые события (конференции, форумы, саммиты, митапы, вебинары, мастер-классы, лекции).
+     * "festival": культурные, развлекательные, музыкальные события, выставки, фестивали и официальные праздники.
+     * "competition": турниры, чемпионаты, хакатоны, конкурсы, премии и церемонии награждения.
+     * "incident": резонансные инфоповоды, происшествия, сбои, аварии, скандалы.
+   - Разрешение коллизий для Event:
+     * Календарные даты ("14 декабря", "2024 год") не являются сущностями — время фиксируется в свойствах поста.
+     * Релизы продуктов и произведений относятся к типу Product ("iOS 18", "The Lovers"), а не к Event.
+     * Методы, спортивные упражнения, законы и геополитические инициативы ("Кикбэк", "Один пояс и один путь", "ФЗ-152") относятся к label="Entity".
+     * Коммерческие площадки, клубы и картодромы ("Black Star Karting") относятся к label="Organization".
+   - Примеры классификации (Few-Shot):
+     * "Вебинар по микросервисам" -> Event (conference).
+     * "VK Fest" / "Курбан-байрам" -> Event (festival).
+     * "Премия AMA" / "Хакатон AI Journey" -> Event (competition).
+     * "Сбой в работе Telegram" -> Event (incident).
 
 4. Критерии выбора типов и разрешение коллизий (Disambiguation Guide):
-   - Brand vs Product: Производители, корпорации, автоконцерны и торговые марки (Mercedes, Apple, Sony, Nike) - строго Organization (brand/company). Конкретные модели, серии, вещи (Mercedes S-Class, iPhone 16, Air Jordan) - Product (physical_good/gadget).
-   - Gadget vs Physical Good: gadget - строго носимая/портативная микроэлектроника (смартфоны, смарт-часы, наушники, планшеты, VR). Любые другие материальные объекты (автомобили, мебель, одежда, косметика) - physical_good.
-   - Technology vs Software vs Method: technology - базовые технологии, языки, протоколы, алгоритмы (Python, LLM, CRISPR). software - готовые десктопные/серверные программы (Photoshop, Blender). method - практики, алгоритмы действий, диеты, подходы (Agile, Scrum, кетодиета, тайм-менеджмент).
-   - Term vs Event/Trend: term - устойчивые научные, медицинские или финансовые термины (инфляция, рефлюкс, маржинальность). trend - временные макротренды, инфоповоды и рыночные фазы (бычий рынок, барбикор).
-   - Person: реальные физические лица (эксперты, спикеры, гости).
+    - Brand vs Product: Любые торговые марки, дома моды, бренды одежды/косметики, автоконцерны и корпорации (Gucci, Chanel, Zara, Dolce & Gabbana, Ferragamo, Mercedes, BMW, Apple, Nike, Dyson, L'Oreal) — это СТРОГО Organization (brand/company). В Product попадают ТОЛЬКО конкретные модели, линейки и наименования товаров с именем собственным (iPhone 16 Pro, Dyson Airwrap, Mercedes AMG GT, Сумка Birkin).
+    - Gadget vs Physical Good: gadget — это ИСКЛЮЧИТЕЛЬНО портативная цифровая микроэлектроника (смартфоны, смарт-часы, беспроводные наушники, планшеты, VR-шлемы, электронные книги). Автомобили (Ford Edge) — это physical_good (если указана модель). Спортинвентарь (штанги, гантели, тренажеры), расчески, бигуди — КАТЕГОРИЧЕСКИ НЕ являются гаджетами и не извлекаются как Product.
+    - Method vs Product vs Entity: Любые спортивные упражнения, тренировочные комплексы, диеты, техники массажа, протоколы лечения и алгоритмы (Присед плие, Румынская тяга, Romanian Deadlift, Lunges, Кетодиета, Scrum, Интервальное голодание) — это СТРОГО Entity с type="method". Их КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product.
+    - Technology vs Software vs Method: technology - базовые технологии, языки, протоколы, алгоритмы (Python, LLM, CRISPR). software - готовые десктопные/серверные программы (Photoshop, Blender). method - практики, алгоритмы действий, диеты, подходы (Agile, Scrum, кетодиета, тайм-менеджмент).
+    - Term vs Trend vs Event: term - устойчивые научные, медицинские или финансовые термины (инфляция, рефлюкс, маржинальность) -> label="Entity" с type="term". Макротренды (бычий рынок, барбикор) отправляй в microconcepts. Event - только дискретные события во времени (конференции, фестивали, турниры, инциденты).
+    - Person: реальные физические лица (эксперты, спикеры, гости).
 
 5. Поле "micro_concepts":
    - Список из 1-2 обобщающих отраслевых категорий СТРОГО на английском языке в Title Case.
@@ -100,6 +102,7 @@ def build_system_prompt(author_title: str, author_handle: str = "") -> str:
    - Высокоуровневые темы блога или поста (например, "Crypto", "Fitness") отправляй в microconcepts, а НЕ в entities.
    - Если каноническая сущность, бренд, продукт, организация или событие упомянуты в тексте через хештег (#chatgpt, #дубай, #iphone16), ты ОБЯЗАН извлечь её как каноническую сущность с нормализованным человекочитаемым именем ("ChatGPT", "Дубай", "iPhone 16").
    - Любые названия брендов, корпораций и производителей (включая автоконцерны вроде Mercedes, Toyota, техногигантов вроде Apple, Google) КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product. Они обязаны маркироваться как label="Organization" с type="brand" или type="company".
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product: нарицательные пищевые продукты (фрукты, овощи, крупы, блюда, напитки), сырье и материалы (ткани, металлы, химикаты), а также любые бытовые предметы, не имеющие уникального торгового наименования (мебель, посуда, инструменты). Общие понятия еды/лайфстайла отправляй в microconcepts.
 </entities-rules>
 
 <relations-rules>
@@ -128,13 +131,18 @@ def build_system_prompt(author_title: str, author_handle: str = "") -> str:
        * "relation_subtype": строго из:
          - Если source="$AUTHOR" -> "creator" | "promoter" | "affiliate"
          - Если source_label="Organization" -> "vendor" | "publisher" | "distributor" | "sponsor"
+     Ограничения: Связь PRODUCES разрешена ИСКЛЮЧИТЕЛЬНО в двух случаях:
+       1) Автор прямо заявляет о создании СОБСТВЕННОГО продукта/курса/бренда/мерча (relation_subtype="creator").
+       2) В посте присутствует прямая официальная коммерческая реклама / промокод / амбассадорство (relation_subtype="promoter" | "affiliate").
+       КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО связывать через PRODUCES: приготовление еды («я приготовил блинчики»), приём пищи («мой завтрак овсянка»), личные покупки («купил телефон») или бытовое использование предметов.
+     Для использования профессиональных инструментов, софта и сервисов используй USES_TECH.
    - PARTICIPATED_IN: ($AUTHOR: Actor | Source: Entity) -> PARTICIPATED_IN -> (Target: Event)
      properties:
        * "role": "speaker" | "organizer" | "sponsor" | "visitor"
    - USES_TECH: ($AUTHOR: Actor | $POST: Post) -> USES_TECH -> (Target: Product | Entity)
      properties:
        * "proficiency": "expert" | "user" | "reviewer"
-   - COAUTHOR: ($AUTHOR: Actor) -> COAUTHOR -> (Target: Entity)
+   - COAUTHOR: ($AUTHOR: Actor) -> COAUTHOR -> (Target: Actor)
      properties:
        * "platform": "instagram" | "telegram"
    - RELATED_TO: (Source: Entity) -> RELATED_TO -> (Target: Entity | Organization | Product)

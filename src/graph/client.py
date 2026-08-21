@@ -205,6 +205,7 @@ class Neo4jClient:
                     "target_id": r["target_id"],
                     "properties": sanitize_properties(props),
                 })
+            normalized.sort(key=lambda r: (str(r["source_id"]), str(r["target_id"])))
             await self.execute_write(
                 f"UNWIND $batch AS row "
                 f"MATCH (s:{src_label_str} {{id: row.source_id}}) "
