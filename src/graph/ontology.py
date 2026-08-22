@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field, model_validator
 
 from src.graph.utils import clean_name_lower, is_author_entity
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class EntityType(StrEnum):
     Actor = "Actor"
@@ -48,7 +52,7 @@ class PlatformType(StrEnum):
 class PostType(StrEnum):
     post = "post"
     reel = "reel"
-    shorts = "short"
+    short = "short"
     tiktok = "tiktok"
     video = "video"
 
@@ -131,21 +135,9 @@ class RelationSubtype(StrEnum):
 
 
 RELATION_DOMAIN_RANGE_MAP: dict[RelationType, dict[str, set[EntityType]]] = {
-    RelationType.PARTICIPATED_IN: {
-        "sources": {EntityType.Actor, EntityType.Entity},
-        "targets": {EntityType.Event},
-    },
-    RelationType.WORKS_AT: {
-        "sources": {EntityType.Actor, EntityType.Entity},
-        "targets": {EntityType.Organization},
-    },
-    RelationType.PRODUCES: {
-        "sources": {EntityType.Organization, EntityType.Actor},
-        "targets": {EntityType.Product},
-    },
-    RelationType.USES_TECH: {
-        "sources": {EntityType.Actor, EntityType.Post},
-        "targets": {EntityType.Product, EntityType.Entity},
+    RelationType.PUBLISHED: {
+        "sources": {EntityType.Actor},
+        "targets": {EntityType.Post},
     },
     RelationType.MENTIONS: {
         "sources": {EntityType.Post},
@@ -160,33 +152,15 @@ RELATION_DOMAIN_RANGE_MAP: dict[RelationType, dict[str, set[EntityType]]] = {
         "sources": {EntityType.Post},
         "targets": {EntityType.MicroConcept},
     },
-    RelationType.TAGGED_WITH: {
-        "sources": {EntityType.Post},
-        "targets": {EntityType.Hashtag},
-    },
-    RelationType.MAPS_TO: {
-        "sources": {EntityType.Hashtag},
-        "targets": {
-            EntityType.Product,
-            EntityType.Entity,
-            EntityType.Organization,
-            EntityType.Event,
-        },
-    },
     RelationType.BELONGS_TO: {
         "sources": {
             EntityType.Entity,
             EntityType.Product,
             EntityType.Organization,
             EntityType.Event,
-            EntityType.Hashtag,
             EntityType.MicroConcept,
         },
         "targets": {EntityType.MicroConcept, EntityType.Concept},
-    },
-    RelationType.PARENT_OF: {
-        "sources": {EntityType.Concept},
-        "targets": {EntityType.Concept},
     },
     RelationType.COVERS_TOPIC: {
         "sources": {EntityType.Actor},
@@ -196,13 +170,43 @@ RELATION_DOMAIN_RANGE_MAP: dict[RelationType, dict[str, set[EntityType]]] = {
         "sources": {EntityType.Actor},
         "targets": {EntityType.Actor},
     },
+    RelationType.WORKS_AT: {
+        "sources": {EntityType.Actor},
+        "targets": {EntityType.Organization},
+    },
+    RelationType.TAGGED_WITH: {
+        "sources": {EntityType.Post},
+        "targets": {EntityType.Hashtag},
+    },
+    RelationType.MAPS_TO: {
+        "sources": {EntityType.Hashtag},
+        "targets": {
+            EntityType.Entity,
+            EntityType.Product,
+            EntityType.Organization,
+            EntityType.Event,
+            EntityType.MicroConcept,
+        },
+    },
     RelationType.RELATED_TO: {
         "sources": {EntityType.Entity},
         "targets": {EntityType.Entity, EntityType.Organization, EntityType.Product},
     },
-    RelationType.PUBLISHED: {
+    RelationType.PARTICIPATED_IN: {
         "sources": {EntityType.Actor},
-        "targets": {EntityType.Post},
+        "targets": {EntityType.Event},
+    },
+    RelationType.USES_TECH: {
+        "sources": {EntityType.Actor, EntityType.Post},
+        "targets": {EntityType.Product, EntityType.Entity},
+    },
+    RelationType.PRODUCES: {
+        "sources": {EntityType.Organization, EntityType.Actor},
+        "targets": {EntityType.Product},
+    },
+    RelationType.PARENT_OF: {
+        "sources": {EntityType.Concept},
+        "targets": {EntityType.Concept},
     },
 }
 
@@ -218,6 +222,12 @@ def validate_and_repair_relation(
         return None
     rule = RELATION_DOMAIN_RANGE_MAP.get(relation_type)
     if rule is None:
+        return None
+    if relation_type == RelationType.BELONGS_TO:
+        if source_label in {EntityType.Entity, EntityType.Product, EntityType.Organization, EntityType.Event} and target_label == EntityType.MicroConcept:
+            return (source_id, source_label, target_id, target_label, relation_type)
+        if source_label == EntityType.MicroConcept and target_label == EntityType.Concept:
+            return (source_id, source_label, target_id, target_label, relation_type)
         return None
     if source_label in rule["sources"] and target_label in rule["targets"]:
         return (source_id, source_label, target_id, target_label, relation_type)
@@ -257,9 +267,9 @@ class ActorNode(BaseModel):
     platform_id: str
     primary_language: str | None = None
     primary_tone: ToneType | None = None
+    secondary_tone: ToneType | None = None
     primary_hormone: HormoneType | None = None
     secondary_hormone: HormoneType | None = None
-    secondary_tone: ToneType | None = None
 
     @model_validator(mode="after")
     def _fill_name_lower(self) -> ActorNode:
@@ -277,7 +287,6 @@ class PostNode(BaseModel):
     language: str | None = None
     tone: ToneType | None = None
     secondary_tone: ToneType | None = None
-    tone_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     primary_hormone: HormoneType | None = None
     secondary_hormone: HormoneType | None = None
     score_dopamine: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -294,7 +303,7 @@ class EntityNode(BaseModel):
     id: str | None = None
     name: str
     name_lower: str | None = None
-    entity_type: EntityCategory = EntityCategory.general
+    entity_type: EntityCategory
     mentions_count: int = 1
 
     @model_validator(mode="after")
@@ -307,7 +316,7 @@ class OrganizationNode(BaseModel):
     id: str | None = None
     name: str
     name_lower: str | None = None
-    org_type: OrgType = OrgType.company
+    org_type: OrgType
     mentions_count: int = 1
 
     @model_validator(mode="after")
@@ -320,7 +329,7 @@ class ProductNode(BaseModel):
     id: str | None = None
     name: str
     name_lower: str | None = None
-    product_type: ProductType | None = None
+    product_type: ProductType
     mentions_count: int = 1
 
     @model_validator(mode="after")
@@ -333,7 +342,7 @@ class EventNode(BaseModel):
     id: str | None = None
     name: str
     name_lower: str | None = None
-    event_type: EventType | None = None
+    event_type: EventType
     mentions_count: int = 1
 
     @model_validator(mode="after")
@@ -495,7 +504,6 @@ class OpenSPGExtractionResult(BaseModel):
         author_title: str | None = None,
         author_handle: str | None = None,
     ) -> OpenSPGExtractionResult:
-
         from src.graph.utils import build_node_id, is_garbage_value
 
         phantom_names = frozenset({"<name>", "unknown", "null", "none", "n/a", ""})
@@ -516,37 +524,47 @@ class OpenSPGExtractionResult(BaseModel):
 
             if e.label == EntityType.Product:
                 val = e.properties.get("product_type")
-                if val is not None:
-                    try:
-                        e.properties["product_type"] = ProductType(str(val).lower().strip())
-                    except ValueError:
-                        e.properties.pop("product_type", None)
+                if val is None:
+                    logger.warning(f"Entity '{e.name}' (label={e.label}): missing required 'product_type'")
+                    continue
+                try:
+                    e.properties["product_type"] = ProductType(str(val).lower().strip())
+                except ValueError:
+                    logger.warning(f"Entity '{e.name}' (label={e.label}): invalid 'product_type' value: {val}")
+                    continue
                 e.properties = {k: v for k, v in e.properties.items() if k == "product_type"}
             elif e.label == EntityType.Organization:
                 val = e.properties.get("org_type")
-                if val is not None:
-                    try:
-                        e.properties["org_type"] = OrgType(str(val).lower().strip())
-                    except ValueError:
-                        e.properties.pop("org_type", None)
+                if val is None:
+                    logger.warning(f"Entity '{e.name}' (label={e.label}): missing required 'org_type'")
+                    continue
+                try:
+                    e.properties["org_type"] = OrgType(str(val).lower().strip())
+                except ValueError:
+                    logger.warning(f"Entity '{e.name}' (label={e.label}): invalid 'org_type' value: {val}")
+                    continue
                 e.properties = {k: v for k, v in e.properties.items() if k == "org_type"}
             elif e.label == EntityType.Entity:
                 val = e.properties.get("entity_type")
-                if val is not None:
-                    try:
-                        e.properties["entity_type"] = EntityCategory(str(val).lower().strip())
-                    except ValueError:
-                        e.properties.pop("entity_type", None)
-                if "entity_type" not in e.properties:
-                    e.properties["entity_type"] = EntityCategory.general
+                if val is None:
+                    logger.warning(f"Entity '{e.name}' (label={e.label}): missing required 'entity_type'")
+                    continue
+                try:
+                    e.properties["entity_type"] = EntityCategory(str(val).lower().strip())
+                except ValueError:
+                    logger.warning(f"Entity '{e.name}' (label={e.label}): invalid 'entity_type' value: {val}")
+                    continue
                 e.properties = {k: v for k, v in e.properties.items() if k == "entity_type"}
             elif e.label == EntityType.Event:
                 val = e.properties.get("event_type")
-                if val is not None:
-                    try:
-                        e.properties["event_type"] = EventType(str(val).lower().strip())
-                    except ValueError:
-                        e.properties.pop("event_type", None)
+                if val is None:
+                    logger.warning(f"Entity '{e.name}' (label={e.label}): missing required 'event_type'")
+                    continue
+                try:
+                    e.properties["event_type"] = EventType(str(val).lower().strip())
+                except ValueError:
+                    logger.warning(f"Entity '{e.name}' (label={e.label}): invalid 'event_type' value: {val}")
+                    continue
                 e.properties = {k: v for k, v in e.properties.items() if k == "event_type"}
             elif e.label == EntityType.MicroConcept:
                 e.properties = {"is_classified": bool(e.properties.get("is_classified", False))}
@@ -555,15 +573,23 @@ class OpenSPGExtractionResult(BaseModel):
             else:
                 e.properties.clear()
 
+            if not e.id:
+                e.id = build_node_id(e.label, e.name)
             clean_entities.append(e)
-            if e.id:
-                valid_ids.add(e.id)
+            valid_ids.add(e.id)
 
         self.entities = clean_entities
 
+        for h in self.hashtags:
+            valid_ids.add(f"hashtag_{h.normalized}")
+
         clean_relations: list[ExtractedRelation] = []
         for r in self.relations:
-            if r.source_id not in valid_ids or r.target_id not in valid_ids:
+            source_is_concept = r.source_label == EntityType.Concept or r.source_id.startswith("concept_")
+            target_is_concept = r.target_label == EntityType.Concept or r.target_id.startswith("concept_")
+            source_valid = source_is_concept or r.source_id in valid_ids
+            target_valid = target_is_concept or r.target_id in valid_ids
+            if not (source_valid and target_valid):
                 continue
             repaired = validate_and_repair_relation(
                 r.source_id,

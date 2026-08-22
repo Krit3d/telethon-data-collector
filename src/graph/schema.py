@@ -25,6 +25,7 @@ SCHEMA_QUERIES: list[str] = [
     "CREATE INDEX idx_actor_handle IF NOT EXISTS FOR (a:Actor) ON (a.handle)",
     "CREATE INDEX idx_post_published IF NOT EXISTS FOR (p:Post) ON (p.published_at)",
     "CREATE INDEX idx_post_account_id IF NOT EXISTS FOR (p:Post) ON (p.account_id)",
+    "CREATE INDEX idx_post_content_id IF NOT EXISTS FOR (p:Post) ON (p.content_id)",
     "CREATE FULLTEXT INDEX entity_name_ft IF NOT EXISTS FOR (n:Entity|Actor|Organization|Product|Event|MicroConcept|Concept|Hashtag) ON EACH [n.name]",
 ]
 

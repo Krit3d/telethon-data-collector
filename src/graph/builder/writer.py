@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -144,13 +143,15 @@ class GraphWriter:
             total_rels, len(rel_groups), rel_elapsed, pg_elapsed,
         )
 
-        for author_id in unique_author_ids:
-            await self._run_post_aggregations(author_id)
+        if unique_author_ids:
+            await self._run_post_aggregations(list(unique_author_ids))
 
     @staticmethod
     def _build_graph_payload(items: list[tuple[OpenSPGExtractionResult, PostBatchContext]]) -> tuple[dict[str, dict[str, dict[str, Any]]], dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]]]:
         nodes_by_label: dict[str, dict[str, dict[str, Any]]] = {}
         rel_groups: dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]] = {}
+
+        entity_occurrence_counter: dict[str, int] = {}
 
         for extraction_result, context in items:
             psychographics = extraction_result.psychographics
@@ -209,6 +210,9 @@ class GraphWriter:
                 else:
                     label_dict[node_dict["id"]] = node_dict
 
+                if label_str in ("Entity", "Organization", "Product", "Event", "Hashtag"):
+                    entity_occurrence_counter[entity.id] = entity_occurrence_counter.get(entity.id, 0) + 1
+
             for rel in extraction_result.relations:
                 key = (rel.source_label.value, rel.target_label.value, rel.relation_type.value)
                 rel_dict = rel_groups.setdefault(key, {})
@@ -237,16 +241,27 @@ class GraphWriter:
                 else:
                     rel_dict[pair_key] = rel_props
 
+        for label_str, node_dict in nodes_by_label.items():
+            if label_str in ("Entity", "Organization", "Product", "Event", "Hashtag"):
+                for node_id, node in node_dict.items():
+                    count = entity_occurrence_counter.get(node_id, 0)
+                    if count > 0:
+                        node["batch_mentions_count"] = count
+
         return nodes_by_label, rel_groups
 
-    async def _run_post_aggregations(self, author_id: str) -> None:
+    async def _run_post_aggregations(self, author_ids: list[str]) -> None:
+        if not author_ids:
+            return
+
         covers_query = (
-            "MATCH (a:Actor {id: $author_id})-[:PUBLISHED]->(p:Post) "
+            "UNWIND $author_ids AS author_id "
+            "MATCH (a:Actor {id: author_id})-[:PUBLISHED]->(p:Post) "
             "WITH a, COUNT(p) AS total_posts "
             "MATCH (a)-[:PUBLISHED]->(p:Post) "
             "OPTIONAL MATCH (p)-[:ABOUT]->(:MicroConcept)-[:BELONGS_TO]->(concept:Concept) "
             "WITH a, total_posts, concept, COUNT(DISTINCT p) AS post_count "
-            "WHERE concept IS NOT NULL AND post_count >= 2 "
+            "WHERE concept IS NOT NULL AND post_count >= 1 "
             "WITH a, total_posts, concept, post_count "
             "ORDER BY a.id, concept.id "
             "MERGE (a)-[r:COVERS_TOPIC]->(concept) "
@@ -255,11 +270,12 @@ class GraphWriter:
             "    r.last_updated = timestamp()"
         )
         covers_micro_query = (
-            "MATCH (a:Actor {id: $author_id})-[:PUBLISHED]->(p:Post) "
+            "UNWIND $author_ids AS author_id "
+            "MATCH (a:Actor {id: author_id})-[:PUBLISHED]->(p:Post) "
             "WITH a, COUNT(p) AS total_posts "
             "MATCH (a)-[:PUBLISHED]->(p:Post)-[:ABOUT]->(mc:MicroConcept) "
             "WITH a, total_posts, mc, COUNT(DISTINCT p) AS post_count "
-            "WHERE post_count >= 2 "
+            "WHERE post_count >= 1 "
             "WITH a, total_posts, mc, post_count "
             "ORDER BY a.id, mc.id "
             "MERGE (a)-[r:COVERS_TOPIC]->(mc) "
@@ -268,24 +284,26 @@ class GraphWriter:
             "    r.last_updated = timestamp()"
         )
         try:
-            await self._neo4j_client.execute_write(covers_query, {"author_id": author_id})
+            await self._neo4j_client.execute_write(covers_query, {"author_ids": author_ids})
         except Exception as exc:
-            logger.warning("COVERS_TOPIC aggregation failed for author %s: %s", author_id, exc)
+            logger.warning("COVERS_TOPIC aggregation failed for authors: %s", exc)
 
         try:
-            await self._neo4j_client.execute_write(covers_micro_query, {"author_id": author_id})
+            await self._neo4j_client.execute_write(covers_micro_query, {"author_ids": author_ids})
         except Exception as exc:
-            logger.warning("COVERS_TOPIC MicroConcept aggregation failed for author %s: %s", author_id, exc)
+            logger.warning("COVERS_TOPIC MicroConcept aggregation failed for authors: %s", exc)
 
         try:
-            await self._aggregate_actor_profile(author_id)
+            await self._aggregate_actors_profiles(author_ids)
         except Exception as exc:
-            logger.warning("Actor profile Python aggregation failed for author %s: %s", author_id, exc)
+            logger.warning("Actor profile aggregation failed for authors: %s", exc)
 
-    async def _aggregate_actor_profile(self, author_id: str) -> None:
+    async def _aggregate_actors_profiles(self, author_ids: list[str]) -> None:
         posts_query = (
-            "MATCH (a:Actor {id: $author_id})-[:PUBLISHED]->(p:Post) "
-            "RETURN a.account_id AS account_id, "
+            "MATCH (a:Actor)-[:PUBLISHED]->(p:Post) "
+            "WHERE a.id IN $author_ids "
+            "RETURN a.id AS author_id, "
+            "       a.account_id AS account_id, "
             "       p.published_at AS published_at, "
             "       p.score_dopamine AS score_dopamine, "
             "       p.score_oxytocin AS score_oxytocin, "
@@ -297,144 +315,178 @@ class GraphWriter:
             "       p.secondary_tone AS secondary_tone, "
             "       p.language AS language"
         )
-        rows = await self._neo4j_client.execute_read(posts_query, {"author_id": author_id})
+        rows = await self._neo4j_client.execute_read(posts_query, {"author_ids": author_ids})
         if not rows:
             return
 
-        account_id = rows[0].get("account_id")
+        posts_by_author: dict[str, list[dict[str, Any]]] = {}
+        account_id_by_author: dict[str, int | None] = {}
+        for row in rows:
+            aid = row.get("author_id")
+            if aid is None:
+                continue
+            posts_by_author.setdefault(aid, []).append(row)
+            if aid not in account_id_by_author:
+                account_id_by_author[aid] = row.get("account_id")
 
         now_ts = time.time()
         use_time_decay = self._settings.use_time_decay
         half_life_days = self._settings.time_decay_half_life_days
 
-        sum_dopamine = 0.0
-        sum_oxytocin = 0.0
-        sum_serotonin = 0.0
-        sum_cortisol = 0.0
-        sum_adrenaline = 0.0
-        sum_endorphin = 0.0
+        updates: list[dict[str, Any]] = []
+        missing_language_authors: list[tuple[str, int]] = []
 
-        tone_counter: dict[str, float] = {}
-        secondary_tone_counter: dict[str, float] = {}
-        language_counter: dict[str, float] = {}
+        for aid, posts in posts_by_author.items():
+            sum_dopamine = 0.0
+            sum_oxytocin = 0.0
+            sum_serotonin = 0.0
+            sum_cortisol = 0.0
+            sum_adrenaline = 0.0
+            sum_endorphin = 0.0
 
-        for row in rows:
-            published_at = row.get("published_at")
-            w = 1.0
-            if use_time_decay:
-                if published_at is None:
-                    delta_days = 0.0
-                else:
-                    delta_days = max(0.0, (now_ts - published_at) / 86400.0)
-                w = math.exp(-math.log(2) * delta_days / half_life_days)
+            tone_counter: dict[str, float] = {}
+            secondary_tone_counter: dict[str, float] = {}
+            language_counter: dict[str, float] = {}
 
-            sum_dopamine += (row.get("score_dopamine") or 0.0) * w
-            sum_oxytocin += (row.get("score_oxytocin") or 0.0) * w
-            sum_serotonin += (row.get("score_serotonin") or 0.0) * w
-            sum_cortisol += (row.get("score_cortisol") or 0.0) * w
-            sum_adrenaline += (row.get("score_adrenaline") or 0.0) * w
-            sum_endorphin += (row.get("score_endorphin") or 0.0) * w
+            for row in posts:
+                published_at = row.get("published_at")
+                w = 1.0
+                if use_time_decay:
+                    if published_at is None:
+                        delta_days = 0.0
+                    else:
+                        delta_days = max(0.0, (now_ts - published_at) / 86400.0)
+                    w = math.exp(-math.log(2) * delta_days / half_life_days)
 
-            tone = row.get("tone")
-            if tone is not None:
-                tone_counter[tone] = tone_counter.get(tone, 0.0) + w
+                sum_dopamine += (row.get("score_dopamine") or 0.0) * w
+                sum_oxytocin += (row.get("score_oxytocin") or 0.0) * w
+                sum_serotonin += (row.get("score_serotonin") or 0.0) * w
+                sum_cortisol += (row.get("score_cortisol") or 0.0) * w
+                sum_adrenaline += (row.get("score_adrenaline") or 0.0) * w
+                sum_endorphin += (row.get("score_endorphin") or 0.0) * w
 
-            secondary_tone = row.get("secondary_tone")
-            if secondary_tone is not None:
-                secondary_tone_counter[secondary_tone] = secondary_tone_counter.get(secondary_tone, 0.0) + 0.5 * w
+                tone = row.get("tone")
+                if tone is not None:
+                    tone_counter[tone] = tone_counter.get(tone, 0.0) + w
 
-            language = row.get("language")
-            if language is not None:
-                language_counter[language] = language_counter.get(language, 0.0) + w
+                secondary_tone = row.get("secondary_tone")
+                if secondary_tone is not None:
+                    secondary_tone_counter[secondary_tone] = secondary_tone_counter.get(secondary_tone, 0.0) + 0.5 * w
 
-        N = len(rows)
-        total_hormone_score = (
-            sum_dopamine + sum_oxytocin + sum_serotonin
-            + sum_cortisol + sum_adrenaline + sum_endorphin
-        )
-        mean_intensity = total_hormone_score / N
+                language = row.get("language")
+                if language is not None:
+                    language_counter[language] = language_counter.get(language, 0.0) + w
 
-        primary_hormone: str | None = None
-        secondary_hormone: str | None = None
+            N = len(posts)
+            total_hormone_score = (
+                sum_dopamine + sum_oxytocin + sum_serotonin
+                + sum_cortisol + sum_adrenaline + sum_endorphin
+            )
+            mean_intensity = total_hormone_score / N if N > 0 else 0.0
 
-        if total_hormone_score > 0 and mean_intensity >= 0.05:
-            sum_dopamine /= total_hormone_score
-            sum_oxytocin /= total_hormone_score
-            sum_serotonin /= total_hormone_score
-            sum_cortisol /= total_hormone_score
-            sum_adrenaline /= total_hormone_score
-            sum_endorphin /= total_hormone_score
+            primary_hormone: str | None = None
+            secondary_hormone: str | None = None
 
-            hormone_scores: list[tuple[str, float]] = [
-                ("dopamine", sum_dopamine),
-                ("oxytocin", sum_oxytocin),
-                ("serotonin", sum_serotonin),
-                ("cortisol", sum_cortisol),
-                ("adrenaline", sum_adrenaline),
-                ("endorphin", sum_endorphin),
-            ]
-            hormone_scores.sort(key=lambda item: item[1], reverse=True)
+            if total_hormone_score > 0 and mean_intensity >= 0.05:
+                sum_dopamine /= total_hormone_score
+                sum_oxytocin /= total_hormone_score
+                sum_serotonin /= total_hormone_score
+                sum_cortisol /= total_hormone_score
+                sum_adrenaline /= total_hormone_score
+                sum_endorphin /= total_hormone_score
 
-            primary_hormone = hormone_scores[0][0]
-            if len(hormone_scores) > 1 and hormone_scores[1][1] >= 0.15:
-                secondary_hormone = hormone_scores[1][0]
+                hormone_scores: list[tuple[str, float]] = [
+                    ("dopamine", sum_dopamine),
+                    ("oxytocin", sum_oxytocin),
+                    ("serotonin", sum_serotonin),
+                    ("cortisol", sum_cortisol),
+                    ("adrenaline", sum_adrenaline),
+                    ("endorphin", sum_endorphin),
+                ]
+                hormone_scores.sort(key=lambda item: item[1], reverse=True)
 
-        primary_tone = max(tone_counter, key=lambda k: tone_counter[k]) if tone_counter else None
+                primary_hormone = hormone_scores[0][0]
+                if len(hormone_scores) > 1 and hormone_scores[1][1] >= 0.15:
+                    secondary_hormone = hormone_scores[1][0]
 
-        combined_secondary: dict[str, float] = {}
-        for t, count in tone_counter.items():
-            if t != primary_tone:
-                combined_secondary[t] = combined_secondary.get(t, 0.0) + count * 0.5
-        for st, count in secondary_tone_counter.items():
-            if st != primary_tone:
-                combined_secondary[st] = combined_secondary.get(st, 0.0) + count
+            primary_tone = max(tone_counter, key=lambda k: tone_counter[k]) if tone_counter else None
 
-        total_tone_mass = sum(tone_counter.values()) + sum(secondary_tone_counter.values())
-        secondary_tone: str | None = None
-        if combined_secondary and total_tone_mass > 0:
-            candidate = max(combined_secondary, key=lambda k: combined_secondary[k])
-            candidate_score = combined_secondary[candidate]
-            if candidate_score / total_tone_mass >= 0.15:
-                secondary_tone = candidate
+            combined_secondary: dict[str, float] = {}
+            for t, count in tone_counter.items():
+                if t != primary_tone:
+                    combined_secondary[t] = combined_secondary.get(t, 0.0) + count * 0.5
+            for st, count in secondary_tone_counter.items():
+                if st != primary_tone:
+                    combined_secondary[st] = combined_secondary.get(st, 0.0) + count
 
-        primary_language = max(language_counter, key=lambda k: language_counter[k]) if language_counter else None
+            total_tone_mass = sum(tone_counter.values()) + sum(secondary_tone_counter.values())
+            secondary_tone_val: str | None = None
+            if combined_secondary and total_tone_mass > 0:
+                candidate = max(combined_secondary, key=lambda k: combined_secondary[k])
+                candidate_score = combined_secondary[candidate]
+                if candidate_score / total_tone_mass >= 0.15:
+                    secondary_tone_val = candidate
 
-        if primary_language is None and account_id is not None:
-            async with self._db.async_session() as session:
-                result = await session.execute(
-                    select(Account.description, Account.title).where(Account.id == account_id)
-                )
-                row = result.one_or_none()
-            if row is not None:
-                description, title = row
-                if description is not None and len(description.split()) > 3:
-                    if re.search(r'[а-яА-ЯеЁ]', description):
-                        primary_language = 'ru'
-                    elif re.search(r'[a-zA-Z]', description):
-                        primary_language = 'en'
-                if primary_language is None and title is not None:
-                    if re.search(r'[а-яА-ЯеЁ]', title):
-                        primary_language = 'ru'
-                    elif re.search(r'[a-zA-Z]', title):
-                        primary_language = 'en'
+            primary_language = max(language_counter, key=lambda k: language_counter[k]) if language_counter else None
 
-        update_query = (
-            "MATCH (a:Actor {id: $author_id}) "
-            "SET a.primary_language = $primary_language, "
-            "    a.primary_tone = $primary_tone, "
-            "    a.secondary_tone = $secondary_tone, "
-            "    a.primary_hormone = $primary_hormone, "
-            "    a.secondary_hormone = $secondary_hormone, "
-            "    a.updated_at = timestamp()"
-        )
-        await self._neo4j_client.execute_write(
-            update_query,
-            {
-                "author_id": author_id,
+            account_id = account_id_by_author.get(aid)
+            if primary_language is None and account_id is not None:
+                missing_language_authors.append((aid, account_id))
+
+            updates.append({
+                "author_id": aid,
                 "primary_language": _to_val(primary_language, None),
                 "primary_tone": _to_val(primary_tone, None),
-                "secondary_tone": _to_val(secondary_tone, None),
+                "secondary_tone": _to_val(secondary_tone_val, None),
                 "primary_hormone": _to_val(primary_hormone, None),
                 "secondary_hormone": _to_val(secondary_hormone, None),
-            },
-        )
+            })
+
+        if missing_language_authors:
+            missing_account_ids = [acc_id for _, acc_id in missing_language_authors]
+            async with self._db.async_session() as session:
+                result = await session.execute(
+                    select(Account.id, Account.description, Account.title).where(Account.id.in_(missing_account_ids))
+                )
+                pg_rows = result.all()
+
+            account_lang_map: dict[int, str | None] = {}
+            for pg_row in pg_rows:
+                pg_account_id, description, title = pg_row
+                lang: str | None = None
+                if description is not None and len(description.split()) > 3:
+                    has_cyrillic = any('\u0400' <= c <= '\u04ff' for c in description)
+                    has_latin = any('a' <= c.lower() <= 'z' for c in description)
+                    if has_cyrillic:
+                        lang = 'ru'
+                    elif has_latin:
+                        lang = 'en'
+                if lang is None and title is not None:
+                    has_cyrillic = any('\u0400' <= c <= '\u04ff' for c in title)
+                    has_latin = any('a' <= c.lower() <= 'z' for c in title)
+                    if has_cyrillic:
+                        lang = 'ru'
+                    elif has_latin:
+                        lang = 'en'
+                account_lang_map[pg_account_id] = lang
+
+            for aid, acc_id in missing_language_authors:
+                detected_lang = account_lang_map.get(acc_id)
+                if detected_lang is not None:
+                    for u in updates:
+                        if u["author_id"] == aid:
+                            u["primary_language"] = detected_lang
+                            break
+
+        if updates:
+            update_query = (
+                "UNWIND $updates AS u "
+                "MATCH (a:Actor {id: u.author_id}) "
+                "SET a.primary_language = u.primary_language, "
+                "    a.primary_tone = u.primary_tone, "
+                "    a.secondary_tone = u.secondary_tone, "
+                "    a.primary_hormone = u.primary_hormone, "
+                "    a.secondary_hormone = u.secondary_hormone, "
+                "    a.updated_at = timestamp()"
+            )
+            await self._neo4j_client.execute_write(update_query, {"updates": updates})

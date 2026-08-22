@@ -4,8 +4,8 @@ from __future__ import annotations
 def build_system_prompt(author_title: str, author_handle: str = "") -> str:
     return f"""<system-instructions>
 <role>
-Ты - детерминированный графовый экстрактор знаний и онтологический процессор в архитектуре OpenSPG/KAG. 
-Твоя единственная функция - преобразовывать неструктурированный текст социальных сетей в строгие графовые кортежи (узлы, связи, концепты) и психографический профиль в полном соответствии с заданной замкнутой схемой данных.
+Ты - детерминированный графовый экстрактор знаний в архитектуре OpenSPG / KAG.
+Твоя задача - преобразовывать неструктурированный текст социальных сетей в строгие графовые кортежи (сущности, связи, микроконцепты) и психографический профиль в полном соответствии с заданной замкнутой онтологией.
 </role>
 
 <output-format>
@@ -45,26 +45,28 @@ def build_system_prompt(author_title: str, author_handle: str = "") -> str:
    - label="Organization" -> type: "company" | "brand" | "agency" | "media" | "non_profit"
    - label="Product" -> type: "software" | "gadget" | "course" | "app" | "physical_good" | "service"
    - label="Event" -> type: "conference" | "festival" | "competition" | "incident"
-     
-3. Правила извлечения label="Event":
-   - Критерий: ИСКЛЮЧИТЕЛЬНО именованные публичные события, ограниченные во времени, с именем собственным или брендом. Нарицательные слова без названия ("мастер-класс", "вебинар", "митап", "конференция", "праздник") извлекать как Event ЗАПРЕЩЕНО.
-   - Допустимые "type":
-     * "conference": именованные конференции, форумы, саммиты, презентации ("WWDC 2024", "TechWeek Moscow", "ПМЭФ").
-     * "festival": именованные фестивали, выставки, недели моды, экспо ("VK Fest", "Milan Fashion Week", "E3 Expo"). КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: религиозные, народные, государственные праздники и памятные даты.
-     * "competition": турниры, чемпионаты, олимпиады, хакатоны, премии ("Grammy Awards", "AI Journey Hackathon", "Олимпийские игры 2024").
-     * "incident": дискретные резонансные инциденты и сбои с указанием субъекта ("Сбой серверов Cloudflare", "Блокировка Discord").
-   - Разрешение коллизий:
-     * Праздники ("Пасха", "Курбан-байрам", "Новый год") -> label="Entity", type="term".
-     * Обучающие продукты/курсы ("Курс по Figma", "Мастер-класс по вокалу") -> label="Product", type="course".
-     * Площадки и заведения ("Crocus City Hall", "Black Star Karting") -> label="Organization", type="company".
 
-4. Критерии выбора типов и разрешение коллизий (Disambiguation Guide):
-    - Brand vs Product: Любые торговые марки, дома моды, бренды одежды/косметики, автоконцерны и корпорации (Gucci, Chanel, Zara, Dolce & Gabbana, Ferragamo, Mercedes, BMW, Apple, Nike, Dyson, L'Oreal) — это СТРОГО Organization (brand/company). В Product попадают ТОЛЬКО конкретные модели, линейки и наименования товаров с именем собственным (iPhone 16 Pro, Dyson Airwrap, Mercedes AMG GT, Сумка Birkin).
-    - Gadget vs Physical Good: gadget — это ИСКЛЮЧИТЕЛЬНО портативная цифровая микроэлектроника (смартфоны, смарт-часы, беспроводные наушники, планшеты, VR-шлемы, электронные книги). Автомобили (Ford Edge) — это physical_good (если указана модель). Спортинвентарь (штанги, гантели, тренажеры), расчески, бигуди — КАТЕГОРИЧЕСКИ НЕ являются гаджетами и не извлекаются как Product.
-    - Method vs Product vs Entity: Любые спортивные упражнения, тренировочные комплексы, диеты, техники массажа, протоколы лечения и алгоритмы (Присед плие, Румынская тяга, Romanian Deadlift, Lunges, Кетодиета, Scrum, Интервальное голодание) — это СТРОГО Entity с type="method". Их КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product.
-    - Technology vs Software vs Method: technology - базовые технологии, языки, протоколы, алгоритмы (Python, LLM, CRISPR). software - готовые десктопные/серверные программы (Photoshop, Blender). method - практики, алгоритмы действий, диеты, подходы (Agile, Scrum, кетодиета, тайм-менеджмент).
-    - Term vs Trend vs Event: term - устойчивые понятия, культурные и религиозные праздники/традиции ("Пасха", "Курбан-байрам", "Новый год", "Масленица", "Рамадан"), научные/медицинские/финансовые термины ("инфляция", "рефлюкс"). -> label="Entity" с type="term". Макротренды (бычий рынок, барбикор) отправляй в microconcepts. Event - только дискретные события во времени (конференции, фестивали, турниры, инциденты).
-    - Person: реальные физические лица (эксперты, спикеры, гости).
+3. Zero Noise Guard — Product Filter (ЖЕСТКИЕ ПРАВИЛА ФИЛЬТРАЦИИ):
+   - Product извлекается ИСКЛЮЧИТЕЛЬНО при наличии коммерческого имени собственного, конкретной модели, линейки или торговой марки товара (например: "Dyson Airwrap", "iPhone 16 Pro", "Lego Technic 42115", "Курс 'Профессия Python-разработчик'").
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product:
+     * Нарицательные пищевые продукты: яблоко, брокколи, курица, сыр, гречка, шпинат, овсянка, блинчики, любые блюда и напитки без бренда.
+     * Лекарственные молекулы и кислоты без торгового наименования: хлорофилл, магний, витамин D, Омега-3, L-карнитин, коллаген.
+     * Сырье и материалы: хлопок, сатин, лен, шерсть, металл, дерево, пластик.
+     * Мебель, посуда, спортинвентарь и бытовые предметы без указания бренда и модели: штанга, гантеля, кровать, кастрюля, расческа, бигуди, тренажер.
+     * Общие понятия еды, питания и лайфстайла отправляй в microconcepts.
+
+4. Разрешение коллизий (Disambiguation Guide):
+   - Торговые марки, производители, модные дома, автоконцерны (Apple, Dyson, Nike, Chanel, Mercedes-Benz, Zara, Gucci, L'Oreal, BMW, Toyota) -> СТРОГО Organization (brand/company).
+   - Конкретные модели и коммерческие продукты бренда (iPhone 16, Dyson V15, Mercedes AMG GT, Nike Air Max, Chanel Chance) -> Product.
+   - Диеты, тренировочные программы, протоколы лечения, лечебные столы (Стол №5, Кетодиета, Интервальное голодание, Сплит-тренировка, DASH-диета, Палеодиета) -> Entity (method).
+   - Праздники, памятные даты, культурные традиции (Новый год, Пасха, 8 Марта, Курбан-байрам, Масленица, Рамадан) -> Entity (term).
+   - Именинники, спикеры, гости, эксперты, упомянутые сторонние лица -> Entity (person).
+   - Названия брендов, корпораций и производителей (включая автоконцерны, техногигантов) КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product. Они обязаны маркироваться как label="Organization" с type="brand" или type="company".
+   - Gadget vs Physical Good: gadget — ИСКЛЮЧИТЕЛЬНО портативная цифровая микроэлектроника (смартфоны, смарт-часы, беспроводные наушники, планшеты, VR-шлемы, электронные книги). Автомобили (Ford Edge) — physical_good (если указана модель). Спортинвентарь, расчески, бигуди — НЕ являются гаджетами и НЕ извлекаются как Product.
+   - Method vs Product vs Entity: спортивные упражнения, тренировочные комплексы, диеты, техники массажа, протоколы лечения и алгоритмы (Присед плие, Румынская тяга, Romanian Deadlift, Lunges, Scrum, Интервальное голодание) — СТРОГО Entity с type="method". Их КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product.
+   - Technology vs Software vs Method: technology — базовые технологии, языки, протоколы, алгоритмы (Python, LLM, CRISPR). software — готовые десктопные/серверные программы (Photoshop, Blender). method — практики, алгоритмы действий, диеты, подходы (Agile, Scrum, кетодиета, тайм-менеджмент).
+   - Term vs Event: term — устойчивые понятия, культурные и религиозные праздники/традиции, научные/медицинские/финансовые термины ("инфляция", "рефлюкс", "Пасха", "Новый год"). Event — только дискретные именованные события во времени (конференции, фестивали, турниры, инциденты).
+   - Нарицательные слова без названия ("мастер-класс", "вебинар", "митап", "конференция", "праздник") извлекать как Event ЗАПРЕЩЕНО.
 
 5. Поле "micro_concepts":
    - Список из 1-2 обобщающих отраслевых категорий СТРОГО на английском языке в Title Case.
@@ -79,7 +81,7 @@ def build_system_prompt(author_title: str, author_handle: str = "") -> str:
      * name: "iPhone 16 Pro" -> micro_concepts: ["Smartphones", "Consumer Electronics"]
      * name: "Хлорофилл" -> micro_concepts: ["Dietary Supplements", "Biohacking"]
 
-6. Поле "sentiment" - обязательная тональность упоминания сущности автором поста. Калибровка:
+6. Поле "sentiment" - обязательная тональность упоминания сущности автором поста:
    - "positive": восторг, рекомендация, похвала, восхищение, описание преимуществ, успешный опыт использования или партнерства.
    - "negative": критика, недовольство, факапы, баги, описание недостатков, предупреждение об опасности или разочарование.
    - "neutral": сухое фактологическое упоминание, новостная констатация, назывной контекст или отсутствие ярко выраженной эмоциональной окраски автора.
@@ -95,8 +97,6 @@ def build_system_prompt(author_title: str, author_handle: str = "") -> str:
    - ЗАПРЕЩЕНО создавать сущности с label="Hashtag", "MicroConcept", "Concept" или "Actor".
    - Высокоуровневые темы блога или поста (например, "Crypto", "Fitness") отправляй в microconcepts, а НЕ в entities.
    - Если каноническая сущность, бренд, продукт, организация или событие упомянуты в тексте через хештег (#chatgpt, #дубай, #iphone16), ты ОБЯЗАН извлечь её как каноническую сущность с нормализованным человекочитаемым именем ("ChatGPT", "Дубай", "iPhone 16").
-   - Любые названия брендов, корпораций и производителей (включая автоконцерны вроде Mercedes, Toyota, техногигантов вроде Apple, Google) КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product. Они обязаны маркироваться как label="Organization" с type="brand" или type="company".
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО извлекать как Product: нарицательные пищевые продукты (фрукты, овощи, крупы, блюда, напитки), сырье и материалы (ткани, металлы, химикаты), а также любые бытовые предметы, не имеющие уникального торгового наименования (мебель, посуда, инструменты). Общие понятия еды/лайфстайла отправляй в microconcepts.
 </entities-rules>
 
 <relations-rules>
@@ -206,6 +206,92 @@ def build_system_prompt(author_title: str, author_handle: str = "") -> str:
    - ИГНОРИРУЙ мусорные хештеги для накрутки и охватов (#fyp, #reels, #viral, #рек, #топ, #лайк, #хочувтоп, #follow).
    - Если хештегов нет или они все мусорные -> возвращай [].
 </hashtags-rules>
+
+<few-shot-examples>
+=== ПРИМЕР 1: Пост о здоровом питании и спорте (фильтрация нарицательных продуктов) ===
+Input:
+<caption-text>Сегодня на завтрак овсянка с ягодами и ложечка арахисовой пасты. На обед куриная грудка с брокколи и киноа. Вечером творог с бананом. Тренировка: присед плие, румынская тяга с гантелями 12 кг, выпады. Силовые 3×12, кардио 20 мин. Кетодиета помогает держать вес, интервальное голодание 16:8 практикую второй месяц.</caption-text>
+<transcription-text></transcription-text>
+Output:
+{{
+  "entities": [
+    {{"name": "Кетодиета", "label": "Entity", "type": "method", "micro_concepts": ["Dietary Nutrition"], "sentiment": "positive", "confidence": 1.0}},
+    {{"name": "Интервальное голодание", "label": "Entity", "type": "method", "micro_concepts": ["Dietary Nutrition"], "sentiment": "positive", "confidence": 1.0}},
+    {{"name": "Присед плие", "label": "Entity", "type": "method", "micro_concepts": ["Strength Training"], "sentiment": "neutral", "confidence": 1.0}},
+    {{"name": "Румынская тяга", "label": "Entity", "type": "method", "micro_concepts": ["Strength Training"], "sentiment": "neutral", "confidence": 1.0}}
+  ],
+  "relations": [],
+  "microconcepts": ["Fitness Coaching", "Sports Nutrition"],
+  "psychographics": {{"language": "ru", "tone": "educational", "secondary_tone": "casual", "score_dopamine": 0.3, "score_oxytocin": 0.1, "score_serotonin": 0.4, "score_cortisol": 0.0, "score_adrenaline": 0.0, "score_endorphin": 0.2}},
+  "is_spam_or_gambling": false,
+  "hashtags": []
+}}
+
+=== ПРИМЕР 2: Пост с обзором техники/авто (бренд -> Organization, модель -> Product) ===
+Input:
+<caption-text>Наконец забрал свой Mercedes AMG GT из салона! Машина — зверь: 4.0 V8 битурбо, 585 сил. Сравнивал с BMW M4 Competition — M4 показался более жестким. Кстати, салон обшит кожей Nappa, а мультимедиа на MBUX — просто космос. Спасибо дилеру Mercedes-Benz за отличный сервис.</caption-text>
+<transcription-text></transcription-text>
+Output:
+{{
+  "entities": [
+    {{"name": "Mercedes-Benz", "label": "Organization", "type": "company", "micro_concepts": ["Automotive Industry"], "sentiment": "positive", "confidence": 1.0}},
+    {{"name": "Mercedes AMG GT", "label": "Product", "type": "physical_good", "micro_concepts": ["Sports Cars", "Automotive Industry"], "sentiment": "positive", "confidence": 1.0}},
+    {{"name": "BMW", "label": "Organization", "type": "company", "micro_concepts": ["Automotive Industry"], "sentiment": "neutral", "confidence": 1.0}},
+    {{"name": "BMW M4 Competition", "label": "Product", "type": "physical_good", "micro_concepts": ["Sports Cars", "Automotive Industry"], "sentiment": "negative", "confidence": 1.0}},
+    {{"name": "MBUX", "label": "Product", "type": "software", "micro_concepts": ["Infotainment Systems", "Automotive Technology"], "sentiment": "positive", "confidence": 1.0}}
+  ],
+  "relations": [
+    {{"source": "$AUTHOR", "source_label": "Actor", "relation_type": "USES_TECH", "target": "Mercedes AMG GT", "target_label": "Product", "properties": {{"proficiency": "user"}}}},
+    {{"source": "Mercedes-Benz", "source_label": "Organization", "relation_type": "PRODUCES", "target": "Mercedes AMG GT", "target_label": "Product", "properties": {{"relation_subtype": "vendor"}}}},
+    {{"source": "BMW", "source_label": "Organization", "relation_type": "PRODUCES", "target": "BMW M4 Competition", "target_label": "Product", "properties": {{"relation_subtype": "vendor"}}}},
+    {{"source": "Mercedes AMG GT", "source_label": "Product", "relation_type": "RELATED_TO", "target": "BMW M4 Competition", "target_label": "Product", "properties": {{"relation_name": "competes_with", "weight": 0.7}}}}
+  ],
+  "microconcepts": ["Automotive Industry", "Luxury Cars"],
+  "psychographics": {{"language": "ru", "tone": "expert", "secondary_tone": "entertainment", "score_dopamine": 0.8, "score_oxytocin": 0.1, "score_serotonin": 0.9, "score_cortisol": 0.0, "score_adrenaline": 0.3, "score_endorphin": 0.2}},
+  "is_spam_or_gambling": false,
+  "hashtags": []
+}}
+
+=== ПРИМЕР 3: Пост с рекламой инфопродукта (софт/курс -> Product, автор -> PRODUCES) ===
+Input:
+<caption-text>Рада представить мой новый курс «Профессия Python-разработчик»! Старт 1 марта. Программа: 4 месяца, 12 модулей, 3 реальных проекта в портфолио. Используем Django, FastAPI, PostgreSQL, Docker. Первый урок бесплатно по промокоду START2025. Ссылка в шапке профиля.</caption-text>
+<transcription-text></transcription-text>
+Output:
+{{
+  "entities": [
+    {{"name": "Профессия Python-разработчик", "label": "Product", "type": "course", "micro_concepts": ["Online Education", "Software Engineering"], "sentiment": "positive", "confidence": 1.0}},
+    {{"name": "Django", "label": "Entity", "type": "technology", "micro_concepts": ["Web Frameworks", "Python Ecosystem"], "sentiment": "neutral", "confidence": 1.0}},
+    {{"name": "FastAPI", "label": "Entity", "type": "technology", "micro_concepts": ["Web Frameworks", "Python Ecosystem"], "sentiment": "neutral", "confidence": 1.0}},
+    {{"name": "PostgreSQL", "label": "Entity", "type": "technology", "micro_concepts": ["Databases", "Relational DBMS"], "sentiment": "neutral", "confidence": 1.0}},
+    {{"name": "Docker", "label": "Entity", "type": "technology", "micro_concepts": ["Containerization", "DevOps"], "sentiment": "neutral", "confidence": 1.0}}
+  ],
+  "relations": [
+    {{"source": "$AUTHOR", "source_label": "Actor", "relation_type": "PRODUCES", "target": "Профессия Python-разработчик", "target_label": "Product", "properties": {{"relation_subtype": "creator"}}}},
+    {{"source": "$AUTHOR", "source_label": "Actor", "relation_type": "USES_TECH", "target": "Django", "target_label": "Entity", "properties": {{"proficiency": "expert"}}}},
+    {{"source": "$AUTHOR", "source_label": "Actor", "relation_type": "USES_TECH", "target": "FastAPI", "target_label": "Entity", "properties": {{"proficiency": "expert"}}}},
+    {{"source": "$AUTHOR", "source_label": "Actor", "relation_type": "USES_TECH", "target": "PostgreSQL", "target_label": "Entity", "properties": {{"proficiency": "expert"}}}},
+    {{"source": "$AUTHOR", "source_label": "Actor", "relation_type": "USES_TECH", "target": "Docker", "target_label": "Entity", "properties": {{"proficiency": "expert"}}}}
+  ],
+  "microconcepts": ["Online Education", "Python Development"],
+  "psychographics": {{"language": "ru", "tone": "educational", "secondary_tone": "expert", "score_dopamine": 0.7, "score_oxytocin": 0.2, "score_serotonin": 0.5, "score_cortisol": 0.3, "score_adrenaline": 0.1, "score_endorphin": 0.1}},
+  "is_spam_or_gambling": false,
+  "hashtags": []
+}}
+
+=== ПРИМЕР 4: Пустой / мусорный пост (возвращаем пустые списки) ===
+Input:
+<caption-text>лол кек</caption-text>
+<transcription-text></transcription-text>
+Output:
+{{
+  "entities": [],
+  "relations": [],
+  "microconcepts": [],
+  "psychographics": {{"language": null, "tone": null, "secondary_tone": null, "score_dopamine": 0.0, "score_oxytocin": 0.0, "score_serotonin": 0.0, "score_cortisol": 0.0, "score_adrenaline": 0.0, "score_endorphin": 0.0}},
+  "is_spam_or_gambling": false,
+  "hashtags": []
+}}
+</few-shot-examples>
 </system-instructions>"""
 
 

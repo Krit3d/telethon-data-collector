@@ -345,27 +345,39 @@ class Aligner:
             seen_raw.add(ht.raw)
             unique.append(ht)
 
+        existing_entity_ids: set[str] = {e.id for e in extraction_result.entities if e.id}
+        existing_relation_keys: set[tuple[str, str, str]] = {
+            (r.source_id, r.target_id, r.relation_type.value)
+            for r in extraction_result.relations
+            if r.source_id and r.target_id
+        }
+
         for ht in unique:
             ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
-            extraction_result.entities.append(
-                ExtractedEntity(
-                    id=ht_node_id,
-                    name=f"#{ht.raw}",
-                    name_lower=clean_name_lower(ht.raw),
-                    label=EntityType.Hashtag,
-                    properties={"raw": ht.raw, "normalized": ht.normalized},
-                )
-            )
-            if context.pub_node_id:
-                extraction_result.relations.append(
-                    ExtractedRelation(
-                        source_id=context.pub_node_id,
-                        source_label=EntityType.Post,
-                        target_id=ht_node_id,
-                        target_label=EntityType.Hashtag,
-                        relation_type=RelationType.TAGGED_WITH,
+            if ht_node_id not in existing_entity_ids:
+                extraction_result.entities.append(
+                    ExtractedEntity(
+                        id=ht_node_id,
+                        name=f"#{ht.raw}",
+                        name_lower=clean_name_lower(ht.raw),
+                        label=EntityType.Hashtag,
+                        properties={"raw": ht.raw, "normalized": ht.normalized},
                     )
                 )
+                existing_entity_ids.add(ht_node_id)
+            if context.pub_node_id:
+                tagged_key = (context.pub_node_id, ht_node_id, RelationType.TAGGED_WITH.value)
+                if tagged_key not in existing_relation_keys:
+                    extraction_result.relations.append(
+                        ExtractedRelation(
+                            source_id=context.pub_node_id,
+                            source_label=EntityType.Post,
+                            target_id=ht_node_id,
+                            target_label=EntityType.Hashtag,
+                            relation_type=RelationType.TAGGED_WITH,
+                        )
+                    )
+                    existing_relation_keys.add(tagged_key)
 
         normalized_texts = [ht.normalized for ht in unique]
         try:
@@ -424,8 +436,6 @@ class Aligner:
 
         qdrant_elapsed = (time.perf_counter() - t0) * 1000
 
-        existing_entity_ids: set[str] = {e.id for e in extraction_result.entities if e.id}
-
         maps_to_count = 0
         belongs_to_count = 0
 
@@ -449,14 +459,30 @@ class Aligner:
                 ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
                 if canonical_id not in existing_entity_ids:
                     match target_label:
-                        case EntityType.Entity:
-                            props: dict[str, object] = {"entity_type": "general"}
-                        case EntityType.Organization:
-                            props = {"org_type": "company"}
                         case EntityType.Product:
-                            props = {"product_type": None}
+                            type_val = payload.get("product_type")
+                            if not type_val:
+                                logger.warning("Hashtag '%s' -> Product: missing 'product_type' in payload, skipping MAPS_TO for canonical '%s'", ht.raw, canonical_name)
+                                continue
+                            props: dict[str, object] = {"product_type": type_val}
                         case EntityType.Event:
-                            props = {"event_type": None}
+                            type_val = payload.get("event_type")
+                            if not type_val:
+                                logger.warning("Hashtag '%s' -> Event: missing 'event_type' in payload, skipping MAPS_TO for canonical '%s'", ht.raw, canonical_name)
+                                continue
+                            props = {"event_type": type_val}
+                        case EntityType.Organization:
+                            type_val = payload.get("org_type")
+                            if not type_val:
+                                logger.warning("Hashtag '%s' -> Organization: missing 'org_type' in payload, skipping MAPS_TO for canonical '%s'", ht.raw, canonical_name)
+                                continue
+                            props = {"org_type": type_val}
+                        case EntityType.Entity:
+                            type_val = payload.get("entity_type")
+                            if not type_val:
+                                logger.warning("Hashtag '%s' -> Entity: missing 'entity_type' in payload, skipping MAPS_TO for canonical '%s'", ht.raw, canonical_name)
+                                continue
+                            props = {"entity_type": type_val}
                         case _:
                             props = {}
                     extraction_result.entities.append(
@@ -469,17 +495,20 @@ class Aligner:
                         )
                     )
                     existing_entity_ids.add(canonical_id)
-                extraction_result.relations.append(
-                    ExtractedRelation(
-                        source_id=ht_node_id,
-                        source_label=EntityType.Hashtag,
-                        target_id=canonical_id,
-                        target_label=target_label,
-                        relation_type=RelationType.MAPS_TO,
-                        properties={},
+                maps_to_key = (ht_node_id, canonical_id, RelationType.MAPS_TO.value)
+                if maps_to_key not in existing_relation_keys:
+                    extraction_result.relations.append(
+                        ExtractedRelation(
+                            source_id=ht_node_id,
+                            source_label=EntityType.Hashtag,
+                            target_id=canonical_id,
+                            target_label=target_label,
+                            relation_type=RelationType.MAPS_TO,
+                            properties={},
+                        )
                     )
-                )
-                maps_to_count += 1
+                    existing_relation_keys.add(maps_to_key)
+                    maps_to_count += 1
 
         if cat_resp is not None:
             for ht, response in zip(unique, cat_resp):
@@ -494,17 +523,20 @@ class Aligner:
                     continue
                 concept_node_id = build_node_id(EntityType.Concept, code)
                 ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
-                extraction_result.relations.append(
-                    ExtractedRelation(
-                        source_id=ht_node_id,
-                        source_label=EntityType.Hashtag,
-                        target_id=concept_node_id,
-                        target_label=EntityType.Concept,
-                        relation_type=RelationType.BELONGS_TO,
-                        properties={"similarity": round(hit.score, 4)},
+                belongs_to_key = (ht_node_id, concept_node_id, RelationType.BELONGS_TO.value)
+                if belongs_to_key not in existing_relation_keys:
+                    extraction_result.relations.append(
+                        ExtractedRelation(
+                            source_id=ht_node_id,
+                            source_label=EntityType.Hashtag,
+                            target_id=concept_node_id,
+                            target_label=EntityType.Concept,
+                            relation_type=RelationType.BELONGS_TO,
+                            properties={"similarity": round(hit.score, 4)},
+                        )
                     )
-                )
-                belongs_to_count += 1
+                    existing_relation_keys.add(belongs_to_key)
+                    belongs_to_count += 1
 
         logger.debug(
             "Qdrant hashtag search for %d hashtags done in %.1fms | MAPS_TO: %d, BELONGS_TO: %d",
@@ -641,6 +673,14 @@ class Aligner:
             deduped_relations.append(relation)
         extraction_result.relations = deduped_relations
 
+        concept_ids: set[str] = set()
+        for relation in extraction_result.relations:
+            if relation.relation_type == RelationType.BELONGS_TO and relation.target_label == EntityType.Concept and relation.target_id:
+                concept_ids.add(relation.target_id)
+        for entity in extraction_result.entities:
+            if entity.label == EntityType.Concept and entity.id:
+                concept_ids.add(entity.id)
+
         coauthor_ids = {
             f"actor_{context.platform.lower()}_{clean_identifier(ca)}"
             for ca in context.post_coauthors
@@ -651,7 +691,7 @@ class Aligner:
         if author_handle:
             forbidden_names.add(clean_name_lower(author_handle))
         extraction_result.sanitize_and_validate(
-            allowed_ids={context.pub_node_id, context.author_node_id} | coauthor_ids,
+            allowed_ids={context.pub_node_id, context.author_node_id} | coauthor_ids | concept_ids,
             forbidden_names=forbidden_names,
             author_title=context.author_title,
             author_handle=author_handle,

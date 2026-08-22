@@ -328,12 +328,14 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
         name = re.sub(r"\s+", " ", name).strip()
         if not name or len(name) < 2:
             continue
-        raw_label = str(raw.get("label", "Entity")).strip()
+        raw_label = str(raw.get("label", "")).strip()
+        if not raw_label:
+            continue
         try:
             label = EntityType(raw_label)
         except ValueError:
-            label = EntityType.Entity
-        if raw_label == "Hashtag" or label == EntityType.Hashtag:
+            continue
+        if label == EntityType.Hashtag:
             continue
         if is_garbage_value(name, label):
             continue
@@ -346,16 +348,6 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
         )
         if raw_entity_type is not None:
             raw_entity_type = str(raw_entity_type).lower().strip()
-        if raw_entity_type:
-            raw_type_lower = raw_entity_type.lower()
-            if raw_type_lower in {member.value for member in EntityCategory} and label != EntityType.Entity:
-                label = EntityType.Entity
-            elif raw_type_lower in {member.value for member in OrgType} and label != EntityType.Organization:
-                label = EntityType.Organization
-            elif raw_type_lower in {member.value for member in ProductType} and label != EntityType.Product:
-                label = EntityType.Product
-            elif raw_type_lower in {member.value for member in EventType} and label != EntityType.Event:
-                label = EntityType.Event
         raw_sentiment = str(raw.get("sentiment", "neutral")).strip().lower()
         if raw_sentiment not in _SENTIMENT_VALUES:
             raw_sentiment = "neutral"
@@ -371,37 +363,41 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
         entity_id = build_node_id(label, name)
         properties: dict[str, Any] = {}
         if label == EntityType.Product:
-            if raw_entity_type:
-                try:
-                    properties["product_type"] = ProductType(raw_entity_type).value
-                except ValueError:
-                    properties["product_type"] = None
-            else:
-                properties["product_type"] = None
+            if not raw_entity_type:
+                logger.warning("Dropping invalid Product entity '%s': missing or invalid product_type '%s'", name, raw_entity_type)
+                continue
+            try:
+                properties["product_type"] = ProductType(raw_entity_type).value
+            except ValueError:
+                logger.warning("Dropping invalid Product entity '%s': missing or invalid product_type '%s'", name, raw_entity_type)
+                continue
         elif label == EntityType.Organization:
-            if raw_entity_type:
-                try:
-                    properties["org_type"] = OrgType(raw_entity_type).value
-                except ValueError:
-                    properties["org_type"] = OrgType.company.value
-            else:
-                properties["org_type"] = OrgType.company.value
+            if not raw_entity_type:
+                logger.warning("Dropping invalid Organization entity '%s': missing or invalid org_type '%s'", name, raw_entity_type)
+                continue
+            try:
+                properties["org_type"] = OrgType(raw_entity_type).value
+            except ValueError:
+                logger.warning("Dropping invalid Organization entity '%s': missing or invalid org_type '%s'", name, raw_entity_type)
+                continue
         elif label == EntityType.Entity:
-            if raw_entity_type:
-                try:
-                    properties["entity_type"] = EntityCategory(raw_entity_type).value
-                except ValueError:
-                    properties["entity_type"] = EntityCategory.general.value
-            else:
-                properties["entity_type"] = EntityCategory.general.value
+            if not raw_entity_type:
+                logger.warning("Dropping invalid Entity '%s': missing or invalid entity_type '%s'", name, raw_entity_type)
+                continue
+            try:
+                properties["entity_type"] = EntityCategory(raw_entity_type).value
+            except ValueError:
+                logger.warning("Dropping invalid Entity '%s': missing or invalid entity_type '%s'", name, raw_entity_type)
+                continue
         elif label == EntityType.Event:
-            if raw_entity_type:
-                try:
-                    properties["event_type"] = EventType(raw_entity_type).value
-                except ValueError:
-                    properties["event_type"] = None
-            else:
-                properties["event_type"] = None
+            if not raw_entity_type:
+                logger.warning("Dropping invalid Event entity '%s': missing or invalid event_type '%s'", name, raw_entity_type)
+                continue
+            try:
+                properties["event_type"] = EventType(raw_entity_type).value
+            except ValueError:
+                logger.warning("Dropping invalid Event entity '%s': missing or invalid event_type '%s'", name, raw_entity_type)
+                continue
         result.append(ExtractedEntity(
             id=entity_id,
             name=name,
@@ -638,7 +634,7 @@ def _parse_hashtags(raw_hashtags_llm: Any, input_raw_tags: list[str]) -> tuple[l
     hashtag_items: list[HashtagItem] = []
     entities: list[ExtractedEntity] = []
     id_map: dict[str, str] = {}
-    seen_raw_lower: set[str] = set()
+    seen_name_lower: set[str] = set()
     MAX_HASHTAGS = 7
 
     def _is_garbage_hashtag(tag: str) -> bool:
@@ -659,61 +655,59 @@ def _parse_hashtags(raw_hashtags_llm: Any, input_raw_tags: list[str]) -> tuple[l
         normalized = str(item.get("normalized", "")).strip()
         if not raw or not normalized:
             continue
-        raw_lower = raw.lower()
         if _is_garbage_hashtag(raw):
             continue
-        if raw_lower in seen_raw_lower:
+        name_lower = clean_name_lower(raw)
+        if name_lower in seen_name_lower:
             continue
-        seen_raw_lower.add(raw_lower)
+        seen_name_lower.add(name_lower)
 
         hashtag_items.append(HashtagItem(raw=raw, normalized=normalized))
 
-        entity_id = build_node_id(EntityType.Hashtag, raw_lower)
+        entity_id = build_node_id(EntityType.Hashtag, name_lower)
         entities.append(ExtractedEntity(
             id=entity_id,
             name=f"#{raw}",
-            name_lower=raw_lower,
+            name_lower=name_lower,
             label=EntityType.Hashtag,
             properties={"normalized": normalized},
         ))
         id_map[raw] = entity_id
-        id_map[raw_lower] = entity_id
+        id_map[name_lower] = entity_id
 
     for tag in input_raw_tags:
         if len(hashtag_items) >= MAX_HASHTAGS:
             break
-        tag_lower = tag.lower()
-        if tag_lower in seen_raw_lower:
-            continue
         if _is_garbage_hashtag(tag):
             continue
-        seen_raw_lower.add(tag_lower)
+        name_lower = clean_name_lower(tag)
+        if name_lower in seen_name_lower:
+            continue
+        seen_name_lower.add(name_lower)
 
         hashtag_items.append(HashtagItem(raw=tag, normalized=tag))
 
-        entity_id = build_node_id(EntityType.Hashtag, tag_lower)
+        entity_id = build_node_id(EntityType.Hashtag, name_lower)
         entities.append(ExtractedEntity(
             id=entity_id,
             name=f"#{tag}",
-            name_lower=tag_lower,
+            name_lower=name_lower,
             label=EntityType.Hashtag,
             properties={"normalized": tag},
         ))
         id_map[tag] = entity_id
-        id_map[tag_lower] = entity_id
+        id_map[name_lower] = entity_id
 
     return hashtag_items, entities, id_map
 
 
 def _create_structural_relations(
-    entities: list[ExtractedEntity],
     microconcepts: list[ExtractedEntity],
     hashtag_entities: list[ExtractedEntity],
     pub_node_id: str,
     author_node_id: str,
     context: PostBatchContext,
-) -> tuple[list[ExtractedEntity], list[ExtractedRelation]]:
-    extra_entities: list[ExtractedEntity] = []
+) -> list[ExtractedRelation]:
     relations: list[ExtractedRelation] = []
     post_label = EntityType.Post
 
@@ -771,7 +765,7 @@ def _create_structural_relations(
                 properties={"platform": context.platform, "post_id": pub_node_id},
             ))
 
-    return extra_entities, relations
+    return relations
 
 
 class GraphExtractor:
@@ -953,8 +947,7 @@ class GraphExtractor:
                             ))
                         except (ValidationError, ValueError):
                             continue
-                extra_entities, structural_relations = _create_structural_relations(
-                    entities,
+                structural_relations = _create_structural_relations(
                     microconcept_entities,
                     hashtag_entities,
                     context.pub_node_id,
@@ -968,7 +961,6 @@ class GraphExtractor:
                 thinking = str(parsed.get("thinking", ""))
 
                 entities.extend(hashtag_entities)
-                entities.extend(extra_entities)
 
                 seen_entity_ids: set[str] = set()
                 deduped_entities: list[ExtractedEntity] = []

@@ -169,8 +169,8 @@ class Neo4jClient:
             if is_domain_entity:
                 await self.execute_write(
                     f"UNWIND $batch AS row MERGE (n:{label_str} {{id: row.id}}) "
-                    f"ON CREATE SET n += row, n.mentions_count = coalesce(row.mentions_count, 1) "
-                    f"ON MATCH SET n += row, n.mentions_count = coalesce(n.mentions_count, 0) + 1",
+                    f"ON CREATE SET n += row, n.mentions_count = coalesce(row.batch_mentions_count, row.mentions_count, 1) "
+                    f"ON MATCH SET n += row, n.mentions_count = coalesce(n.mentions_count, 0) + coalesce(row.batch_mentions_count, 1)",
                     {"batch": batch},
                 )
             else:
