@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from src.graph.utils import clean_name_lower, is_author_entity
+from src.graph.utils import build_node_id, clean_identifier, clean_name_lower, is_author_entity, is_garbage_value
 
 import logging
 
@@ -114,6 +114,24 @@ class EventType(StrEnum):
     festival = "festival"
     competition = "competition"
     incident = "incident"
+
+
+PRODUCT_TYPE_VALUES: frozenset[str] = frozenset({e.value for e in ProductType})
+ORG_TYPE_VALUES: frozenset[str] = frozenset({e.value for e in OrgType})
+ENTITY_CATEGORY_VALUES: frozenset[str] = frozenset({e.value for e in EntityCategory})
+EVENT_TYPE_VALUES: frozenset[str] = frozenset({e.value for e in EventType})
+
+PREFIX_TO_LABEL_MAP: dict[str, EntityType] = {
+    "event_publication_": EntityType.Post,
+    "microconcept_": EntityType.MicroConcept,
+    "organization_": EntityType.Organization,
+    "hashtag_": EntityType.Hashtag,
+    "concept_": EntityType.Concept,
+    "product_": EntityType.Product,
+    "entity_": EntityType.Entity,
+    "actor_": EntityType.Actor,
+    "event_": EntityType.Event,
+}
 
 
 class RoleType(StrEnum):
@@ -228,6 +246,10 @@ def validate_and_repair_relation(
             return (source_id, source_label, target_id, target_label, relation_type)
         if source_label == EntityType.MicroConcept and target_label == EntityType.Concept:
             return (source_id, source_label, target_id, target_label, relation_type)
+        if target_label in {EntityType.Entity, EntityType.Product, EntityType.Organization, EntityType.Event} and source_label == EntityType.MicroConcept:
+            return (target_id, target_label, source_id, source_label, relation_type)
+        if target_label == EntityType.MicroConcept and source_label == EntityType.Concept:
+            return (target_id, target_label, source_id, source_label, relation_type)
         return None
     if source_label in rule["sources"] and target_label in rule["targets"]:
         return (source_id, source_label, target_id, target_label, relation_type)
@@ -504,8 +526,6 @@ class OpenSPGExtractionResult(BaseModel):
         author_title: str | None = None,
         author_handle: str | None = None,
     ) -> OpenSPGExtractionResult:
-        from src.graph.utils import build_node_id, is_garbage_value
-
         phantom_names = frozenset({"<name>", "unknown", "null", "none", "n/a", ""})
         valid_ids = set(allowed_ids) if allowed_ids else set()
         clean_entities: list[ExtractedEntity] = []
@@ -581,7 +601,8 @@ class OpenSPGExtractionResult(BaseModel):
         self.entities = clean_entities
 
         for h in self.hashtags:
-            valid_ids.add(f"hashtag_{h.normalized}")
+            valid_ids.add(build_node_id(EntityType.Hashtag, h.raw))
+            valid_ids.add(build_node_id(EntityType.Hashtag, h.normalized))
 
         clean_relations: list[ExtractedRelation] = []
         for r in self.relations:

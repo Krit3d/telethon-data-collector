@@ -36,6 +36,13 @@ _RELATION_PROPERTY_KEYS: dict[RelationType, frozenset[str]] = {
     RelationType.WORKS_AT: frozenset({"role"}),
     RelationType.USES_TECH: frozenset({"proficiency"}),
     RelationType.PARTICIPATED_IN: frozenset({"role"}),
+    RelationType.COAUTHOR: frozenset({"platform", "post_id"}),
+    RelationType.RELATED_TO: frozenset({"relation_name", "weight"}),
+    RelationType.ABOUT: frozenset({"weight"}),
+    RelationType.COVERS_TOPIC: frozenset({"posts_count", "weight"}),
+    RelationType.PARENT_OF: frozenset({"depth"}),
+    RelationType.TAGGED_WITH: frozenset(),
+    RelationType.MAPS_TO: frozenset(),
 }
 
 
@@ -228,6 +235,16 @@ class GraphWriter:
                     sim = filtered_props.get("similarity")
                     if sim is not None:
                         filtered_props["similarity"] = float(sim)
+
+                if rel.relation_type in (RelationType.ABOUT, RelationType.RELATED_TO, RelationType.COVERS_TOPIC):
+                    weight = filtered_props.get("weight")
+                    if weight is not None:
+                        filtered_props["weight"] = float(weight)
+
+                if rel.relation_type == RelationType.MENTIONS:
+                    confidence = filtered_props.get("confidence")
+                    if confidence is not None:
+                        filtered_props["confidence"] = float(confidence)
 
                 rel_props = {
                     "source_id": rel.source_id,

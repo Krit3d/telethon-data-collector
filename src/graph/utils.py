@@ -9,9 +9,10 @@ from typing import Any
 
 _NON_ALNUM_WS_RE = re.compile(r"[^\w\s]")
 _MULTI_WS_RE = re.compile(r"\s+")
-_HASHTAG_RE = re.compile(r"#\w+")
 _HASHTAG_EXTRACT_RE = re.compile(r"#([\w_]+)")
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
+
+_ALNUM_KEEP_RE = re.compile(r"[^\w]")
 
 _SYSTEM_GARBAGE: frozenset[str] = frozenset({
     "name", "unknown", "null", "none", "undefined",
@@ -34,28 +35,28 @@ _POST_GARBAGE: frozenset[str] = frozenset({
 })
 
 _ENTITY_GARBAGE: frozenset[str] = frozenset({
-    "entity", "entities", "object", "term", "person",
+    "entity", "entities", "object", "term", "person", "technology", "method", "general",
     "сущность", "сущности", "объект", "термин", "понятие", "персоналия",
 })
 
 _ORGANIZATION_GARBAGE: frozenset[str] = frozenset({
-    "organization", "company", "brand", "agency", "media",
+    "organization", "company", "brand", "agency", "media", "non_profit",
     "организация", "организации", "компания", "компании",
     "бренд", "агентство", "сми", "фирма", "предприятие",
 })
 
 _PRODUCT_GARBAGE: frozenset[str] = frozenset({
-    "product", "products", "service", "software", "app", "gadget", "course",
+    "product", "products", "service", "software", "app", "gadget", "course", "physical_good",
     "продукт", "продукты", "сервис", "товар", "товары",
     "услуга", "услуги", "приложение", "софт", "гаджет", "курс",
 })
 
 _EVENT_GARBAGE: frozenset[str] = frozenset({
-    "event", "events", "incident", "conference", "festival",
+    "event", "events", "incident", "conference", "festival", "competition",
     "событие", "события", "мероприятие", "мероприятия",
     "инфоповод", "конференция", "фестиваль", "ивент",
     "соревнование", "турнир", "конкурс", "хакатон", "премия",
-    "competition", "contest", "tournament", "hackathon", "award",
+    "contest", "tournament", "hackathon", "award",
 })
 
 _MICROCONCEPT_GARBAGE: frozenset[str] = frozenset({
@@ -71,6 +72,10 @@ _CONCEPT_GARBAGE: frozenset[str] = frozenset({
 _HASHTAG_GARBAGE: frozenset[str] = frozenset({
     "hashtag", "hashtags", "tag",
     "хештег", "хэштег", "метки",
+})
+
+GEO_NOISE_TYPES: frozenset[str] = frozenset({
+    "city", "country", "location", "place", "region", "geo", "state", "town", "village", "district",
 })
 
 _GARBAGE_WORDS: frozenset[str] = (
@@ -109,6 +114,16 @@ def clean_name_lower(name: str) -> str:
     name = name.replace("_", " ")
     name = _MULTI_WS_RE.sub(" ", name)
     return name.strip().lower()
+
+
+def clean_compact_name(name: str) -> str:
+    name = unicodedata.normalize("NFKC", name)
+    name = name.lower()
+    name = name.replace("#", "").replace("@", "")
+    name = name.replace("\"", "").replace("'", "")
+    name = name.replace(" ", "").replace("-", "").replace("_", "")
+    name = _ALNUM_KEEP_RE.sub("", name)
+    return name
 
 
 def is_author_entity(name: str, author_title: str, author_handle: str | None = None) -> bool:
@@ -231,9 +246,11 @@ def build_node_id(
     label_str = _resolve_label(label)
     match label_str:
         case "Actor":
-            if platform is None or account_id is None:
-                raise ValueError("platform and account_id are required for Actor")
-            return f"actor_{platform.strip().lower()}_{account_id}"
+            if account_id is not None and platform is not None:
+                return f"actor_{platform.strip().lower()}_{account_id}"
+            if account_id is None and platform is not None and key:
+                return f"actor_{platform.strip().lower()}_{clean_identifier(key)}"
+            raise ValueError("platform and either account_id or key (handle) are required for Actor")
         case "Post":
             if platform is None or account_id is None or content_id is None:
                 raise ValueError("platform, account_id, and content_id are required for Post")
@@ -261,10 +278,6 @@ def format_bge_representation(label: str, name: str, subtype: str | None = None)
     return f"{label}: {name}"
 
 
-def extract_hashtags(text: str) -> list[str]:
-    return _HASHTAG_RE.findall(text)
-
-
 def extract_raw_hashtags(
     text: str | None,
     raw_metadata_hashtags: list[str] | list[dict[str, Any]] | None = None,
@@ -286,18 +299,34 @@ def extract_raw_hashtags(
     _collect(author_bio)
     _collect(author_title)
 
-    if raw_metadata_hashtags:
-        for item in raw_metadata_hashtags:
-            if isinstance(item, str):
-                cleaned = clean_identifier(item)
-                if cleaned and not is_garbage_value(cleaned, "Hashtag"):
-                    result.add(cleaned)
-            elif isinstance(item, dict):
+    if raw_metadata_hashtags is not None:
+        if isinstance(raw_metadata_hashtags, str):
+            items: list[Any] = [raw_metadata_hashtags]
+        elif isinstance(raw_metadata_hashtags, set):
+            items = list(raw_metadata_hashtags)
+        else:
+            items = raw_metadata_hashtags
+
+        for item in items:
+            if isinstance(item, dict):
                 for v in item.values():
                     if isinstance(v, str):
-                        cleaned = clean_identifier(v)
-                        if cleaned and not is_garbage_value(cleaned, "Hashtag"):
-                            result.add(cleaned)
+                        for token in v.replace(",", " ").split():
+                            cleaned = clean_identifier(token)
+                            if cleaned and not is_garbage_value(cleaned, "Hashtag"):
+                                result.add(cleaned)
+                    elif isinstance(v, list):
+                        for sub in v:
+                            if isinstance(sub, str):
+                                for token in sub.replace(",", " ").split():
+                                    cleaned = clean_identifier(token)
+                                    if cleaned and not is_garbage_value(cleaned, "Hashtag"):
+                                        result.add(cleaned)
+            elif isinstance(item, str):
+                for token in item.replace(",", " ").split():
+                    cleaned = clean_identifier(token)
+                    if cleaned and not is_garbage_value(cleaned, "Hashtag"):
+                        result.add(cleaned)
 
     return sorted(result)
 

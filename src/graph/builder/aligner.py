@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
+from typing import Any
 
 from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, RateLimitError
 from qdrant_client import AsyncQdrantClient
@@ -23,15 +24,15 @@ from src.graph.ontology import (
     VECTORIZABLE_ENTITY_LABELS,
     extract_entity_subtype,
 )
-from src.graph.utils import build_node_id, clean_identifier, clean_name_lower, format_bge_representation, format_display_name
+from src.graph.utils import build_node_id, clean_compact_name, clean_identifier, clean_name_lower, format_bge_representation, format_display_name
 
 logger = logging.getLogger(__name__)
 
 _L1_CACHE_MAX = 50_000
 _EMBEDDING_RETRIES = 3
 _ENTITY_SCORE_THRESHOLD = 0.88
-_CATEGORY_SCORE_GAP = 0.03
-_CATEGORY_MIN_SCORE = 0.55
+_CATEGORY_MIN_SCORE = 0.68
+_CATEGORY_DEPTH_DELTA = 0.05
 _HASHTAG_ENTITY_SCORE_THRESHOLD = 0.85
 
 _CANONICAL_ENTITY_LABELS: frozenset[str] = frozenset({
@@ -39,7 +40,6 @@ _CANONICAL_ENTITY_LABELS: frozenset[str] = frozenset({
     EntityType.Organization.value,
     EntityType.Entity.value,
     EntityType.Event.value,
-    EntityType.Hashtag.value,
 })
 
 
@@ -234,6 +234,49 @@ class Aligner:
         if resolved_count:
             logger.debug("Actor mention resolution: resolved %d entities to Actor nodes", resolved_count)
 
+    async def _resolve_coauthors(
+        self,
+        extraction_result: OpenSPGExtractionResult,
+        context: PostBatchContext,
+        id_map: dict[str, str],
+    ) -> None:
+        if not context.post_coauthors:
+            return
+
+        unresolved_temp_ids: set[str] = set()
+        for ca in context.post_coauthors:
+            clean_ca = clean_identifier(ca)
+            if not clean_ca:
+                continue
+            temp_id = build_node_id(EntityType.Actor, clean_ca, platform=context.platform)
+            cache_key = f"Actor:{clean_name_lower(clean_ca)}"
+            cached = self._l1_cache.get(cache_key)
+            if cached is not None:
+                id_map[temp_id] = cached
+                self._l1_cache.move_to_end(cache_key)
+                continue
+            try:
+                rows = await self._neo4j_client.execute_read(
+                    "MATCH (a:Actor) WHERE (a.handle = $handle OR a.name_lower = $name_lower) AND toLower(a.platform) = $platform RETURN a.id AS id LIMIT 1",
+                    {"handle": clean_ca, "name_lower": clean_name_lower(clean_ca), "platform": context.platform.lower()},
+                )
+                if rows:
+                    raw_id = rows[0].get("id")
+                    if isinstance(raw_id, str):
+                        self._cache_set(cache_key, raw_id)
+                        id_map[temp_id] = raw_id
+                        continue
+            except Exception as exc:
+                logger.warning("Neo4j coauthor lookup failed for %s: %s", ca, exc)
+                continue
+            unresolved_temp_ids.add(temp_id)
+
+        if unresolved_temp_ids:
+            extraction_result.relations = [
+                r for r in extraction_result.relations
+                if not (r.relation_type == RelationType.COAUTHOR and r.target_id in unresolved_temp_ids)
+            ]
+
     async def _link_microconcepts(
         self,
         microconcepts: list[ExtractedEntity],
@@ -272,7 +315,7 @@ class Aligner:
                     models.QueryRequest(
                         query=emb,
                         using="text",
-                        limit=3,
+                        limit=10,
                         with_payload=True,
                     )
                     for emb in embeddings
@@ -291,20 +334,41 @@ class Aligner:
                 {"score": hit.score, "payload": hit.payload or {}}
                 for hit in response.points
             ]
-            chosen = hit_candidates[0]
-            if float(chosen["score"]) < _CATEGORY_MIN_SCORE:
+            valid: list[dict[str, Any]] = [
+                cand for cand in hit_candidates
+                if float(cand["score"]) >= _CATEGORY_MIN_SCORE
+            ]
+            if not valid:
                 continue
-            if (
-                len(hit_candidates) >= 2
-                and (hit_candidates[0]["score"] - hit_candidates[1]["score"]) < _CATEGORY_SCORE_GAP
-                and context.account_category_id
-            ):
+            for cand in valid:
+                payload = cand["payload"]
+                if payload.get("tier_4"):
+                    cand["_depth"] = 4
+                elif payload.get("tier_3"):
+                    cand["_depth"] = 3
+                elif payload.get("tier_2"):
+                    cand["_depth"] = 2
+                elif payload.get("tier_1"):
+                    cand["_depth"] = 1
+                else:
+                    cand["_depth"] = 0
+            max_score = max(float(cand["score"]) for cand in valid)
+            delta_window = [
+                cand for cand in valid
+                if float(cand["score"]) >= max_score - _CATEGORY_DEPTH_DELTA
+            ]
+            chosen: dict[str, Any] | None = None
+            if context.account_category_id:
                 matched = next(
-                    (c for c in hit_candidates if str(c["payload"].get("code")).strip().lower() == str(context.account_category_id).strip().lower()),
+                    (c for c in delta_window if str(c["payload"].get("code")).strip().lower() == str(context.account_category_id).strip().lower()),
                     None,
                 )
                 if matched is not None:
                     chosen = matched
+            if chosen is None:
+                max_depth = max(int(cand["_depth"]) for cand in delta_window)
+                deepest = [cand for cand in delta_window if int(cand["_depth"]) == max_depth]
+                chosen = max(deepest, key=lambda c: float(c["score"]))
             code = chosen["payload"].get("code")
             if not code:
                 continue
@@ -379,130 +443,289 @@ class Aligner:
                     )
                     existing_relation_keys.add(tagged_key)
 
-        normalized_texts = [ht.normalized for ht in unique]
-        try:
-            embeddings = await self._get_embeddings_batch(normalized_texts)
-        except Exception as exc:
-            logger.warning("Embedding generation failed in _link_hashtags: %s", exc)
-            return
-
-        if len(embeddings) != len(unique):
-            return
-
-        t0 = time.perf_counter()
-
-        async def _query_social_entities() -> list[models.QueryResponse] | None:
-            try:
-                return await self._qdrant_client.query_batch_points(
-                    collection_name=ENTITIES_COLLECTION,
-                    requests=[
-                        models.QueryRequest(
-                            query=emb,
-                            using="text",
-                            limit=1,
-                            score_threshold=_HASHTAG_ENTITY_SCORE_THRESHOLD,
-                            with_payload=True,
-                        )
-                        for emb in embeddings
-                    ],
-                )
-            except Exception as exc:
-                logger.warning("Qdrant social_entities query failed in _link_hashtags: %s", exc)
-                return None
-
-        async def _query_categories() -> list[models.QueryResponse] | None:
-            try:
-                return await self._qdrant_client.query_batch_points(
-                    collection_name=CATEGORIES_COLLECTION,
-                    requests=[
-                        models.QueryRequest(
-                            query=emb,
-                            using="text",
-                            limit=1,
-                            score_threshold=_CATEGORY_MIN_SCORE,
-                            with_payload=True,
-                        )
-                        for emb in embeddings
-                    ],
-                )
-            except Exception as exc:
-                logger.warning("Qdrant categories query failed in _link_hashtags: %s", exc)
-                return None
-
-        social_resp, cat_resp = await asyncio.gather(
-            _query_social_entities(),
-            _query_categories(),
-        )
-
-        qdrant_elapsed = (time.perf_counter() - t0) * 1000
-
+        unresolved: list[HashtagItem] = []
         maps_to_count = 0
-        belongs_to_count = 0
 
-        if social_resp is not None:
-            for ht, response in zip(unique, social_resp):
-                if not response.points:
+        for ht in unique:
+            ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
+            raw_lower = clean_name_lower(ht.raw)
+            norm_lower = clean_name_lower(ht.normalized)
+            raw_compact = clean_compact_name(ht.raw)
+            norm_compact = clean_compact_name(ht.normalized)
+
+            resolved = False
+            for entity in extraction_result.entities:
+                if entity.label not in (EntityType.MicroConcept, EntityType.Entity, EntityType.Product, EntityType.Organization, EntityType.Event):
                     continue
-                hit = response.points[0]
-                if hit.score < _HASHTAG_ENTITY_SCORE_THRESHOLD:
+                if not entity.id:
                     continue
-                payload = hit.payload or {}
-                canonical_label = payload.get("label") or payload.get("Label")
-                if not canonical_label or canonical_label not in _CANONICAL_ENTITY_LABELS:
-                    continue
-                try:
-                    target_label = EntityType(canonical_label)
-                except ValueError:
-                    continue
-                canonical_name = format_display_name(str(payload.get("name") or payload.get("title") or canonical_label), target_label)
-                canonical_id = build_node_id(target_label, canonical_name)
-                ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
-                if canonical_id not in existing_entity_ids:
-                    match target_label:
-                        case EntityType.Product:
-                            type_val = payload.get("product_type")
-                            if not type_val:
-                                logger.warning("Hashtag '%s' -> Product: missing 'product_type' in payload, skipping MAPS_TO for canonical '%s'", ht.raw, canonical_name)
-                                continue
-                            props: dict[str, object] = {"product_type": type_val}
-                        case EntityType.Event:
-                            type_val = payload.get("event_type")
-                            if not type_val:
-                                logger.warning("Hashtag '%s' -> Event: missing 'event_type' in payload, skipping MAPS_TO for canonical '%s'", ht.raw, canonical_name)
-                                continue
-                            props = {"event_type": type_val}
-                        case EntityType.Organization:
-                            type_val = payload.get("org_type")
-                            if not type_val:
-                                logger.warning("Hashtag '%s' -> Organization: missing 'org_type' in payload, skipping MAPS_TO for canonical '%s'", ht.raw, canonical_name)
-                                continue
-                            props = {"org_type": type_val}
-                        case EntityType.Entity:
-                            type_val = payload.get("entity_type")
-                            if not type_val:
-                                logger.warning("Hashtag '%s' -> Entity: missing 'entity_type' in payload, skipping MAPS_TO for canonical '%s'", ht.raw, canonical_name)
-                                continue
-                            props = {"entity_type": type_val}
-                        case _:
-                            props = {}
-                    extraction_result.entities.append(
-                        ExtractedEntity(
-                            id=canonical_id,
-                            name=canonical_name,
-                            name_lower=clean_name_lower(canonical_name),
-                            label=target_label,
-                            properties=props,
+                el_lower = clean_name_lower(entity.name)
+                el_compact = clean_compact_name(entity.name)
+
+                matched = False
+                if el_lower == raw_lower or el_lower == norm_lower:
+                    matched = True
+                elif el_compact and (el_compact == raw_compact or el_compact == norm_compact):
+                    matched = True
+                elif len(el_compact) >= 4 and (raw_compact and el_compact in raw_compact or norm_compact and el_compact in norm_compact):
+                    matched = True
+
+                if matched:
+                    maps_to_key = (ht_node_id, entity.id, RelationType.MAPS_TO.value)
+                    if maps_to_key not in existing_relation_keys:
+                        extraction_result.relations.append(
+                            ExtractedRelation(
+                                source_id=ht_node_id,
+                                source_label=EntityType.Hashtag,
+                                target_id=entity.id,
+                                target_label=entity.label,
+                                relation_type=RelationType.MAPS_TO,
+                                properties={},
+                            )
                         )
+                        existing_relation_keys.add(maps_to_key)
+                        maps_to_count += 1
+                    resolved = True
+                    break
+            if not resolved:
+                unresolved.append(ht)
+
+        if unresolved:
+            l2_names: list[str] = []
+            l2_node_ids: list[str] = []
+            for ht in unresolved:
+                raw_lower = clean_name_lower(ht.raw)
+                norm_lower = clean_name_lower(ht.normalized)
+                l2_names.append(raw_lower)
+                if norm_lower != raw_lower:
+                    l2_names.append(norm_lower)
+                mc_id_raw = build_node_id(EntityType.MicroConcept, ht.raw)
+                mc_id_norm = build_node_id(EntityType.MicroConcept, ht.normalized)
+                l2_node_ids.append(mc_id_raw)
+                if mc_id_norm != mc_id_raw:
+                    l2_node_ids.append(mc_id_norm)
+
+            l2_rows: list[dict[str, Any]] = []
+            try:
+                l2_rows = await self._neo4j_client.execute_read(
+                    "MATCH (n) WHERE (n:MicroConcept OR n:Entity OR n:Product OR n:Organization OR n:Event) "
+                    "AND (n.name_lower IN $names OR n.id IN $node_ids) "
+                    "RETURN n.id AS id, labels(n) AS labels, n.name AS name, n.name_lower AS name_lower, properties(n) AS props",
+                    {"names": l2_names, "node_ids": l2_node_ids},
+                )
+            except Exception as exc:
+                logger.warning("Neo4j L2 hashtag lookup failed: %s", exc)
+
+            if l2_rows:
+                l2_found_ids: set[str] = set()
+                for row in l2_rows:
+                    node_id = row.get("id")
+                    if not node_id:
+                        continue
+                    node_labels: list[str] = row.get("labels", [])
+                    node_name = row.get("name") or ""
+                    node_name_lower = row.get("name_lower") or clean_name_lower(node_name)
+                    canonical_label: EntityType | None = None
+                    for lbl in (EntityType.MicroConcept, EntityType.Entity, EntityType.Product, EntityType.Organization, EntityType.Event):
+                        if lbl.value in node_labels:
+                            canonical_label = lbl
+                            break
+                    if canonical_label is None:
+                        continue
+                    if node_id not in existing_entity_ids:
+                        node_props: dict[str, Any] = row.get("props") or {}
+                        match canonical_label:
+                            case EntityType.Product:
+                                props: dict[str, object] = {"product_type": str(node_props.get("product_type") or "service")}
+                            case EntityType.Organization:
+                                props = {"org_type": str(node_props.get("org_type") or "company")}
+                            case EntityType.Entity:
+                                props = {"entity_type": str(node_props.get("entity_type") or "general")}
+                            case EntityType.Event:
+                                props = {"event_type": str(node_props.get("event_type") or "incident")}
+                            case EntityType.MicroConcept:
+                                props = {"is_classified": bool(node_props.get("is_classified", False))}
+                            case _:
+                                props = {}
+                        extraction_result.entities.append(
+                            ExtractedEntity(
+                                id=node_id,
+                                name=node_name,
+                                name_lower=node_name_lower,
+                                label=canonical_label,
+                                properties=props,
+                            )
+                        )
+                        existing_entity_ids.add(node_id)
+                    l2_found_ids.add(node_id)
+
+                for ht in unresolved:
+                    ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
+                    if any(
+                        (ht_node_id, eid, RelationType.MAPS_TO.value) in existing_relation_keys
+                        for eid in l2_found_ids
+                    ):
+                        continue
+                    raw_lower = clean_name_lower(ht.raw)
+                    norm_lower = clean_name_lower(ht.normalized)
+                    mc_id_raw = build_node_id(EntityType.MicroConcept, ht.raw)
+                    mc_id_norm = build_node_id(EntityType.MicroConcept, ht.normalized)
+                    matched_id: str | None = None
+                    matched_label: EntityType | None = None
+                    for row in l2_rows:
+                        node_id = row.get("id")
+                        if not node_id:
+                            continue
+                        row_name_lower = row.get("name_lower") or ""
+                        if row_name_lower in (raw_lower, norm_lower) or node_id in (mc_id_raw, mc_id_norm):
+                            matched_id = node_id
+                            node_labels: list[str] = row.get("labels", [])
+                            for lbl in (EntityType.MicroConcept, EntityType.Entity, EntityType.Product, EntityType.Organization, EntityType.Event):
+                                if lbl.value in node_labels:
+                                    matched_label = lbl
+                                    break
+                            break
+                    if matched_id and matched_label:
+                        maps_to_key = (ht_node_id, matched_id, RelationType.MAPS_TO.value)
+                        if maps_to_key not in existing_relation_keys:
+                            extraction_result.relations.append(
+                                ExtractedRelation(
+                                    source_id=ht_node_id,
+                                    source_label=EntityType.Hashtag,
+                                    target_id=matched_id,
+                                    target_label=matched_label,
+                                    relation_type=RelationType.MAPS_TO,
+                                    properties={},
+                                )
+                            )
+                            existing_relation_keys.add(maps_to_key)
+                            maps_to_count += 1
+
+            still_unresolved = [
+                ht for ht in unresolved
+                if not any(
+                    (build_node_id(EntityType.Hashtag, ht.raw), eid, RelationType.MAPS_TO.value) in existing_relation_keys
+                    for eid in (l2_found_ids if l2_rows else set())
+                )
+            ]
+
+            if still_unresolved:
+                normalized_texts = [ht.normalized for ht in still_unresolved]
+                try:
+                    embeddings = await self._get_embeddings_batch(normalized_texts)
+                except Exception as exc:
+                    logger.warning("Embedding generation failed in _link_hashtags L3: %s", exc)
+                    embeddings = []
+
+                if embeddings and len(embeddings) == len(still_unresolved):
+                    t0 = time.perf_counter()
+                    try:
+                        batch_response = await self._qdrant_client.query_batch_points(
+                            collection_name=ENTITIES_COLLECTION,
+                            requests=[
+                                models.QueryRequest(
+                                    query=emb,
+                                    using="text",
+                                    limit=1,
+                                    score_threshold=_HASHTAG_ENTITY_SCORE_THRESHOLD,
+                                    with_payload=True,
+                                )
+                                for emb in embeddings
+                            ],
+                        )
+                    except Exception as exc:
+                        logger.warning("Qdrant entities query failed in _link_hashtags L3: %s", exc)
+                        batch_response = []
+
+                    qdrant_elapsed = (time.perf_counter() - t0) * 1000
+
+                    for ht, response in zip(still_unresolved, batch_response):
+                        ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
+                        if not response or not response.points:
+                            continue
+                        hit = response.points[0]
+                        if hit.score < _HASHTAG_ENTITY_SCORE_THRESHOLD:
+                            continue
+                        payload = hit.payload or {}
+                        canonical_label = payload.get("label") or payload.get("Label")
+                        if not canonical_label or canonical_label not in _CANONICAL_ENTITY_LABELS:
+                            continue
+                        try:
+                            target_label = EntityType(canonical_label)
+                        except ValueError:
+                            continue
+                        canonical_name = format_display_name(
+                            str(payload.get("name") or payload.get("title") or canonical_label),
+                            target_label,
+                        )
+                        canonical_id = build_node_id(target_label, canonical_name)
+                        if canonical_id not in existing_entity_ids:
+                            match target_label:
+                                case EntityType.Product:
+                                    props: dict[str, object] = {"product_type": str(payload.get("product_type") or "service")}
+                                case EntityType.Event:
+                                    props = {"event_type": str(payload.get("event_type") or "incident")}
+                                case EntityType.Organization:
+                                    props = {"org_type": str(payload.get("org_type") or "company")}
+                                case EntityType.Entity:
+                                    props = {"entity_type": str(payload.get("entity_type") or "general")}
+                                case _:
+                                    props = {}
+                            extraction_result.entities.append(
+                                ExtractedEntity(
+                                    id=canonical_id,
+                                    name=canonical_name,
+                                    name_lower=clean_name_lower(canonical_name),
+                                    label=target_label,
+                                    properties=props,
+                                )
+                            )
+                            existing_entity_ids.add(canonical_id)
+                        maps_to_key = (ht_node_id, canonical_id, RelationType.MAPS_TO.value)
+                        if maps_to_key not in existing_relation_keys:
+                            extraction_result.relations.append(
+                                ExtractedRelation(
+                                    source_id=ht_node_id,
+                                    source_label=EntityType.Hashtag,
+                                    target_id=canonical_id,
+                                    target_label=target_label,
+                                    relation_type=RelationType.MAPS_TO,
+                                    properties={},
+                                )
+                            )
+                            existing_relation_keys.add(maps_to_key)
+                            maps_to_count += 1
+
+                    logger.debug(
+                        "Qdrant hashtag L3 search for %d hashtags done in %.1fms | MAPS_TO: %d",
+                        len(still_unresolved), qdrant_elapsed, maps_to_count,
                     )
-                    existing_entity_ids.add(canonical_id)
-                maps_to_key = (ht_node_id, canonical_id, RelationType.MAPS_TO.value)
+
+        microconcepts_in_post = [
+            e for e in extraction_result.entities
+            if e.label == EntityType.MicroConcept and e.id
+        ]
+        if microconcepts_in_post:
+            for ht in unresolved:
+                ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
+                already_mapped = any(
+                    src == ht_node_id and rel == RelationType.MAPS_TO.value
+                    for src, _, rel in existing_relation_keys
+                )
+                if already_mapped:
+                    continue
+                target_mc = microconcepts_in_post[0]
+                mc_id = target_mc.id
+                if not mc_id:
+                    continue
+                maps_to_key = (ht_node_id, mc_id, RelationType.MAPS_TO.value)
                 if maps_to_key not in existing_relation_keys:
                     extraction_result.relations.append(
                         ExtractedRelation(
                             source_id=ht_node_id,
                             source_label=EntityType.Hashtag,
-                            target_id=canonical_id,
-                            target_label=target_label,
+                            target_id=mc_id,
+                            target_label=EntityType.MicroConcept,
                             relation_type=RelationType.MAPS_TO,
                             properties={},
                         )
@@ -510,37 +733,9 @@ class Aligner:
                     existing_relation_keys.add(maps_to_key)
                     maps_to_count += 1
 
-        if cat_resp is not None:
-            for ht, response in zip(unique, cat_resp):
-                if not response.points:
-                    continue
-                hit = response.points[0]
-                if hit.score < _CATEGORY_MIN_SCORE:
-                    continue
-                payload = hit.payload or {}
-                code = payload.get("code")
-                if not code:
-                    continue
-                concept_node_id = build_node_id(EntityType.Concept, code)
-                ht_node_id = build_node_id(EntityType.Hashtag, ht.raw)
-                belongs_to_key = (ht_node_id, concept_node_id, RelationType.BELONGS_TO.value)
-                if belongs_to_key not in existing_relation_keys:
-                    extraction_result.relations.append(
-                        ExtractedRelation(
-                            source_id=ht_node_id,
-                            source_label=EntityType.Hashtag,
-                            target_id=concept_node_id,
-                            target_label=EntityType.Concept,
-                            relation_type=RelationType.BELONGS_TO,
-                            properties={"similarity": round(hit.score, 4)},
-                        )
-                    )
-                    existing_relation_keys.add(belongs_to_key)
-                    belongs_to_count += 1
-
         logger.debug(
-            "Qdrant hashtag search for %d hashtags done in %.1fms | MAPS_TO: %d, BELONGS_TO: %d",
-            len(unique), qdrant_elapsed, maps_to_count, belongs_to_count,
+            "Hashtag linking complete: %d unique hashtags, %d MAPS_TO relations created",
+            len(unique), maps_to_count,
         )
 
     async def align(
@@ -577,9 +772,15 @@ class Aligner:
                     self._cache_set(key, entity.id)
                     id_map[entity.id] = entity.id
 
+        t_coauthor_resolve = time.perf_counter()
+        await self._resolve_coauthors(extraction_result, context, id_map)
+        coauthor_resolve_elapsed = (time.perf_counter() - t_coauthor_resolve) * 1000
+
         t_actor_resolve = time.perf_counter()
         await self._resolve_actor_mentions(extraction_result, context, id_map)
         actor_resolve_elapsed = (time.perf_counter() - t_actor_resolve) * 1000
+
+        resolved_actor_ids = {v for v in id_map.values() if v.startswith("actor_")}
 
         still_missed = [
             e for e in missed
@@ -641,6 +842,20 @@ class Aligner:
                 if relation.target_id in id_map:
                     relation.target_id = id_map[relation.target_id]
 
+        coauthor_ids = {
+            build_node_id(EntityType.Actor, clean_identifier(ca), platform=context.platform)
+            for ca in context.post_coauthors
+            if clean_identifier(ca)
+        }
+
+        concept_ids: set[str] = set()
+        for relation in extraction_result.relations:
+            if relation.relation_type == RelationType.BELONGS_TO and relation.target_label == EntityType.Concept and relation.target_id:
+                concept_ids.add(relation.target_id)
+        for entity in extraction_result.entities:
+            if entity.label == EntityType.Concept and entity.id:
+                concept_ids.add(entity.id)
+
         id_to_label: dict[str, EntityType] = {}
         for entity in extraction_result.entities:
             if entity.id:
@@ -649,6 +864,12 @@ class Aligner:
             id_to_label[context.author_node_id] = EntityType.Actor
         if context.pub_node_id:
             id_to_label[context.pub_node_id] = EntityType.Post
+        for eid in resolved_actor_ids:
+            id_to_label[eid] = EntityType.Actor
+        for eid in coauthor_ids:
+            id_to_label[eid] = EntityType.Actor
+        for eid in concept_ids:
+            id_to_label[eid] = EntityType.Concept
         for relation in extraction_result.relations:
             resolved_source = id_to_label.get(relation.source_id)
             if resolved_source is not None:
@@ -673,25 +894,14 @@ class Aligner:
             deduped_relations.append(relation)
         extraction_result.relations = deduped_relations
 
-        concept_ids: set[str] = set()
-        for relation in extraction_result.relations:
-            if relation.relation_type == RelationType.BELONGS_TO and relation.target_label == EntityType.Concept and relation.target_id:
-                concept_ids.add(relation.target_id)
-        for entity in extraction_result.entities:
-            if entity.label == EntityType.Concept and entity.id:
-                concept_ids.add(entity.id)
-
-        coauthor_ids = {
-            f"actor_{context.platform.lower()}_{clean_identifier(ca)}"
-            for ca in context.post_coauthors
-            if clean_identifier(ca)
-        }
         author_handle = (getattr(context, "author_handle", "") or getattr(context, "author_username", "") or "").strip()
         forbidden_names = {clean_name_lower(context.author_title)}
         if author_handle:
             forbidden_names.add(clean_name_lower(author_handle))
+        allowed_ids = {context.pub_node_id, context.author_node_id} | resolved_actor_ids | coauthor_ids | concept_ids
+        allowed_ids.discard(None)
         extraction_result.sanitize_and_validate(
-            allowed_ids={context.pub_node_id, context.author_node_id} | coauthor_ids | concept_ids,
+            allowed_ids=allowed_ids,
             forbidden_names=forbidden_names,
             author_title=context.author_title,
             author_handle=author_handle,
@@ -700,9 +910,9 @@ class Aligner:
         total_elapsed = (time.perf_counter() - t0) * 1000
         l1_miss = len(missed)
         logger.debug(
-            "Aligner done in %.1fms | L1 cache: %d hit, %d miss | Neo4j lookup: %.1fms | Qdrant social_entities: %.1fms | Actor resolve: %.1fms | Qdrant categories: %.1fms | entities: %d, relations: %d",
+            "Aligner done in %.1fms | L1 cache: %d hit, %d miss | Neo4j lookup: %.1fms | Coauthor resolve: %.1fms | Qdrant social_entities: %.1fms | Actor resolve: %.1fms | Qdrant categories: %.1fms | entities: %d, relations: %d",
             total_elapsed, l1_hits, l1_miss, neo4j_elapsed,
-            qdrant_entities_elapsed, actor_resolve_elapsed, qdrant_categories_elapsed,
+            coauthor_resolve_elapsed, qdrant_entities_elapsed, actor_resolve_elapsed, qdrant_categories_elapsed,
             len(extraction_result.entities), len(extraction_result.relations),
         )
         return extraction_result

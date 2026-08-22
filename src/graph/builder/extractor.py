@@ -17,8 +17,10 @@ from src.config.config import Settings
 from src.graph.builder.prompts import build_system_prompt, build_user_prompt
 from src.graph.builder.reader import PostBatchContext
 from src.graph.ontology import (
+    ENTITY_CATEGORY_VALUES,
     EntityCategory,
     EntityType,
+    EVENT_TYPE_VALUES,
     EventType,
     ExtractedEntity,
     ExtractedPsychographics,
@@ -26,7 +28,10 @@ from src.graph.ontology import (
     HashtagItem,
     HormoneType,
     OpenSPGExtractionResult,
+    ORG_TYPE_VALUES,
     OrgType,
+    PREFIX_TO_LABEL_MAP,
+    PRODUCT_TYPE_VALUES,
     ProductType,
     RelationSubtype,
     RelationType,
@@ -34,7 +39,16 @@ from src.graph.ontology import (
     ToneType,
     _SENTIMENT_VALUES,
 )
-from src.graph.utils import build_node_id, clean_identifier, clean_name_lower, extract_raw_hashtags, format_display_name, is_garbage_value, sanitize_properties
+from src.graph.utils import (
+    GEO_NOISE_TYPES,
+    build_node_id,
+    clean_identifier,
+    clean_name_lower,
+    extract_raw_hashtags,
+    format_display_name,
+    is_garbage_value,
+    sanitize_properties,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,17 +68,16 @@ _GARBAGE_HASHTAGS: frozenset[str] = frozenset({
     "explore", "explorepage",
 })
 
-_PREFIX_LABEL_MAP: dict[str, EntityType] = {
-    "actor_": EntityType.Actor,
-    "event_publication_": EntityType.Post,
-    "microconcept_": EntityType.MicroConcept,
-    "concept_": EntityType.Concept,
-    "hashtag_": EntityType.Hashtag,
-    "organization_": EntityType.Organization,
-    "product_": EntityType.Product,
-    "entity_": EntityType.Entity,
-    "event_": EntityType.Event,
-}
+MAX_HASHTAGS = 15
+
+
+def _is_garbage_hashtag(tag: str) -> bool:
+    tag_lower = tag.lower().strip()
+    if tag_lower in _GARBAGE_HASHTAGS:
+        return True
+    if is_garbage_value(tag, EntityType.Hashtag):
+        return True
+    return False
 
 def _ensure_dict(val: Any) -> dict[str, Any]:
     if isinstance(val, dict):
@@ -348,6 +361,19 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
         )
         if raw_entity_type is not None:
             raw_entity_type = str(raw_entity_type).lower().strip()
+        if raw_entity_type and raw_entity_type in GEO_NOISE_TYPES:
+            continue
+        if raw_entity_type:
+            if label == EntityType.Entity and raw_entity_type in PRODUCT_TYPE_VALUES:
+                label = EntityType.Product
+            elif label == EntityType.Entity and raw_entity_type in ORG_TYPE_VALUES:
+                label = EntityType.Organization
+            elif label == EntityType.Entity and raw_entity_type in EVENT_TYPE_VALUES:
+                label = EntityType.Event
+            elif label == EntityType.Product and raw_entity_type in ENTITY_CATEGORY_VALUES:
+                label = EntityType.Entity
+            elif label == EntityType.Organization and raw_entity_type in PRODUCT_TYPE_VALUES:
+                label = EntityType.Product
         raw_sentiment = str(raw.get("sentiment", "neutral")).strip().lower()
         if raw_sentiment not in _SENTIMENT_VALUES:
             raw_sentiment = "neutral"
@@ -527,7 +553,7 @@ def _parse_relations(
         else:
             raw_source_label = str(raw.get("source_label", "Entity")).strip()
             source_label = None
-            for prefix, etype in _PREFIX_LABEL_MAP.items():
+            for prefix, etype in PREFIX_TO_LABEL_MAP.items():
                 if source_id.startswith(prefix):
                     source_label = etype
                     break
@@ -543,7 +569,7 @@ def _parse_relations(
         else:
             raw_target_label = str(raw.get("target_label", "Entity")).strip()
             target_label = None
-            for prefix, etype in _PREFIX_LABEL_MAP.items():
+            for prefix, etype in PREFIX_TO_LABEL_MAP.items():
                 if target_id.startswith(prefix):
                     target_label = etype
                     break
@@ -635,25 +661,36 @@ def _parse_hashtags(raw_hashtags_llm: Any, input_raw_tags: list[str]) -> tuple[l
     entities: list[ExtractedEntity] = []
     id_map: dict[str, str] = {}
     seen_name_lower: set[str] = set()
-    MAX_HASHTAGS = 7
-
-    def _is_garbage_hashtag(tag: str) -> bool:
-        tag_lower = tag.lower().strip()
-        if tag_lower in _GARBAGE_HASHTAGS:
-            return True
-        if is_garbage_value(tag, EntityType.Hashtag):
-            return True
-        return False
 
     raw_list = _ensure_list(raw_hashtags_llm)
     for item in raw_list:
         if len(hashtag_items) >= MAX_HASHTAGS:
             break
-        if not isinstance(item, dict):
-            continue
-        raw = str(item.get("raw", "")).strip()
-        normalized = str(item.get("normalized", "")).strip()
-        if not raw or not normalized:
+        if isinstance(item, str):
+            raw = item.lstrip("#").strip()
+            if not raw:
+                continue
+            normalized = clean_name_lower(raw)
+        elif isinstance(item, dict):
+            raw = (
+                item.get("raw")
+                or item.get("tag")
+                or item.get("hashtag")
+                or item.get("name")
+            )
+            if raw is None:
+                continue
+            raw = str(raw).lstrip("#").strip()
+            if not raw:
+                continue
+            normalized = (
+                item.get("normalized")
+                or item.get("name")
+                or item.get("tag")
+                or clean_name_lower(raw)
+            )
+            normalized = str(normalized).strip()
+        else:
             continue
         if _is_garbage_hashtag(raw):
             continue
@@ -670,10 +707,12 @@ def _parse_hashtags(raw_hashtags_llm: Any, input_raw_tags: list[str]) -> tuple[l
             name=f"#{raw}",
             name_lower=name_lower,
             label=EntityType.Hashtag,
-            properties={"normalized": normalized},
+            properties={"raw": raw, "normalized": normalized},
         ))
         id_map[raw] = entity_id
         id_map[name_lower] = entity_id
+        id_map[f"#{raw}"] = entity_id
+        id_map[f"#{name_lower}"] = entity_id
 
     for tag in input_raw_tags:
         if len(hashtag_items) >= MAX_HASHTAGS:
@@ -693,10 +732,12 @@ def _parse_hashtags(raw_hashtags_llm: Any, input_raw_tags: list[str]) -> tuple[l
             name=f"#{tag}",
             name_lower=name_lower,
             label=EntityType.Hashtag,
-            properties={"normalized": tag},
+            properties={"raw": tag, "normalized": tag},
         ))
         id_map[tag] = entity_id
         id_map[name_lower] = entity_id
+        id_map[f"#{tag}"] = entity_id
+        id_map[f"#{name_lower}"] = entity_id
 
     return hashtag_items, entities, id_map
 
@@ -755,7 +796,7 @@ def _create_structural_relations(
     for coauthor in context.post_coauthors:
         clean_ca = clean_identifier(coauthor)
         if clean_ca:
-            coauthor_id = f"actor_{context.platform.lower()}_{clean_ca}"
+            coauthor_id = build_node_id(EntityType.Actor, clean_ca, platform=context.platform)
             relations.append(ExtractedRelation(
                 source_id=context.author_node_id,
                 source_label=EntityType.Actor,
@@ -985,7 +1026,7 @@ class GraphExtractor:
                 if author_handle:
                     forbidden_names.add(clean_name_lower(author_handle))
                 coauthor_ids = {
-                    f"actor_{context.platform.lower()}_{clean_identifier(ca)}"
+                    build_node_id(EntityType.Actor, clean_identifier(ca), platform=context.platform)
                     for ca in context.post_coauthors
                     if clean_identifier(ca)
                 }
