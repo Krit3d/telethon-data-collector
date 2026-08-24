@@ -55,6 +55,8 @@ logger = logging.getLogger(__name__)
 _TRUNCATED_TAG_RE = re.compile(r"(?:\.{2,}|…|\.$|[\-\—]$)")
 _INVALID_TAG_CHARS_RE = re.compile(r"[^A-Za-z0-9\s'\-&/]")
 
+_ALLOWED_CONTENT_LABELS: frozenset[EntityType] = frozenset({EntityType.Entity, EntityType.Organization, EntityType.Product, EntityType.Event})
+
 _GARBAGE_HASHTAGS: frozenset[str] = frozenset({
     "fyp", "foryou", "foryoupage", "fypシ", "fy",
     "reels", "reel", "reelsinstagram",
@@ -348,7 +350,7 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
             label = EntityType(raw_label)
         except ValueError:
             continue
-        if label == EntityType.Hashtag:
+        if label not in _ALLOWED_CONTENT_LABELS:
             continue
         if is_garbage_value(name, label):
             continue
@@ -364,14 +366,17 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
         if raw_entity_type and raw_entity_type in GEO_NOISE_TYPES:
             continue
         if raw_entity_type:
-            if label == EntityType.Entity and raw_entity_type in PRODUCT_TYPE_VALUES:
-                label = EntityType.Product
-            elif label == EntityType.Entity and raw_entity_type in ORG_TYPE_VALUES:
-                label = EntityType.Organization
-            elif label == EntityType.Entity and raw_entity_type in EVENT_TYPE_VALUES:
-                label = EntityType.Event
-            elif label == EntityType.Product and raw_entity_type in ENTITY_CATEGORY_VALUES:
+            if label == EntityType.Entity:
+                if raw_entity_type in ORG_TYPE_VALUES:
+                    label = EntityType.Organization
+                elif raw_entity_type in PRODUCT_TYPE_VALUES:
+                    label = EntityType.Product
+                elif raw_entity_type in EVENT_TYPE_VALUES:
+                    label = EntityType.Event
+            elif label == EntityType.Event and raw_entity_type in ENTITY_CATEGORY_VALUES:
                 label = EntityType.Entity
+            elif label == EntityType.Product and raw_entity_type in ORG_TYPE_VALUES:
+                label = EntityType.Organization
             elif label == EntityType.Organization and raw_entity_type in PRODUCT_TYPE_VALUES:
                 label = EntityType.Product
         raw_sentiment = str(raw.get("sentiment", "neutral")).strip().lower()
@@ -389,52 +394,40 @@ def _parse_entities(raw_entities: Any) -> tuple[list[ExtractedEntity], dict[str,
         entity_id = build_node_id(label, name)
         properties: dict[str, Any] = {}
         if label == EntityType.Product:
-            if not raw_entity_type:
+            if not raw_entity_type or raw_entity_type not in PRODUCT_TYPE_VALUES:
                 logger.warning("Dropping invalid Product entity '%s': missing or invalid product_type '%s'", name, raw_entity_type)
                 continue
-            try:
-                properties["product_type"] = ProductType(raw_entity_type).value
-            except ValueError:
-                logger.warning("Dropping invalid Product entity '%s': missing or invalid product_type '%s'", name, raw_entity_type)
-                continue
+            properties["product_type"] = ProductType(raw_entity_type).value
         elif label == EntityType.Organization:
-            if not raw_entity_type:
+            if not raw_entity_type or raw_entity_type not in ORG_TYPE_VALUES:
                 logger.warning("Dropping invalid Organization entity '%s': missing or invalid org_type '%s'", name, raw_entity_type)
                 continue
-            try:
-                properties["org_type"] = OrgType(raw_entity_type).value
-            except ValueError:
-                logger.warning("Dropping invalid Organization entity '%s': missing or invalid org_type '%s'", name, raw_entity_type)
-                continue
+            properties["org_type"] = OrgType(raw_entity_type).value
         elif label == EntityType.Entity:
-            if not raw_entity_type:
+            if not raw_entity_type or raw_entity_type not in ENTITY_CATEGORY_VALUES:
                 logger.warning("Dropping invalid Entity '%s': missing or invalid entity_type '%s'", name, raw_entity_type)
                 continue
-            try:
-                properties["entity_type"] = EntityCategory(raw_entity_type).value
-            except ValueError:
-                logger.warning("Dropping invalid Entity '%s': missing or invalid entity_type '%s'", name, raw_entity_type)
-                continue
+            properties["entity_type"] = EntityCategory(raw_entity_type).value
         elif label == EntityType.Event:
-            if not raw_entity_type:
+            if not raw_entity_type or raw_entity_type not in EVENT_TYPE_VALUES:
                 logger.warning("Dropping invalid Event entity '%s': missing or invalid event_type '%s'", name, raw_entity_type)
                 continue
-            try:
-                properties["event_type"] = EventType(raw_entity_type).value
-            except ValueError:
-                logger.warning("Dropping invalid Event entity '%s': missing or invalid event_type '%s'", name, raw_entity_type)
-                continue
-        result.append(ExtractedEntity(
-            id=entity_id,
-            name=name,
-            name_lower=clean_name_lower(name),
-            label=label,
-            properties=properties,
-            confidence=confidence_val,
-        ))
-        entity_sentiment_map[entity_id] = (raw_sentiment, confidence_val)
-        id_map[name] = entity_id
-        id_map[name.lower()] = entity_id
+            properties["event_type"] = EventType(raw_entity_type).value
+        try:
+            result.append(ExtractedEntity(
+                id=entity_id,
+                name=name,
+                name_lower=clean_name_lower(name),
+                label=label,
+                properties=properties,
+                confidence=confidence_val,
+            ))
+            entity_sentiment_map[entity_id] = (raw_sentiment, confidence_val)
+            id_map[name] = entity_id
+            id_map[name.lower()] = entity_id
+        except (ValidationError, ValueError) as e:
+            logger.warning("Dropping invalid %s entity '%s' due to validation error: %s", label.value, name, e)
+            continue
         raw_mc_list = raw.get("micro_concepts")
         if raw_mc_list and isinstance(raw_mc_list, list):
             for mc_item in raw_mc_list:
@@ -585,14 +578,7 @@ def _parse_relations(
             continue
         raw_properties = raw.get("properties")
         properties: dict[str, Any] = sanitize_properties(dict(raw_properties)) if isinstance(raw_properties, dict) else {}
-        if relation_type == RelationType.ABOUT:
-            raw_weight = properties.get("weight")
-            try:
-                weight_val = float(raw_weight) if raw_weight is not None else 1.0
-            except (TypeError, ValueError):
-                weight_val = 1.0
-            properties["weight"] = weight_val if weight_val > 0.0 else 1.0
-        elif relation_type == RelationType.RELATED_TO:
+        if relation_type == RelationType.RELATED_TO:
             if "weight" not in properties:
                 properties["weight"] = 1.0
             raw_relation_name = properties.get("relation_name")
@@ -641,6 +627,9 @@ def _parse_relations(
         else:
             confidence = 0.8
         properties["confidence"] = confidence
+        if not source_id or not target_id or source_label is None or target_label is None:
+            logger.debug("Skipping relation with invalid source/target: source=%s target=%s source_label=%s target_label=%s type=%s", source_id, target_id, source_label, target_label, raw_rel_type)
+            continue
         try:
             result.append(ExtractedRelation(
                 source_id=source_id,
@@ -650,8 +639,8 @@ def _parse_relations(
                 relation_type=relation_type,
                 properties=properties,
             ))
-        except (ValidationError, ValueError, Exception):
-            logger.debug("Skipping invalid relation: source=%s target=%s type=%s", source_id, target_id, raw_rel_type)
+        except (ValidationError, ValueError) as e:
+            logger.debug("Skipping invalid relation (%s)-[%s]->(%s): %s", source_id, raw_rel_type, target_id, e)
             continue
     return result
 
@@ -779,7 +768,7 @@ def _create_structural_relations(
             target_id=mc.id,
             target_label=EntityType.MicroConcept,
             relation_type=RelationType.ABOUT,
-            properties={"weight": 1.0},
+            properties={},
         ))
 
     for ht in hashtag_entities:

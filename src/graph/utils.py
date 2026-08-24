@@ -134,7 +134,7 @@ def is_author_entity(name: str, author_title: str, author_handle: str | None = N
         return False
     if name_clean == title_clean or (handle_clean and name_clean == handle_clean):
         return True
-    if handle_clean and len(name_clean) >= 4 and name_clean == handle_clean.replace('_', ''):
+    if author_handle and len(name_clean) >= 4 and clean_compact_name(name) == clean_compact_name(author_handle):
         return True
     if title_clean:
         name_tokens = name_clean.split()

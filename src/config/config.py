@@ -102,14 +102,13 @@ class Settings(BaseSettings):
         default=None,
         description="Batch size for Qdrant upsert operations",
     )
-    qdrant_timeout: int | None = Field(
-        default=None,
-        description="Qdrant request timeout in seconds",
-    )
+    qdrant_timeout: int = Field(default=60, description="Qdrant request timeout in seconds")
     qdrant_retries: int | None = Field(
         default=None,
         description="Number of retries for failed Qdrant operations",
     )
+    qdrant_prefer_grpc: bool = Field(default=True, description="Use gRPC transport for Qdrant client")
+    qdrant_grpc_port: int = Field(default=6334, description="Qdrant gRPC port")
 
     # ---- Scrape Creators API settings ----
     scrape_creators_api_key: str | None = Field(

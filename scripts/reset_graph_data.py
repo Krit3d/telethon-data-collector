@@ -25,7 +25,6 @@ NEO4J_LABELS: list[str] = [
     "Actor",
     "Post",
     "Entity",
-    "Place",
     "Organization",
     "Product",
     "Event",

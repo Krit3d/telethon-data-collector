@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import httpx
 import logging
 import random
 import time
@@ -8,6 +9,7 @@ import uuid
 
 from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, RateLimitError
 from qdrant_client import AsyncQdrantClient
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.models import PointStruct
 
 from src.config.config import Settings
@@ -18,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 _EMBEDDING_RETRIES = 3
+_QDRANT_RETRIES = 3
 
 
 class EntityVectorizer:
@@ -30,6 +33,9 @@ class EntityVectorizer:
         self._qdrant_client = AsyncQdrantClient(
             url=settings.qdrant_url,
             api_key=settings.qdrant_api_key,
+            prefer_grpc=settings.qdrant_prefer_grpc,
+            grpc_port=settings.qdrant_grpc_port,
+            timeout=settings.qdrant_timeout,
         )
         self._model = settings.cloud_ru_embedding_model
 
@@ -119,10 +125,21 @@ class EntityVectorizer:
 
         t1 = time.perf_counter()
         if ready:
-            await self._qdrant_client.upsert(
-                collection_name="social_entities",
-                points=ready,
-            )
+            last_error: Exception | None = None
+            for attempt in range(_QDRANT_RETRIES):
+                try:
+                    await self._qdrant_client.upsert(
+                        collection_name="social_entities",
+                        points=ready,
+                    )
+                    break
+                except (httpx.TransportError, httpx.TimeoutException, ResponseHandlingException, UnexpectedResponse) as exc:
+                    last_error = exc
+                    logger.warning("Qdrant upsert attempt %d/%d failed: %s", attempt + 1, _QDRANT_RETRIES, exc)
+                    if attempt < _QDRANT_RETRIES - 1:
+                        await asyncio.sleep(2 ** attempt)
+            else:
+                raise last_error or RuntimeError("Qdrant upsert failed after all retries")
         upsert_elapsed = (time.perf_counter() - t1) * 1000
 
         logger.debug(

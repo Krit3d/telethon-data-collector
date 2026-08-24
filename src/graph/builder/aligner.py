@@ -54,6 +54,9 @@ class Aligner:
         self._qdrant_client = AsyncQdrantClient(
             url=settings.qdrant_url,
             api_key=settings.qdrant_api_key,
+            prefer_grpc=settings.qdrant_prefer_grpc,
+            grpc_port=settings.qdrant_grpc_port,
+            timeout=settings.qdrant_timeout,
         )
         self._neo4j_client = neo4j_client
         self._l1_cache: OrderedDict[str, str] = OrderedDict()
@@ -140,7 +143,7 @@ class Aligner:
             if not canonical_name:
                 continue
             canonical_name = format_display_name(canonical_name, entity.label)
-            canonical_id = build_node_id(entity.label, canonical_name)
+            canonical_id = payload.get("id") or build_node_id(entity.label, canonical_name)
             entity.name = canonical_name
             entity.name_lower = clean_name_lower(canonical_name)
             key = f"{entity.label.value}:{clean_name_lower(canonical_name)}"
@@ -369,10 +372,12 @@ class Aligner:
                 max_depth = max(int(cand["_depth"]) for cand in delta_window)
                 deepest = [cand for cand in delta_window if int(cand["_depth"]) == max_depth]
                 chosen = max(deepest, key=lambda c: float(c["score"]))
-            code = chosen["payload"].get("code")
+            payload = chosen["payload"]
+            code = payload.get("code")
             if not code:
                 continue
-            concept_node_id = build_node_id(EntityType.Concept, code)
+            canonical_name = payload.get("name") or payload.get("title") or code
+            canonical_id = payload.get("id") or build_node_id(EntityType.MicroConcept, canonical_name)
             mc.properties["is_classified"] = True
             self._classified_mc_ids.add(mc_id)
             key = f"{EntityType.MicroConcept.value}:{clean_name_lower(mc.name)}"
@@ -381,7 +386,7 @@ class Aligner:
                 ExtractedRelation(
                     source_id=mc_id,
                     source_label=EntityType.MicroConcept,
-                    target_id=concept_node_id,
+                    target_id=canonical_id,
                     target_label=EntityType.Concept,
                     relation_type=RelationType.BELONGS_TO,
                     properties={"similarity": round(float(chosen["score"]), 4)},

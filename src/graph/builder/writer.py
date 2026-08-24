@@ -38,8 +38,8 @@ _RELATION_PROPERTY_KEYS: dict[RelationType, frozenset[str]] = {
     RelationType.PARTICIPATED_IN: frozenset({"role"}),
     RelationType.COAUTHOR: frozenset({"platform", "post_id"}),
     RelationType.RELATED_TO: frozenset({"relation_name", "weight"}),
-    RelationType.ABOUT: frozenset({"weight"}),
-    RelationType.COVERS_TOPIC: frozenset({"posts_count", "weight"}),
+    RelationType.ABOUT: frozenset(),
+    RelationType.COVERS_TOPIC: frozenset({"posts_count", "weight", "last_updated"}),
     RelationType.PARENT_OF: frozenset({"depth"}),
     RelationType.TAGGED_WITH: frozenset(),
     RelationType.MAPS_TO: frozenset(),
@@ -236,7 +236,7 @@ class GraphWriter:
                     if sim is not None:
                         filtered_props["similarity"] = float(sim)
 
-                if rel.relation_type in (RelationType.ABOUT, RelationType.RELATED_TO, RelationType.COVERS_TOPIC):
+                if rel.relation_type in (RelationType.RELATED_TO, RelationType.COVERS_TOPIC):
                     weight = filtered_props.get("weight")
                     if weight is not None:
                         filtered_props["weight"] = float(weight)
@@ -275,15 +275,14 @@ class GraphWriter:
             "UNWIND $author_ids AS author_id "
             "MATCH (a:Actor {id: author_id})-[:PUBLISHED]->(p:Post) "
             "WITH a, COUNT(p) AS total_posts "
-            "MATCH (a)-[:PUBLISHED]->(p:Post) "
-            "OPTIONAL MATCH (p)-[:ABOUT]->(:MicroConcept)-[:BELONGS_TO]->(concept:Concept) "
-            "WITH a, total_posts, concept, COUNT(DISTINCT p) AS post_count "
-            "WHERE concept IS NOT NULL AND post_count >= 1 "
-            "WITH a, total_posts, concept, post_count "
-            "ORDER BY a.id, concept.id "
-            "MERGE (a)-[r:COVERS_TOPIC]->(concept) "
+            "MATCH (a)-[:PUBLISHED]->(p:Post)-[:ABOUT]->(mc:MicroConcept)-[b:BELONGS_TO]->(c:Concept) "
+            "WITH a, total_posts, c, p, MAX(coalesce(b.similarity, 1.0)) AS post_concept_score "
+            "WITH a, total_posts, c, SUM(post_concept_score) AS weighted_posts_sum, COUNT(DISTINCT p) AS post_count "
+            "WHERE post_count >= 1 "
+            "ORDER BY a.id, c.id "
+            "MERGE (a)-[r:COVERS_TOPIC]->(c) "
             "SET r.posts_count = post_count, "
-            "    r.weight = toFloat(post_count) / total_posts, "
+            "    r.weight = round(weighted_posts_sum / total_posts, 4), "
             "    r.last_updated = timestamp()"
         )
         covers_micro_query = (
@@ -293,11 +292,10 @@ class GraphWriter:
             "MATCH (a)-[:PUBLISHED]->(p:Post)-[:ABOUT]->(mc:MicroConcept) "
             "WITH a, total_posts, mc, COUNT(DISTINCT p) AS post_count "
             "WHERE post_count >= 1 "
-            "WITH a, total_posts, mc, post_count "
             "ORDER BY a.id, mc.id "
             "MERGE (a)-[r:COVERS_TOPIC]->(mc) "
             "SET r.posts_count = post_count, "
-            "    r.weight = toFloat(post_count) / total_posts, "
+            "    r.weight = round(toFloat(post_count) / total_posts, 4), "
             "    r.last_updated = timestamp()"
         )
         try:
