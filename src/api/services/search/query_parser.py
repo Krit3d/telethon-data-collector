@@ -1,3 +1,4 @@
+import json
 import logging
 
 from openai import AsyncOpenAI
@@ -23,36 +24,58 @@ class QueryParser:
             return ReformulatedQuery(
                 dense_query="",
                 graph_entities=[],
-                target_topics=[],
-                target_iab_ids=[],
+                semantic_topics=[],
                 profile_type_intent="expert",
             )
 
-        system_prompt = (
-            "You are an expert search query analyzer for a hybrid semantic knowledge-graph search engine. "
-            "Analyze the user query and output a valid JSON object matching: "
-            '{"dense_query": "string", "graph_entities": ["string"], "target_topics": ["string"], "target_iab_ids": ["string"], "profile_type_intent": "expert|business"}.\n\n'
-            "FIELD INSTRUCTIONS:\n\n"
-            "1. dense_query:\n"
-            "- Enrich and reformulate the query for BGE-M3 vector search.\n"
-            '- Remove conversational noise ("посоветуй", "ищу", "нужен").\n'
-            "- Expand acronyms and add relevant domain synonyms in the query's native language.\n\n"
-            "2. graph_entities: Extract 2-5 core subject-matter entities representing Knowledge Graph nodes.\n"
-            "- CRITICAL META-WORD BLACKLIST: NEVER extract words denoting creator roles, search request types, or media formats (e.g., DO NOT extract \"автор\", \"авторы\", \"эксперт\", \"эксперты\", \"блог\", \"блогер\", \"канал\", \"видео\", \"новости\", \"советы\", \"обзор\", \"author\", \"expert\", \"blogger\", \"channel\").\n"
-            "ONTOLOGICAL EXTRACTION RULE:\n"
-            "- EXTRACT: Domain entities, technologies, products, specific niche concepts, brands, platforms, proper nouns, and subject topics that define WHAT the content is about.\n"
-            "- OMIT: Meta-search modifiers, action verbs, and structural phrasing that define HOW the user is searching (e.g., requests for reviews, experiences, comparisons, or general seeking phrasing) UNLESS those words form an integral part of a recognized standard, proper term, or subject domain itself.\n"
-            "- DOMAIN INTEGRITY & ATOMIC SAFEGUARD (CRITICAL): Never extract standalone generic nouns that lose their domain meaning or cause semantic shift when isolated (e.g., for 'крем для собак', NEVER extract standalone 'крем' or 'уход' because isolated 'крем' shifts domain to human cosmetics). Only extract standalone atomic words if they remain strictly unambiguous within the target domain context (e.g., 'собаки', 'ветеринария'). Compound concepts MUST retain their qualifying domain modifiers.\n"
-            "- RECALL & SPECIFICITY RULE: For multi-word domain concepts, extract BOTH the full multi-word phrase AND its primary unambiguous atomic domain terms or acronyms (e.g., for 'когнитивно-поведенческая терапия' include BOTH 'когнитивно-поведенческая терапия' and 'кпт').\n"
-            "- ONTOLOGICAL BOUNDARY RULE: Never extract standalone words that denote abstract workflow stages, execution phases, deployment environments (e.g., production/prod, staging), software lifecycles, media formats, or container types. Such terms MUST ONLY exist as part of compound entities.\n"
-            "3. target_topics: Extract 1-3 standard IAB 3.1 category string names in English matching query intent.\n"
-            "SUBJECT DOMAIN ANCHORING RULE (CRITICAL):\n"
-            "- First identify the target subject entity of the query (e.g., animal/pet, automotive, fintech, human health, industrial equipment).\n"
-            "- If the query specifies non-human subjects (e.g., pets, animals, dogs, cats, machinery), ALL target_topics MUST strictly belong to that target subject's industry (e.g., 'Pets', 'Pet Supplies', 'Veterinary Medicine').\n"
-            "- NEVER assign human personal care, human cosmetics, human skin care, or human lifestyle IAB categories to products, care, or services intended for animals or non-human entities.\n"
-            "4. target_iab_ids: Output a list of string IAB taxonomy codes (e.g., [\"IAB1-1\", \"IAB2\"]) matching the query intent.\n"
-            "5. profile_type_intent: Output 'expert' or 'business' based on query context."
-        )
+        system_prompt = """<system-instructions>
+<role>
+You are an expert search query analyzer for a hybrid bilingual knowledge-graph search engine powered by OpenSPG ontology and BGE-M3 dense vector retrieval.
+</role>
+
+<task>
+Analyze the incoming user search query and output a strictly valid JSON object containing four keys: dense_query, graph_entities, semantic_topics, profile_type_intent.
+</task>
+
+<field_definitions>
+1. dense_query: String optimized for BGE-M3 dense vector search. Strip out conversational noise ("посоветуй", "ищу", "топ", "нужен", "подскажи", "find", "recommend"), expand abbreviations, and append relevant domain synonyms in the query's primary language.
+2. graph_entities: Array of 3-6 key subject-matter entities, brands, technologies, tools, and domain terms IN THE QUERY'S ORIGINAL LANGUAGE (e.g., RU).
+3. semantic_topics: Array of 4-7 canonical subject concepts, niches, and microconcepts STRICTLY IN THE ENGLISH LANGUAGE (EN) for matching against English-language Concept and MicroConcept nodes in the OpenSPG knowledge graph. Include both high-level categories and specific niche terms.
+4. profile_type_intent: Value must be either "expert" or "business". Determine from query intent, but prioritize the explicit author_type filter from user input if it is not "all".
+</field_definitions>
+
+<rules>
+- META-WORD BLACKLIST: NEVER extract words representing creator roles, media formats, or query types. Forbidden words include: блогер, эксперт, канал, автор, видео, новости, советы, обзор, паблик, author, expert, blogger, channel, tips, reviews, news.
+- DOMAIN INTEGRITY: Extract only terms that define the core subject matter. Do not extract isolated generic nouns that lose specific meaning outside of context.
+- RECALL AND SPECIFICITY: For multi-word domain concepts, extract both the full phrase and its unambiguous atomic terms or standard acronyms.
+- STRICT ENGLISH FOR TOPICS: All items in semantic_topics must be in English only (e.g., "Personal Finance", "Stock Market", "Dividend Investing", "Cardiology").
+- NO EXPLANATIONS: Output ONLY the JSON object. Do not include markdown code fences or conversational text.
+</rules>
+
+<examples>
+Example 1:
+User query: "посоветуй каналы про дивидендные акции и пассивный доход на бирже рф"
+Output:
+{
+  "dense_query": "стратегии инвестирования дивидендные акции пассивный доход московская биржа moex фондовый рынок рф ценные бумаги",
+  "graph_entities": ["дивидендные акции", "пассивный доход", "фондовый рынок", "московская биржа", "акции рф"],
+  "semantic_topics": ["Personal Finance", "Stock Market", "Dividend Investing", "Passive Income", "Financial Markets"],
+  "profile_type_intent": "expert"
+}
+
+Example 2:
+User query: "курсы и студии по веб дизайну ui ux figma"
+Output:
+{
+  "dense_query": "обучение веб дизайн ui ux интерфейсы figma продуктовый дизайн прототипирование",
+  "graph_entities": ["веб дизайн", "ui ux", "figma", "продуктовый дизайн", "прототипирование"],
+  "semantic_topics": ["Web Design", "UI UX Design", "Figma", "Product Design", "User Interface"],
+  "profile_type_intent": "business"
+}
+</examples>
+</system-instructions>"""
+
+        content: str | None = None
 
         try:
             response = await self._llm_client.chat.completions.create(
@@ -61,45 +84,52 @@ class QueryParser:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"User query: {cleaned_query}\nRequest author_type filter: {request.author_type}"},
                 ],
-                response_format={"type": "json_object"},
                 temperature=0.0,
                 max_tokens=1000,
+                response_format={"type": "json_object"},
+                extra_body={"thinking": {"type": "disabled"}},
             )
 
             content = response.choices[0].message.content
 
-            if content is None:
-                msg = "LLM returned empty content"
-                raise ValueError(msg)
+            if content is None or content == "":
+                raise ValueError("Empty LLM output")
 
-            parsed = ReformulatedQuery.model_validate_json(content)
-            parsed.graph_entities = self._sanitize_entities(parsed.graph_entities)
+            content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+            parsed = ReformulatedQuery.model_validate(json.loads(content))
+            parsed.graph_entities = self._normalize_strings(parsed.graph_entities)
+            parsed.semantic_topics = self._normalize_strings(parsed.semantic_topics)
+
+            if request.author_type != "all":
+                parsed.profile_type_intent = request.author_type
+
             return parsed
 
         except Exception:
             logging.warning(
-                "QueryParser LLM call failed for query=%r, returning fallback",
+                "QueryParser LLM call failed for query=%r, content=%r, returning fallback",
                 cleaned_query,
+                content,
+                exc_info=True,
             )
             return ReformulatedQuery(
                 dense_query=cleaned_query,
                 graph_entities=[],
-                target_topics=[],
-                target_iab_ids=[],
+                semantic_topics=[],
                 profile_type_intent="expert",
             )
 
     @staticmethod
-    def _sanitize_entities(entities: list[str]) -> list[str]:
+    def _normalize_strings(items: list[str], max_items: int = 6) -> list[str]:
         cleaned: list[str] = []
         seen: set[str] = set()
-        strip_chars = "|/#,\"'()"
-        for entity in entities:
-            if not isinstance(entity, str):
+        for item in items:
+            if not isinstance(item, str):
                 continue
-            normalized = entity.lower().strip().translate(str.maketrans("", "", strip_chars))
+            normalized = item.lower().strip().strip("|/#,\"'()")
             if not normalized or len(normalized) < 2 or normalized in seen:
                 continue
             cleaned.append(normalized)
             seen.add(normalized)
-        return cleaned[:5]
+        return cleaned[:max_items]

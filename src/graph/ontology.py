@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from src.graph.utils import build_node_id, clean_identifier, clean_name_lower, is_author_entity, is_garbage_value
+from src.graph.utils import build_node_id, clean_name_lower, is_author_entity, is_garbage_value
 
 import logging
 

@@ -72,6 +72,10 @@ class QdrantService:
     ) -> tuple[list[list[float]], list[models.SparseVector]]:
         return await self.generator.generate_batch(texts)
 
+    async def generate_dense_embedding(self, text: str) -> list[float]:
+        dense_list, _ = await self.generator.generate_batch([text])
+        return dense_list[0]
+
     async def upsert_batch(
         self,
         points: list[dict[str, Any]],

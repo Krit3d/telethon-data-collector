@@ -1,27 +1,18 @@
 from collections.abc import AsyncGenerator
-from functools import cache
 
-from fastapi import Depends, Request
+from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.services.search import SearchService
+from src.api.services.search.dbsf_engine import DbsfRankingEngine
+from src.api.services.search.graph_reasoner import GraphReasoner
+from src.api.services.search.hydrator import PostgresHydrator
 from src.api.services.search.query_parser import QueryParser
-from src.api.services.search.ranker import SearchRanker, TaxonomyLoader
-from src.api.services.search.retriever import SearchRetriever
+from src.api.services.search.retriever import VectorRetriever
+from src.api.services.search.search_service import SearchService
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.client import Neo4jClient
 from src.graph.search_repo import Neo4jSearchRepository
-
-
-@cache
-def get_ancestors_map(taxonomy_path: str) -> dict[str, list[str]]:
-    return TaxonomyLoader().load_ancestors_map(taxonomy_path)
-
-
-@cache
-def get_name_to_id_map(taxonomy_path: str) -> dict[str, str]:
-    return TaxonomyLoader().load_name_to_id_map(taxonomy_path)
 
 
 def get_db(request: Request) -> Database:
@@ -42,19 +33,21 @@ async def get_db_session(request: Request) -> AsyncGenerator[AsyncSession, None]
         yield session
 
 
-async def get_search_service(
-    request: Request,
-    session: AsyncSession = Depends(get_db_session),
-) -> SearchService:
+def get_search_service(request: Request) -> SearchService:
     settings = request.app.state.settings
-    taxonomy_path_str = str(settings.taxonomy_path)
+    db = get_db(request)
     qdrant = get_qdrant(request)
     neo4j = get_neo4j(request)
-    graph_search_repo = Neo4jSearchRepository(client=neo4j)
-    query_parser = QueryParser(settings)
-    retriever = SearchRetriever(session=session, qdrant_service=qdrant, graph_search_repo=graph_search_repo)
-    ranker = SearchRanker(
-        ancestors_map=get_ancestors_map(taxonomy_path_str),
-        name_to_id_map=get_name_to_id_map(taxonomy_path_str),
+    query_parser = QueryParser(settings=settings)
+    retriever = VectorRetriever(qdrant_service=qdrant)
+    graph_repo = Neo4jSearchRepository(client=neo4j)
+    graph_reasoner = GraphReasoner(graph_repo=graph_repo)
+    dbsf_engine = DbsfRankingEngine()
+    hydrator = PostgresHydrator(session_factory=db.async_session)
+    return SearchService(
+        query_parser=query_parser,
+        retriever=retriever,
+        graph_reasoner=graph_reasoner,
+        dbsf_engine=dbsf_engine,
+        hydrator=hydrator,
     )
-    return SearchService(query_parser=query_parser, retriever=retriever, ranker=ranker)

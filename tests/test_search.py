@@ -1,421 +1,496 @@
-import json
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
-import openai
 import pytest
 
-from src.api.schemas import AuthorSearchResultItem, SearchRequest, SearchResponse
-from src.api.services.search import SearchService
-from src.api.services.search.query_parser import QueryParser, ParsedQuerySchema
-from src.api.services.search.retriever import SearchRetriever, RetrievalResult
-from src.api.services.search.ranker import SearchRanker
-from src.db.database import Database
-from src.embeddings.qdrant_service import QdrantService
-from src.graph.db.search_repo import GraphSearchRepository
+from src.api.schemas import (
+    AuthorVectorAggregate,
+    DbsfScoredCandidate,
+    GraphAuthorEvidence,
+    HydratedAuthorRecord,
+    ReformulatedQuery,
+    SearchRequest,
+    SearchResponse,
+)
+from src.api.services.search.dbsf_engine import DbsfRankingEngine
+from src.api.services.search.graph_reasoner import GraphReasoner
+from src.api.services.search.hydrator import PostgresHydrator
+from src.api.services.search.search_service import SearchService
 
 
-class MockSettings:
-    cloud_ru_api_key = "test-api-key"
-    cloud_ru_base_url = "https://test-api.example.com"
-    cloud_ru_llm_model = "test-model"
-    deepseek_api_key = "test-deepseek-key"
-    deepseek_base_url = "https://api.deepseek.com/v1"
-    deepseek_llm_model = "deepseek-chat"
-    qdrant_collection_name = "social_posts"
-    graph_name = "social_graph"
+class TestDbsfRankingEngine:
+
+    def test_aggregate_author_vector_score_decay(self):
+        scores = [0.90, 0.50, 0.40]
+        result = DbsfRankingEngine.aggregate_author_vector_score(scores)
+        expected = 0.90 + max(0.0, 0.50 - 0.30) / (2.0 ** 0.70) + max(0.0, 0.40 - 0.30) / (3.0 ** 0.70)
+        assert result == pytest.approx(expected, rel=1e-4)
+        assert result < 0.90 + 0.20 + 0.10
+        assert result > 0.90
+
+    def test_aggregate_author_vector_score_empty(self):
+        assert DbsfRankingEngine.aggregate_author_vector_score([]) == 0.0
+
+    def test_aggregate_author_vector_score_single(self):
+        assert DbsfRankingEngine.aggregate_author_vector_score([0.85]) == 0.85
+
+    def test_calculate_raw_graph_score_priors(self):
+        evidence = GraphAuthorEvidence(
+            account_id=1,
+            topic_coverage_weight=0.50,
+            matched_categories=["IAB1"],
+            matched_entities_count=3,
+            direct_mentions_count=2,
+            has_role_relation=True,
+            has_tech_relation=True,
+            is_creator=True,
+            is_promoter=False,
+            is_spam_or_gambling=False,
+            graph_tms_score=0.0,
+            raw_graph_score=0.0,
+        )
+        mention_signal = min(1.0, 2 * 0.20 + 3 * 0.10)
+        ontological_priors = 0.25 + 0.20 + 0.15
+        expected_raw = 0.45 * 0.50 + 0.35 * mention_signal + ontological_priors
+        raw_score, tms_score = DbsfRankingEngine.calculate_raw_graph_score(evidence)
+        assert raw_score == pytest.approx(expected_raw, rel=1e-4)
+        assert tms_score == 0.0
+
+    def test_calculate_raw_graph_score_promoter_penalty(self):
+        evidence = GraphAuthorEvidence(
+            account_id=2,
+            topic_coverage_weight=0.50,
+            matched_categories=[],
+            matched_entities_count=0,
+            direct_mentions_count=0,
+            has_role_relation=False,
+            has_tech_relation=False,
+            is_creator=False,
+            is_promoter=True,
+            is_spam_or_gambling=False,
+            graph_tms_score=0.0,
+            raw_graph_score=0.0,
+        )
+        mention_signal = min(1.0, 0 * 0.20 + 0 * 0.10)
+        ontological_priors = -0.10
+        expected_raw = max(0.0, 0.45 * 0.50 + 0.35 * mention_signal + ontological_priors)
+        raw_score, tms_score = DbsfRankingEngine.calculate_raw_graph_score(evidence)
+        assert raw_score == pytest.approx(expected_raw, rel=1e-4)
+
+    def test_calculate_raw_graph_score_none(self):
+        raw_score, tms_score = DbsfRankingEngine.calculate_raw_graph_score(None)
+        assert raw_score == 0.0
+        assert tms_score == 0.10
+
+    def test_calculate_raw_graph_score_spam(self):
+        evidence = GraphAuthorEvidence(
+            account_id=3,
+            topic_coverage_weight=0.80,
+            matched_categories=[],
+            matched_entities_count=0,
+            direct_mentions_count=0,
+            has_role_relation=False,
+            has_tech_relation=False,
+            is_creator=False,
+            is_promoter=False,
+            is_spam_or_gambling=True,
+            graph_tms_score=0.0,
+            raw_graph_score=0.0,
+        )
+        raw_score, tms_score = DbsfRankingEngine.calculate_raw_graph_score(evidence)
+        assert raw_score == 0.0
+        assert tms_score == 0.0
+
+    def test_normalize_distribution_edge_cases(self):
+        assert DbsfRankingEngine._normalize_distribution([]) == []
+        assert DbsfRankingEngine._normalize_distribution([0.0]) == [0.0]
+        assert DbsfRankingEngine._normalize_distribution([5.0]) == [1.0]
+        result_all_same = DbsfRankingEngine._normalize_distribution([1.0, 1.0, 1.0])
+        assert result_all_same == [1.0, 1.0, 1.0]
+        result_all_zero = DbsfRankingEngine._normalize_distribution([0.0, 0.0, 0.0])
+        assert result_all_zero == [0.0, 0.0, 0.0]
+
+    def test_rank_candidates_sorting(self):
+        vector_aggregates = {
+            1: AuthorVectorAggregate(account_id=1, post_scores=[0.9], max_vector_score=0.9, matched_posts_count=1),
+            2: AuthorVectorAggregate(account_id=2, post_scores=[0.8], max_vector_score=0.8, matched_posts_count=1),
+            3: AuthorVectorAggregate(account_id=3, post_scores=[0.7], max_vector_score=0.7, matched_posts_count=1),
+        }
+        graph_evidences = {
+            1: GraphAuthorEvidence(account_id=1, topic_coverage_weight=0.5, matched_categories=["IAB1"], matched_entities_count=1, direct_mentions_count=1, has_role_relation=True, has_tech_relation=False, is_creator=False, is_promoter=False, is_spam_or_gambling=False, graph_tms_score=0.0, raw_graph_score=0.0),
+            2: GraphAuthorEvidence(account_id=2, topic_coverage_weight=0.3, matched_categories=[], matched_entities_count=0, direct_mentions_count=0, has_role_relation=False, has_tech_relation=False, is_creator=False, is_promoter=False, is_spam_or_gambling=False, graph_tms_score=0.0, raw_graph_score=0.0),
+            3: GraphAuthorEvidence(account_id=3, topic_coverage_weight=0.1, matched_categories=[], matched_entities_count=0, direct_mentions_count=0, has_role_relation=False, has_tech_relation=False, is_creator=False, is_promoter=False, is_spam_or_gambling=False, graph_tms_score=0.0, raw_graph_score=0.0),
+        }
+        candidates = DbsfRankingEngine.rank_candidates(vector_aggregates, graph_evidences)
+        assert len(candidates) == 3
+        for i in range(len(candidates) - 1):
+            assert candidates[i].final_score >= candidates[i + 1].final_score
+        assert candidates[0].account_id == 1
+        assert candidates[2].account_id == 3
+
+    def test_rank_candidates_spam_zeroed(self):
+        vector_aggregates = {
+            1: AuthorVectorAggregate(account_id=1, post_scores=[0.9], max_vector_score=0.9, matched_posts_count=1),
+        }
+        graph_evidences = {
+            1: GraphAuthorEvidence(account_id=1, topic_coverage_weight=0.0, matched_categories=[], matched_entities_count=0, direct_mentions_count=0, has_role_relation=False, has_tech_relation=False, is_creator=False, is_promoter=False, is_spam_or_gambling=True, graph_tms_score=0.0, raw_graph_score=0.0),
+        }
+        candidates = DbsfRankingEngine.rank_candidates(vector_aggregates, graph_evidences)
+        assert len(candidates) == 1
+        assert candidates[0].final_score == 0.0
 
 
-def _create_mock_llm_response(content: str) -> MagicMock:
-    mock_response = MagicMock()
-    mock_response.choices = [
-        MagicMock(message=MagicMock(content=content))
-    ]
-    return mock_response
+class TestGraphReasoner:
+
+    @pytest.fixture
+    def reasoner(self):
+        mock_repo = AsyncMock()
+        return GraphReasoner(mock_repo)
+
+    def test_tms_direct_category_match(self, reasoner):
+        author_categories = ["IAB1-1", "IAB2"]
+        target_iab_ids = ["IAB1-1", "IAB3"]
+        ancestor_map = {"IAB1-1": ["IAB1"], "IAB3": ["IAB2"]}
+        tms = reasoner._calculate_tms_score(author_categories, target_iab_ids, ancestor_map)
+        assert tms == 1.0
+
+    def test_tms_ancestor_category_match(self, reasoner):
+        author_categories = ["IAB1"]
+        target_iab_ids = ["IAB1-1", "IAB3"]
+        ancestor_map = {"IAB1-1": ["IAB1", "IAB0"], "IAB3": ["IAB2"]}
+        tms = reasoner._calculate_tms_score(author_categories, target_iab_ids, ancestor_map)
+        assert tms == 0.70
+
+    def test_tms_no_match(self, reasoner):
+        author_categories = ["IAB5"]
+        target_iab_ids = ["IAB1-1", "IAB3"]
+        ancestor_map = {"IAB1-1": ["IAB1"], "IAB3": ["IAB2"]}
+        tms = reasoner._calculate_tms_score(author_categories, target_iab_ids, ancestor_map)
+        assert tms == 0.0
+
+    def test_tms_empty_categories(self, reasoner):
+        assert reasoner._calculate_tms_score([], ["IAB1"], {}) == 0.0
+        assert reasoner._calculate_tms_score(["IAB1"], [], {}) == 0.0
+        assert reasoner._calculate_tms_score([], [], {}) == 0.0
 
 
-@pytest.fixture
-def mock_settings():
-    return MockSettings()
+class TestPostgresHydrator:
+
+    def test_extract_contacts_with_contacts(self):
+        raw_metadata = {
+            "contacts": {
+                "emails": ["test@example.com"],
+                "phones": ["+79123456789"],
+                "telegram_handles": [],
+                "telegram_channels": [],
+                "telegram_personal": [],
+                "advertising_emails": [],
+                "advertising_telegrams": [],
+            }
+        }
+        contacts, has_contacts = PostgresHydrator._extract_contacts(raw_metadata)
+        assert has_contacts is True
+        assert contacts is not None
+        assert contacts["emails"] == ["test@example.com"]
+        assert contacts["phones"] == ["+79123456789"]
+
+    def test_extract_contacts_no_contacts(self):
+        raw_metadata = {
+            "contacts": {
+                "emails": [],
+                "phones": [],
+                "telegram_handles": [],
+                "telegram_channels": [],
+                "telegram_personal": [],
+                "advertising_emails": [],
+                "advertising_telegrams": [],
+            }
+        }
+        contacts, has_contacts = PostgresHydrator._extract_contacts(raw_metadata)
+        assert has_contacts is False
+        assert contacts is None
+
+    def test_extract_contacts_none(self):
+        contacts, has_contacts = PostgresHydrator._extract_contacts(None)
+        assert has_contacts is False
+        assert contacts is None
+
+    def test_extract_contacts_empty_dict(self):
+        contacts, has_contacts = PostgresHydrator._extract_contacts({})
+        assert has_contacts is False
+        assert contacts is None
+
+    def test_extract_contacts_fallback_to_root(self):
+        raw_metadata = {
+            "emails": ["admin@example.com"],
+            "phones": [],
+            "telegram_handles": [],
+            "telegram_channels": [],
+            "telegram_personal": [],
+            "advertising_emails": [],
+            "advertising_telegrams": [],
+        }
+        contacts, has_contacts = PostgresHydrator._extract_contacts(raw_metadata)
+        assert has_contacts is True
+        assert contacts is not None
+        assert contacts["emails"] == ["admin@example.com"]
+
+    def test_extract_profile_url_instagram(self):
+        url = PostgresHydrator._extract_profile_url("instagram", "testuser", None)
+        assert url == "https://instagram.com/testuser"
+
+    def test_extract_profile_url_telegram(self):
+        url = PostgresHydrator._extract_profile_url("telegram", "testchannel", None)
+        assert url == "https://t.me/testchannel"
+
+    def test_extract_profile_url_case_insensitive(self):
+        url = PostgresHydrator._extract_profile_url("Instagram", "TestUser", None)
+        assert url == "https://instagram.com/TestUser"
+
+    def test_extract_profile_url_from_metadata(self):
+        raw_metadata = {"profile_url": "https://custom.url/profile"}
+        url = PostgresHydrator._extract_profile_url("instagram", "testuser", raw_metadata)
+        assert url == "https://custom.url/profile"
+
+    def test_extract_profile_url_no_username(self):
+        url = PostgresHydrator._extract_profile_url("instagram", None, None)
+        assert url is None
+
+    def test_extract_profile_url_unknown_platform(self):
+        url = PostgresHydrator._extract_profile_url("tiktok", "testuser", None)
+        assert url is None
 
 
-@pytest.fixture
-def mock_db():
-    return AsyncMock(spec=Database)
+class TestSearchService:
 
+    @pytest.fixture
+    def mock_query_parser(self):
+        parser = MagicMock()
+        parser.parse = AsyncMock()
+        return parser
 
-@pytest.fixture
-def mock_qdrant():
-    return AsyncMock(spec=QdrantService)
+    @pytest.fixture
+    def mock_retriever(self):
+        retriever = MagicMock()
+        retriever.retrieve_vector_candidates = AsyncMock()
+        return retriever
 
+    @pytest.fixture
+    def mock_graph_reasoner(self):
+        reasoner = AsyncMock()
+        return reasoner
 
-@pytest.fixture
-def mock_graph_repo():
-    return AsyncMock(spec=GraphSearchRepository)
+    @pytest.fixture
+    def mock_dbsf_engine(self):
+        engine = MagicMock()
+        engine.rank_candidates = MagicMock()
+        return engine
 
+    @pytest.fixture
+    def mock_hydrator(self):
+        hydrator = MagicMock()
+        hydrator.hydrate_and_filter_candidates = AsyncMock()
+        return hydrator
 
-@pytest.fixture
-def search_service(mock_settings, mock_db, mock_qdrant, mock_graph_repo):
-    mock_llm_client = MagicMock()
-    mock_llm_client.chat.completions.create = AsyncMock()
+    @pytest.fixture
+    def search_service(self, mock_query_parser, mock_retriever, mock_graph_reasoner, mock_dbsf_engine, mock_hydrator):
+        return SearchService(
+            query_parser=mock_query_parser,
+            retriever=mock_retriever,
+            graph_reasoner=mock_graph_reasoner,
+            dbsf_engine=mock_dbsf_engine,
+            hydrator=mock_hydrator,
+        )
 
-    mock_query_parser = MagicMock(spec=QueryParser)
-    mock_query_parser._llm_client = mock_llm_client
-    mock_query_parser._llm_model = mock_settings.deepseek_llm_model
-    mock_query_parser._cached_yaml_taxonomy = ""
-    mock_query_parser._taxonomy_dict = {}
-    mock_query_parser.parse_query = AsyncMock(
-        return_value=ParsedQuerySchema(dense_query="test query")
-    )
-    mock_query_parser.calculate_taxonomy_match_score = MagicMock(return_value=0.0)
+    @pytest.mark.asyncio
+    async def test_execute_search_empty_query(self, search_service, mock_query_parser):
+        mock_query_parser.parse.return_value = ReformulatedQuery(
+            dense_query="",
+            graph_entities=[],
+            target_topics=[],
+            target_iab_ids=[],
+            profile_type_intent="expert",
+        )
+        request = SearchRequest(query="  ", limit=10)
+        response = await search_service.execute_search(request)
+        assert isinstance(response, SearchResponse)
+        assert response.total == 0
+        assert response.items == []
+        assert response.query_metadata is not None
+        assert response.query_metadata.original_query == ""
+        assert response.query_metadata.dense_query == ""
 
-    mock_retriever = MagicMock(spec=SearchRetriever)
-    mock_retriever._qdrant = mock_qdrant
-    mock_retriever._graph_search_repo = mock_graph_repo
-    mock_retriever._db = mock_db
-    mock_retriever.retrieve_candidates = AsyncMock()
+    @pytest.mark.asyncio
+    async def test_execute_search_full_pipeline(
+        self,
+        search_service,
+        mock_query_parser,
+        mock_retriever,
+        mock_graph_reasoner,
+        mock_dbsf_engine,
+        mock_hydrator,
+    ):
+        mock_query_parser.parse.return_value = ReformulatedQuery(
+            dense_query="test query",
+            graph_entities=["entity1"],
+            target_topics=["topic1"],
+            target_iab_ids=["IAB1"],
+            profile_type_intent="expert",
+        )
 
-    mock_ranker = MagicMock(spec=SearchRanker)
-    mock_ranker._query_parser = mock_query_parser
-    mock_ranker.rank_and_fuse = AsyncMock()
+        vector_aggregates = {
+            1: AuthorVectorAggregate(
+                account_id=1,
+                post_scores=[0.95, 0.85],
+                max_vector_score=0.95,
+                matched_posts_count=2,
+            ),
+            2: AuthorVectorAggregate(
+                account_id=2,
+                post_scores=[0.80],
+                max_vector_score=0.80,
+                matched_posts_count=1,
+            ),
+        }
+        vector_timings = {"embedding_ms": 15.0, "qdrant_posts_ms": 45.0}
+        mock_retriever.retrieve_vector_candidates.return_value = (vector_aggregates, vector_timings)
 
-    service = SearchService(
-        query_parser=mock_query_parser,
-        retriever=mock_retriever,
-        ranker=mock_ranker,
-    )
-    service._query_parser = mock_query_parser
-    service._retriever = mock_retriever
-    service._ranker = mock_ranker
-    return service
+        graph_evidences = {
+            1: GraphAuthorEvidence(
+                account_id=1,
+                topic_coverage_weight=0.5,
+                matched_categories=["IAB1"],
+                matched_entities_count=1,
+                direct_mentions_count=2,
+                has_role_relation=True,
+                has_tech_relation=False,
+                is_creator=False,
+                is_promoter=False,
+                is_spam_or_gambling=False,
+                graph_tms_score=0.0,
+                raw_graph_score=0.0,
+            ),
+            2: GraphAuthorEvidence(
+                account_id=2,
+                topic_coverage_weight=0.3,
+                matched_categories=[],
+                matched_entities_count=0,
+                direct_mentions_count=0,
+                has_role_relation=False,
+                has_tech_relation=False,
+                is_creator=False,
+                is_promoter=False,
+                is_spam_or_gambling=False,
+                graph_tms_score=0.0,
+                raw_graph_score=0.0,
+            ),
+        }
+        mock_graph_reasoner.reason_author_evidences.return_value = graph_evidences
 
-
-@pytest.mark.asyncio
-async def test_short_query_returns_empty(search_service):
-    payload = SearchRequest(query="insurance", limit=10)
-    result = await search_service.execute_search(payload)
-    assert isinstance(result, SearchResponse)
-    assert result.results == []
-    search_service._query_parser.parse_query.assert_not_called()
-    search_service._retriever.retrieve_candidates.assert_not_called()
-    search_service._ranker.rank_and_fuse.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_stopwords_only_query_returns_empty(search_service):
-    payload = SearchRequest(query="the a is", limit=10)
-    result = await search_service.execute_search(payload)
-    assert isinstance(result, SearchResponse)
-    assert result.results == []
-    search_service._query_parser.parse_query.assert_not_called()
-    search_service._retriever.retrieve_candidates.assert_not_called()
-    search_service._ranker.rank_and_fuse.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_happy_path_search_with_mmr_and_contact_enrichment(
-    search_service, mock_db, mock_qdrant, mock_graph_repo
-):
-    mock_query_parser = search_service._query_parser
-    mock_retriever = search_service._retriever
-    mock_ranker = search_service._ranker
-
-    parsed_query = ParsedQuerySchema(
-        dense_query="test query",
-        lexical_queries=["tech", "content"],
-        graph_entities=["tech"],
-        core_tech_entities=["tech"],
-        target_domains=["content"],
-        negative_domains=[],
-        target_iab_ids=[],
-        profile_type_intent="both",
-    )
-    mock_query_parser.parse_query = AsyncMock(return_value=parsed_query)
-
-    mock_qdrant.search_posts.return_value = [
-        {"post_id": 101, "score": 0.85, "engagement_rate": 5.5},
-        {"post_id": 102, "score": 0.75, "engagement_rate": 3.2},
-    ]
-    mock_qdrant.search_entities.return_value = []
-
-    mock_graph_repo.search_posts_by_topics.return_value = {}
-    mock_graph_repo.search_posts_by_entities.return_value = {}
-
-    current_time = datetime.now(timezone.utc)
-    five_days_ago = datetime.fromtimestamp(current_time.timestamp() - 5 * 24 * 3600, tz=timezone.utc)
-
-    mock_db.get_search_candidates.return_value = [
-        {
-            "id": 101,
-            "account_id": 1001,
-            "username": "author_one",
-            "account_title": "Tech Content Creator",
-            "description": "Creating tech content",
-            "subscribers_count": 50000,
-            "platform": "TELEGRAM",
-            "content": "Latest tech trends and reviews",
-            "transcription": None,
-            "published_at": five_days_ago,
-            "created_at": five_days_ago,
-            "message_id": 10001,
-            "platform_content_id": None,
-            "raw_metadata": json.dumps({"contacts": {"email": "author@example.com", "telegram": "@author_one"}}),
-            "static_avg_er": 5.5,
-            "category_id": None,
-            "category_path": None,
-            "is_enriched": True,
-            "explanation": None,
-            "category_extension": None,
-            "is_author_blog": None,
-        },
-        {
-            "id": 102,
-            "account_id": 1002,
-            "username": "author_two",
-            "account_title": "Gadget Reviewer",
-            "description": "Reviewing the latest gadgets",
-            "subscribers_count": 75000,
-            "platform": "TELEGRAM",
-            "content": "In-depth gadget reviews and comparisons",
-            "transcription": None,
-            "published_at": five_days_ago,
-            "created_at": five_days_ago,
-            "message_id": 10002,
-            "platform_content_id": None,
-            "raw_metadata": json.dumps({"contacts": {}}),
-            "static_avg_er": 3.2,
-            "category_id": None,
-            "category_path": None,
-            "is_enriched": True,
-            "explanation": None,
-            "category_extension": None,
-            "is_author_blog": None,
-        },
-    ]
-
-    retrieval_result = RetrievalResult(
-        vector_scores={101: 0.85, 102: 0.75},
-        graph_scores={101: 0.5, 102: 0.3},
-        graph_post_entities={101: ["ent1"], 102: ["ent2"]},
-        topic_post_weights={},
-        intersection_post_ids=set(),
-        entity_id_to_score={"ent1": 0.9, "ent2": 0.8},
-        candidates_rows=mock_db.get_search_candidates.return_value,
-        parsed_query=parsed_query,
-    )
-    mock_retriever.retrieve_candidates = AsyncMock(return_value=retrieval_result)
-
-    mock_ranker.rank_and_fuse.return_value = SearchResponse(
-        results=[
-            AuthorSearchResultItem(
-                author_id="1001",
-                username="author_one",
-                title="Tech Content Creator",
-                description="Creating tech content",
-                subscribers_count=50000,
-                platform="TELEGRAM",
+        scored_candidates = [
+            DbsfScoredCandidate(
+                account_id=1,
+                raw_vector_score=0.95,
+                raw_graph_score=0.50,
+                normalized_vector_score=0.85,
+                normalized_graph_score=0.75,
+                tms_score=1.0,
                 final_score=0.85,
-                vector_score=0.85,
-                graph_score=0.0,
-                avg_engagement_rate=5.5,
-                explanation="Excellent match for tech project",
-                contacts={"email": "author@example.com", "telegram": "@author_one"},
-                has_contacts=True,
-                is_dormant=False,
-                most_recent_post_at=five_days_ago.isoformat(),
             ),
-            AuthorSearchResultItem(
-                author_id="1002",
-                username="author_two",
-                title="Gadget Reviewer",
-                description="Reviewing the latest gadgets",
-                subscribers_count=75000,
-                platform="TELEGRAM",
-                final_score=0.75,
-                vector_score=0.75,
-                graph_score=0.0,
-                avg_engagement_rate=3.2,
-                explanation="Good gadget reviewer",
-                contacts=None,
-                has_contacts=False,
-                is_dormant=False,
-                most_recent_post_at=five_days_ago.isoformat(),
+            DbsfScoredCandidate(
+                account_id=2,
+                raw_vector_score=0.80,
+                raw_graph_score=0.30,
+                normalized_vector_score=0.60,
+                normalized_graph_score=0.40,
+                tms_score=0.0,
+                final_score=0.50,
             ),
-        ],
-    )
+        ]
+        mock_dbsf_engine.rank_candidates.return_value = scored_candidates
 
-    payload = SearchRequest(query="looking for tech content creators for product launch", limit=10)
-    result = await search_service.execute_search(payload)
-
-    assert isinstance(result, SearchResponse)
-    assert len(result.results) == 2
-
-    author_one = next(r for r in result.results if r.author_id == "1001")
-    author_two = next(r for r in result.results if r.author_id == "1002")
-
-    assert author_one.final_score == pytest.approx(0.85, abs=0.01)
-    assert "Excellent match" in author_one.explanation
-    assert author_two.final_score == pytest.approx(0.75, abs=0.01)
-    assert "Good gadget reviewer" in author_two.explanation
-
-
-@pytest.mark.asyncio
-async def test_safety_prefiltering_discards_gambling_authors(
-    search_service, mock_db, mock_qdrant, mock_graph_repo
-):
-    mock_retriever = search_service._retriever
-    mock_ranker = search_service._ranker
-
-    mock_qdrant.search_posts.return_value = [
-        {"post_id": 201, "score": 0.9, "engagement_rate": 10.0},
-    ]
-    mock_qdrant.search_entities.return_value = []
-
-    mock_graph_repo.search_posts_by_entities.return_value = {}
-
-    current_time = datetime.now(timezone.utc)
-    one_day_ago = datetime.fromtimestamp(current_time.timestamp() - 1 * 24 * 3600, tz=timezone.utc)
-
-    candidates_rows = [
-        {
-            "id": 201,
-            "account_id": 2001,
-            "username": "gambling_promoter",
-            "account_title": "Best 1xbet predictions and casino wins",
-            "description": "Daily casino and 1xbet tips",
-            "subscribers_count": 100000,
-            "platform": "TELEGRAM",
-            "content": "Join our casino channel for daily 1xbet wins and kazino bonuses",
-            "transcription": None,
-            "published_at": one_day_ago,
-            "created_at": one_day_ago,
-            "message_id": 20001,
-            "platform_content_id": None,
-            "raw_metadata": json.dumps({}),
-            "static_avg_er": 0.0,
-            "category_id": None,
-            "category_path": None,
-            "is_enriched": True,
-            "explanation": None,
-            "category_extension": None,
-            "is_author_blog": None,
-        },
-    ]
-    mock_db.get_search_candidates.return_value = candidates_rows
-
-    parsed_query = ParsedQuerySchema(dense_query="test query")
-    retrieval_result = RetrievalResult(
-        vector_scores={201: 0.9},
-        graph_scores={},
-        graph_post_entities={},
-        topic_post_weights={},
-        intersection_post_ids=set(),
-        entity_id_to_score={},
-        candidates_rows=candidates_rows,
-        parsed_query=parsed_query,
-    )
-    mock_retriever.retrieve_candidates = AsyncMock(return_value=retrieval_result)
-
-    mock_ranker.rank_and_fuse = AsyncMock(
-        return_value=SearchResponse(
-            results=[],
-            message="По вашему запросу не найдено подходящих авторов. Попробуйте переформулировать запрос или расширить описание проекта.",
+        hydrated_record = HydratedAuthorRecord(
+            account_id=1,
+            platform="telegram",
+            username="test_channel",
+            title="Test Channel",
+            category_id="IAB1",
+            category_path="Technology",
+            explanation="Relevant author",
+            static_avg_er=0.05,
+            subscribers_count=10000,
+            is_author_blog=True,
+            raw_metadata={"key": "value"},
+            contacts=None,
+            has_contacts=False,
+            profile_url="https://t.me/test_channel",
         )
-    )
+        mock_hydrator.hydrate_and_filter_candidates.return_value = [
+            (scored_candidates[0], hydrated_record),
+        ]
 
-    payload = SearchRequest(query="looking for content creators", limit=10)
-    result = await search_service.execute_search(payload)
-
-    assert isinstance(result, SearchResponse)
-    assert result.results == []
-
-
-@pytest.mark.asyncio
-async def test_external_api_failure_graceful_fallback(
-    search_service, mock_db, mock_qdrant, mock_graph_repo
-):
-    mock_query_parser = search_service._query_parser
-    mock_retriever = search_service._retriever
-    mock_ranker = search_service._ranker
-
-    parsed_query = ParsedQuerySchema(dense_query="test query")
-    mock_query_parser.parse_query = AsyncMock(return_value=parsed_query)
-
-    mock_qdrant.search_posts.return_value = [
-        {"post_id": 501, "score": 0.85, "engagement_rate": 6.0},
-    ]
-    mock_qdrant.search_entities.return_value = []
-
-    mock_graph_repo.search_posts_by_entities.return_value = {}
-
-    current_time = datetime.now(timezone.utc)
-    three_days_ago = datetime.fromtimestamp(current_time.timestamp() - 3 * 24 * 3600, tz=timezone.utc)
-
-    candidates_rows = [
-        {
-            "id": 501,
-            "account_id": 5001,
-            "username": "test_author",
-            "account_title": "Test Content Creator",
-            "description": "Creating test content",
-            "subscribers_count": 40000,
-            "platform": "TELEGRAM",
-            "content": "Test content for various projects",
-            "transcription": None,
-            "published_at": three_days_ago,
-            "created_at": three_days_ago,
-            "message_id": 50001,
-            "platform_content_id": None,
-            "raw_metadata": json.dumps({}),
-            "static_avg_er": 6.0,
-            "category_id": None,
-            "category_path": None,
-            "is_enriched": True,
-            "explanation": None,
-            "category_extension": None,
-            "is_author_blog": None,
-        },
-    ]
-    mock_db.get_search_candidates.return_value = candidates_rows
-
-    retrieval_result = RetrievalResult(
-        vector_scores={501: 0.85},
-        graph_scores={},
-        graph_post_entities={},
-        topic_post_weights={},
-        intersection_post_ids=set(),
-        entity_id_to_score={},
-        candidates_rows=candidates_rows,
-        parsed_query=parsed_query,
-    )
-    mock_retriever.retrieve_candidates = AsyncMock(return_value=retrieval_result)
-
-    mock_ranker.rank_and_fuse = AsyncMock(
-        return_value=SearchResponse(
-            results=[
-                AuthorSearchResultItem(
-                    author_id="5001",
-                    username="test_author",
-                    title="Test Content Creator",
-                    description="Creating test content",
-                    subscribers_count=40000,
-                    platform="TELEGRAM",
-                    final_score=0.7,
-                    vector_score=0.85,
-                    graph_score=0.0,
-                    avg_engagement_rate=6.0,
-                    explanation="Test explanation",
-                    has_contacts=False,
-                    is_dormant=False,
-                    most_recent_post_at=three_days_ago.isoformat(),
-                ),
-            ],
+        request = SearchRequest(
+            query="test query",
+            limit=10,
+            author_type="expert",
+            include_contacts=False,
+            include_analytics=True,
         )
-    )
+        response = await search_service.execute_search(request)
 
-    payload = SearchRequest(query="need content creators for project", limit=10)
-    result = await search_service.execute_search(payload)
+        assert isinstance(response, SearchResponse)
+        assert response.total == 1
+        assert len(response.items) == 1
+        assert response.items[0].account_id == 1
+        assert response.items[0].platform == "telegram"
+        assert response.items[0].username == "test_channel"
+        assert response.items[0].title == "Test Channel"
+        assert response.items[0].url == "https://t.me/test_channel"
+        assert response.items[0].final_score == 0.85
+        assert response.items[0].vector_score == 0.85
+        assert response.items[0].graph_score == 0.75
+        assert response.items[0].tms_score == 1.0
+        assert response.items[0].has_contacts is False
+        assert response.items[0].contacts is None
+        assert response.items[0].subscribers_count == 10000
+        assert response.items[0].category_path == "Technology"
+        assert response.items[0].explanation == "Relevant author"
+        assert response.query_metadata is not None
+        assert response.query_metadata.original_query == "test query"
+        assert response.query_metadata.dense_query == "test query"
+        assert response.query_metadata.graph_entities == ["entity1"]
+        assert response.query_metadata.target_iab_ids == ["IAB1"]
+        assert response.query_metadata.resolved_profile_type == "expert"
+        assert response.confidence_level == "HIGH"
+        assert response.warning_message is None
 
-    assert isinstance(result, SearchResponse)
-    assert len(result.results) == 1
-    assert result.results[0].final_score > 0.0
+        mock_query_parser.parse.assert_awaited_once_with(request)
+        mock_retriever.retrieve_vector_candidates.assert_awaited_once_with(dense_query="test query")
+        mock_graph_reasoner.reason_author_evidences.assert_awaited_once()
+        mock_dbsf_engine.rank_candidates.assert_called_once_with(
+            vector_aggregates=vector_aggregates,
+            graph_evidences=graph_evidences,
+        )
+        mock_hydrator.hydrate_and_filter_candidates.assert_awaited_once_with(
+            candidates=scored_candidates,
+            request=request,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_search_no_vector_results(self, search_service, mock_query_parser, mock_retriever):
+        mock_query_parser.parse.return_value = ReformulatedQuery(
+            dense_query="some query",
+            graph_entities=[],
+            target_topics=[],
+            target_iab_ids=[],
+            profile_type_intent="expert",
+        )
+        mock_retriever.retrieve_vector_candidates.return_value = ({}, {"embedding_ms": 5.0, "qdrant_posts_ms": 10.0})
+        request = SearchRequest(query="some query", limit=10)
+        response = await search_service.execute_search(request)
+        assert response.total == 0
+        assert response.items == []
+        assert response.query_metadata is not None
+        assert response.query_metadata.dense_query == "some query"
+        assert response.confidence_level == "NONE"
+        assert response.message == "No relevant content found matching the query topic."
+        assert response.warning_message is None
