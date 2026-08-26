@@ -14,7 +14,7 @@ from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError, R
 from pydantic import ValidationError
 
 from src.config.config import Settings
-from src.graph.builder.prompts import build_system_prompt, build_user_prompt
+from src.graph.builder.prompts import SYSTEM_PROMPT, build_user_prompt
 from src.graph.builder.reader import PostBatchContext
 from src.graph.ontology import (
     ENTITY_CATEGORY_VALUES,
@@ -248,23 +248,22 @@ def _normalize_language_code(raw: Any) -> str | None:
 
 
 def repair_and_load_json(raw_text: str) -> dict[str, Any]:
-    cleaned = raw_text.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    cleaned = cleaned.strip()
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        cleaned = match.group()
+    cleaned = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    start = cleaned.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in LLM response")
+    end = cleaned.rfind("}")
+    if end > start:
+        try:
+            res = json.loads(cleaned[start:end+1])
+            return _ensure_dict(res)
+        except json.JSONDecodeError:
+            pass
     try:
-        result = json.loads(cleaned)
-        return _ensure_dict(result)
-    except json.JSONDecodeError:
-        pass
-    try:
-        repaired = repair_json(cleaned, return_objects=True)
-        result = _ensure_dict(repaired)
-        if result:
-            return result
+        repaired = repair_json(cleaned[start:], return_objects=True)
+        res = _ensure_dict(repaired)
+        if isinstance(res, dict):
+            return res
     except Exception:
         pass
     raise ValueError("Failed to parse LLM response as JSON after all repair attempts")
@@ -280,16 +279,28 @@ def _safe_float_score(raw: Any) -> float:
 
 def _parse_psychographics(data: Any) -> ExtractedPsychographics:
     dict_data = _ensure_dict(data)
+    nested = _ensure_dict(dict_data.get("hormones") or dict_data.get("scores") or dict_data.get("neurotransmitters"))
     raw_tone = dict_data.get("tone")
     primary_tone = _TONE_MAP.get(str(raw_tone).lower().strip()) if raw_tone else None
     raw_secondary = dict_data.get("secondary_tone")
     secondary_tone = _TONE_MAP.get(str(raw_secondary).lower().strip()) if raw_secondary else None
-    score_dopamine = _safe_float_score(dict_data.get("score_dopamine"))
-    score_oxytocin = _safe_float_score(dict_data.get("score_oxytocin"))
-    score_serotonin = _safe_float_score(dict_data.get("score_serotonin"))
-    score_cortisol = _safe_float_score(dict_data.get("score_cortisol"))
-    score_adrenaline = _safe_float_score(dict_data.get("score_adrenaline"))
-    score_endorphin = _safe_float_score(dict_data.get("score_endorphin"))
+    hormone_names = ("dopamine", "oxytocin", "serotonin", "cortisol", "adrenaline", "endorphin")
+    scores: dict[str, float] = {}
+    for h in hormone_names:
+        raw = dict_data.get(f"score_{h}")
+        if raw is None:
+            raw = dict_data.get(h)
+        if raw is None:
+            raw = nested.get(f"score_{h}")
+        if raw is None:
+            raw = nested.get(h)
+        scores[h] = _safe_float_score(raw)
+    score_dopamine = scores["dopamine"]
+    score_oxytocin = scores["oxytocin"]
+    score_serotonin = scores["serotonin"]
+    score_cortisol = scores["cortisol"]
+    score_adrenaline = scores["adrenaline"]
+    score_endorphin = scores["endorphin"]
     tone_confidence: float | None = None
     raw_tone_confidence = dict_data.get("tone_confidence")
     if raw_tone_confidence is not None:
@@ -299,7 +310,6 @@ def _parse_psychographics(data: Any) -> ExtractedPsychographics:
             parsed_tone_confidence = None
         if parsed_tone_confidence is not None and 0.0 <= parsed_tone_confidence <= 1.0:
             tone_confidence = parsed_tone_confidence
-    scores = {"dopamine": score_dopamine, "oxytocin": score_oxytocin, "serotonin": score_serotonin, "cortisol": score_cortisol, "adrenaline": score_adrenaline, "endorphin": score_endorphin}
     max_score = max(scores.values())
     if max_score <= 0.0:
         primary_hormone = None
@@ -798,13 +808,18 @@ def _create_structural_relations(
     return relations
 
 
+class LLMInfrastructureError(Exception):
+    ...
+
+
 class GraphExtractor:
 
     def __init__(self, settings: Settings) -> None:
         http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=100, keepalive_expiry=30.0),
+            timeout=httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=15.0),
             verify=False,
+            http2=False,
         )
         if settings.ml_inference_key_id and settings.ml_inference_secret and settings.ml_inference_base_url:
             self._client = EvolutionAsyncOpenAI(
@@ -823,6 +838,8 @@ class GraphExtractor:
                 max_retries=0,
             )
             self._model = settings.cloud_ru_llm_model
+
+        self._semaphore = asyncio.Semaphore(settings.graph_concurrency)
 
     async def close(self) -> None:
         await self._client.close()
@@ -854,7 +871,7 @@ class GraphExtractor:
 
         author_handle = (getattr(context, 'author_handle', '') or getattr(context, 'author_username', '') or '').strip()
         messages: Any = [
-            {"role": "system", "content": build_system_prompt(context.author_title, author_handle)},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_user_prompt(
                 caption_text=caption_text,
                 transcription_text=transcription_text,
@@ -872,37 +889,62 @@ class GraphExtractor:
         for attempt in range(retries):
             t0 = time.perf_counter()
             try:
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    temperature=0.1,
-                    max_tokens=4096,
-                    timeout=60.0,
-                )
-            except (APIError, APITimeoutError, APIConnectionError, RateLimitError) as e:
+                async with self._semaphore:
+                    response = await self._client.chat.completions.create(
+                        model=self._model,
+                        messages=messages,
+                        response_format={"type": "json_object"},
+                        temperature=0.1,
+                        max_tokens=3072,
+                        extra_body={
+                            "chat_template_kwargs": {"enable_thinking": False},
+                            "enable_thinking": False,
+                            "thinking": {"type": "disabled"},
+                        },
+                    )
+                llm_elapsed = (time.perf_counter() - t0) * 1000
+                usage = response.usage
+                prompt_tokens = usage.prompt_tokens if usage else 0
+                completion_tokens = usage.completion_tokens if usage else 0
+                total_tokens = usage.total_tokens if usage else 0
+                finish_reason = response.choices[0].finish_reason
+                if finish_reason == "length":
+                    logger.warning(
+                        "JSON response truncated due to token limit for content_id=%d (model=%s)",
+                        context.content_id, self._model,
+                    )
+            except (APIError, APITimeoutError, APIConnectionError, RateLimitError, httpx.HTTPError) as e:
                 elapsed = (time.perf_counter() - t0) * 1000
-                delay = 2 ** attempt
+                base_delay = 1.5
+                delay = min(15.0, base_delay * (2 ** attempt)) * (0.75 + (0.5 * (time.perf_counter() % 1.0)))
                 logger.warning(
-                    "LLM call attempt %d/%d failed after %.1fms (model=%s): %s | retrying in %ds",
-                    attempt + 1, retries, elapsed, self._model, e, delay,
+                    "LLM call attempt %d/%d failed after %.1fms (model=%s, error=%s): %s | retrying in %.1fs",
+                    attempt + 1, retries, elapsed, self._model, type(e).__name__, e, delay,
                 )
                 last_error = e
                 if attempt < retries - 1:
                     await asyncio.sleep(delay)
                 continue
 
-            llm_elapsed = (time.perf_counter() - t0) * 1000
             logger.debug(
-                "LLM call attempt %d/%d completed in %.1fms (model=%s)",
+                "LLM call attempt %d/%d completed in %.1fms (model=%s, prompt=%d, completion=%d, total=%d)",
                 attempt + 1, retries, llm_elapsed, self._model,
+                prompt_tokens, completion_tokens, total_tokens,
             )
 
-            raw_content = response.choices[0].message.content
+            choice = response.choices[0]
+            raw_content = choice.message.content or getattr(choice.message, "reasoning_content", None)
+            if raw_content:
+                if " response" in raw_content:
+                    raw_content = raw_content.split(" response")[-1]
+                elif " thinking" in raw_content:
+                    raw_content = raw_content.split(" thinking")[0]
+                raw_content = raw_content.strip()
             if not raw_content:
-                delay = 2 ** attempt
+                base_delay = 1.5
+                delay = min(15.0, base_delay * (2 ** attempt)) * (0.75 + (0.5 * (time.perf_counter() % 1.0)))
                 logger.warning(
-                    "Empty LLM response on attempt %d/%d | retrying in %ds",
+                    "Empty LLM response on attempt %d/%d | retrying in %.1fs",
                     attempt + 1, retries, delay,
                 )
                 last_error = ValueError("Empty LLM response")
@@ -913,18 +955,14 @@ class GraphExtractor:
             try:
                 parsed = repair_and_load_json(raw_content)
             except ValueError as e:
-                delay = 2 ** attempt
+                base_delay = 1.5
+                delay = min(15.0, base_delay * (2 ** attempt)) * (0.75 + (0.5 * (time.perf_counter() % 1.0)))
                 logger.warning(
-                    "JSON parse error on attempt %d/%d: %s | retrying in %ds",
+                    "JSON parse error on attempt %d/%d: %s | retrying in %.1fs",
                     attempt + 1, retries, e, delay,
                 )
                 last_error = e
                 if attempt < retries - 1:
-                    messages.append({"role": "assistant", "content": raw_content})
-                    messages.append({"role": "user", "content": (
-                        f"Твой предыдущий ответ вызвал ошибку: {e}. "
-                        "Исправь ошибки и ответь строго валидным JSON без текста вокруг."
-                    )})
                     await asyncio.sleep(delay)
                 continue
 
@@ -1011,9 +1049,7 @@ class GraphExtractor:
                     hashtags=hashtag_items,
                 )
 
-                forbidden_names = {clean_name_lower(context.author_title)}
-                if author_handle:
-                    forbidden_names.add(clean_name_lower(author_handle))
+                forbidden_names = {clean_name_lower(n) for n in (context.author_title, author_handle) if n and clean_name_lower(n)}
                 coauthor_ids = {
                     build_node_id(EntityType.Actor, clean_identifier(ca), platform=context.platform)
                     for ca in context.post_coauthors
@@ -1026,25 +1062,24 @@ class GraphExtractor:
                     author_handle=author_handle,
                 )
             except Exception as e:
-                delay = 2 ** attempt
+                base_delay = 1.5
+                delay = min(15.0, base_delay * (2 ** attempt)) * (0.75 + (0.5 * (time.perf_counter() % 1.0)))
                 logger.warning(
-                    "Validation error on attempt %d/%d: %s | retrying in %ds",
+                    "Validation error on attempt %d/%d: %s | retrying in %.1fs",
                     attempt + 1, retries, e, delay,
                 )
                 last_error = e
                 if attempt < retries - 1:
-                    messages.append({"role": "assistant", "content": raw_content})
-                    messages.append({"role": "user", "content": (
-                        f"Твой предыдущий ответ вызвал ошибку: {e}. "
-                        "Исправь ошибки и ответь строго валидным JSON без текста вокруг."
-                    )})
                     await asyncio.sleep(delay)
                 continue
 
-            logger.debug(
-                "Extraction done in %.1fms: %d entities, %d relations (model=%s)",
+            logger.info(
+                "Extraction done in %.1fms: %d entities, %d relations (model=%s, prompt=%d, completion=%d, total=%d)",
                 llm_elapsed, len(result.entities), len(result.relations), self._model,
+                prompt_tokens, completion_tokens, total_tokens,
             )
             return result
 
+        if isinstance(last_error, (APIError, APITimeoutError, APIConnectionError, RateLimitError, httpx.HTTPError, httpx.HTTPStatusError)):
+            raise LLMInfrastructureError(str(last_error)) from last_error
         raise last_error or RuntimeError("Extraction failed after all retries")

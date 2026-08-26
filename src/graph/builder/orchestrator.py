@@ -11,7 +11,7 @@ from src.db.models import Content
 from src.graph.client import Neo4jClient
 from src.graph.builder.reader import PostBatchContext, Reader
 from src.graph.builder.splitter import TextSplitter
-from src.graph.builder.extractor import GraphExtractor
+from src.graph.builder.extractor import GraphExtractor, LLMInfrastructureError
 from src.graph.builder.aligner import Aligner
 from src.graph.builder.vectorizer import EntityVectorizer
 from src.graph.builder.writer import GraphWriter
@@ -104,15 +104,26 @@ class KagBuilderOrchestrator:
                 context.content_id, total_elapsed,
                 splitter_elapsed, total_extractor, total_aligner, total_writer,
             )
-        except Exception:
-            logger.exception("Post %d processing failed, marking as failed", context.content_id)
+        except Exception as e:
+            is_infra_error = isinstance(e, LLMInfrastructureError)
+            if is_infra_error:
+                logger.warning(
+                    "Post %d transient LLM infrastructure failure, resetting status for retry: %s",
+                    context.content_id, e,
+                )
+                target_status = 0
+            else:
+                logger.exception("Post %d processing failed, marking as failed: %s", context.content_id, e)
+                target_status = 3
             async with self._db.async_session() as session:
                 async with session.begin():
                     await session.execute(
                         update(Content)
                         .where(Content.id == context.content_id)
-                        .values(graph_status=3, updated_at=datetime.now(timezone.utc))
+                        .values(graph_status=target_status, updated_at=datetime.now(timezone.utc))
                     )
+            if is_infra_error:
+                await asyncio.sleep(2.0)
 
     async def _producer_loop(self, poll_interval: float = 3.0) -> None:
         iteration = 0
