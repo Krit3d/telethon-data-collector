@@ -36,8 +36,6 @@ class DbsfRankingEngine:
     def _normalize_distribution(values: list[float], tau: float = 1.8) -> list[float]:
         if not values:
             return []
-        if max(values) == 0.0:
-            return [0.0] * len(values)
         mu = sum(values) / len(values)
         sigma = math.sqrt(sum((x - mu) ** 2 for x in values) / len(values))
         if sigma < 1e-6:
@@ -55,8 +53,8 @@ class DbsfRankingEngine:
     def rank_candidates(
         vector_aggregates: dict[int, AuthorVectorAggregate],
         graph_evidences: dict[int, GraphAuthorEvidence],
-        vector_weight: float = 0.60,
-        graph_weight: float = 0.40,
+        vector_weight: float = 0.65,
+        graph_weight: float = 0.35,
     ) -> list[DbsfScoredCandidate]:
         all_ids = list(set(vector_aggregates.keys()) | set(graph_evidences.keys()))
 
@@ -91,17 +89,23 @@ class DbsfRankingEngine:
 
         candidates: list[DbsfScoredCandidate] = []
         for account_id in clean_ids:
+            evidence = graph_evidences.get(account_id)
             nv = norm_vec_map[account_id]
             ng = norm_graph_map[account_id]
-            if nv == 0.0 and ng == 0.0:
-                final_score = 0.0
-            else:
+            raw_graph = raw_graph_scores[account_id]
+
+            if evidence is not None and raw_graph > 0.0:
                 final_score = vector_weight * nv + graph_weight * ng
+            elif evidence is None or evidence.total_topics_count == 0:
+                final_score = nv * 0.60
+            else:
+                final_score = nv * 0.35
+
             candidates.append(
                 DbsfScoredCandidate(
                     account_id=account_id,
                     raw_vector_score=raw_vector_scores[account_id],
-                    raw_graph_score=raw_graph_scores[account_id],
+                    raw_graph_score=raw_graph,
                     normalized_vector_score=nv,
                     normalized_graph_score=ng,
                     final_score=final_score,

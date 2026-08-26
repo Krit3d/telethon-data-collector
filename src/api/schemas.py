@@ -74,6 +74,8 @@ class GraphAuthorEvidence(BaseModel):
     topic_coverage_weight: float = Field(default=0.0, description="Topic coverage weight computed as posts_count / 12.0")
     matched_concepts: list[str] = Field(default_factory=list, description="Matched Concept names from graph traversal")
     matched_microconcepts: list[str] = Field(default_factory=list, description="Matched MicroConcept names from graph traversal")
+    total_topics_count: int = Field(default=0, description="Total number of topics associated with the author in graph")
+    matched_topics_count: int = Field(default=0, description="Number of topics matched to the query for this author")
     matched_entities_count: int = Field(default=0, description="Number of graph entities matched for this author")
     direct_mentions_count: int = Field(default=0, description="Number of direct entity mentions in author posts")
     has_role_relation: bool = Field(default=False, description="Whether author has WORKS_AT role relations in graph")

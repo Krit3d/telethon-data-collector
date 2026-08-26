@@ -42,6 +42,8 @@ class Neo4jSearchRepository:
             MATCH (a:Actor)
             WHERE a.account_id IN $account_ids
             WITH a,
+                size([(a)-[:COVERS_TOPIC]->() | 1]) AS total_topics_count,
+                size([(a)-[:PUBLISHED]->(:Post) | 1]) AS graphed_posts_count,
                 [(a)-[r:COVERS_TOPIC]->(c:Concept)
                     WHERE c.name_lower IN $search_tokens
                     | {name: c.name_lower, posts_count: coalesce(r.posts_count, 0)}] AS concept_topics,
@@ -68,6 +70,7 @@ class Neo4jSearchRepository:
                     | coalesce(r.relation_subtype, 'creator')] AS prod_subtypes,
                 EXISTS { MATCH (a)-[:PUBLISHED]->(p:Post) WHERE p.is_spam_or_gambling = true } AS is_spam
             WITH a, is_spam,
+                total_topics_count, graphed_posts_count,
                 concept_topics, micro_topics,
                 REDUCE(acc = [], x IN [t IN concept_topics | t.name] | CASE WHEN x IN acc THEN acc ELSE acc + x END) AS uniq_concept_names,
                 REDUCE(acc = [], x IN [t IN micro_topics | t.name] | CASE WHEN x IN acc THEN acc ELSE acc + x END) AS uniq_micro_names,
@@ -79,6 +82,9 @@ class Neo4jSearchRepository:
                 'promoter' IN prod_subtypes AS is_promoter
             RETURN
                 a.account_id AS account_id,
+                total_topics_count,
+                graphed_posts_count,
+                size(uniq_concept_names) + size(uniq_micro_names) AS matched_topics_count,
                 REDUCE(s = 0, x IN concept_topics | s + x.posts_count) + REDUCE(s = 0, x IN micro_topics | s + x.posts_count) AS total_posts_count,
                 uniq_concept_names AS matched_concept_names,
                 uniq_micro_names AS matched_micro_names,
@@ -120,6 +126,8 @@ class Neo4jSearchRepository:
                 topic_coverage_weight=topic_coverage_weight,
                 matched_concepts=matched_concepts,
                 matched_microconcepts=matched_microconcepts,
+                total_topics_count=int(row["total_topics_count"]),
+                matched_topics_count=int(row["matched_topics_count"]),
                 matched_entities_count=matched_entities_count,
                 direct_mentions_count=direct_mentions_count,
                 has_role_relation=has_role_relation,

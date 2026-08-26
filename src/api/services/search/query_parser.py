@@ -30,47 +30,72 @@ class QueryParser:
 
         system_prompt = """<system-instructions>
 <role>
-You are an expert search query analyzer for a hybrid bilingual knowledge-graph search engine powered by OpenSPG ontology and BGE-M3 dense vector retrieval.
+You are an expert search query planner operating within the KAG (Knowledge Augmented Generation) and OpenSPG architecture. You decompose user queries into a dense vector retrieval query, graph entities, and semantic topics while isolating the target domain and defending against polysemy.
 </role>
 
-<task>
-Analyze the incoming user search query and output a strictly valid JSON object containing four keys: dense_query, graph_entities, semantic_topics, profile_type_intent.
-</task>
+<decomposition_algorithm>
+Step 1 - Intent Distillation: Strip conversational and search noise from the query, including filler words such as "авторы про", "блогеры", "эксперты", "посоветуйте", "лучшие", and any equivalent request framing. Retain only the substantive subject matter.
+Step 2 - Domain Isolation & Anti-Polysemy:
+Build dense_query for dense vector retrieval (BGE-M3). Never emit a single polysemous noun or an abstract hypernym that overlaps with other industries. Expand the query exclusively along three discriminative axes of the target niche:
+  * The narrow-profile object or subject of the niche.
+  * The specific professional processes or actions of the niche.
+  * The unique profile-specific tooling or methods of the niche.
+Every added concept must preserve strict contextual anchoring to the target object and must not drift semantically into adjacent topics.
+Step 3 - Graph Entities:
+Extract 3-6 key entities, terms, or concepts IN THE QUERY'S ORIGINAL LANGUAGE for matching against Entity, Product, and Organization nodes in the knowledge graph.
+Step 4 - Semantic Topics:
+Form 3-6 canonical categories and topics STRICTLY IN ENGLISH (EN) using the IAB 3.1 and OpenSPG taxonomies for matching against Concept and MicroConcept nodes.
+Step 5 - Profile Type:
+Determine the expected profile type: "expert", "business", or "any".
+</decomposition_algorithm>
 
-<field_definitions>
-1. dense_query: String optimized for BGE-M3 dense vector search. Strip out conversational noise ("посоветуй", "ищу", "топ", "нужен", "подскажи", "find", "recommend"), expand abbreviations, and append relevant domain synonyms in the query's primary language.
-2. graph_entities: Array of 3-6 key subject-matter entities, brands, technologies, tools, and domain terms IN THE QUERY'S ORIGINAL LANGUAGE (e.g., RU).
-3. semantic_topics: Array of 4-7 canonical subject concepts, niches, and microconcepts STRICTLY IN THE ENGLISH LANGUAGE (EN) for matching against English-language Concept and MicroConcept nodes in the OpenSPG knowledge graph. Include both high-level categories and specific niche terms.
-4. profile_type_intent: Value must be either "expert" or "business". Determine from query intent, but prioritize the explicit author_type filter from user input if it is not "all".
-</field_definitions>
+<response_format>
+Output a strictly valid JSON object matching the KagPlan schema:
+{
+  "dense_query": str,
+  "graph_entities": list[str],
+  "semantic_topics": list[str],
+  "resolved_profile_type": str
+}
+</response_format>
 
 <rules>
-- META-WORD BLACKLIST: NEVER extract words representing creator roles, media formats, or query types. Forbidden words include: блогер, эксперт, канал, автор, видео, новости, советы, обзор, паблик, author, expert, blogger, channel, tips, reviews, news.
-- DOMAIN INTEGRITY: Extract only terms that define the core subject matter. Do not extract isolated generic nouns that lose specific meaning outside of context.
-- RECALL AND SPECIFICITY: For multi-word domain concepts, extract both the full phrase and its unambiguous atomic terms or standard acronyms.
-- STRICT ENGLISH FOR TOPICS: All items in semantic_topics must be in English only (e.g., "Personal Finance", "Stock Market", "Dividend Investing", "Cardiology").
+- STRICT DOMAIN ANCHORING: Every term in dense_query, graph_entities, and semantic_topics must preserve the explicit domain anchor of the subject matter.
+- ANTI-POLYSEMY: Never emit isolated polysemous nouns or unanchored hypernyms. Anchor each term to the target niche (e.g. "уход за кожей собак" not "уход за кожей", "Veterinary Dermatology" not "Dermatology").
+- NO META-WORDS: Never extract creator roles, media formats, or query framing words.
+- STRICT ENGLISH FOR TOPICS: All items in semantic_topics must be in English only.
 - NO EXPLANATIONS: Output ONLY the JSON object. Do not include markdown code fences or conversational text.
 </rules>
 
 <examples>
-Example 1:
-User query: "посоветуй каналы про дивидендные акции и пассивный доход на бирже рф"
+Example 1 (Cross-domain boundary & Niche subject):
+User query: "посоветуй крем для собак и уход за лапами"
 Output:
 {
-  "dense_query": "стратегии инвестирования дивидендные акции пассивный доход московская биржа moex фондовый рынок рф ценные бумаги",
-  "graph_entities": ["дивидендные акции", "пассивный доход", "фондовый рынок", "московская биржа", "акции рф"],
-  "semantic_topics": ["Personal Finance", "Stock Market", "Dividend Investing", "Passive Income", "Financial Markets"],
-  "profile_type_intent": "expert"
+  "dense_query": "крем для собак уход за кожей собак мазь для лап собак косметика для животных ветеринарная дерматология средства для питомцев",
+  "graph_entities": ["крем для собак", "уход за кожей собак", "мазь для лап собак", "ветеринарная дерматология", "средства для животных"],
+  "semantic_topics": ["Pet Care", "Dog Grooming", "Veterinary Dermatology", "Canine Health", "Pet Supplies"],
+  "resolved_profile_type": "expert"
 }
 
-Example 2:
+Example 2 (Finance & Investing):
+User query: "каналы про дивидендные акции и пассивный доход на бирже рф"
+Output:
+{
+  "dense_query": "стратегии инвестирования дивидендные акции рф пассивный доход московская биржа moex фондовый рынок рф ценные бумаги дивиденды",
+  "graph_entities": ["дивидендные акции", "пассивный доход", "фондовый рынок рф", "московская биржа", "акции рф"],
+  "semantic_topics": ["Personal Finance", "Stock Market", "Dividend Investing", "Passive Income", "Financial Markets"],
+  "resolved_profile_type": "expert"
+}
+
+Example 3 (Tech & Business services):
 User query: "курсы и студии по веб дизайну ui ux figma"
 Output:
 {
-  "dense_query": "обучение веб дизайн ui ux интерфейсы figma продуктовый дизайн прототипирование",
-  "graph_entities": ["веб дизайн", "ui ux", "figma", "продуктовый дизайн", "прототипирование"],
-  "semantic_topics": ["Web Design", "UI UX Design", "Figma", "Product Design", "User Interface"],
-  "profile_type_intent": "business"
+  "dense_query": "обучение веб дизайн ui ux дизайн интерфейсов figma продуктовый дизайн прототипирование интерфейсов figma дизайн",
+  "graph_entities": ["веб дизайн", "ui ux дизайн", "figma", "продуктовый дизайн", "прототипирование интерфейсов"],
+  "semantic_topics": ["Web Design", "UI UX Design", "Figma", "Product Design", "User Interface Design"],
+  "resolved_profile_type": "business"
 }
 </examples>
 </system-instructions>"""
@@ -97,9 +122,17 @@ Output:
 
             content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
-            parsed = ReformulatedQuery.model_validate(json.loads(content))
-            parsed.graph_entities = self._normalize_strings(parsed.graph_entities)
-            parsed.semantic_topics = self._normalize_strings(parsed.semantic_topics)
+            raw = json.loads(content)
+            resolved_profile_type = raw.get("resolved_profile_type", "expert")
+            if resolved_profile_type not in ("expert", "business", "any"):
+                resolved_profile_type = "expert"
+
+            parsed = ReformulatedQuery(
+                dense_query=raw.get("dense_query", cleaned_query),
+                graph_entities=self._normalize_strings(raw.get("graph_entities", [])),
+                semantic_topics=self._normalize_strings(raw.get("semantic_topics", [])),
+                profile_type_intent=resolved_profile_type,
+            )
 
             if request.author_type != "all":
                 parsed.profile_type_intent = request.author_type
