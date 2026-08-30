@@ -7,6 +7,7 @@ class SearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50, description="Maximum number of results to return")
     location: str | None = Field(default="", description="Filter results by author location")
     min_followers: int | None = Field(default=None, description="Minimum follower count filter")
+    max_followers: int | None = Field(default=None, description="Maximum follower count filter")
     author_type: str = Field(default="expert", description="Author type filter: expert, business, or all")
     include_contacts: bool = Field(default=False, description="Include contact details in response")
     include_analytics: bool = Field(default=True, description="Include analytics data in response")
@@ -23,8 +24,12 @@ class SearchRequest(BaseModel):
         location = data.get("location")
         if location is None or location == "" or (isinstance(location, str) and location.strip().lower() == "string"):
             data["location"] = None
-        if data.get("min_followers") == 0:
+        min_followers = data.get("min_followers")
+        if min_followers is None or min_followers == "" or (isinstance(min_followers, (int, float)) and min_followers <= 0):
             data["min_followers"] = None
+        max_followers = data.get("max_followers")
+        if max_followers is None or max_followers == "" or (isinstance(max_followers, (int, float)) and max_followers <= 0):
+            data["max_followers"] = None
         languages = data.get("languages")
         if languages is None or languages == []:
             data["languages"] = None

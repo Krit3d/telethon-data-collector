@@ -192,17 +192,44 @@ export function renderMetadataBar(metadata, container) {
     return;
   }
   const time = metadata.execution_time_ms != null ? `${Number(metadata.execution_time_ms).toFixed(0)} мс` : "—";
-  const candidates = metadata.total_candidates_count != null ? metadata.total_candidates_count : "—";
+  const qdrant = metadata.qdrant_candidates_count != null ? metadata.qdrant_candidates_count : "—";
+  const graph = metadata.graph_evidences_count != null ? metadata.graph_evidences_count : "—";
+  const total = metadata.total_candidates_count != null ? metadata.total_candidates_count : "—";
   const timings = metadata.timings || {};
-  const timingParts = Object.entries(timings)
-    .map(([key, val]) => `<span class="meta-chip">${escapeHtml(key)}: ${Number(val).toFixed(0)} мс</span>`)
+  const timingRows = Object.entries(timings)
+    .map(([key, val]) => `<div class="analytics-row">
+      <span class="analytics-key">${escapeHtml(key)}</span>
+      <span class="analytics-value">${Number(val).toFixed(0)} мс</span>
+    </div>`)
     .join("");
 
-  container.innerHTML = `<div class="metadata-bar">
-    <span class="meta-chip">Время: ${time}</span>
-    <span class="meta-chip">Кандидатов: ${candidates}</span>
-    ${timingParts}
-  </div>`;
+  container.innerHTML = `<details class="analytics-accordion">
+    <summary class="analytics-summary">
+      <span class="analytics-total">${time}</span>
+      <span class="analytics-badge">Аналитика пайплайна</span>
+      <svg class="analytics-chevron" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+    </summary>
+    <div class="analytics-body">
+      <div class="analytics-grid">
+        <div class="analytics-metric">
+          <span class="analytics-metric-label">Кандидаты Qdrant</span>
+          <span class="analytics-metric-value">${qdrant}</span>
+        </div>
+        <div class="analytics-metric">
+          <span class="analytics-metric-label">Кандидаты Graph</span>
+          <span class="analytics-metric-value">${graph}</span>
+        </div>
+        <div class="analytics-metric">
+          <span class="analytics-metric-label">Всего кандидатов</span>
+          <span class="analytics-metric-value">${total}</span>
+        </div>
+      </div>
+      <div class="analytics-section">
+        <div class="analytics-section-title">Тайминги</div>
+        ${timingRows || `<div class="analytics-row"><span class="analytics-key">нет данных</span></div>`}
+      </div>
+    </div>
+  </details>`;
 }
 
 export function renderShortlist(shortlist, container, store) {

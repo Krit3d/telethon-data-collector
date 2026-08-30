@@ -11,21 +11,12 @@ export class SearchApiClient {
     this.controller = new AbortController();
     const effectiveSignal = signal || this.controller.signal;
 
-    const body = {
-      query: payload.query,
-      limit: payload.limit || 20,
-      author_type: payload.author_type || "expert",
-      min_followers: payload.min_followers || null,
-      include_contacts: true,
-      include_analytics: true,
-    };
-
     let response;
     try {
       response = await fetch(`${this.baseUrl}/api/v1/search/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
         signal: effectiveSignal,
       });
     } catch (err) {

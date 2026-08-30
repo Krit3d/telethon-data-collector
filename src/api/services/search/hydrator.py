@@ -83,8 +83,17 @@ class PostgresHydrator:
             elif request.author_type == "business":
                 stmt = stmt.where(Account.is_author_blog.is_(False))
 
-            if request.min_followers is not None and request.min_followers > 0:
-                stmt = stmt.where(Account.subscribers_count >= request.min_followers)
+            if request.min_followers is not None:
+                stmt = stmt.where(
+                    Account.subscribers_count.is_not(None),
+                    Account.subscribers_count >= request.min_followers,
+                )
+
+            if request.max_followers is not None:
+                stmt = stmt.where(
+                    Account.subscribers_count.is_not(None),
+                    Account.subscribers_count <= request.max_followers,
+                )
 
             result = await session.execute(stmt)
             accounts = result.scalars().all()

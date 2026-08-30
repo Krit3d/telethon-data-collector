@@ -53,19 +53,44 @@ function buildSearchTab() {
           <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#6366f1" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
           <span class="search-label-text">Опишите задачу для кампании</span>
         </div>
-        <div class="platform-pills">
-          <button class="pill on" data-action="platform" data-platform="all">Все</button>
-          <button class="pill" data-action="platform" data-platform="instagram">Instagram</button>
-          <button class="pill" data-action="platform" data-platform="telegram">Telegram</button>
-        </div>
       </div>
       <textarea class="search-textarea" data-search-input rows="2" placeholder="Например: натуральная косметика для чувствительной кожи, продаёмся на Wildberries. Нужны авторы, которые реально говорят про уход и составы."></textarea>
       <div class="search-bottom">
-        <div class="search-hint">Подбор по смыслу контента, а не по категориям</div>
-        <button class="btn-primary" data-action="run-search">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
-          <span>Найти авторов на основе AI-анализа</span>
-        </button>
+        <div class="search-filters">
+          <select class="select-pill" data-country-select>
+            <option value="all" selected>Все страны</option>
+            <option value="kz">Казахстан</option>
+            <option value="ru">Россия</option>
+            <option value="by">Беларусь</option>
+            <option value="uz">Узбекистан</option>
+            <option value="ae">ОАЭ</option>
+            <option value="us">США / Global</option>
+          </select>
+          <select class="select-pill" data-language-select>
+            <option value="all" selected>Все языки</option>
+            <option value="ru">Русский</option>
+            <option value="kk">Казахский</option>
+            <option value="en">Английский</option>
+            <option value="uk">Украинский</option>
+          </select>
+          <div class="subscribers-group">
+            <span class="subscribers-label">Подписчики:</span>
+            <input type="number" class="range-input" data-filter="min-followers" placeholder="от">
+            <span class="range-divider">—</span>
+            <input type="number" class="range-input" data-filter="max-followers" placeholder="до">
+          </div>
+        </div>
+        <div class="search-controls">
+          <div class="platform-pills">
+            <button class="pill on" data-action="platform" data-platform="all">Все</button>
+            <button class="pill" data-action="platform" data-platform="instagram">Instagram</button>
+            <button class="pill" data-action="platform" data-platform="telegram">Telegram</button>
+          </div>
+          <button class="btn-primary" data-action="run-search">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
+            <span>Найти авторов →</span>
+          </button>
+        </div>
       </div>
     </div>
     <div data-progress></div>
@@ -135,6 +160,34 @@ function render() {
           e.preventDefault();
           runSearch();
         }
+      });
+    }
+    const countrySelect = tab.querySelector("[data-country-select]");
+    if (countrySelect) {
+      countrySelect.value = store.selectedCountry || "all";
+      countrySelect.addEventListener("change", () => {
+        store.selectedCountry = countrySelect.value;
+      });
+    }
+    const languageSelect = tab.querySelector("[data-language-select]");
+    if (languageSelect) {
+      languageSelect.value = store.selectedLanguage || "all";
+      languageSelect.addEventListener("change", () => {
+        store.selectedLanguage = languageSelect.value;
+      });
+    }
+    const minFollowers = tab.querySelector("[data-filter='min-followers']");
+    if (minFollowers) {
+      minFollowers.value = store.minFollowers ?? "";
+      minFollowers.addEventListener("input", () => {
+        store.minFollowers = minFollowers.value === "" ? null : Number(minFollowers.value);
+      });
+    }
+    const maxFollowers = tab.querySelector("[data-filter='max-followers']");
+    if (maxFollowers) {
+      maxFollowers.value = store.maxFollowers ?? "";
+      maxFollowers.addEventListener("input", () => {
+        store.maxFollowers = maxFollowers.value === "" ? null : Number(maxFollowers.value);
       });
     }
     const pills = tab.querySelectorAll("[data-action='platform']");
@@ -327,11 +380,7 @@ async function runSearch() {
   startProgress();
 
   try {
-    const data = await api.search({
-      query,
-      limit: 20,
-      author_type: store.authorType,
-    });
+    const data = await api.search(store.buildSearchRequest(query));
     store.searchResults = data.items || [];
     store.queryMetadata = data.query_metadata || null;
     stopProgress();

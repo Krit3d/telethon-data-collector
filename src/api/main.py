@@ -1,11 +1,16 @@
 """FastAPI application entry point with production-ready configuration."""
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+from starlette.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 from src.config.config import load_settings
 from src.db.database import Database
@@ -14,6 +19,18 @@ from src.graph.client import Neo4jClient
 from src.api.routers import search, health
 
 logger = logging.getLogger(__name__)
+
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+INDEX_FILE = WEB_DIR / "index.html"
+CSS_FILE = WEB_DIR / "css" / "style.css"
+JS_FILE = WEB_DIR / "js" / "app.js"
+CSS_ASSET = "/css/style.css"
+JS_ASSET = "/js/app.js"
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 @asynccontextmanager
@@ -56,6 +73,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+class NoCacheMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        for header, value in NO_CACHE_HEADERS.items():
+            response.headers[header] = value
+        return response
+
+
+class NoCacheStaticFiles(StaticFiles):
+    def file_response(self, *args, **kwargs) -> Response:
+        response = super().file_response(*args, **kwargs)
+        for header, value in NO_CACHE_HEADERS.items():
+            response.headers[header] = value
+        return response
+
+
+app.add_middleware(NoCacheMiddleware)
+
 # Add CORS middleware for internal production APIs
 app.add_middleware(
     CORSMiddleware,
@@ -76,6 +112,17 @@ async def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
-web_dir = Path(__file__).resolve().parent.parent / "web"
-if web_dir.exists():
-    app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")
+@app.get("/", response_class=HTMLResponse)
+@app.get("/index.html", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    html = INDEX_FILE.read_text(encoding="utf-8")
+    css_mtime = int(os.path.getmtime(CSS_FILE))
+    js_mtime = int(os.path.getmtime(JS_FILE))
+    html = html.replace(CSS_ASSET, f"{CSS_ASSET}?t={css_mtime}")
+    html = html.replace(JS_ASSET, f"{JS_ASSET}?t={js_mtime}")
+    return HTMLResponse(content=html, headers=NO_CACHE_HEADERS)
+
+
+if WEB_DIR.exists():
+    app.mount("/css", NoCacheStaticFiles(directory=str(WEB_DIR / "css")), name="css")
+    app.mount("/js", NoCacheStaticFiles(directory=str(WEB_DIR / "js")), name="js")

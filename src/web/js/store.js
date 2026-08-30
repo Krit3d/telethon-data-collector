@@ -24,6 +24,10 @@ export class AppStore {
   constructor() {
     this.activeTab = "search";
     this.searchQuery = "";
+    this.selectedCountry = "all";
+    this.selectedLanguage = "all";
+    this.minFollowers = null;
+    this.maxFollowers = null;
     this.platformFilter = "all";
     this.sortFilter = "relevance";
     this.reachFilter = "all";
@@ -33,6 +37,20 @@ export class AppStore {
     this.shortlist = readStorage(SHORTLIST_KEY, []);
     this.threads = readStorage(THREADS_KEY, []);
     this.activeThreadId = null;
+  }
+
+  buildSearchRequest(query) {
+    return {
+      query,
+      limit: 20,
+      author_type: this.authorType || "expert",
+      min_followers: (this.minFollowers && Number(this.minFollowers) > 0) ? Number(this.minFollowers) : null,
+      max_followers: (this.maxFollowers && Number(this.maxFollowers) > 0) ? Number(this.maxFollowers) : null,
+      location: this.selectedCountry !== "all" ? this.selectedCountry : null,
+      languages: this.selectedLanguage !== "all" ? [this.selectedLanguage] : null,
+      include_contacts: false,
+      include_analytics: true,
+    };
   }
 
   toggleShortlist(author) {
