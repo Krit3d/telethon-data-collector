@@ -35,6 +35,7 @@ class SearchService:
                     dense_query="",
                     graph_entities=[],
                     semantic_topics=[],
+                    target_languages=reformulated.target_languages,
                     resolved_profile_type=request.author_type,
                     execution_time_ms=total_ms,
                     timings=timings,
@@ -61,6 +62,7 @@ class SearchService:
                     dense_query=reformulated.dense_query,
                     graph_entities=reformulated.graph_entities,
                     semantic_topics=reformulated.semantic_topics,
+                    target_languages=reformulated.target_languages,
                     resolved_profile_type=request.author_type,
                     execution_time_ms=total_ms,
                     timings=timings,
@@ -75,6 +77,7 @@ class SearchService:
             account_ids=account_ids,
             graph_entities=reformulated.graph_entities,
             semantic_topics=reformulated.semantic_topics,
+            target_languages=reformulated.target_languages,
         )
         timings["graph_reasoning_ms"] = (time.perf_counter() - graph_start) * 1000.0
 
@@ -82,6 +85,7 @@ class SearchService:
         scored_candidates = self._dbsf_engine.rank_candidates(
             vector_aggregates=vector_aggregates,
             graph_evidences=graph_evidences,
+            target_languages=reformulated.target_languages,
         )
         timings["dbsf_fusion_ms"] = (time.perf_counter() - dbsf_start) * 1000.0
 
@@ -94,6 +98,9 @@ class SearchService:
 
         items: list[AuthorSearchResultItem] = []
         for scored, hydrated in hydrated_pairs:
+            evidence = graph_evidences.get(hydrated.account_id)
+            location = (evidence.location_name if evidence and evidence.location_name else (hydrated.raw_metadata.get("location") if hydrated.raw_metadata else None))
+            primary_language = evidence.primary_language if evidence else None
             items.append(
                 AuthorSearchResultItem(
                     account_id=hydrated.account_id,
@@ -110,6 +117,8 @@ class SearchService:
                     contacts=hydrated.contacts,
                     has_contacts=hydrated.has_contacts,
                     subscribers_count=hydrated.subscribers_count,
+                    location=location,
+                    primary_language=primary_language,
                 )
             )
 
@@ -120,6 +129,7 @@ class SearchService:
             dense_query=reformulated.dense_query,
             graph_entities=reformulated.graph_entities,
             semantic_topics=reformulated.semantic_topics,
+            target_languages=reformulated.target_languages,
             resolved_profile_type=request.author_type,
             execution_time_ms=total_ms,
             timings=timings,

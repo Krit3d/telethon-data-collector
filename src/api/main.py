@@ -2,8 +2,10 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from src.config.config import load_settings
 from src.db.database import Database
@@ -72,3 +74,8 @@ app.include_router(health.router, prefix="/api/v1")
 async def health_check() -> dict[str, str]:
     """Health check endpoint for monitoring and load balancers."""
     return {"status": "ok"}
+
+
+web_dir = Path(__file__).resolve().parent.parent / "web"
+if web_dir.exists():
+    app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")

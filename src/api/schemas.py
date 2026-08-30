@@ -10,6 +10,7 @@ class SearchRequest(BaseModel):
     author_type: str = Field(default="expert", description="Author type filter: expert, business, or all")
     include_contacts: bool = Field(default=False, description="Include contact details in response")
     include_analytics: bool = Field(default=True, description="Include analytics data in response")
+    languages: list[str] | None = Field(default=[], description="Optional filter by ISO language codes (e.g. ['ru', 'uk', 'en'])")
 
     @model_validator(mode="before")
     @classmethod
@@ -24,6 +25,17 @@ class SearchRequest(BaseModel):
             data["location"] = None
         if data.get("min_followers") == 0:
             data["min_followers"] = None
+        languages = data.get("languages")
+        if languages is None or languages == []:
+            data["languages"] = None
+        elif isinstance(languages, list):
+            normalized_languages = []
+            for lang in languages:
+                if isinstance(lang, str):
+                    stripped = lang.strip().lower()
+                    if stripped:
+                        normalized_languages.append(stripped)
+            data["languages"] = normalized_languages if normalized_languages else None
         author_type = data.get("author_type")
         if author_type is None or author_type == "" or (isinstance(author_type, str) and author_type.strip().lower() == "string"):
             data["author_type"] = "expert"
@@ -38,8 +50,9 @@ class ReformulatedQuery(BaseModel):
     graph_entities: list[str] = Field(default_factory=list, description="Target entity names for graph traversal")
     semantic_topics: list[str] = Field(default_factory=list, description="Extracted natural topic areas matching query intent")
     profile_type_intent: str = Field(default="expert", description="Inferred target profile type: expert or business")
+    target_languages: list[str] = Field(default_factory=list, description="Target language codes (e.g. ru, uk, kz, en) extracted or inferred from query")
 
-    @field_validator("graph_entities", "semantic_topics", mode="before")
+    @field_validator("graph_entities", "semantic_topics", "target_languages", mode="before")
     @classmethod
     def list_null_to_empty(cls, v: Any) -> Any:
         if v is None:
@@ -84,6 +97,8 @@ class GraphAuthorEvidence(BaseModel):
     is_promoter: bool = Field(default=False, description="Whether author has PRODUCES promoter relation in graph")
     is_spam_or_gambling: bool = Field(default=False, description="Whether author is flagged as spam or gambling content")
     raw_graph_score: float = Field(default=0.0, description="Raw graph traversal relevance score before normalization")
+    location_name: str | None = Field(default=None, description="Raw location name from Actor node in Neo4j")
+    primary_language: str | None = Field(default=None, description="Aggregated primary language from Actor node in Neo4j")
 
 
 class DbsfScoredCandidate(BaseModel):
@@ -118,6 +133,7 @@ class QueryMetadata(BaseModel):
     dense_query: str = Field(description="Reformulated dense query used for embedding search")
     graph_entities: list[str] = Field(default_factory=list, description="Entity names used for graph traversal")
     semantic_topics: list[str] = Field(default_factory=list, description="Natural topic areas used for concept activation")
+    target_languages: list[str] = Field(default_factory=list, description="Extracted target languages")
     resolved_profile_type: str = Field(description="Final resolved profile type after normalization")
     execution_time_ms: float = Field(description="Total query execution time in milliseconds")
     timings: dict[str, float] = Field(default_factory=dict, description="Phase-level execution timing breakdown in milliseconds")
@@ -142,6 +158,8 @@ class AuthorSearchResultItem(BaseModel):
     contacts: dict[str, Any] | None = Field(default=None, description="Contact information dictionary")
     has_contacts: bool = Field(default=False, description="Whether contact data is available")
     subscribers_count: int | None = Field(default=None, description="Number of subscribers or followers")
+    location: str | None = Field(default=None, description="Author location name from graph or profile")
+    primary_language: str | None = Field(default=None, description="Author primary language code (e.g. ru, uk, en)")
 
 
 class SearchResponse(BaseModel):

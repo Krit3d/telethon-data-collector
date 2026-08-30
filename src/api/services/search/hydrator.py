@@ -62,26 +62,6 @@ class PostgresHydrator:
 
         return None
 
-    @staticmethod
-    def _matches_location(raw_metadata: dict[str, Any] | None, target_location: str | None) -> bool:
-        if target_location is None or target_location == "":
-            return True
-        if not isinstance(raw_metadata, dict):
-            return False
-        loc = target_location.lower().strip()
-        raw_loc = raw_metadata.get("location")
-        if isinstance(raw_loc, str) and loc in raw_loc.lower():
-            return True
-        geo_data = raw_metadata.get("geo_data")
-        if isinstance(geo_data, dict):
-            city = geo_data.get("city")
-            if isinstance(city, str) and loc in city.lower():
-                return True
-            country = geo_data.get("country")
-            if isinstance(country, str) and loc in country.lower():
-                return True
-        return False
-
     async def hydrate_and_filter_candidates(
         self,
         candidates: list[DbsfScoredCandidate],
@@ -115,9 +95,6 @@ class PostgresHydrator:
         for candidate in candidates:
             acc = account_map.get(candidate.account_id)
             if acc is None:
-                continue
-
-            if not self._matches_location(acc.raw_metadata, request.location):
                 continue
 
             contacts, has_contacts = self._extract_contacts(acc.raw_metadata)

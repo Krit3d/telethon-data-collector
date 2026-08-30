@@ -19,17 +19,17 @@ class DbsfRankingEngine:
     def calculate_raw_graph_score(evidence: GraphAuthorEvidence | None) -> float:
         if evidence is None or evidence.is_spam_or_gambling:
             return 0.0
-        if evidence.topic_coverage_weight == 0.0 and evidence.direct_mentions_count == 0 and evidence.matched_entities_count == 0:
+        if evidence.topic_coverage_weight == 0.0 and evidence.direct_mentions_count == 0 and evidence.matched_topics_count == 0:
             return 0.0
         mentions_signal = min(1.0, evidence.direct_mentions_count * 0.25 + evidence.matched_entities_count * 0.15)
         ontological_priors = (
-            (0.30 if evidence.has_role_relation else 0.0)
-            + (0.25 if evidence.has_tech_relation else 0.0)
-            + (0.20 if evidence.is_creator else 0.0)
+            (0.35 if evidence.has_role_relation else 0.0)
+            + (0.30 if evidence.has_tech_relation else 0.0)
+            + (0.25 if evidence.is_creator else 0.0)
             - (0.15 if evidence.is_promoter and not (evidence.has_role_relation or evidence.is_creator) else 0.0)
         )
         priors_signal = min(1.0, max(0.0, ontological_priors))
-        raw_score = 0.45 * evidence.topic_coverage_weight + 0.35 * mentions_signal + 0.20 * priors_signal
+        raw_score = 0.50 * evidence.topic_coverage_weight + 0.35 * mentions_signal + 0.15 * priors_signal
         return min(1.0, max(0.0, raw_score))
 
     @staticmethod
@@ -55,6 +55,7 @@ class DbsfRankingEngine:
         graph_evidences: dict[int, GraphAuthorEvidence],
         vector_weight: float = 0.65,
         graph_weight: float = 0.35,
+        target_languages: list[str] | None = None,
     ) -> list[DbsfScoredCandidate]:
         all_ids = list(set(vector_aggregates.keys()) | set(graph_evidences.keys()))
 
@@ -95,11 +96,13 @@ class DbsfRankingEngine:
             raw_graph = raw_graph_scores[account_id]
 
             if evidence is not None and raw_graph > 0.0:
-                final_score = vector_weight * nv + graph_weight * ng
-            elif evidence is None or evidence.total_topics_count == 0:
-                final_score = nv * 0.60
+                base_score = vector_weight * nv + graph_weight * ng
+            elif evidence is not None and evidence.total_topics_count > 0 and evidence.matched_topics_count == 0 and evidence.direct_mentions_count == 0:
+                base_score = nv * 0.20
             else:
-                final_score = nv * 0.35
+                base_score = nv * 0.60
+
+            final_score = min(1.0, max(0.0, base_score))
 
             candidates.append(
                 DbsfScoredCandidate(
@@ -112,5 +115,5 @@ class DbsfRankingEngine:
                 )
             )
 
-        candidates.sort(key=lambda c: c.final_score, reverse=True)
+        candidates.sort(key=lambda c: -c.final_score)
         return candidates

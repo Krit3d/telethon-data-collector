@@ -12,6 +12,7 @@ class GraphReasoner:
         account_ids: list[int],
         graph_entities: list[str],
         semantic_topics: list[str],
+        target_languages: list[str] | None = None,
     ) -> dict[int, GraphAuthorEvidence]:
         if not account_ids:
             return {}
@@ -21,4 +22,5 @@ class GraphReasoner:
         return await self._graph_repo.get_authors_graph_evidence(
             account_ids=account_ids,
             search_tokens=search_tokens,
+            target_languages=target_languages,
         )

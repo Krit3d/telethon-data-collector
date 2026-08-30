@@ -34,6 +34,7 @@ class Neo4jSearchRepository:
         self,
         account_ids: list[int],
         search_tokens: list[str],
+        target_languages: list[str] | None = None,
     ) -> dict[int, GraphAuthorEvidence]:
         if not account_ids:
             return {}
@@ -82,6 +83,9 @@ class Neo4jSearchRepository:
                 'promoter' IN prod_subtypes AS is_promoter
             RETURN
                 a.account_id AS account_id,
+                a.location_name AS location_name,
+                a.primary_language AS primary_language,
+                CASE WHEN $target_languages IS NOT NULL AND size(coalesce($target_languages, [])) > 0 THEN coalesce(a.primary_language, '') IN $target_languages ELSE true END AS matched_language,
                 total_topics_count,
                 graphed_posts_count,
                 size(uniq_concept_names) + size(uniq_micro_names) AS matched_topics_count,
@@ -100,6 +104,7 @@ class Neo4jSearchRepository:
         params: dict[str, object] = {
             "account_ids": account_ids,
             "search_tokens": search_tokens,
+            "target_languages": [lang.lower().strip() for lang in target_languages] if target_languages else None,
         }
 
         rows = await self._client.execute_read(query, params)
@@ -115,8 +120,10 @@ class Neo4jSearchRepository:
             is_creator = bool(row["is_creator"])
             is_promoter = bool(row["is_promoter"])
             is_spam_or_gambling = bool(row["is_spam_or_gambling"])
+            location_name = str(row["location_name"]) if row.get("location_name") else None
+            primary_language = str(row["primary_language"]) if row.get("primary_language") else None
 
-            topic_coverage_weight = min(1.0, total_posts_count / 6.0)
+            topic_coverage_weight = min(1.0, total_posts_count / 12.0)
 
             matched_concepts = [str(n) for n in row["matched_concept_names"] if n]
             matched_microconcepts = [str(n) for n in row["matched_micro_names"] if n]
@@ -135,6 +142,8 @@ class Neo4jSearchRepository:
                 is_creator=is_creator,
                 is_promoter=is_promoter,
                 is_spam_or_gambling=is_spam_or_gambling,
+                location_name=location_name,
+                primary_language=primary_language,
                 raw_graph_score=0.0,
             )
 
