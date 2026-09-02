@@ -20,6 +20,15 @@ if (!app) {
 let progressTimer = null;
 let progressStep = 0;
 
+const HORMONE_OPTIONS = [
+  { value: "dopamine", label: "Дофамин" },
+  { value: "serotonin", label: "Серотонин" },
+  { value: "oxytocin", label: "Окситоцин" },
+  { value: "adrenaline", label: "Адреналин" },
+  { value: "cortisol", label: "Кортизол" },
+  { value: "endorphin", label: "Эндорфин" },
+];
+
 function buildHeader() {
   const header = document.createElement("header");
   header.className = "header";
@@ -44,89 +53,105 @@ function buildHeader() {
   return header;
 }
 
+function buildFilterBar() {
+  const hormonePills = HORMONE_OPTIONS.map((h) => {
+    const on = store.selectedHormones.includes(h.value) ? " on" : "";
+    return `<button class="pill hormone-pill${on}" data-action="toggle-hormone" data-hormone="${h.value}">${h.label}</button>`;
+  }).join("");
+  return `
+    <div class="search-filters">
+      <select class="select-pill" data-country-select>
+        <option value="all" selected>Все страны</option>
+        <option value="kz">Казахстан</option>
+        <option value="ru">Россия</option>
+        <option value="by">Беларусь</option>
+        <option value="uz">Узбекистан</option>
+        <option value="ae">ОАЭ</option>
+        <option value="us">США / Global</option>
+      </select>
+      <select class="select-pill" data-language-select>
+        <option value="all" selected>Все языки</option>
+        <option value="ru">Русский</option>
+        <option value="kk">Казахский</option>
+        <option value="en">Английский</option>
+        <option value="uk">Украинский</option>
+      </select>
+      <div class="subscribers-group">
+        <span class="subscribers-label">Подписчики:</span>
+        <input type="number" class="range-input" data-filter="min-followers" placeholder="от">
+        <span class="range-divider">—</span>
+        <input type="number" class="range-input" data-filter="max-followers" placeholder="до">
+      </div>
+      <select class="select-pill" data-tone-select>
+        <option value="all" selected>Все стили</option>
+        <option value="expert">Экспертный</option>
+        <option value="educational">Обучающий</option>
+        <option value="entertainment">Развлекательный</option>
+        <option value="provocative">Провокационный</option>
+        <option value="casual">Повседневный</option>
+        <option value="analytical">Аналитический</option>
+      </select>
+      <div class="hormone-pills">${hormonePills}</div>
+      <input type="text" class="stop-topics-input" data-filter="stop-topics" placeholder="Исключить темы...">
+    </div>`;
+}
+
 function buildSearchTab() {
   const container = document.createElement("div");
-  const audienceBanner = store.isAudienceConfirmed
-    ? `<div class="audience-confirm-banner">
-        <span>🎯 Целевая аудитория определена. Проверьте описание и параметры ниже перед поиском</span>
-        <button class="btn-banner-reset" data-action="reset-audience">Сбросить</button>
-      </div>`
-    : "";
-  const inputValue = store.isAudienceConfirmed
-    ? store.targetAudienceDescription || store.searchQuery
-    : store.brandDescription || store.searchQuery;
+  const isStepOne = store.currentStep === 1;
   const analyzeLabel = store.isAnalyzingBrand ? "Анализ ЦА..." : "Определить ЦА ✨";
-  const textareaRows = store.isAudienceConfirmed ? Math.max(4, Math.ceil((inputValue.length || 1) / 60)) : 2;
-  container.innerHTML = `
-    <div class="search-card">
+  const brandValue = store.brandDescription || store.searchQuery;
+  const audienceValue = store.targetAudienceDescription || store.searchQuery;
+  const brandRows = Math.max(2, Math.ceil((brandValue.length || 1) / 60));
+  const audienceRows = Math.max(4, Math.ceil((audienceValue.length || 1) / 60));
+
+  const cardInner = isStepOne
+    ? `
       <div class="search-top">
         <div class="search-label">
           <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#6366f1" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
           <span class="search-label-text">AI-подбор авторов</span>
         </div>
       </div>
-      ${audienceBanner}
-      <textarea class="search-textarea" data-search-input rows="${textareaRows}" placeholder="Например: натуральная косметика для чувствительной кожи, продаёмся на Wildberries. Нужны авторы, которые реально говорят про уход и составы.">${escapeText(inputValue)}</textarea>
+      <textarea class="search-textarea" data-search-input rows="${brandRows}" placeholder="Например: натуральная косметика для чувствительной кожи, продаёмся на Wildberries. Нужны авторы, которые реально говорят про уход и составы.">${escapeText(brandValue)}</textarea>
       <div class="search-bottom">
-        <div class="search-filters">
-          <select class="select-pill" data-country-select>
-            <option value="all" selected>Все страны</option>
-            <option value="kz">Казахстан</option>
-            <option value="ru">Россия</option>
-            <option value="by">Беларусь</option>
-            <option value="uz">Узбекистан</option>
-            <option value="ae">ОАЭ</option>
-            <option value="us">США / Global</option>
-          </select>
-          <select class="select-pill" data-language-select>
-            <option value="all" selected>Все языки</option>
-            <option value="ru">Русский</option>
-            <option value="kk">Казахский</option>
-            <option value="en">Английский</option>
-            <option value="uk">Украинский</option>
-          </select>
-          <div class="subscribers-group">
-            <span class="subscribers-label">Подписчики:</span>
-            <input type="number" class="range-input" data-filter="min-followers" placeholder="от">
-            <span class="range-divider">—</span>
-            <input type="number" class="range-input" data-filter="max-followers" placeholder="до">
-          </div>
-          <select class="select-pill" data-tone-select>
-            <option value="all" selected>Все стили</option>
-            <option value="expert">Экспертный</option>
-            <option value="educational">Обучающий</option>
-            <option value="entertainment">Развлекательный</option>
-            <option value="provocative">Провокационный</option>
-            <option value="casual">Повседневный</option>
-            <option value="analytical">Аналитический</option>
-          </select>
-          <select class="select-pill" data-hormone-select>
-            <option value="all" selected>Все гормоны</option>
-            <option value="dopamine">Дофамин / Вдохновение</option>
-            <option value="serotonin">Серотонин / Статус</option>
-            <option value="oxytocin">Окситоцин / Доверие</option>
-            <option value="adrenaline">Адреналин / Драйв</option>
-            <option value="cortisol">Кортизол / Проблема</option>
-            <option value="endorphin">Эндорфин / Радость</option>
-          </select>
-          <input type="text" class="stop-topics-input" data-filter="stop-topics" placeholder="Исключить темы...">
-        </div>
+        ${buildFilterBar()}
         <div class="search-controls">
-          <div class="platform-pills">
-            <button class="pill on" data-action="platform" data-platform="all">Все</button>
-            <button class="pill" data-action="platform" data-platform="instagram">Instagram</button>
-            <button class="pill" data-action="platform" data-platform="telegram">Telegram</button>
-          </div>
           <button class="btn-secondary-ai" data-action="analyze-brand"${store.isAnalyzingBrand ? " disabled" : ""}>
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
             <span>${analyzeLabel}</span>
           </button>
-          <button class="btn-primary" data-action="run-search">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
-            <span>Найти авторов</span>
-          </button>
+        </div>
+      </div>`
+    : `
+      <div class="search-top">
+        <div class="search-label">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#6366f1" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
+          <span class="search-label-text">AI-подбор авторов</span>
         </div>
       </div>
+      <div class="audience-confirm-card">
+        <div class="audience-confirm-head">
+          <span class="audience-confirm-badge">🎯</span>
+          <span class="audience-confirm-title">Корректно ли определена ваша целевая аудитория?</span>
+        </div>
+        <textarea class="search-textarea audience-textarea" data-audience-input rows="${audienceRows}">${escapeText(audienceValue)}</textarea>
+        <div class="brand-summary-badge">
+          <span class="brand-summary-label">Исходный бренд:</span>
+          <span class="brand-summary-text">${escapeText(store.brandDescription)}</span>
+        </div>
+      </div>
+      <div class="search-bottom">
+        ${buildFilterBar()}
+        <div class="search-controls">
+          <button class="btn-secondary-ai" data-action="reset-audience">↺ Сбросить к бренду</button>
+          <button class="btn-primary" data-action="run-search">🔍 Найти авторов</button>
+        </div>
+      </div>`;
+
+  container.innerHTML = `
+    <div class="search-card">
+      ${cardInner}
     </div>
     <div data-progress></div>
     <div data-metadata></div>
@@ -164,6 +189,55 @@ function buildCrmTab() {
   return container;
 }
 
+function bindFilterBar(tab) {
+  const countrySelect = tab.querySelector("[data-country-select]");
+  if (countrySelect) {
+    countrySelect.value = store.selectedCountry || "all";
+    countrySelect.addEventListener("change", () => {
+      store.selectedCountry = countrySelect.value;
+    });
+  }
+  const languageSelect = tab.querySelector("[data-language-select]");
+  if (languageSelect) {
+    languageSelect.value = store.selectedLanguage || "all";
+    languageSelect.addEventListener("change", () => {
+      store.selectedLanguage = languageSelect.value;
+    });
+  }
+  const minFollowers = tab.querySelector("[data-filter='min-followers']");
+  if (minFollowers) {
+    minFollowers.value = store.minFollowers ?? "";
+    minFollowers.addEventListener("input", () => {
+      store.minFollowers = minFollowers.value === "" ? null : Number(minFollowers.value);
+    });
+  }
+  const maxFollowers = tab.querySelector("[data-filter='max-followers']");
+  if (maxFollowers) {
+    maxFollowers.value = store.maxFollowers ?? "";
+    maxFollowers.addEventListener("input", () => {
+      store.maxFollowers = maxFollowers.value === "" ? null : Number(maxFollowers.value);
+    });
+  }
+  const toneSelect = tab.querySelector("[data-tone-select]");
+  if (toneSelect) {
+    toneSelect.value = store.selectedTone || "all";
+    toneSelect.addEventListener("change", () => {
+      store.selectedTone = toneSelect.value;
+    });
+  }
+  const stopTopicsInput = tab.querySelector("[data-filter='stop-topics']");
+  if (stopTopicsInput) {
+    stopTopicsInput.value = store.stopTopicsInput || "";
+    stopTopicsInput.addEventListener("input", () => {
+      store.stopTopicsInput = stopTopicsInput.value;
+    });
+  }
+  const hormonePills = tab.querySelectorAll("[data-action='toggle-hormone']");
+  hormonePills.forEach((pill) => {
+    pill.classList.toggle("on", store.selectedHormones.includes(pill.dataset.hormone));
+  });
+}
+
 function render() {
   const main = app.querySelector(".main");
   if (!main) return;
@@ -187,73 +261,34 @@ function render() {
   if (store.activeTab === "search") {
     const tab = buildSearchTab();
     main.appendChild(tab);
-    const input = tab.querySelector("[data-search-input]");
-    if (input) {
-      input.addEventListener("keydown", (e) => {
+    const brandInput = tab.querySelector("[data-search-input]");
+    if (brandInput) {
+      brandInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          analyzeBrandAction();
+        }
+      });
+      brandInput.addEventListener("input", () => {
+        store.brandDescription = brandInput.value;
+        if (store.precomputedPlan && brandInput.value.trim() !== store.searchQuery.trim()) {
+          store.precomputedPlan = null;
+        }
+      });
+    }
+    const audienceInput = tab.querySelector("[data-audience-input]");
+    if (audienceInput) {
+      audienceInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
           runSearch();
         }
       });
-      input.addEventListener("input", () => {
-        if (store.precomputedPlan && input.value.trim() !== store.searchQuery.trim()) {
-          store.precomputedPlan = null;
-        }
+      audienceInput.addEventListener("input", () => {
+        store.targetAudienceDescription = audienceInput.value;
       });
     }
-    const countrySelect = tab.querySelector("[data-country-select]");
-    if (countrySelect) {
-      countrySelect.value = store.selectedCountry || "all";
-      countrySelect.addEventListener("change", () => {
-        store.selectedCountry = countrySelect.value;
-      });
-    }
-    const languageSelect = tab.querySelector("[data-language-select]");
-    if (languageSelect) {
-      languageSelect.value = store.selectedLanguage || "all";
-      languageSelect.addEventListener("change", () => {
-        store.selectedLanguage = languageSelect.value;
-      });
-    }
-    const minFollowers = tab.querySelector("[data-filter='min-followers']");
-    if (minFollowers) {
-      minFollowers.value = store.minFollowers ?? "";
-      minFollowers.addEventListener("input", () => {
-        store.minFollowers = minFollowers.value === "" ? null : Number(minFollowers.value);
-      });
-    }
-    const maxFollowers = tab.querySelector("[data-filter='max-followers']");
-    if (maxFollowers) {
-      maxFollowers.value = store.maxFollowers ?? "";
-      maxFollowers.addEventListener("input", () => {
-        store.maxFollowers = maxFollowers.value === "" ? null : Number(maxFollowers.value);
-      });
-    }
-    const toneSelect = tab.querySelector("[data-tone-select]");
-    if (toneSelect) {
-      toneSelect.value = store.selectedTone || "all";
-      toneSelect.addEventListener("change", () => {
-        store.selectedTone = toneSelect.value;
-      });
-    }
-    const hormoneSelect = tab.querySelector("[data-hormone-select]");
-    if (hormoneSelect) {
-      hormoneSelect.value = store.selectedHormone || "all";
-      hormoneSelect.addEventListener("change", () => {
-        store.selectedHormone = hormoneSelect.value;
-      });
-    }
-    const stopTopicsInput = tab.querySelector("[data-filter='stop-topics']");
-    if (stopTopicsInput) {
-      stopTopicsInput.value = store.stopTopicsInput || "";
-      stopTopicsInput.addEventListener("input", () => {
-        store.stopTopicsInput = stopTopicsInput.value;
-      });
-    }
-    const pills = tab.querySelectorAll("[data-action='platform']");
-    pills.forEach((pill) => {
-      pill.classList.toggle("on", pill.dataset.platform === store.platformFilter);
-    });
+    bindFilterBar(tab);
     renderResults();
   } else if (store.activeTab === "shortlist") {
     const tab = buildShortlistTab();
@@ -295,6 +330,8 @@ function renderResults() {
   const metadataEl = main.querySelector("[data-metadata]");
   if (!resultsEl) return;
 
+  resultsEl.innerHTML = "";
+
   renderMetadataBar(store.queryMetadata, metadataEl);
 
   let filtered = store.searchResults.slice();
@@ -321,11 +358,7 @@ function renderResults() {
       }
     });
   }
-  if (store.sortFilter === "subscribers") {
-    filtered.sort((a, b) => (b.subscribers_count || 0) - (a.subscribers_count || 0));
-  } else if (store.sortFilter === "er") {
-    filtered.sort((a, b) => (b.static_avg_er || 0) - (a.static_avg_er || 0));
-  }
+  filtered.sort((a, b) => (b.final_score || 0) - (a.final_score || 0));
 
   if (store.searchResults.length === 0) {
     resultsEl.innerHTML = `<div class="empty-state">
@@ -335,17 +368,6 @@ function renderResults() {
     return;
   }
 
-  const head = document.createElement("div");
-  head.className = "results-head";
-  head.innerHTML = `
-    <div>
-      <div class="results-eyebrow">Результаты подбора</div>
-      <h2 class="results-title">${escapeText(store.searchQuery || "Результаты")}</h2>
-      <div class="results-meta">Найдено авторов: ${filtered.length}</div>
-    </div>`;
-  resultsEl.innerHTML = "";
-  resultsEl.appendChild(head);
-
   const filters = document.createElement("div");
   filters.className = "filters";
   filters.innerHTML = `
@@ -354,11 +376,6 @@ function renderResults() {
       <option value="all">Все платформы</option>
       <option value="instagram">Instagram</option>
       <option value="telegram">Telegram</option>
-    </select>
-    <select class="filter-select" data-filter="sort">
-      <option value="relevance">По релевантности</option>
-      <option value="subscribers">По подписчикам ↓</option>
-      <option value="er">По ER</option>
     </select>
     <select class="filter-select" data-filter="reach">
       <option value="all">Любой охват</option>
@@ -373,12 +390,6 @@ function renderResults() {
   platformSel.value = store.platformFilter;
   platformSel.addEventListener("change", () => {
     store.platformFilter = platformSel.value;
-    renderResults();
-  });
-  const sortSel = filters.querySelector("[data-filter='sort']");
-  sortSel.value = store.sortFilter;
-  sortSel.addEventListener("change", () => {
-    store.sortFilter = sortSel.value;
     renderResults();
   });
   const reachSel = filters.querySelector("[data-filter='reach']");
@@ -447,18 +458,17 @@ function stopProgress() {
 
 async function runSearch() {
   const main = app.querySelector(".main");
-  const input = main ? main.querySelector("[data-search-input]") : null;
-  const query = input ? input.value.trim() : store.searchQuery.trim();
+  const audienceInput = main ? main.querySelector("[data-audience-input]") : null;
+  const brandInput = main ? main.querySelector("[data-search-input]") : null;
+  const query = audienceInput
+    ? audienceInput.value.trim()
+    : (brandInput ? brandInput.value.trim() : store.searchQuery.trim());
   if (!query) {
     showToast("Введите описание задачи", "error");
     return;
   }
+  store.targetAudienceDescription = query;
   store.searchQuery = query;
-  if (store.isAudienceConfirmed) {
-    store.targetAudienceDescription = query;
-  } else {
-    store.brandDescription = query;
-  }
   startProgress();
 
   try {
@@ -472,6 +482,7 @@ async function runSearch() {
     stopProgress();
     const progressEl = app.querySelector("[data-progress]");
     if (progressEl) progressEl.innerHTML = "";
+    store.currentStep = 3;
     renderResults();
     if (store.searchResults.length === 0) {
       showToast("Ничего не найдено, попробуйте изменить запрос", "error");
@@ -517,16 +528,15 @@ function syncInferredFilters() {
     toneSelect.value = store.selectedTone || "all";
     flashInferred(toneSelect);
   }
-  const hormoneSelect = main.querySelector("[data-hormone-select]");
-  if (hormoneSelect) {
-    hormoneSelect.value = store.selectedHormone || "all";
-    flashInferred(hormoneSelect);
-  }
   const stopTopicsInput = main.querySelector("[data-filter='stop-topics']");
   if (stopTopicsInput) {
     stopTopicsInput.value = store.stopTopicsInput || "";
     flashInferred(stopTopicsInput);
   }
+  const hormonePills = main.querySelectorAll("[data-action='toggle-hormone']");
+  hormonePills.forEach((pill) => {
+    pill.classList.toggle("on", store.selectedHormones.includes(pill.dataset.hormone));
+  });
 }
 
 function flashInferred(el) {
@@ -577,6 +587,7 @@ async function analyzeBrandAction() {
     });
     store.applyBrandAnalysis(data);
     store.isAnalyzingBrand = false;
+    store.currentStep = 2;
     render();
     syncInferredFilters();
     showToast("Целевая аудитория определена");
@@ -592,6 +603,7 @@ async function analyzeBrandAction() {
 
 function resetAudience() {
   store.resetAudienceState();
+  store.matchTypeFilter = "all";
   render();
   syncInferredFilters();
 }
@@ -616,6 +628,12 @@ app.addEventListener("click", (e) => {
     analyzeBrandAction();
   } else if (action === "reset-audience") {
     resetAudience();
+  } else if (action === "toggle-hormone") {
+    store.toggleHormone(target.dataset.hormone);
+    const pills = app.querySelectorAll("[data-action='toggle-hormone']");
+    pills.forEach((pill) => {
+      pill.classList.toggle("on", store.selectedHormones.includes(pill.dataset.hormone));
+    });
   } else if (action === "match-type") {
     store.matchTypeFilter = target.dataset.matchType || "all";
     renderResults();

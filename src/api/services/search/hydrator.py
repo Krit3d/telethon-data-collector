@@ -64,13 +64,16 @@ class PostgresHydrator:
 
     async def hydrate_and_filter_candidates(
         self,
-        candidates: list[DbsfScoredCandidate],
+        direct_candidates: list[DbsfScoredCandidate],
+        affinity_candidates: list[DbsfScoredCandidate],
         request: SearchRequest,
+        direct_limit: int = 20,
+        affinity_limit: int = 20,
     ) -> list[tuple[DbsfScoredCandidate, HydratedAuthorRecord]]:
-        if not candidates:
+        if not direct_candidates and not affinity_candidates:
             return []
 
-        candidate_ids = [c.account_id for c in candidates]
+        candidate_ids = list({c.account_id for c in direct_candidates} | {c.account_id for c in affinity_candidates})
 
         async with self._session_factory() as session:
             stmt = select(Account).where(
@@ -105,16 +108,15 @@ class PostgresHydrator:
 
         stop_words = [w.lower().strip() for w in request.stop_topics if w and len(w.strip()) > 1] if request.stop_topics else []
 
-        result_list: list[tuple[DbsfScoredCandidate, HydratedAuthorRecord]] = []
-        for candidate in candidates:
+        def build_pair(candidate: DbsfScoredCandidate) -> tuple[DbsfScoredCandidate, HydratedAuthorRecord] | None:
             acc = account_map.get(candidate.account_id)
             if acc is None:
-                continue
+                return None
 
             if stop_words:
                 searchable_text = f"{acc.title or ''} {acc.category_path or ''} {acc.explanation or ''}".lower()
                 if any(sw in searchable_text for sw in stop_words):
-                    continue
+                    return None
 
             contacts, has_contacts = self._extract_contacts(acc.raw_metadata)
 
@@ -136,6 +138,24 @@ class PostgresHydrator:
                 profile_url=profile_url,
             )
 
-            result_list.append((candidate, hydrated))
+            return (candidate, hydrated)
 
-        return result_list[:request.limit]
+        direct_pairs: list[tuple[DbsfScoredCandidate, HydratedAuthorRecord]] = []
+        for candidate in direct_candidates:
+            if len(direct_pairs) >= direct_limit:
+                break
+            pair = build_pair(candidate)
+            if pair is not None:
+                direct_pairs.append(pair)
+
+        affinity_pairs: list[tuple[DbsfScoredCandidate, HydratedAuthorRecord]] = []
+        for candidate in affinity_candidates:
+            if len(affinity_pairs) >= affinity_limit:
+                break
+            pair = build_pair(candidate)
+            if pair is not None:
+                affinity_pairs.append(pair)
+
+        merged = direct_pairs + affinity_pairs
+        merged.sort(key=lambda pair: -pair[0].final_score)
+        return merged

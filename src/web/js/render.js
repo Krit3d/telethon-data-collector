@@ -109,6 +109,31 @@ export function renderSearchProgress(stepIndex, container) {
   container.innerHTML = `<div class="stages">${rows}</div>`;
 }
 
+export function renderAudienceValidationCard(store) {
+  if (!store || store.currentStep < 2 || !store.targetAudienceDescription) {
+    return "";
+  }
+  return `<div class="audience-validation-card">
+    <div class="audience-validation-head">
+      <div class="audience-validation-title-group">
+        <span class="audience-validation-title">Корректно ли определена ваша целевая аудитория?</span>
+        <span class="audience-validation-badge">🎯 ЦА</span>
+      </div>
+      <button class="btn-banner-reset" data-action="reset-audience">↺ Сбросить к бренду</button>
+    </div>
+    <textarea class="audience-editable-textarea" data-audience-input rows="3">${escapeHtml(store.targetAudienceDescription)}</textarea>
+  </div>`;
+}
+
+export function renderHormoneChips(selectedHormones = []) {
+  const selected = Array.isArray(selectedHormones) ? selectedHormones : [];
+  const chips = Object.entries(HORMONE_LABELS).map(([key, label]) => {
+    const on = selected.includes(key) ? " on" : "";
+    return `<button class="hormone-chip${on}" data-action="toggle-hormone" data-hormone="${key}">${escapeHtml(label)}</button>`;
+  }).join("");
+  return `<div class="hormone-chips">${chips}</div>`;
+}
+
 export function renderAuthorCards(authors, container, store) {
   if (!container) return;
   if (!authors || authors.length === 0) {
@@ -127,7 +152,8 @@ export function renderAuthorCards(authors, container, store) {
     const platformRaw = item.platform || "";
     const platform = platformRaw ? platformRaw.charAt(0).toUpperCase() + platformRaw.slice(1).toLowerCase() : "";
     const platformSvg = platformIcon(platformRaw);
-    const rel = `${Math.round((item.final_score || 0) * 100)}%`;
+    const relPct = Math.min(100, Math.max(0, (item.final_score || 0) * 100));
+    const rel = `${Math.round(relPct)}%`;
     const er = item.static_avg_er != null ? `${Number(item.static_avg_er).toFixed(1)}%` : "—";
     const subs = formatCount(item.subscribers_count);
     const category = item.category_path || "";
@@ -136,11 +162,10 @@ export function renderAuthorCards(authors, container, store) {
     const shortLabel = inShort ? "В шортлисте" : "В шортлист";
     const color = colorFor(name);
     const explanation = item.explanation || "";
-    const relPct = Math.min(100, Math.max(0, (item.final_score || 0) * 100));
     const matchBadge = item.match_type === "affinity"
-      ? `<span class="badge-affinity"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="12" r="5"></circle><circle cx="15" cy="12" r="5"></circle></svg><span>${item.affinity_reason ? `Смежная ЦА · ${escapeHtml(item.affinity_reason)}` : "Смежная аудитория"}</span></span>`
+      ? `<span class="badge-affinity"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="12" r="5"></circle><circle cx="15" cy="12" r="5"></circle></svg><span>${item.affinity_reason ? `Смежная ЦА · ${escapeHtml(item.affinity_reason)}` : "Смежная ЦА"}</span></span>`
       : item.match_type === "direct"
-        ? `<span class="badge-direct"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"></circle><path d="M12 2v3"></path><path d="M12 19v3"></path><path d="M2 12h3"></path><path d="M19 12h3"></path></svg><span>Прямая тема</span></span>`
+        ? `<span class="badge-direct"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"></circle><path d="M12 2v3"></path><path d="M12 19v3"></path><path d="M2 12h3"></path><path d="M19 12h3"></path></svg><span>Прямой поиск</span></span>`
         : "";
     const psychoBadges = [];
     if (item.primary_tone) {

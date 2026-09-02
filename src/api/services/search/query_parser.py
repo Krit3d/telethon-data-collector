@@ -381,6 +381,8 @@ class QueryParser:
     async def parse(self, request: SearchRequest) -> ReformulatedQuery:
         if request.precomputed_plan is not None:
             plan = request.precomputed_plan.model_copy(deep=True)
+            if request.query and request.query != plan.dense_query:
+                plan.dense_query = request.query
             if request.direct_cluster is not None:
                 plan.direct_cluster = request.direct_cluster
             if request.audience_clusters:

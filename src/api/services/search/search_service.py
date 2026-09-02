@@ -170,9 +170,11 @@ class SearchService:
             )
             cluster_candidate_pools.append(cluster_candidates)
 
-        scored_candidates = self._dbsf_engine.combine_multi_cluster_candidates(
+        direct_ids = {c.account_id for c in direct_candidates}
+
+        affinity_candidates = self._dbsf_engine.combine_multi_cluster_candidates(
             audience_cluster_pools=cluster_candidate_pools,
-            direct_candidates=direct_candidates,
+            direct_account_ids=direct_ids,
         )
         timings["dbsf_fusion_ms"] = (time.perf_counter() - dbsf_start) * 1000.0
 
@@ -182,8 +184,11 @@ class SearchService:
 
         hydration_start = time.perf_counter()
         hydrated_pairs = await self._hydrator.hydrate_and_filter_candidates(
-            candidates=scored_candidates,
+            direct_candidates=direct_candidates,
+            affinity_candidates=affinity_candidates,
             request=request,
+            direct_limit=20,
+            affinity_limit=20,
         )
         timings["db_hydration_ms"] = (time.perf_counter() - hydration_start) * 1000.0
 
@@ -230,7 +235,7 @@ class SearchService:
             timings=timings,
             qdrant_candidates_count=sum(len(aggregates) for aggregates in all_aggregates) if request.include_analytics else None,
             graph_evidences_count=len(graph_evidences) if request.include_analytics else None,
-            total_candidates_count=len(scored_candidates) if request.include_analytics else None,
+            total_candidates_count=len(direct_candidates) + len(affinity_candidates) if request.include_analytics else None,
             affinity_dense_query=reformulated.affinity_dense_query,
             negative_topics=reformulated.negative_topics,
         )

@@ -60,6 +60,7 @@ export class AppStore {
     this.audienceClusters = [];
     this.isAudienceConfirmed = false;
     this.isAnalyzingBrand = false;
+    this.currentStep = 1;
     this.selectedCountry = "all";
     this.selectedLanguage = "all";
     this.minFollowers = null;
@@ -70,7 +71,7 @@ export class AppStore {
     this.authorType = "expert";
     this.matchTypeFilter = "all";
     this.selectedTone = "all";
-    this.selectedHormone = "all";
+    this.selectedHormones = [];
     this.stopTopicsInput = "";
     this.precomputedPlan = null;
     this.inferredFilters = null;
@@ -88,6 +89,7 @@ export class AppStore {
     this.directCluster = data.direct_cluster || null;
     this.audienceClusters = Array.isArray(data.audience_clusters) ? data.audience_clusters : [];
     this.isAudienceConfirmed = true;
+    this.currentStep = 2;
     this.applyInferredFilters(data.inferred_filters);
   }
 
@@ -96,8 +98,8 @@ export class AppStore {
     if (filters.target_tone) {
       this.selectedTone = filters.target_tone;
     }
-    if (Array.isArray(filters.target_hormones) && filters.target_hormones.length > 0) {
-      this.selectedHormone = filters.target_hormones[0];
+    if (Array.isArray(filters.target_hormones)) {
+      this.selectedHormones = filters.target_hormones.slice(0, 2);
     }
     if (Array.isArray(filters.stop_topics)) {
       this.stopTopicsInput = filters.stop_topics.join(", ");
@@ -119,8 +121,8 @@ export class AppStore {
 
   buildSearchRequest(query) {
     return {
-      query,
-      limit: 20,
+      query: (this.targetAudienceDescription || query || this.brandDescription || "").trim(),
+      limit: 40,
       author_type: this.authorType || "expert",
       platform: this.platformFilter || "all",
       min_followers: (this.minFollowers && Number(this.minFollowers) > 0) ? Number(this.minFollowers) : null,
@@ -128,7 +130,7 @@ export class AppStore {
       location: this.selectedCountry !== "all" ? this.selectedCountry : null,
       languages: this.selectedLanguage !== "all" ? [this.selectedLanguage] : null,
       target_tone: this.selectedTone !== "all" ? this.selectedTone : null,
-      target_hormones: this.selectedHormone !== "all" ? [this.selectedHormone] : [],
+      target_hormones: this.selectedHormones,
       stop_topics: this.stopTopicsInput ? this.stopTopicsInput.split(",").map((s) => s.trim()).filter(Boolean) : [],
       direct_cluster: this.directCluster || null,
       audience_clusters: (Array.isArray(this.audienceClusters) && this.audienceClusters.length > 0) ? this.audienceClusters : [],
@@ -139,20 +141,36 @@ export class AppStore {
   }
 
   resetAudienceState() {
+    this.currentStep = 1;
     this.isAudienceConfirmed = false;
     this.targetAudienceDescription = "";
     this.directCluster = null;
     this.audienceClusters = [];
-    this.searchQuery = this.brandDescription || "";
+    this.precomputedPlan = null;
     this.searchResults = [];
     this.queryMetadata = null;
     this.selectedCountry = "all";
     this.selectedLanguage = "all";
     this.selectedTone = "all";
-    this.selectedHormone = "all";
+    this.selectedHormones = [];
     this.minFollowers = null;
     this.maxFollowers = null;
     this.stopTopicsInput = "";
+    this.searchQuery = this.brandDescription || "";
+  }
+
+  toggleHormone(hormone) {
+    const index = this.selectedHormones.indexOf(hormone);
+    if (index >= 0) {
+      this.selectedHormones.splice(index, 1);
+      return;
+    }
+    if (this.selectedHormones.length < 2) {
+      this.selectedHormones.push(hormone);
+      return;
+    }
+    this.selectedHormones.shift();
+    this.selectedHormones.push(hormone);
   }
 
   toggleShortlist(author) {

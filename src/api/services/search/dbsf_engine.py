@@ -149,47 +149,45 @@ class DbsfRankingEngine:
     ) -> list[DbsfScoredCandidate]:
         seen_ids: set[int] = set()
         merged: list[DbsfScoredCandidate] = []
-        direct_index = 0
-        affinity_index = 0
-        while direct_index < len(direct_candidates) or affinity_index < len(affinity_candidates):
-            if direct_index < len(direct_candidates):
-                direct_candidate = direct_candidates[direct_index]
-                direct_index += 1
-                if direct_candidate.account_id not in seen_ids:
-                    seen_ids.add(direct_candidate.account_id)
-                    merged.append(direct_candidate)
-            if affinity_index < len(affinity_candidates):
-                affinity_candidate = affinity_candidates[affinity_index]
-                affinity_index += 1
-                if affinity_candidate.account_id not in seen_ids:
-                    seen_ids.add(affinity_candidate.account_id)
-                    merged.append(affinity_candidate)
+        for candidate in direct_candidates:
+            if candidate.account_id not in seen_ids:
+                seen_ids.add(candidate.account_id)
+                merged.append(candidate)
+        for candidate in affinity_candidates:
+            if candidate.account_id not in seen_ids:
+                seen_ids.add(candidate.account_id)
+                merged.append(candidate)
         return merged
 
     @staticmethod
     def combine_multi_cluster_candidates(
         audience_cluster_pools: list[list[DbsfScoredCandidate]],
-        direct_candidates: list[DbsfScoredCandidate],
+        direct_account_ids: set[int],
     ) -> list[DbsfScoredCandidate]:
-        active_pools = [pool for pool in audience_cluster_pools if pool]
-        seen_ids: set[int] = set()
+        active_pools: list[list[DbsfScoredCandidate]] = []
+        for pool in audience_cluster_pools:
+            if not pool:
+                continue
+            sorted_pool = sorted(pool, key=lambda c: -c.final_score)
+            active_pools.append(sorted_pool)
+
+        if not active_pools:
+            return []
+
+        seen_ids: set[int] = set(direct_account_ids)
         merged: list[DbsfScoredCandidate] = []
-        pool_indexes = [0] * len(active_pools)
+        pool_index = 0
         while True:
-            progressed = False
-            for pool_index, pool in enumerate(active_pools):
-                if pool_indexes[pool_index] >= len(pool):
-                    continue
-                candidate = pool[pool_indexes[pool_index]]
-                pool_indexes[pool_index] += 1
-                progressed = True
+            pool = active_pools[pool_index]
+            while pool:
+                candidate = pool.pop(0)
                 if candidate.account_id not in seen_ids:
                     seen_ids.add(candidate.account_id)
                     merged.append(candidate)
-            if not progressed:
+                    break
+            pool_index += 1
+            if pool_index >= len(active_pools):
+                pool_index = 0
+            if all(not p for p in active_pools):
                 break
-        for candidate in direct_candidates:
-            if candidate.account_id not in seen_ids:
-                seen_ids.add(candidate.account_id)
-                merged.append(candidate)
         return merged

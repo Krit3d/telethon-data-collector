@@ -13,11 +13,14 @@ export class SearchApiClient {
   }
 
   async _post(path, payload, signal) {
-    if (this.controller) {
+    if (this.controller && !signal) {
       this.controller.abort();
     }
-    this.controller = new AbortController();
-    const effectiveSignal = signal || this.controller.signal;
+    const controller = signal ? null : new AbortController();
+    if (controller) {
+      this.controller = controller;
+    }
+    const effectiveSignal = signal || (controller ? controller.signal : undefined);
 
     let response;
     try {

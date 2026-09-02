@@ -180,7 +180,7 @@ class BriefContext(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str = Field(description="User search query text")
-    limit: int = Field(default=10, ge=1, le=50, description="Maximum number of results to return")
+    limit: int = Field(default=40, ge=1, le=100, description="Maximum number of results to return")
     location: str | None = Field(default="", description="Filter results by author location")
     min_followers: int | None = Field(default=None, description="Minimum follower count filter")
     max_followers: int | None = Field(default=None, description="Maximum follower count filter")
