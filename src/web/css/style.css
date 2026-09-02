@@ -372,13 +372,16 @@ select {
 
 .search-textarea {
   width: 100%;
+  min-height: 80px;
+  max-height: 240px;
   resize: none;
+  overflow-y: hidden;
   background: transparent;
   border: 0;
   outline: none;
-  padding: 8px 14px;
+  padding: 10px 16px;
   font-size: 16px;
-  line-height: 1.5;
+  line-height: 1.6;
   color: #0a0b14;
 }
 
@@ -505,29 +508,49 @@ select {
   user-select: none;
 }
 
-.search-bottom {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
-  padding: 12px 14px;
-  border-top: 1px solid rgba(15, 18, 40, 0.06);
-}
-
 .search-filters {
   display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-top: 1px solid rgba(15, 18, 40, 0.06);
+  min-width: 0;
+}
+
+.filter-row {
+  display: flex;
   align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.filter-row-top {
   flex-wrap: wrap;
+}
+
+.filter-row-bottom {
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.psycho-group {
+  display: flex;
+  align-items: center;
   gap: 8px;
   min-width: 0;
+}
+
+.psycho-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #5b6175;
+  white-space: nowrap;
 }
 
 .search-controls {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-left: auto;
+  gap: 10px;
   flex-shrink: 0;
 }
 
@@ -950,6 +973,7 @@ select {
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   white-space: nowrap;
+  cursor: help;
 }
 
 .rel-block {
@@ -1910,8 +1934,28 @@ select {
   gap: 6px;
 }
 
+.hormone-info-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: #f5f3ff;
+  color: #8b5cf6;
+  border: 1px solid rgba(139, 92, 246, 0.25);
+  cursor: help;
+  flex-shrink: 0;
+  transition: background .15s ease, color .15s ease;
+}
+
+.hormone-info-badge:hover {
+  background: #eef0ff;
+  color: #6366f1;
+}
+
 .hormone-pill {
-  height: 34px;
+  height: 30px;
   padding: 0 12px;
   font-size: 12.5px;
   border-radius: 999px;
@@ -1929,13 +1973,27 @@ select {
 .hormone-pill:hover {
   border-color: #6366f1;
   color: #6366f1;
+  background: #eef0ff;
 }
 
 .hormone-pill.on {
   border-color: #6366f1;
   background: #6366f1;
   color: #fff;
-  box-shadow: 0 2px 8px -2px rgba(99, 102, 241, 0.5);
+  box-shadow: 0 2px 10px -2px rgba(99, 102, 241, 0.55);
+}
+
+.hormone-hint {
+  font-size: 11px;
+  font-weight: 500;
+  opacity: 0.75;
+  margin-left: 3px;
+  pointer-events: none;
+}
+
+.hormone-pill.on .hormone-hint {
+  opacity: 0.9;
+  color: rgba(255, 255, 255, 0.9);
 }
 
 .hormone-chips {
@@ -2041,19 +2099,9 @@ select {
 }
 
 @media (max-width: 900px) {
-  .search-bottom {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
   .search-controls {
-    margin-left: 0;
     width: 100%;
     flex-wrap: wrap;
-  }
-
-  .search-controls .platform-pills {
-    flex: 1 1 auto;
   }
 
   .search-controls .btn-secondary-ai,
@@ -2068,7 +2116,16 @@ select {
   }
 }
 
-@media (max-width: 560px) {
+@media (max-width: 720px) {
+  .filter-row-bottom {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .psycho-group {
+    flex-wrap: wrap;
+  }
+
   .search-controls {
     flex-direction: column;
     align-items: stretch;

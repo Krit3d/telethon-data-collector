@@ -21,13 +21,24 @@ let progressTimer = null;
 let progressStep = 0;
 
 const HORMONE_OPTIONS = [
-  { value: "dopamine", label: "Дофамин" },
-  { value: "serotonin", label: "Серотонин" },
-  { value: "oxytocin", label: "Окситоцин" },
-  { value: "adrenaline", label: "Адреналин" },
-  { value: "cortisol", label: "Кортизол" },
-  { value: "endorphin", label: "Эндорфин" },
+  { value: "dopamine", label: "Дофамин", desc: "Дофамин: новизна, вдохновение, тренды и вау-эффект" },
+  { value: "serotonin", label: "Серотонин", desc: "Серотонин: статус, уверенность, экспертность и контроль" },
+  { value: "oxytocin", label: "Окситоцин", desc: "Окситоцин: забота, дети, семья, безопасность и доверие" },
+  { value: "adrenaline", label: "Адреналин", desc: "Адреналин: вызов, смелость, скорость и спорт" },
+  { value: "cortisol", label: "Кортизол", desc: "Кортизол: решение проблем, страхи, боли и защита" },
+  { value: "endorphin", label: "Эндорфин", desc: "Эндорфин: радость, смех, легкость и хорошее настроение" },
 ];
+
+const TEXTAREA_MIN_HEIGHT = 80;
+const TEXTAREA_MAX_HEIGHT = 240;
+
+function autoResizeTextarea(el) {
+  if (!el) return;
+  el.style.height = "auto";
+  const next = Math.min(Math.max(el.scrollHeight, TEXTAREA_MIN_HEIGHT), TEXTAREA_MAX_HEIGHT);
+  el.style.height = `${next}px`;
+  el.style.overflowY = next >= TEXTAREA_MAX_HEIGHT ? "auto" : "hidden";
+}
 
 function buildHeader() {
   const header = document.createElement("header");
@@ -56,54 +67,71 @@ function buildHeader() {
 function buildFilterBar() {
   const hormonePills = HORMONE_OPTIONS.map((h) => {
     const on = store.selectedHormones.includes(h.value) ? " on" : "";
-    return `<button class="pill hormone-pill${on}" data-action="toggle-hormone" data-hormone="${h.value}">${h.label}</button>`;
+    return `<button class="hormone-pill${on}" data-action="toggle-hormone" data-hormone="${h.value}" title="${h.desc}">${h.label}</button>`;
   }).join("");
+  const isStepOne = store.currentStep === 1;
+  const analyzeLabel = store.isAnalyzingBrand ? "Анализ ЦА..." : "Определить ЦА ✨";
+  const controls = isStepOne
+    ? `<button class="btn-secondary-ai" data-action="analyze-brand"${store.isAnalyzingBrand ? " disabled" : ""}>
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
+        <span>${analyzeLabel}</span>
+      </button>`
+    : `<button class="btn-secondary-ai" data-action="reset-audience">↺ Сбросить к бренду</button>
+       <button class="btn-primary" data-action="run-search">🔍 Найти авторов</button>`;
   return `
     <div class="search-filters">
-      <select class="select-pill" data-country-select>
-        <option value="all" selected>Все страны</option>
-        <option value="kz">Казахстан</option>
-        <option value="ru">Россия</option>
-        <option value="by">Беларусь</option>
-        <option value="uz">Узбекистан</option>
-        <option value="ae">ОАЭ</option>
-        <option value="us">США / Global</option>
-      </select>
-      <select class="select-pill" data-language-select>
-        <option value="all" selected>Все языки</option>
-        <option value="ru">Русский</option>
-        <option value="kk">Казахский</option>
-        <option value="en">Английский</option>
-        <option value="uk">Украинский</option>
-      </select>
-      <div class="subscribers-group">
-        <span class="subscribers-label">Подписчики:</span>
-        <input type="number" class="range-input" data-filter="min-followers" placeholder="от">
-        <span class="range-divider">—</span>
-        <input type="number" class="range-input" data-filter="max-followers" placeholder="до">
+      <div class="filter-row filter-row-top">
+        <select class="select-pill" data-country-select>
+          <option value="all" selected>Все страны</option>
+          <option value="kz">Казахстан</option>
+          <option value="ru">Россия</option>
+          <option value="by">Беларусь</option>
+          <option value="uz">Узбекистан</option>
+          <option value="ae">ОАЭ</option>
+          <option value="us">США / Global</option>
+        </select>
+        <select class="select-pill" data-language-select>
+          <option value="all" selected>Все языки</option>
+          <option value="ru">Русский</option>
+          <option value="kk">Казахский</option>
+          <option value="en">Английский</option>
+          <option value="uk">Украинский</option>
+        </select>
+        <div class="subscribers-group">
+          <span class="subscribers-label">Подписчики:</span>
+          <input type="number" class="range-input" data-filter="min-followers" placeholder="от">
+          <span class="range-divider">—</span>
+          <input type="number" class="range-input" data-filter="max-followers" placeholder="до">
+        </div>
+        <select class="select-pill" data-tone-select>
+          <option value="all" selected>Все стили</option>
+          <option value="expert">Экспертный</option>
+          <option value="educational">Обучающий</option>
+          <option value="entertainment">Развлекательный</option>
+          <option value="provocative">Провокационный</option>
+          <option value="casual">Повседневный</option>
+          <option value="analytical">Аналитический</option>
+        </select>
+        <input type="text" class="stop-topics-input" data-filter="stop-topics" placeholder="Исключить темы...">
       </div>
-      <select class="select-pill" data-tone-select>
-        <option value="all" selected>Все стили</option>
-        <option value="expert">Экспертный</option>
-        <option value="educational">Обучающий</option>
-        <option value="entertainment">Развлекательный</option>
-        <option value="provocative">Провокационный</option>
-        <option value="casual">Повседневный</option>
-        <option value="analytical">Аналитический</option>
-      </select>
-      <div class="hormone-pills">${hormonePills}</div>
-      <input type="text" class="stop-topics-input" data-filter="stop-topics" placeholder="Исключить темы...">
+      <div class="filter-row filter-row-bottom">
+        <div class="psycho-group">
+          <span class="psycho-label">Психографика</span>
+          <div class="hormone-pills">${hormonePills}</div>
+          <span class="hormone-info-badge" title="Психографические триггеры контента: определяют эмоциональное состояние и мотив аудитории автора">
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path><path d="M12 17h.01"></path></svg>
+          </span>
+        </div>
+        <div class="search-controls">${controls}</div>
+      </div>
     </div>`;
 }
 
 function buildSearchTab() {
   const container = document.createElement("div");
   const isStepOne = store.currentStep === 1;
-  const analyzeLabel = store.isAnalyzingBrand ? "Анализ ЦА..." : "Определить ЦА ✨";
   const brandValue = store.brandDescription || store.searchQuery;
   const audienceValue = store.targetAudienceDescription || store.searchQuery;
-  const brandRows = Math.max(2, Math.ceil((brandValue.length || 1) / 60));
-  const audienceRows = Math.max(4, Math.ceil((audienceValue.length || 1) / 60));
 
   const cardInner = isStepOne
     ? `
@@ -113,16 +141,8 @@ function buildSearchTab() {
           <span class="search-label-text">AI-подбор авторов</span>
         </div>
       </div>
-      <textarea class="search-textarea" data-search-input rows="${brandRows}" placeholder="Например: натуральная косметика для чувствительной кожи, продаёмся на Wildberries. Нужны авторы, которые реально говорят про уход и составы.">${escapeText(brandValue)}</textarea>
-      <div class="search-bottom">
-        ${buildFilterBar()}
-        <div class="search-controls">
-          <button class="btn-secondary-ai" data-action="analyze-brand"${store.isAnalyzingBrand ? " disabled" : ""}>
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
-            <span>${analyzeLabel}</span>
-          </button>
-        </div>
-      </div>`
+      <textarea class="search-textarea" data-search-input placeholder="Например: натуральная косметика для чувствительной кожи, продаёмся на Wildberries. Нужны авторы, которые реально говорят про уход и составы.">${escapeText(brandValue)}</textarea>
+      ${buildFilterBar()}`
     : `
       <div class="search-top">
         <div class="search-label">
@@ -135,19 +155,13 @@ function buildSearchTab() {
           <span class="audience-confirm-badge">🎯</span>
           <span class="audience-confirm-title">Корректно ли определена ваша целевая аудитория?</span>
         </div>
-        <textarea class="search-textarea audience-textarea" data-audience-input rows="${audienceRows}">${escapeText(audienceValue)}</textarea>
+        <textarea class="search-textarea audience-textarea" data-audience-input>${escapeText(audienceValue)}</textarea>
         <div class="brand-summary-badge">
           <span class="brand-summary-label">Исходный бренд:</span>
           <span class="brand-summary-text">${escapeText(store.brandDescription)}</span>
         </div>
       </div>
-      <div class="search-bottom">
-        ${buildFilterBar()}
-        <div class="search-controls">
-          <button class="btn-secondary-ai" data-action="reset-audience">↺ Сбросить к бренду</button>
-          <button class="btn-primary" data-action="run-search">🔍 Найти авторов</button>
-        </div>
-      </div>`;
+      ${buildFilterBar()}`;
 
   container.innerHTML = `
     <div class="search-card">
@@ -274,7 +288,9 @@ function render() {
         if (store.precomputedPlan && brandInput.value.trim() !== store.searchQuery.trim()) {
           store.precomputedPlan = null;
         }
+        autoResizeTextarea(brandInput);
       });
+      autoResizeTextarea(brandInput);
     }
     const audienceInput = tab.querySelector("[data-audience-input]");
     if (audienceInput) {
@@ -286,7 +302,9 @@ function render() {
       });
       audienceInput.addEventListener("input", () => {
         store.targetAudienceDescription = audienceInput.value;
+        autoResizeTextarea(audienceInput);
       });
+      autoResizeTextarea(audienceInput);
     }
     bindFilterBar(tab);
     renderResults();

@@ -25,6 +25,23 @@ const CLAMP_CLASS = "explanation-clamped";
 
 const TONE_LABELS = { expert: "Экспертный", educational: "Обучающий", entertainment: "Развлекательный", provocative: "Провокационный", casual: "Повседневный", analytical: "Аналитический" };
 const HORMONE_LABELS = { dopamine: "Дофамин", serotonin: "Серотонин", oxytocin: "Окситоцин", adrenaline: "Адреналин", cortisol: "Кортизол", endorphin: "Эндорфин" };
+const HORMONE_HINTS = { dopamine: "Драйв и тренды", serotonin: "Статус и порядок", oxytocin: "Семья и забота", adrenaline: "Экстрим и риск", cortisol: "Боли и проблемы", endorphin: "Юмор и позитив" };
+const TONE_DESCRIPTIONS = {
+  expert: "Экспертный: глубокий профессиональный анализ и авторитет",
+  educational: "Обучающий: пошаговые инструкции, лайфхаки и советы",
+  entertainment: "Развлекательный: шоу, эмоции и вирусный контент",
+  provocative: "Провокационный: острые дискуссии, мнения и споры",
+  casual: "Повседневный: лайфстайл, личные истории и искренность",
+  analytical: "Аналитический: факты, цифры, сравнения и логика",
+};
+const HORMONE_DESCRIPTIONS = {
+  dopamine: "Дофамин: новизна, вдохновение, тренды и вау-эффект",
+  serotonin: "Серотонин: статус, уверенность, экспертность и контроль",
+  oxytocin: "Окситоцин: забота, дети, семья, безопасность и доверие",
+  adrenaline: "Адреналин: вызов, смелость, скорость и спорт",
+  cortisol: "Кортизол: решение проблем, страхи, боли и защита",
+  endorphin: "Эндорфин: радость, смех, легкость и хорошее настроение",
+};
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -129,7 +146,9 @@ export function renderHormoneChips(selectedHormones = []) {
   const selected = Array.isArray(selectedHormones) ? selectedHormones : [];
   const chips = Object.entries(HORMONE_LABELS).map(([key, label]) => {
     const on = selected.includes(key) ? " on" : "";
-    return `<button class="hormone-chip${on}" data-action="toggle-hormone" data-hormone="${key}">${escapeHtml(label)}</button>`;
+    const desc = HORMONE_DESCRIPTIONS[key] || "";
+    const hint = HORMONE_HINTS[key] || "";
+    return `<button class="hormone-chip${on}" data-action="toggle-hormone" data-hormone="${key}" title="${escapeHtml(desc)}"><span class="hormone-label">${escapeHtml(label)}</span><span class="hormone-hint">· ${escapeHtml(hint)}</span></button>`;
   }).join("");
   return `<div class="hormone-chips">${chips}</div>`;
 }
@@ -169,10 +188,12 @@ export function renderAuthorCards(authors, container, store) {
         : "";
     const psychoBadges = [];
     if (item.primary_tone) {
-      psychoBadges.push(`<span class="badge-psycho">${escapeHtml(TONE_LABELS[item.primary_tone] || item.primary_tone)}</span>`);
+      const toneDesc = TONE_DESCRIPTIONS[item.primary_tone] || "";
+      psychoBadges.push(`<span class="badge-psycho" title="${escapeHtml(toneDesc)}">${escapeHtml(TONE_LABELS[item.primary_tone] || item.primary_tone)}</span>`);
     }
     if (item.primary_hormone) {
-      psychoBadges.push(`<span class="badge-psycho">${escapeHtml(HORMONE_LABELS[item.primary_hormone] || item.primary_hormone)}</span>`);
+      const hormoneDesc = HORMONE_DESCRIPTIONS[item.primary_hormone] || "";
+      psychoBadges.push(`<span class="badge-psycho" title="${escapeHtml(hormoneDesc)}">${escapeHtml(HORMONE_LABELS[item.primary_hormone] || item.primary_hormone)}</span>`);
     }
     const psychoRow = psychoBadges.length > 0 ? `<div class="badges-psycho">${psychoBadges.join("")}</div>` : "";
     const badgesRow = (matchBadge || psychoRow) ? `<div class="author-badges">${matchBadge}${psychoRow}</div>` : "";
