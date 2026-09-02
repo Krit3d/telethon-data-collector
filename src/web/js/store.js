@@ -20,10 +20,46 @@ function writeStorage(key, value) {
   }
 }
 
+const COUNTRY_ALIASES = {
+  "казахстан": "kz",
+  "kazakhstan": "kz",
+  "kz": "kz",
+  "россия": "ru",
+  "russia": "ru",
+  "рф": "ru",
+  "ru": "ru",
+  "беларусь": "by",
+  "belarus": "by",
+  "by": "by",
+  "узбекистан": "uz",
+  "uzbekistan": "uz",
+  "uz": "uz",
+  "оаэ": "ae",
+  "uae": "ae",
+  "эмираты": "ae",
+  "ae": "ae",
+  "сша": "us",
+  "usa": "us",
+  "америка": "us",
+  "us": "us",
+};
+
+function mapCountry(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "all";
+  return COUNTRY_ALIASES[normalized] || "all";
+}
+
 export class AppStore {
   constructor() {
     this.activeTab = "search";
     this.searchQuery = "";
+    this.brandDescription = "";
+    this.targetAudienceDescription = "";
+    this.directCluster = null;
+    this.audienceClusters = [];
+    this.isAudienceConfirmed = false;
+    this.isAnalyzingBrand = false;
     this.selectedCountry = "all";
     this.selectedLanguage = "all";
     this.minFollowers = null;
@@ -32,6 +68,12 @@ export class AppStore {
     this.sortFilter = "relevance";
     this.reachFilter = "all";
     this.authorType = "expert";
+    this.matchTypeFilter = "all";
+    this.selectedTone = "all";
+    this.selectedHormone = "all";
+    this.stopTopicsInput = "";
+    this.precomputedPlan = null;
+    this.inferredFilters = null;
     this.searchResults = [];
     this.queryMetadata = null;
     this.shortlist = readStorage(SHORTLIST_KEY, []);
@@ -39,18 +81,78 @@ export class AppStore {
     this.activeThreadId = null;
   }
 
+  applyBrandAnalysis(data) {
+    if (!data) return;
+    this.targetAudienceDescription = data.target_audience_description || "";
+    this.searchQuery = data.target_audience_description || "";
+    this.directCluster = data.direct_cluster || null;
+    this.audienceClusters = Array.isArray(data.audience_clusters) ? data.audience_clusters : [];
+    this.isAudienceConfirmed = true;
+    this.applyInferredFilters(data.inferred_filters);
+  }
+
+  applyInferredFilters(filters) {
+    if (!filters) return;
+    if (filters.target_tone) {
+      this.selectedTone = filters.target_tone;
+    }
+    if (Array.isArray(filters.target_hormones) && filters.target_hormones.length > 0) {
+      this.selectedHormone = filters.target_hormones[0];
+    }
+    if (Array.isArray(filters.stop_topics)) {
+      this.stopTopicsInput = filters.stop_topics.join(", ");
+    }
+    if (filters.country && String(filters.country).trim() !== "") {
+      this.selectedCountry = mapCountry(String(filters.country));
+    }
+    if (Array.isArray(filters.languages) && filters.languages.length > 0) {
+      this.selectedLanguage = filters.languages[0];
+    }
+    if (filters.min_followers != null) {
+      this.minFollowers = filters.min_followers;
+    }
+    if (filters.max_followers != null) {
+      this.maxFollowers = filters.max_followers;
+    }
+    this.inferredFilters = filters;
+  }
+
   buildSearchRequest(query) {
     return {
       query,
       limit: 20,
       author_type: this.authorType || "expert",
+      platform: this.platformFilter || "all",
       min_followers: (this.minFollowers && Number(this.minFollowers) > 0) ? Number(this.minFollowers) : null,
       max_followers: (this.maxFollowers && Number(this.maxFollowers) > 0) ? Number(this.maxFollowers) : null,
       location: this.selectedCountry !== "all" ? this.selectedCountry : null,
       languages: this.selectedLanguage !== "all" ? [this.selectedLanguage] : null,
+      target_tone: this.selectedTone !== "all" ? this.selectedTone : null,
+      target_hormones: this.selectedHormone !== "all" ? [this.selectedHormone] : [],
+      stop_topics: this.stopTopicsInput ? this.stopTopicsInput.split(",").map((s) => s.trim()).filter(Boolean) : [],
+      direct_cluster: this.directCluster || null,
+      audience_clusters: (Array.isArray(this.audienceClusters) && this.audienceClusters.length > 0) ? this.audienceClusters : [],
+      precomputed_plan: this.precomputedPlan || null,
       include_contacts: false,
       include_analytics: true,
     };
+  }
+
+  resetAudienceState() {
+    this.isAudienceConfirmed = false;
+    this.targetAudienceDescription = "";
+    this.directCluster = null;
+    this.audienceClusters = [];
+    this.searchQuery = this.brandDescription || "";
+    this.searchResults = [];
+    this.queryMetadata = null;
+    this.selectedCountry = "all";
+    this.selectedLanguage = "all";
+    this.selectedTone = "all";
+    this.selectedHormone = "all";
+    this.minFollowers = null;
+    this.maxFollowers = null;
+    this.stopTopicsInput = "";
   }
 
   toggleShortlist(author) {

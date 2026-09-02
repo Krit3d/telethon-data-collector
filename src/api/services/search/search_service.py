@@ -1,6 +1,7 @@
+import asyncio
 import time
 
-from src.api.schemas import AuthorSearchResultItem, QueryMetadata, SearchRequest, SearchResponse
+from src.api.schemas import AuthorSearchResultItem, AuthorVectorAggregate, BrandAnalysisRequest, BrandAnalysisResponse, DbsfScoredCandidate, GraphAuthorEvidence, QueryMetadata, SearchPlanRequest, SearchPlanResponse, SearchRequest, SearchResponse, coerce_hormone, coerce_tone
 from src.api.services.search.query_parser import QueryParser
 from src.api.services.search.retriever import VectorRetriever
 from src.api.services.search.graph_reasoner import GraphReasoner
@@ -16,6 +17,12 @@ class SearchService:
         self._graph_reasoner = graph_reasoner
         self._dbsf_engine = dbsf_engine
         self._hydrator = hydrator
+
+    async def plan_campaign(self, request: SearchPlanRequest) -> SearchPlanResponse:
+        return await self._query_parser.plan(request)
+
+    async def analyze_brand(self, payload: BrandAnalysisRequest) -> BrandAnalysisResponse:
+        return await self._query_parser.analyze_brand(payload)
 
     async def execute_search(self, request: SearchRequest) -> SearchResponse:
         start_time = time.perf_counter()
@@ -39,7 +46,10 @@ class SearchService:
                     resolved_profile_type=request.author_type,
                     execution_time_ms=total_ms,
                     timings=timings,
+                    affinity_dense_query=reformulated.affinity_dense_query,
+                    negative_topics=reformulated.negative_topics,
                 ),
+                inferred_filters=reformulated.inferred_filters,
             )
 
         is_author_blog: bool | None = (
@@ -47,12 +57,36 @@ class SearchService:
             else False if request.author_type == "business"
             else None
         )
-        vector_aggregates, vector_timings = await self._retriever.retrieve_vector_candidates(
-            dense_query=reformulated.dense_query, is_author_blog=is_author_blog,
-        )
-        timings.update(vector_timings)
 
-        if not vector_aggregates:
+        audience_clusters = request.audience_clusters if request.audience_clusters else reformulated.audience_clusters
+        direct_query = request.direct_cluster.dense_query if request.direct_cluster and request.direct_cluster.dense_query else reformulated.dense_query
+
+        retrieval_tasks = [
+            self._retriever.retrieve_vector_candidates(
+                dense_query=direct_query, is_author_blog=is_author_blog,
+            )
+        ]
+        for cluster in audience_clusters:
+            retrieval_tasks.append(
+                self._retriever.retrieve_vector_candidates(
+                    dense_query=cluster.dense_query, is_author_blog=is_author_blog,
+                )
+            )
+
+        retrieval_start = time.perf_counter()
+        retrieval_results = await asyncio.gather(*retrieval_tasks)
+        timings["vector_retrieval_ms"] = (time.perf_counter() - retrieval_start) * 1000.0
+
+        direct_aggregates, direct_timings = retrieval_results[0]
+        timings.update(direct_timings)
+        cluster_aggregates: list[dict[int, AuthorVectorAggregate]] = []
+        for result in retrieval_results[1:]:
+            aggregates, cluster_timings = result
+            timings.update(cluster_timings)
+            cluster_aggregates.append(aggregates)
+
+        all_aggregates = [direct_aggregates, *cluster_aggregates]
+        if not any(all_aggregates):
             total_ms = (time.perf_counter() - start_time) * 1000.0
             return SearchResponse(
                 items=[],
@@ -66,28 +100,85 @@ class SearchService:
                     resolved_profile_type=request.author_type,
                     execution_time_ms=total_ms,
                     timings=timings,
+                    affinity_dense_query=reformulated.affinity_dense_query,
+                    negative_topics=reformulated.negative_topics,
                 ),
                 confidence_level="NONE",
                 message="No relevant content found matching the query topic.",
+                inferred_filters=reformulated.inferred_filters,
             )
 
         graph_start = time.perf_counter()
-        account_ids = list(vector_aggregates.keys())
-        graph_evidences = await self._graph_reasoner.reason_author_evidences(
-            account_ids=account_ids,
-            graph_entities=reformulated.graph_entities,
-            semantic_topics=reformulated.semantic_topics,
-            target_languages=reformulated.target_languages,
-        )
+        direct_semantic_topics = request.direct_cluster.semantic_topics if request.direct_cluster and request.direct_cluster.semantic_topics else reformulated.semantic_topics
+        graph_tasks = [
+            self._graph_reasoner.reason_author_evidences(
+                account_ids=list(direct_aggregates.keys()),
+                graph_entities=reformulated.graph_entities,
+                semantic_topics=direct_semantic_topics,
+                target_languages=reformulated.target_languages,
+                negative_topics=reformulated.negative_topics,
+                negative_entities=reformulated.negative_entities,
+            )
+        ]
+        for cluster, aggregates in zip(audience_clusters, cluster_aggregates):
+            cluster_tokens = cluster.semantic_topics or cluster.dense_query.split()
+            graph_tasks.append(
+                self._graph_reasoner.reason_author_evidences(
+                    account_ids=list(aggregates.keys()),
+                    graph_entities=reformulated.graph_entities,
+                    semantic_topics=cluster.semantic_topics,
+                    search_tokens=cluster_tokens,
+                    target_languages=reformulated.target_languages,
+                    negative_topics=reformulated.negative_topics,
+                    negative_entities=reformulated.negative_entities,
+                )
+            )
+        graph_results = await asyncio.gather(*graph_tasks)
         timings["graph_reasoning_ms"] = (time.perf_counter() - graph_start) * 1000.0
 
+        direct_evidences: dict[int, GraphAuthorEvidence] = graph_results[0]
+        cluster_evidences: list[dict[int, GraphAuthorEvidence]] = list(graph_results[1:])
+
         dbsf_start = time.perf_counter()
-        scored_candidates = self._dbsf_engine.rank_candidates(
-            vector_aggregates=vector_aggregates,
-            graph_evidences=graph_evidences,
+        target_tone = reformulated.target_tone.value if reformulated.target_tone else None
+        target_hormones = [h.value if hasattr(h, 'value') else str(h) for h in reformulated.target_hormones] if reformulated.target_hormones else None
+
+        direct_candidates = self._dbsf_engine.rank_candidates(
+            vector_aggregates=direct_aggregates,
+            graph_evidences=direct_evidences,
+            match_type="direct",
+            affinity_reason=None,
             target_languages=reformulated.target_languages,
+            target_tone=target_tone,
+            target_hormones=target_hormones,
+        )
+
+        cluster_candidate_pools: list[list[DbsfScoredCandidate]] = []
+        for cluster, aggregates, evidences in zip(audience_clusters, cluster_aggregates, cluster_evidences):
+            if not aggregates:
+                cluster_candidate_pools.append([])
+                continue
+            cluster_candidates = self._dbsf_engine.rank_candidates(
+                vector_aggregates=aggregates,
+                graph_evidences=evidences,
+                match_type="affinity",
+                affinity_reason=cluster.name,
+                affinity_mode=True,
+                target_languages=reformulated.target_languages,
+                target_tone=target_tone,
+                target_hormones=target_hormones,
+            )
+            cluster_candidate_pools.append(cluster_candidates)
+
+        scored_candidates = self._dbsf_engine.combine_multi_cluster_candidates(
+            audience_cluster_pools=cluster_candidate_pools,
+            direct_candidates=direct_candidates,
         )
         timings["dbsf_fusion_ms"] = (time.perf_counter() - dbsf_start) * 1000.0
+
+        graph_evidences = dict(direct_evidences)
+        for evidences in cluster_evidences:
+            graph_evidences.update(evidences)
 
         hydration_start = time.perf_counter()
         hydrated_pairs = await self._hydrator.hydrate_and_filter_candidates(
@@ -119,6 +210,10 @@ class SearchService:
                     subscribers_count=hydrated.subscribers_count,
                     location=location,
                     primary_language=primary_language,
+                    match_type=scored.match_type,
+                    affinity_reason=scored.affinity_reason,
+                    primary_tone=coerce_tone(evidence.primary_tone) if evidence else None,
+                    primary_hormone=coerce_hormone(evidence.primary_hormone) if evidence else None,
                 )
             )
 
@@ -133,9 +228,11 @@ class SearchService:
             resolved_profile_type=request.author_type,
             execution_time_ms=total_ms,
             timings=timings,
-            qdrant_candidates_count=len(vector_aggregates) if request.include_analytics else None,
+            qdrant_candidates_count=sum(len(aggregates) for aggregates in all_aggregates) if request.include_analytics else None,
             graph_evidences_count=len(graph_evidences) if request.include_analytics else None,
             total_candidates_count=len(scored_candidates) if request.include_analytics else None,
+            affinity_dense_query=reformulated.affinity_dense_query,
+            negative_topics=reformulated.negative_topics,
         )
 
         if not items:
@@ -154,4 +251,5 @@ class SearchService:
             query_metadata=query_metadata,
             confidence_level=confidence_level,
             warning_message=warning_message,
+            inferred_filters=reformulated.inferred_filters,
         )

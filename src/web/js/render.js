@@ -23,6 +23,9 @@ const QUOT = String.fromCharCode(34);
 const APOS = String.fromCharCode(39);
 const CLAMP_CLASS = "explanation-clamped";
 
+const TONE_LABELS = { expert: "Экспертный", educational: "Обучающий", entertainment: "Развлекательный", provocative: "Провокационный", casual: "Повседневный", analytical: "Аналитический" };
+const HORMONE_LABELS = { dopamine: "Дофамин", serotonin: "Серотонин", oxytocin: "Окситоцин", adrenaline: "Адреналин", cortisol: "Кортизол", endorphin: "Эндорфин" };
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replace(/&/g, AMP + "amp;")
@@ -32,11 +35,26 @@ function escapeHtml(value) {
     .replace(/'/g, APOS + "#39;");
 }
 
+function platformIcon(platform) {
+  const key = String(platform || "").toLowerCase();
+  if (key === "instagram") {
+    return `<svg class="platform-icon" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="5"></rect><circle cx="12" cy="12" r="4"></circle><circle cx="17.2" cy="6.8" r="1.1" fill="currentColor" stroke="none"></circle></svg>`;
+  }
+  if (key === "telegram") {
+    return `<svg class="platform-icon" viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M21.9 4.6 18.8 19c-.2 1-.8 1.2-1.7.8l-4.6-3.4-2.2 2.1c-.3.3-.5.5-.9.5l.3-4.6L18.2 6c.4-.3-.1-.5-.6-.2L6.9 12.4l-4.5-1.4c-1-.3-1-1 .2-1.4L20.6 3.2c.8-.3 1.5.2 1.3 1.4z"></path></svg>`;
+  }
+  return "";
+}
+
 function initials(name) {
-  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return "?";
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[1][0]).toUpperCase();
+  const cleaned = String(name || "")
+    .replace(/[.,/()\[\]{}"'-]/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (cleaned.length === 0) return "?";
+  if (cleaned.length === 1) return cleaned[0].slice(0, 2).toLocaleUpperCase("ru-RU");
+  return (cleaned[0][0] + cleaned[1][0]).toLocaleUpperCase("ru-RU");
 }
 
 function colorFor(value) {
@@ -76,7 +94,7 @@ export function renderSearchProgress(stepIndex, container) {
     if (i < stepIndex) {
       cls += " done";
       dotCls += " done";
-      mark = "✓";
+      mark = `<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>`;
     } else if (i === stepIndex) {
       cls += " active";
       dotCls += " active";
@@ -108,6 +126,7 @@ export function renderAuthorCards(authors, container, store) {
     const url = item.url || "#";
     const platformRaw = item.platform || "";
     const platform = platformRaw ? platformRaw.charAt(0).toUpperCase() + platformRaw.slice(1).toLowerCase() : "";
+    const platformSvg = platformIcon(platformRaw);
     const rel = `${Math.round((item.final_score || 0) * 100)}%`;
     const er = item.static_avg_er != null ? `${Number(item.static_avg_er).toFixed(1)}%` : "—";
     const subs = formatCount(item.subscribers_count);
@@ -118,6 +137,20 @@ export function renderAuthorCards(authors, container, store) {
     const color = colorFor(name);
     const explanation = item.explanation || "";
     const relPct = Math.min(100, Math.max(0, (item.final_score || 0) * 100));
+    const matchBadge = item.match_type === "affinity"
+      ? `<span class="badge-affinity"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="12" r="5"></circle><circle cx="15" cy="12" r="5"></circle></svg><span>${item.affinity_reason ? `Смежная ЦА · ${escapeHtml(item.affinity_reason)}` : "Смежная аудитория"}</span></span>`
+      : item.match_type === "direct"
+        ? `<span class="badge-direct"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"></circle><path d="M12 2v3"></path><path d="M12 19v3"></path><path d="M2 12h3"></path><path d="M19 12h3"></path></svg><span>Прямая тема</span></span>`
+        : "";
+    const psychoBadges = [];
+    if (item.primary_tone) {
+      psychoBadges.push(`<span class="badge-psycho">${escapeHtml(TONE_LABELS[item.primary_tone] || item.primary_tone)}</span>`);
+    }
+    if (item.primary_hormone) {
+      psychoBadges.push(`<span class="badge-psycho">${escapeHtml(HORMONE_LABELS[item.primary_hormone] || item.primary_hormone)}</span>`);
+    }
+    const psychoRow = psychoBadges.length > 0 ? `<div class="badges-psycho">${psychoBadges.join("")}</div>` : "";
+    const badgesRow = (matchBadge || psychoRow) ? `<div class="author-badges">${matchBadge}${psychoRow}</div>` : "";
     let thirdStat = "";
     if (item.location) {
       thirdStat = item.location.length > 28 ? item.location.slice(0, 26) + "…" : item.location;
@@ -128,6 +161,13 @@ export function renderAuthorCards(authors, container, store) {
       thirdStat = lastLevel.length > 25 ? lastLevel.slice(0, 25) : lastLevel;
     }
 
+    const handleHtml = handle
+      ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${platformSvg}${escapeHtml(handle)}</a>`
+      : "";
+    const platformHtml = platform
+      ? `${handle ? " · " : ""}${handle ? "" : platformSvg}${escapeHtml(platform)}`
+      : "";
+
     return `<div class="author-card" data-author-id="${id}">
       <div class="author-top">
         <span class="avatar" style="width:44px;height:44px;background:${color};color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;">${escapeHtml(initials(name))}</span>
@@ -137,8 +177,8 @@ export function renderAuthorCards(authors, container, store) {
             <svg class="verified-badge" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#10b981" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>
           </div>
           <div class="author-handle">
-            ${handle ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(handle)}</a>` : ""}
-            ${platform ? ` · ${escapeHtml(platform)}` : ""}
+            ${handleHtml}
+            ${platformHtml}
           </div>
         </div>
         <div class="rel-block">
@@ -147,6 +187,8 @@ export function renderAuthorCards(authors, container, store) {
           <div class="rel-caption">релевантность</div>
         </div>
       </div>
+
+      ${badgesRow}
 
       ${explanation ? `<div class="author-bio">
         <div class="explanation-text ${CLAMP_CLASS}" data-explanation>${escapeHtml(explanation)}</div>

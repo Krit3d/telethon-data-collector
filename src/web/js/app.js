@@ -1,13 +1,13 @@
 import { SearchApiClient } from "./api.js";
-import { AppStore } from "./store.js";
 import {
-  renderSearchProgress,
   renderAuthorCards,
-  renderMetadataBar,
-  renderShortlist,
   renderCRM,
+  renderMetadataBar,
+  renderSearchProgress,
+  renderShortlist,
   showToast,
 } from "./render.js";
+import { AppStore } from "./store.js";
 
 const store = new AppStore();
 const api = new SearchApiClient();
@@ -46,15 +46,27 @@ function buildHeader() {
 
 function buildSearchTab() {
   const container = document.createElement("div");
+  const audienceBanner = store.isAudienceConfirmed
+    ? `<div class="audience-confirm-banner">
+        <span>🎯 Целевая аудитория определена. Проверьте описание и параметры ниже перед поиском</span>
+        <button class="btn-banner-reset" data-action="reset-audience">Сбросить</button>
+      </div>`
+    : "";
+  const inputValue = store.isAudienceConfirmed
+    ? store.targetAudienceDescription || store.searchQuery
+    : store.brandDescription || store.searchQuery;
+  const analyzeLabel = store.isAnalyzingBrand ? "Анализ ЦА..." : "Определить ЦА ✨";
+  const textareaRows = store.isAudienceConfirmed ? Math.max(4, Math.ceil((inputValue.length || 1) / 60)) : 2;
   container.innerHTML = `
     <div class="search-card">
       <div class="search-top">
         <div class="search-label">
           <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#6366f1" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
-          <span class="search-label-text">Опишите задачу для кампании</span>
+          <span class="search-label-text">AI-подбор авторов</span>
         </div>
       </div>
-      <textarea class="search-textarea" data-search-input rows="2" placeholder="Например: натуральная косметика для чувствительной кожи, продаёмся на Wildberries. Нужны авторы, которые реально говорят про уход и составы."></textarea>
+      ${audienceBanner}
+      <textarea class="search-textarea" data-search-input rows="${textareaRows}" placeholder="Например: натуральная косметика для чувствительной кожи, продаёмся на Wildberries. Нужны авторы, которые реально говорят про уход и составы.">${escapeText(inputValue)}</textarea>
       <div class="search-bottom">
         <div class="search-filters">
           <select class="select-pill" data-country-select>
@@ -79,6 +91,25 @@ function buildSearchTab() {
             <span class="range-divider">—</span>
             <input type="number" class="range-input" data-filter="max-followers" placeholder="до">
           </div>
+          <select class="select-pill" data-tone-select>
+            <option value="all" selected>Все стили</option>
+            <option value="expert">Экспертный</option>
+            <option value="educational">Обучающий</option>
+            <option value="entertainment">Развлекательный</option>
+            <option value="provocative">Провокационный</option>
+            <option value="casual">Повседневный</option>
+            <option value="analytical">Аналитический</option>
+          </select>
+          <select class="select-pill" data-hormone-select>
+            <option value="all" selected>Все гормоны</option>
+            <option value="dopamine">Дофамин / Вдохновение</option>
+            <option value="serotonin">Серотонин / Статус</option>
+            <option value="oxytocin">Окситоцин / Доверие</option>
+            <option value="adrenaline">Адреналин / Драйв</option>
+            <option value="cortisol">Кортизол / Проблема</option>
+            <option value="endorphin">Эндорфин / Радость</option>
+          </select>
+          <input type="text" class="stop-topics-input" data-filter="stop-topics" placeholder="Исключить темы...">
         </div>
         <div class="search-controls">
           <div class="platform-pills">
@@ -86,9 +117,13 @@ function buildSearchTab() {
             <button class="pill" data-action="platform" data-platform="instagram">Instagram</button>
             <button class="pill" data-action="platform" data-platform="telegram">Telegram</button>
           </div>
+          <button class="btn-secondary-ai" data-action="analyze-brand"${store.isAnalyzingBrand ? " disabled" : ""}>
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
+            <span>${analyzeLabel}</span>
+          </button>
           <button class="btn-primary" data-action="run-search">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 13.8 9 20 10.8 13.8 12.6 12 19 10.2 12.6 4 10.8 10.2 9z"></path></svg>
-            <span>Найти авторов →</span>
+            <span>Найти авторов</span>
           </button>
         </div>
       </div>
@@ -154,11 +189,15 @@ function render() {
     main.appendChild(tab);
     const input = tab.querySelector("[data-search-input]");
     if (input) {
-      input.value = store.searchQuery;
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
           runSearch();
+        }
+      });
+      input.addEventListener("input", () => {
+        if (store.precomputedPlan && input.value.trim() !== store.searchQuery.trim()) {
+          store.precomputedPlan = null;
         }
       });
     }
@@ -188,6 +227,27 @@ function render() {
       maxFollowers.value = store.maxFollowers ?? "";
       maxFollowers.addEventListener("input", () => {
         store.maxFollowers = maxFollowers.value === "" ? null : Number(maxFollowers.value);
+      });
+    }
+    const toneSelect = tab.querySelector("[data-tone-select]");
+    if (toneSelect) {
+      toneSelect.value = store.selectedTone || "all";
+      toneSelect.addEventListener("change", () => {
+        store.selectedTone = toneSelect.value;
+      });
+    }
+    const hormoneSelect = tab.querySelector("[data-hormone-select]");
+    if (hormoneSelect) {
+      hormoneSelect.value = store.selectedHormone || "all";
+      hormoneSelect.addEventListener("change", () => {
+        store.selectedHormone = hormoneSelect.value;
+      });
+    }
+    const stopTopicsInput = tab.querySelector("[data-filter='stop-topics']");
+    if (stopTopicsInput) {
+      stopTopicsInput.value = store.stopTopicsInput || "";
+      stopTopicsInput.addEventListener("input", () => {
+        store.stopTopicsInput = stopTopicsInput.value;
       });
     }
     const pills = tab.querySelectorAll("[data-action='platform']");
@@ -241,6 +301,9 @@ function renderResults() {
   if (store.platformFilter !== "all") {
     filtered = filtered.filter((a) => (a.platform || "").toLowerCase() === store.platformFilter);
   }
+  if (store.matchTypeFilter !== "all") {
+    filtered = filtered.filter((a) => a.match_type === store.matchTypeFilter);
+  }
   if (store.reachFilter !== "all") {
     filtered = filtered.filter((a) => {
       const subs = a.subscribers_count || 0;
@@ -262,8 +325,6 @@ function renderResults() {
     filtered.sort((a, b) => (b.subscribers_count || 0) - (a.subscribers_count || 0));
   } else if (store.sortFilter === "er") {
     filtered.sort((a, b) => (b.static_avg_er || 0) - (a.static_avg_er || 0));
-  } else {
-    filtered.sort((a, b) => (b.final_score || 0) - (a.final_score || 0));
   }
 
   if (store.searchResults.length === 0) {
@@ -327,6 +388,22 @@ function renderResults() {
     renderResults();
   });
 
+  const pills = document.createElement("div");
+  pills.className = "match-type-pills";
+  const totalCount = store.searchResults.length;
+  const directCount = store.searchResults.filter((a) => a.match_type === "direct").length;
+  const affinityCount = store.searchResults.filter((a) => a.match_type === "affinity").length;
+  const pillOptions = [
+    { value: "all", label: `🔀 Все авторы (${totalCount})` },
+    { value: "affinity", label: `💡 Целевая аудитория (${affinityCount})` },
+    { value: "direct", label: `🎯 Прямой поиск (${directCount})` },
+  ];
+  pills.innerHTML = pillOptions.map((opt) => `
+    <button class="match-type-pill${store.matchTypeFilter === opt.value ? " on" : ""}" data-action="match-type" data-match-type="${opt.value}">
+      <span>${opt.label}</span>
+    </button>`).join("");
+  resultsEl.appendChild(pills);
+
   const grid = document.createElement("div");
   grid.dataset.grid = "";
   resultsEl.appendChild(grid);
@@ -377,12 +454,21 @@ async function runSearch() {
     return;
   }
   store.searchQuery = query;
+  if (store.isAudienceConfirmed) {
+    store.targetAudienceDescription = query;
+  } else {
+    store.brandDescription = query;
+  }
   startProgress();
 
   try {
     const data = await api.search(store.buildSearchRequest(query));
     store.searchResults = data.items || [];
     store.queryMetadata = data.query_metadata || null;
+    if (data.inferred_filters) {
+      store.applyInferredFilters(data.inferred_filters);
+      syncInferredFilters();
+    }
     stopProgress();
     const progressEl = app.querySelector("[data-progress]");
     if (progressEl) progressEl.innerHTML = "";
@@ -403,6 +489,53 @@ async function runSearch() {
   }
 }
 
+function syncInferredFilters() {
+  const main = app.querySelector(".main");
+  if (!main) return;
+  const countrySelect = main.querySelector("[data-country-select]");
+  if (countrySelect) {
+    countrySelect.value = store.selectedCountry || "all";
+    flashInferred(countrySelect);
+  }
+  const languageSelect = main.querySelector("[data-language-select]");
+  if (languageSelect) {
+    languageSelect.value = store.selectedLanguage || "all";
+    flashInferred(languageSelect);
+  }
+  const minFollowers = main.querySelector("[data-filter='min-followers']");
+  if (minFollowers) {
+    minFollowers.value = store.minFollowers ?? "";
+    flashInferred(minFollowers);
+  }
+  const maxFollowers = main.querySelector("[data-filter='max-followers']");
+  if (maxFollowers) {
+    maxFollowers.value = store.maxFollowers ?? "";
+    flashInferred(maxFollowers);
+  }
+  const toneSelect = main.querySelector("[data-tone-select]");
+  if (toneSelect) {
+    toneSelect.value = store.selectedTone || "all";
+    flashInferred(toneSelect);
+  }
+  const hormoneSelect = main.querySelector("[data-hormone-select]");
+  if (hormoneSelect) {
+    hormoneSelect.value = store.selectedHormone || "all";
+    flashInferred(hormoneSelect);
+  }
+  const stopTopicsInput = main.querySelector("[data-filter='stop-topics']");
+  if (stopTopicsInput) {
+    stopTopicsInput.value = store.stopTopicsInput || "";
+    flashInferred(stopTopicsInput);
+  }
+}
+
+function flashInferred(el) {
+  el.classList.remove("ai-inferred");
+  void el.offsetWidth;
+  el.classList.add("ai-inferred");
+  setTimeout(() => el.classList.remove("ai-inferred"), 2000);
+}
+
 function findAuthor(accountId) {
   return store.searchResults.find((a) => a.account_id === accountId) || null;
 }
@@ -417,6 +550,50 @@ function sendMessage() {
   render();
   const feed = app.querySelector("[data-chat-feed]");
   if (feed) feed.scrollTop = feed.scrollHeight;
+}
+
+async function analyzeBrandAction() {
+  const main = app.querySelector(".main");
+  const input = main ? main.querySelector("[data-search-input]") : null;
+  const text = input ? input.value.trim() : "";
+  if (!text) {
+    showToast("Опишите бренд для анализа", "error");
+    return;
+  }
+  store.brandDescription = text;
+  store.searchResults = [];
+  store.queryMetadata = null;
+  store.isAnalyzingBrand = true;
+  render();
+  const analyzeBtn = app.querySelector("[data-action='analyze-brand']");
+  if (analyzeBtn) {
+    analyzeBtn.disabled = true;
+    analyzeBtn.textContent = "Анализ ЦА...";
+  }
+  try {
+    const data = await api.analyzeBrand({
+      brand_description: text,
+      stop_topics: store.stopTopicsInput ? store.stopTopicsInput.split(",").map((s) => s.trim()).filter(Boolean) : [],
+    });
+    store.applyBrandAnalysis(data);
+    store.isAnalyzingBrand = false;
+    render();
+    syncInferredFilters();
+    showToast("Целевая аудитория определена");
+  } catch (err) {
+    store.isAnalyzingBrand = false;
+    render();
+    if (err.name === "AbortError") {
+      return;
+    }
+    showToast(err.message || "Ошибка анализа ЦА", "error");
+  }
+}
+
+function resetAudience() {
+  store.resetAudienceState();
+  render();
+  syncInferredFilters();
 }
 
 app.addEventListener("click", (e) => {
@@ -435,6 +612,13 @@ app.addEventListener("click", (e) => {
     render();
   } else if (action === "run-search") {
     runSearch();
+  } else if (action === "analyze-brand") {
+    analyzeBrandAction();
+  } else if (action === "reset-audience") {
+    resetAudience();
+  } else if (action === "match-type") {
+    store.matchTypeFilter = target.dataset.matchType || "all";
+    renderResults();
   } else if (action === "toggle-shortlist") {
     const author = findAuthor(Number(target.dataset.authorId));
     if (author) {

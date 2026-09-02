@@ -35,6 +35,7 @@ class Neo4jSearchRepository:
         account_ids: list[int],
         search_tokens: list[str],
         target_languages: list[str] | None = None,
+        negative_tokens: list[str] | None = None,
     ) -> dict[int, GraphAuthorEvidence]:
         if not account_ids:
             return {}
@@ -85,6 +86,14 @@ class Neo4jSearchRepository:
                 a.account_id AS account_id,
                 a.location_name AS location_name,
                 a.primary_language AS primary_language,
+                CASE WHEN $negative_tokens IS NOT NULL AND size($negative_tokens) > 0 THEN
+                    EXISTS { MATCH (a)-[:COVERS_TOPIC]->(nc) WHERE (nc:Concept OR nc:MicroConcept) AND nc.name_lower IN $negative_tokens }
+                    OR EXISTS { MATCH (a)-[:PUBLISHED]->(:Post)-[:MENTIONS]->(ne) WHERE ne.name_lower IN $negative_tokens }
+                ELSE false END AS has_negative_match,
+                a.primary_tone AS primary_tone,
+                a.primary_hormone AS primary_hormone,
+                a.secondary_tone AS secondary_tone,
+                a.secondary_hormone AS secondary_hormone,
                 CASE WHEN $target_languages IS NOT NULL AND size(coalesce($target_languages, [])) > 0 THEN coalesce(a.primary_language, '') IN $target_languages ELSE true END AS matched_language,
                 total_topics_count,
                 graphed_posts_count,
@@ -105,6 +114,7 @@ class Neo4jSearchRepository:
             "account_ids": account_ids,
             "search_tokens": search_tokens,
             "target_languages": [lang.lower().strip() for lang in target_languages] if target_languages else None,
+            "negative_tokens": [token.lower().strip() for token in negative_tokens] if negative_tokens else None,
         }
 
         rows = await self._client.execute_read(query, params)
@@ -120,8 +130,13 @@ class Neo4jSearchRepository:
             is_creator = bool(row["is_creator"])
             is_promoter = bool(row["is_promoter"])
             is_spam_or_gambling = bool(row["is_spam_or_gambling"])
+            has_negative_match = bool(row.get("has_negative_match", False))
             location_name = str(row["location_name"]) if row.get("location_name") else None
             primary_language = str(row["primary_language"]) if row.get("primary_language") else None
+            primary_tone = row.get("primary_tone")
+            primary_hormone = row.get("primary_hormone")
+            secondary_tone = row.get("secondary_tone")
+            secondary_hormone = row.get("secondary_hormone")
 
             topic_coverage_weight = min(1.0, total_posts_count / 12.0)
 
@@ -142,8 +157,13 @@ class Neo4jSearchRepository:
                 is_creator=is_creator,
                 is_promoter=is_promoter,
                 is_spam_or_gambling=is_spam_or_gambling,
+                has_negative_match=has_negative_match,
                 location_name=location_name,
                 primary_language=primary_language,
+                primary_tone=primary_tone,
+                primary_hormone=primary_hormone,
+                secondary_tone=secondary_tone,
+                secondary_hormone=secondary_hormone,
                 raw_graph_score=0.0,
             )
 

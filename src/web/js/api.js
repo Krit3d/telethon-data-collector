@@ -5,6 +5,14 @@ export class SearchApiClient {
   }
 
   async search(payload, signal) {
+    return this._post("/api/v1/search/", payload, signal);
+  }
+
+  async analyzeBrand(payload, signal) {
+    return this._post("/api/v1/search/analyze-brand", payload, signal);
+  }
+
+  async _post(path, payload, signal) {
     if (this.controller) {
       this.controller.abort();
     }
@@ -13,7 +21,7 @@ export class SearchApiClient {
 
     let response;
     try {
-      response = await fetch(`${this.baseUrl}/api/v1/search/`, {
+      response = await fetch(`${this.baseUrl}${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

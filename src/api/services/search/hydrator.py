@@ -2,8 +2,8 @@ from typing import Any
 
 from sqlalchemy import select
 
+from src.api.schemas import DbsfScoredCandidate, HydratedAuthorRecord, SearchRequest, coerce_platform
 from src.db.models import Account
-from src.api.schemas import DbsfScoredCandidate, HydratedAuthorRecord, SearchRequest
 
 
 class PostgresHydrator:
@@ -83,6 +83,9 @@ class PostgresHydrator:
             elif request.author_type == "business":
                 stmt = stmt.where(Account.is_author_blog.is_(False))
 
+            if request.platform and request.platform != "all":
+                stmt = stmt.where(Account.platform == request.platform.upper())
+
             if request.min_followers is not None:
                 stmt = stmt.where(
                     Account.subscribers_count.is_not(None),
@@ -100,11 +103,18 @@ class PostgresHydrator:
 
         account_map: dict[int, Account] = {acc.id: acc for acc in accounts}
 
+        stop_words = [w.lower().strip() for w in request.stop_topics if w and len(w.strip()) > 1] if request.stop_topics else []
+
         result_list: list[tuple[DbsfScoredCandidate, HydratedAuthorRecord]] = []
         for candidate in candidates:
             acc = account_map.get(candidate.account_id)
             if acc is None:
                 continue
+
+            if stop_words:
+                searchable_text = f"{acc.title or ''} {acc.category_path or ''} {acc.explanation or ''}".lower()
+                if any(sw in searchable_text for sw in stop_words):
+                    continue
 
             contacts, has_contacts = self._extract_contacts(acc.raw_metadata)
 
@@ -112,7 +122,7 @@ class PostgresHydrator:
 
             hydrated = HydratedAuthorRecord(
                 account_id=acc.id,
-                platform=acc.platform,
+                platform=coerce_platform(acc.platform),
                 username=acc.username,
                 title=acc.title,
                 category_path=acc.category_path,
