@@ -32,6 +32,8 @@ class SearchService:
         reformulated = await self._query_parser.parse(request)
         timings["planning_ms"] = (time.perf_counter() - planning_start) * 1000.0
 
+        effective_languages = request.languages if request.languages and "all" not in [l.lower() for l in request.languages] else reformulated.target_languages
+
         if not reformulated.dense_query:
             total_ms = (time.perf_counter() - start_time) * 1000.0
             return SearchResponse(
@@ -42,7 +44,7 @@ class SearchService:
                     dense_query="",
                     graph_entities=[],
                     semantic_topics=[],
-                    target_languages=reformulated.target_languages,
+                    target_languages=effective_languages,
                     resolved_profile_type=request.author_type,
                     execution_time_ms=total_ms,
                     timings=timings,
@@ -96,7 +98,7 @@ class SearchService:
                     dense_query=reformulated.dense_query,
                     graph_entities=reformulated.graph_entities,
                     semantic_topics=reformulated.semantic_topics,
-                    target_languages=reformulated.target_languages,
+                    target_languages=effective_languages,
                     resolved_profile_type=request.author_type,
                     execution_time_ms=total_ms,
                     timings=timings,
@@ -115,7 +117,7 @@ class SearchService:
                 account_ids=list(direct_aggregates.keys()),
                 graph_entities=reformulated.graph_entities,
                 semantic_topics=direct_semantic_topics,
-                target_languages=reformulated.target_languages,
+                target_languages=effective_languages,
                 negative_topics=reformulated.negative_topics,
                 negative_entities=reformulated.negative_entities,
             )
@@ -128,7 +130,7 @@ class SearchService:
                     graph_entities=reformulated.graph_entities,
                     semantic_topics=cluster.semantic_topics,
                     search_tokens=cluster_tokens,
-                    target_languages=reformulated.target_languages,
+                    target_languages=effective_languages,
                     negative_topics=reformulated.negative_topics,
                     negative_entities=reformulated.negative_entities,
                 )
@@ -148,7 +150,7 @@ class SearchService:
             graph_evidences=direct_evidences,
             match_type="direct",
             affinity_reason=None,
-            target_languages=reformulated.target_languages,
+            target_languages=effective_languages,
             target_tone=target_tone,
             target_hormones=target_hormones,
         )
@@ -164,7 +166,7 @@ class SearchService:
                 match_type="affinity",
                 affinity_reason=cluster.name,
                 affinity_mode=True,
-                target_languages=reformulated.target_languages,
+                target_languages=effective_languages,
                 target_tone=target_tone,
                 target_hormones=target_hormones,
             )
@@ -229,7 +231,7 @@ class SearchService:
             dense_query=reformulated.dense_query,
             graph_entities=reformulated.graph_entities,
             semantic_topics=reformulated.semantic_topics,
-            target_languages=reformulated.target_languages,
+            target_languages=effective_languages,
             resolved_profile_type=request.author_type,
             execution_time_ms=total_ms,
             timings=timings,

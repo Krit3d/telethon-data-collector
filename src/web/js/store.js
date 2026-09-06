@@ -62,7 +62,7 @@ export class AppStore {
     this.isAnalyzingBrand = false;
     this.currentStep = 1;
     this.selectedCountry = "all";
-    this.selectedLanguage = "all";
+    this.selectedLanguages = [];
     this.minFollowers = null;
     this.maxFollowers = null;
     this.platformFilter = "all";
@@ -80,6 +80,37 @@ export class AppStore {
     this.shortlist = readStorage(SHORTLIST_KEY, []);
     this.threads = readStorage(THREADS_KEY, []);
     this.activeThreadId = null;
+  }
+
+  get selectedLanguage() {
+    return this.selectedLanguages.length > 0 ? this.selectedLanguages[0] : "all";
+  }
+
+  toggleLanguage(code) {
+    const normalized = String(code || "").trim().toLowerCase();
+    if (!normalized || normalized === "all") {
+      this.selectedLanguages = [];
+      return;
+    }
+    const index = this.selectedLanguages.indexOf(normalized);
+    if (index >= 0) {
+      this.selectedLanguages.splice(index, 1);
+      return;
+    }
+    this.selectedLanguages.push(normalized);
+  }
+
+  setLanguages(codes) {
+    if (!Array.isArray(codes)) return;
+    const unique = [];
+    for (const raw of codes) {
+      const normalized = String(raw || "").trim().toLowerCase();
+      if (!normalized || normalized === "all") continue;
+      if (!unique.includes(normalized)) {
+        unique.push(normalized);
+      }
+    }
+    this.selectedLanguages = unique;
   }
 
   applyBrandAnalysis(data) {
@@ -107,8 +138,8 @@ export class AppStore {
     if (filters.country && String(filters.country).trim() !== "") {
       this.selectedCountry = mapCountry(String(filters.country));
     }
-    if (Array.isArray(filters.languages) && filters.languages.length > 0) {
-      this.selectedLanguage = filters.languages[0];
+    if (Array.isArray(filters.languages)) {
+      this.setLanguages(filters.languages);
     }
     if (filters.min_followers != null) {
       this.minFollowers = filters.min_followers;
@@ -128,7 +159,7 @@ export class AppStore {
       min_followers: (this.minFollowers && Number(this.minFollowers) > 0) ? Number(this.minFollowers) : null,
       max_followers: (this.maxFollowers && Number(this.maxFollowers) > 0) ? Number(this.maxFollowers) : null,
       location: this.selectedCountry !== "all" ? this.selectedCountry : null,
-      languages: this.selectedLanguage !== "all" ? [this.selectedLanguage] : null,
+      languages: this.selectedLanguages.length > 0 ? this.selectedLanguages : null,
       target_tone: this.selectedTone !== "all" ? this.selectedTone : null,
       target_hormones: this.selectedHormones,
       stop_topics: this.stopTopicsInput ? this.stopTopicsInput.split(",").map((s) => s.trim()).filter(Boolean) : [],
@@ -150,12 +181,13 @@ export class AppStore {
     this.searchResults = [];
     this.queryMetadata = null;
     this.selectedCountry = "all";
-    this.selectedLanguage = "all";
+    this.selectedLanguages = [];
     this.selectedTone = "all";
     this.selectedHormones = [];
     this.minFollowers = null;
     this.maxFollowers = null;
     this.stopTopicsInput = "";
+    this.sortFilter = "relevance";
     this.searchQuery = this.brandDescription || "";
   }
 

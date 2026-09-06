@@ -34,26 +34,20 @@ echo "Database backup completed successfully."
 
 # Step 2: Locate the most recently created backup file in the backups directory
 echo "Locating most recent backup file in $BACKUP_DIR..."
-# List files sorted by modification time (newest first), filter to regular files, take first result
-BACKUP_FILE=$(ls -t "$BACKUP_DIR" | while read -r file; do
-    if [ -f "$BACKUP_DIR/$file" ]; then
-        echo "$file"
-        break
-    fi
-done)
+# Find the newest file strictly matching the backup pattern, excluding any other files (e.g. backup_pipeline.log)
+LATEST_BACKUP=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "backup_*.sql.gz" -printf "%T@ %p\n" | sort -n | tail -n 1 | cut -d' ' -f2-)
 
 # Validate that a backup file was found
-if [ -z "$BACKUP_FILE" ]; then
-    echo "ERROR: No backup files found in $BACKUP_DIR after successful backup. Exiting with code 1."
+if [ -z "$LATEST_BACKUP" ]; then
+    echo "ERROR: No backup files matching 'backup_*.sql.gz' found in $BACKUP_DIR after successful backup. Exiting with code 1." >&2
     exit 1
 fi
 
-BACKUP_PATH="$BACKUP_DIR/$BACKUP_FILE"
-echo "Found most recent backup file: $BACKUP_PATH"
+echo "Found most recent backup file: $LATEST_BACKUP"
 
 # Step 3: Execute backup verification script against the new backup
-echo "Starting backup verification for $BACKUP_PATH..."
-if ! "$PROJECT_ROOT/scripts/verify_backup.sh" "$BACKUP_PATH"; then
+echo "Starting backup verification for $LATEST_BACKUP..."
+if ! "$PROJECT_ROOT/scripts/verify_backup.sh" "$LATEST_BACKUP"; then
     echo "ERROR: Backup verification failed. Exiting with code 1."
     exit 1
 fi

@@ -1,6 +1,7 @@
 import math
 
 from src.api.schemas import AuthorVectorAggregate, GraphAuthorEvidence, DbsfScoredCandidate
+from src.utils.languages import canonicalize_language, canonicalize_languages
 
 
 class DbsfRankingEngine:
@@ -58,6 +59,13 @@ class DbsfRankingEngine:
         return result
 
     @staticmethod
+    def _matches_language(author_lang: str | None, target_languages: set[str]) -> bool:
+        canonical_author_lang = canonicalize_language(author_lang)
+        if canonical_author_lang is None:
+            return False
+        return canonical_author_lang in target_languages
+
+    @staticmethod
     def rank_candidates(
         vector_aggregates: dict[int, AuthorVectorAggregate],
         graph_evidences: dict[int, GraphAuthorEvidence],
@@ -92,8 +100,7 @@ class DbsfRankingEngine:
 
         clean_ids = list(raw_vector_scores.keys())
 
-        normalized_target_languages = [lang.lower().strip() for lang in target_languages] if target_languages else []
-        language_filter_active = bool(normalized_target_languages) and "all" not in normalized_target_languages
+        canonical_targets = canonicalize_languages(target_languages)
 
         vec_values = [raw_vector_scores[aid] for aid in clean_ids]
         graph_values = [raw_graph_scores[aid] for aid in clean_ids]
@@ -107,9 +114,6 @@ class DbsfRankingEngine:
         candidates: list[DbsfScoredCandidate] = []
         for account_id in clean_ids:
             evidence = graph_evidences.get(account_id)
-            if language_filter_active and evidence is not None and evidence.primary_language is not None:
-                if evidence.primary_language.lower().strip() not in normalized_target_languages:
-                    continue
             nv = norm_vec_map[account_id]
             ng = norm_graph_map[account_id]
             raw_graph = raw_graph_scores[account_id]
@@ -139,6 +143,19 @@ class DbsfRankingEngine:
                 )
             )
 
+        if canonical_targets:
+            target_lang_candidates: list[DbsfScoredCandidate] = []
+            fallback_candidates: list[DbsfScoredCandidate] = []
+            for candidate in candidates:
+                evidence = graph_evidences.get(candidate.account_id)
+                author_lang = evidence.primary_language if evidence else None
+                if DbsfRankingEngine._matches_language(author_lang, canonical_targets):
+                    target_lang_candidates.append(candidate)
+                else:
+                    fallback_candidates.append(candidate)
+            target_lang_candidates.sort(key=lambda c: -c.final_score)
+            fallback_candidates.sort(key=lambda c: -c.final_score)
+            return target_lang_candidates + fallback_candidates
         candidates.sort(key=lambda c: -c.final_score)
         return candidates
 

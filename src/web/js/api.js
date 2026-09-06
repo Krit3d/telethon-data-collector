@@ -8,6 +8,26 @@ export class SearchApiClient {
     return this._post("/api/v1/search/", payload, signal);
   }
 
+  async getLanguages(signal) {
+    let response;
+    try {
+      response = await fetch(`${this.baseUrl}/api/v1/search/languages`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+        signal,
+      });
+    } catch (err) {
+      if (err.name === "AbortError") {
+        throw err;
+      }
+      throw new Error(`Сетевая ошибка: ${err.message}`);
+    }
+    if (!response.ok) {
+      throw new Error(`Ошибка сервера (${response.status})`);
+    }
+    return response.json();
+  }
+
   async analyzeBrand(payload, signal) {
     return this._post("/api/v1/search/analyze-brand", payload, signal);
   }

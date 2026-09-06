@@ -12,6 +12,9 @@ import { AppStore } from "./store.js";
 const store = new AppStore();
 const api = new SearchApiClient();
 
+let availableLanguages = [];
+let languageAliases = {};
+
 const app = document.querySelector(".app");
 if (!app) {
   throw new Error("App root not found");
@@ -31,6 +34,72 @@ const HORMONE_OPTIONS = [
 
 const TEXTAREA_MIN_HEIGHT = 80;
 const TEXTAREA_MAX_HEIGHT = 240;
+
+const QUICK_LANG_CODES = ["RU", "KK", "EN", "UZ", "UK", "KY", "TR"];
+
+function languageName(code) {
+  const normalized = String(code || "").trim().toLowerCase();
+  const canonical = languageAliases[normalized] || normalized;
+  const found = availableLanguages.find((l) => String(l.code || "").trim().toLowerCase() === canonical);
+  return found && found.name_ru ? found.name_ru : canonical.toUpperCase();
+}
+
+function languageButtonLabel() {
+  const selected = store.selectedLanguages;
+  if (selected.length === 0) return "Все языки ▾";
+  if (selected.length === 1) return `${languageName(selected[0])} ▾`;
+  const codes = selected.map((c) => c.toUpperCase()).join(", ");
+  return `Языки (${selected.length}): ${codes} ▾`;
+}
+
+function buildLanguageItems() {
+  return availableLanguages.map((lang) => {
+    const code = String(lang.code || "").trim().toLowerCase();
+    const name = lang.name_ru || lang.name_en || code.toUpperCase();
+    const checked = store.selectedLanguages.includes(code) ? " checked" : "";
+    return `<label class="lang-item">
+      <input type="checkbox" class="lang-checkbox" data-lang-code="${escapeText(code)}"${checked}>
+      <span class="lang-name">${escapeText(name)}</span>
+      <span class="lang-code">${escapeText(code.toUpperCase())}</span>
+    </label>`;
+  }).join("");
+}
+
+function buildQuickChips() {
+  const allOn = store.selectedLanguages.length === 0 ? " on" : "";
+  const chips = [`<button type="button" class="lang-chip${allOn}" data-lang-chip="all">Все</button>`];
+  for (const code of QUICK_LANG_CODES) {
+    const lower = code.toLowerCase();
+    const on = store.selectedLanguages.includes(lower) ? " on" : "";
+    chips.push(`<button type="button" class="lang-chip${on}" data-lang-chip="${lower}">${code}</button>`);
+  }
+  return chips.join("");
+}
+
+function updateLanguageUI() {
+  const main = app.querySelector(".main");
+  if (!main) return;
+  const toggle = main.querySelector("[data-lang-toggle]");
+  if (toggle) toggle.textContent = languageButtonLabel();
+  const chips = main.querySelectorAll("[data-lang-chip]");
+  chips.forEach((chip) => {
+    const code = chip.dataset.langChip;
+    const on = code === "all" ? store.selectedLanguages.length === 0 : store.selectedLanguages.includes(code);
+    chip.classList.toggle("on", on);
+  });
+  const checkboxes = main.querySelectorAll(".lang-checkbox");
+  checkboxes.forEach((cb) => {
+    cb.checked = store.selectedLanguages.includes(cb.dataset.langCode);
+  });
+}
+
+function refreshLanguageDropdown() {
+  const main = app.querySelector(".main");
+  if (!main) return;
+  const list = main.querySelector("[data-lang-list]");
+  if (list) list.innerHTML = buildLanguageItems();
+  updateLanguageUI();
+}
 
 function autoResizeTextarea(el) {
   if (!el) return;
@@ -90,13 +159,17 @@ function buildFilterBar() {
           <option value="ae">ОАЭ</option>
           <option value="us">США / Global</option>
         </select>
-        <select class="select-pill" data-language-select>
-          <option value="all" selected>Все языки</option>
-          <option value="ru">Русский</option>
-          <option value="kk">Казахский</option>
-          <option value="en">Английский</option>
-          <option value="uk">Украинский</option>
-        </select>
+        <div class="lang-dropdown">
+          <button type="button" class="lang-dropdown-btn" data-lang-toggle>${escapeText(languageButtonLabel())}</button>
+          <div class="lang-dropdown-menu" data-lang-menu style="display:none">
+            <div class="lang-search-box">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#8c93a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+              <input type="text" class="lang-search-input" data-lang-search placeholder="Поиск языка...">
+            </div>
+            <div class="lang-quick-chips" data-lang-chips>${buildQuickChips()}</div>
+            <div class="lang-list" data-lang-list>${buildLanguageItems()}</div>
+          </div>
+        </div>
         <div class="subscribers-group">
           <span class="subscribers-label">Подписчики:</span>
           <input type="number" class="range-input" data-filter="min-followers" placeholder="от">
@@ -211,11 +284,46 @@ function bindFilterBar(tab) {
       store.selectedCountry = countrySelect.value;
     });
   }
-  const languageSelect = tab.querySelector("[data-language-select]");
-  if (languageSelect) {
-    languageSelect.value = store.selectedLanguage || "all";
-    languageSelect.addEventListener("change", () => {
-      store.selectedLanguage = languageSelect.value;
+  const langToggle = tab.querySelector("[data-lang-toggle]");
+  const langMenu = tab.querySelector("[data-lang-menu]");
+  if (langToggle && langMenu) {
+    langToggle.addEventListener("click", (e) => {
+      e.stopPropagation();
+      langMenu.style.display = langMenu.style.display === "block" ? "none" : "block";
+    });
+  }
+  const langSearch = tab.querySelector("[data-lang-search]");
+  if (langSearch) {
+    langSearch.addEventListener("input", () => {
+      const query = langSearch.value.trim().toLowerCase();
+      const items = tab.querySelectorAll(".lang-item");
+      items.forEach((item) => {
+        const name = (item.querySelector(".lang-name")?.textContent || "").toLowerCase();
+        const code = (item.querySelector(".lang-code")?.textContent || "").toLowerCase();
+        const match = !query || name.includes(query) || code.includes(query);
+        item.style.display = match ? "flex" : "none";
+      });
+    });
+  }
+  const langChips = tab.querySelectorAll("[data-lang-chip]");
+  langChips.forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const code = chip.dataset.langChip;
+      if (code === "all") {
+        store.setLanguages([]);
+      } else {
+        store.toggleLanguage(code);
+      }
+      updateLanguageUI();
+    });
+  });
+  const langList = tab.querySelector("[data-lang-list]");
+  if (langList) {
+    langList.addEventListener("change", (e) => {
+      const checkbox = e.target.closest(".lang-checkbox");
+      if (!checkbox) return;
+      store.toggleLanguage(checkbox.dataset.langCode);
+      updateLanguageUI();
     });
   }
   const minFollowers = tab.querySelector("[data-filter='min-followers']");
@@ -376,12 +484,33 @@ function renderResults() {
       }
     });
   }
-  filtered.sort((a, b) => (b.final_score || 0) - (a.final_score || 0));
+  if (store.sortFilter === "subscribers") {
+    filtered.sort((a, b) => (b.subscribers_count || 0) - (a.subscribers_count || 0));
+  } else if (store.sortFilter === "er") {
+    filtered.sort((a, b) => (b.static_avg_er || 0) - (a.static_avg_er || 0));
+  } else {
+    filtered.sort((a, b) => (b.final_score || 0) - (a.final_score || 0));
+  }
 
   if (store.searchResults.length === 0) {
+    const emptyState = {
+      1: {
+        title: "AI-подбор авторов",
+        text: "Опишите ваш бренд в поле выше и нажмите «Определить ЦА ✨»",
+      },
+      2: {
+        title: "Целевая аудитория определена",
+        text: "Проверьте формулировку ЦА и параметры, затем нажмите «🔍 Найти авторов»",
+      },
+      3: {
+        title: "Авторы не найдены",
+        text: "Попробуйте расширить фильтры по подписчикам, языкам или изменить описание",
+      },
+    };
+    const state = emptyState[store.currentStep] || emptyState[1];
     resultsEl.innerHTML = `<div class="empty-state">
-      <div class="empty-title">Запустите поиск</div>
-      <div class="empty-text">Опишите задачу и нажмите «Найти авторов»</div>
+      <div class="empty-title">${state.title}</div>
+      <div class="empty-text">${state.text}</div>
     </div>`;
     return;
   }
@@ -389,25 +518,43 @@ function renderResults() {
   const filters = document.createElement("div");
   filters.className = "filters";
   filters.innerHTML = `
-    <svg class="filter-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#b3b8c8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18"></path><path d="M6 12h12"></path><path d="M10 19h4"></path></svg>
-    <select class="filter-select" data-filter="platform">
-      <option value="all">Все платформы</option>
-      <option value="instagram">Instagram</option>
-      <option value="telegram">Telegram</option>
-    </select>
-    <select class="filter-select" data-filter="reach">
-      <option value="all">Любой охват</option>
-      <option value="1k-10k">1K – 10K</option>
-      <option value="10k-50k">10K – 50K</option>
-      <option value="50k-100k">50K – 100K</option>
-      <option value="100k+">100K+</option>
-    </select>`;
+    <div class="filter-controls-row">
+      <svg class="filter-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#b3b8c8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h18"></path><path d="M6 12h12"></path><path d="M10 19h4"></path></svg>
+      <select class="filter-select" data-filter="platform">
+        <option value="all">Все платформы</option>
+        <option value="instagram">Instagram</option>
+        <option value="telegram">Telegram</option>
+      </select>
+      <select class="filter-select" data-filter="reach">
+        <option value="all">Любой охват</option>
+        <option value="1k-10k">1K – 10K</option>
+        <option value="10k-50k">10K – 50K</option>
+        <option value="50k-100k">50K – 100K</option>
+        <option value="100k+">100K+</option>
+      </select>
+    </div>
+    <div class="sort-controls-row">
+      <svg class="sort-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 4v16m-6-6 6 6 6-6"></path>
+      </svg>
+      <select class="filter-select" data-filter="sort">
+        <option value="relevance">По релевантности</option>
+        <option value="subscribers">По подписчикам</option>
+        <option value="er">По вовлечённости (ER)</option>
+      </select>
+    </div>`;
   resultsEl.appendChild(filters);
 
   const platformSel = filters.querySelector("[data-filter='platform']");
   platformSel.value = store.platformFilter;
   platformSel.addEventListener("change", () => {
     store.platformFilter = platformSel.value;
+    renderResults();
+  });
+  const sortSel = filters.querySelector("[data-filter='sort']");
+  sortSel.value = store.sortFilter;
+  sortSel.addEventListener("change", () => {
+    store.sortFilter = sortSel.value;
     renderResults();
   });
   const reachSel = filters.querySelector("[data-filter='reach']");
@@ -526,10 +673,10 @@ function syncInferredFilters() {
     countrySelect.value = store.selectedCountry || "all";
     flashInferred(countrySelect);
   }
-  const languageSelect = main.querySelector("[data-language-select]");
-  if (languageSelect) {
-    languageSelect.value = store.selectedLanguage || "all";
-    flashInferred(languageSelect);
+  const langToggle = main.querySelector("[data-lang-toggle]");
+  if (langToggle) {
+    updateLanguageUI();
+    flashInferred(langToggle);
   }
   const minFollowers = main.querySelector("[data-filter='min-followers']");
   if (minFollowers) {
@@ -624,6 +771,7 @@ function resetAudience() {
   store.matchTypeFilter = "all";
   render();
   syncInferredFilters();
+  refreshLanguageDropdown();
 }
 
 app.addEventListener("click", (e) => {
@@ -706,4 +854,28 @@ app.addEventListener("click", (e) => {
   }
 });
 
+document.addEventListener("click", (e) => {
+  const dropdown = e.target.closest(".lang-dropdown");
+  const menus = document.querySelectorAll(".lang-dropdown-menu");
+  menus.forEach((menu) => {
+    if (!dropdown || !dropdown.contains(menu)) {
+      menu.style.display = "none";
+    }
+  });
+});
+
+async function loadLanguages() {
+  try {
+    const data = await api.getLanguages();
+    availableLanguages = Array.isArray(data.languages) ? data.languages : [];
+    languageAliases = data.aliases && typeof data.aliases === "object" ? data.aliases : {};
+    refreshLanguageDropdown();
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    availableLanguages = [];
+    languageAliases = {};
+  }
+}
+
+loadLanguages();
 render();

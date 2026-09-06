@@ -52,17 +52,6 @@ function escapeHtml(value) {
     .replace(/'/g, APOS + "#39;");
 }
 
-function platformIcon(platform) {
-  const key = String(platform || "").toLowerCase();
-  if (key === "instagram") {
-    return `<svg class="platform-icon" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="5"></rect><circle cx="12" cy="12" r="4"></circle><circle cx="17.2" cy="6.8" r="1.1" fill="currentColor" stroke="none"></circle></svg>`;
-  }
-  if (key === "telegram") {
-    return `<svg class="platform-icon" viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M21.9 4.6 18.8 19c-.2 1-.8 1.2-1.7.8l-4.6-3.4-2.2 2.1c-.3.3-.5.5-.9.5l.3-4.6L18.2 6c.4-.3-.1-.5-.6-.2L6.9 12.4l-4.5-1.4c-1-.3-1-1 .2-1.4L20.6 3.2c.8-.3 1.5.2 1.3 1.4z"></path></svg>`;
-  }
-  return "";
-}
-
 function initials(name) {
   const cleaned = String(name || "")
     .replace(/[.,/()\[\]{}"'-]/g, " ")
@@ -170,7 +159,6 @@ export function renderAuthorCards(authors, container, store) {
     const url = item.url || "#";
     const platformRaw = item.platform || "";
     const platform = platformRaw ? platformRaw.charAt(0).toUpperCase() + platformRaw.slice(1).toLowerCase() : "";
-    const platformSvg = platformIcon(platformRaw);
     const relPct = Math.min(100, Math.max(0, (item.final_score || 0) * 100));
     const rel = `${Math.round(relPct)}%`;
     const er = item.static_avg_er != null ? `${Number(item.static_avg_er).toFixed(1)}%` : "—";
@@ -195,8 +183,11 @@ export function renderAuthorCards(authors, container, store) {
       const hormoneDesc = HORMONE_DESCRIPTIONS[item.primary_hormone] || "";
       psychoBadges.push(`<span class="badge-psycho" title="${escapeHtml(hormoneDesc)}">${escapeHtml(HORMONE_LABELS[item.primary_hormone] || item.primary_hormone)}</span>`);
     }
+    const langBadge = item.primary_language && String(item.primary_language).trim() !== ""
+      ? `<span class="badge-lang" title="Язык контента: ${escapeHtml(String(item.primary_language).toUpperCase())}">${escapeHtml(String(item.primary_language).toUpperCase())}</span>`
+      : "";
     const psychoRow = psychoBadges.length > 0 ? `<div class="badges-psycho">${psychoBadges.join("")}</div>` : "";
-    const badgesRow = (matchBadge || psychoRow) ? `<div class="author-badges">${matchBadge}${psychoRow}</div>` : "";
+    const badgesRow = (matchBadge || langBadge || psychoRow) ? `<div class="author-badges">${matchBadge}${langBadge}${psychoRow}</div>` : "";
     let thirdStat = "";
     if (item.location) {
       thirdStat = item.location.length > 28 ? item.location.slice(0, 26) + "…" : item.location;
@@ -208,10 +199,10 @@ export function renderAuthorCards(authors, container, store) {
     }
 
     const handleHtml = handle
-      ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${platformSvg}${escapeHtml(handle)}</a>`
+      ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(handle)}</a>`
       : "";
     const platformHtml = platform
-      ? `${handle ? " · " : ""}${handle ? "" : platformSvg}${escapeHtml(platform)}`
+      ? `${handle ? " · " : ""}${escapeHtml(platform)}`
       : "";
 
     return `<div class="author-card" data-author-id="${id}">
