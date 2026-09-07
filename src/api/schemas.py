@@ -39,7 +39,8 @@ def coerce_hormone(value: object) -> HormoneType | None:
 
 
 class InferredFilters(BaseModel):
-    country: str | None = None
+    countries: list[str] = Field(default_factory=list)
+    target_gender: str = Field(default="both")
     languages: list[str] | None = None
     min_followers: int | None = None
     max_followers: int | None = None
@@ -89,6 +90,8 @@ class ReformulatedQuery(BaseModel):
     semantic_topics: list[str] = Field(default_factory=list, description="Extracted natural topic areas matching query intent")
     profile_type_intent: str = Field(default="expert", description="Inferred target profile type: expert or business")
     target_languages: list[str] = Field(default_factory=list, description="Target language codes (e.g. ru, uk, kz, en) extracted or inferred from query")
+    target_countries: list[str] = Field(default_factory=list, description="Target ISO 3166-1 alpha-2 country codes")
+    target_gender: str = Field(default="both", description="Target gender: male, female, or both")
     affinity_dense_query: str | None = Field(default=None, description="Dense vector query for adjacent audience topics")
     affinity_topics: list[str] = Field(default_factory=list, description="Adjacent topic areas for concept expansion")
     affinity_reason: str | None = Field(default=None, description="Explanation of affinity audience rationale")
@@ -100,12 +103,22 @@ class ReformulatedQuery(BaseModel):
     target_hormones: list[HormoneType] = Field(default_factory=list, description="Target psychographic hormones")
     inferred_filters: InferredFilters | None = Field(default=None, description="AI-inferred UI filters")
 
-    @field_validator("graph_entities", "semantic_topics", "target_languages", "affinity_topics", "audience_clusters", "negative_topics", "negative_entities", "target_hormones", mode="before")
+    @field_validator("graph_entities", "semantic_topics", "target_languages", "target_countries", "affinity_topics", "audience_clusters", "negative_topics", "negative_entities", "target_hormones", mode="before")
     @classmethod
     def list_null_to_empty(cls, v: Any) -> Any:
         if v is None:
             return []
         return v
+
+    @field_validator("target_gender", mode="before")
+    @classmethod
+    def validate_target_gender(cls, v: Any) -> str:
+        if v is None or not isinstance(v, str):
+            return "both"
+        normalized = v.strip().lower()
+        if normalized not in ("male", "female", "both"):
+            return "both"
+        return normalized
 
     @field_validator("profile_type_intent", mode="before")
     @classmethod
@@ -189,6 +202,8 @@ class SearchRequest(BaseModel):
     include_contacts: bool = Field(default=False, description="Include contact details in response")
     include_analytics: bool = Field(default=True, description="Include analytics data in response")
     languages: list[str] | None = Field(default=[], description="Optional filter by ISO language codes (e.g. ['ru', 'uk', 'en'])")
+    countries: list[str] | None = Field(default=None, description="Filter results by ISO country codes")
+    gender: str = Field(default="both", description="Gender filter: male, female, or both")
     brief: BriefContext | None = Field(default=None, description="Structured campaign brief context")
     target_tone: ToneType | None = Field(default=None, description="Explicit creator tone filter")
     target_hormones: list[HormoneType] = Field(default_factory=list, description="Explicit psychographic hormone filters")
@@ -225,6 +240,23 @@ class SearchRequest(BaseModel):
                     if stripped:
                         normalized_languages.append(stripped)
             data["languages"] = normalized_languages if normalized_languages else None
+        countries = data.get("countries")
+        if isinstance(countries, list):
+            normalized_countries = []
+            for country in countries:
+                if isinstance(country, str):
+                    stripped = country.strip().upper()
+                    if stripped:
+                        normalized_countries.append(stripped)
+            data["countries"] = normalized_countries if normalized_countries else None
+        else:
+            data["countries"] = None
+        gender = data.get("gender")
+        if isinstance(gender, str):
+            normalized_gender = gender.strip().lower()
+            data["gender"] = normalized_gender if normalized_gender in ("male", "female", "both") else "both"
+        else:
+            data["gender"] = "both"
         author_type = data.get("author_type")
         if author_type is None or author_type == "" or (isinstance(author_type, str) and author_type.strip().lower() == "string"):
             data["author_type"] = "expert"
@@ -322,6 +354,9 @@ class HydratedAuthorRecord(BaseModel):
     static_avg_er: float | None = Field(default=None, description="Static average engagement rate for the author")
     subscribers_count: int | None = Field(default=None, description="Number of subscribers or followers")
     is_author_blog: bool = Field(description="Whether the account is flagged as an author blog")
+    country: str | None = Field(default=None, description="ISO 3166-1 alpha-2 country code")
+    city: str | None = Field(default=None, description="City name of the author")
+    gender: str | None = Field(default=None, description="Gender of the author: male, female, or None")
     raw_metadata: dict[str, Any] | None = Field(default=None, description="Raw metadata dictionary from database")
     contacts: dict[str, Any] | None = Field(default=None, description="Contact information dictionary")
     has_contacts: bool = Field(default=False, description="Whether contact data is available for this author")
@@ -381,6 +416,9 @@ class AuthorSearchResultItem(BaseModel):
     has_contacts: bool = Field(default=False, description="Whether contact data is available")
     subscribers_count: int | None = Field(default=None, description="Number of subscribers or followers")
     location: str | None = Field(default=None, description="Author location name from graph or profile")
+    country: str | None = Field(default=None, description="ISO 3166-1 alpha-2 country code")
+    city: str | None = Field(default=None, description="City name of the author")
+    gender: str | None = Field(default=None, description="Gender of the author: male, female, or None")
     primary_language: str | None = Field(default=None, description="Author primary language code (e.g. ru, uk, en)")
     match_type: str = Field(default="direct", description="Match classification: direct or affinity")
     affinity_reason: str | None = Field(default=None, description="Contextual reason for affinity match")

@@ -128,6 +128,19 @@ class Account(Base):
         comment="Pre-calculated average engagement rate from the author's last posts. Avoids heavy runtime aggregations during search",
     )
 
+    country: Mapped[str | None] = mapped_column(
+        String(2), nullable=True, index=True,
+        comment="ISO 3166-1 alpha-2 country code of the author",
+    )
+    city: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="Normalized city name of the author",
+    )
+    gender: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, index=True,
+        comment="Author gender: 'male', 'female', 'duo', 'neutral' or 'unknown'",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

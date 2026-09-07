@@ -76,7 +76,7 @@ class Settings(BaseSettings):
         description="Direct DeepSeek API base URL",
     )
     deepseek_llm_model: str = Field(
-        default="deepseek-chat",
+        default="deepseek-v4-flash",
         description="Direct DeepSeek LLM model name",
     )
 
@@ -309,6 +309,22 @@ class Settings(BaseSettings):
     enrichment_concurrency: int = Field(
         default=15,
         description="Maximum number of accounts processed in parallel by the enrichment worker",
+    )
+    enrichment_enable_categories: bool = Field(
+        default=False,
+        description="Enable category detection via IAB 3.1 taxonomy",
+    )
+    enrichment_enable_er: bool = Field(
+        default=False,
+        description="Enable static_avg_er metric recalculation in the enrichment worker",
+    )
+    enrichment_enable_explanation: bool = Field(
+        default=False,
+        description="Enable factual explanation text generation in the enrichment worker",
+    )
+    enrichment_enable_demographics: bool = Field(
+        default=True,
+        description="Enable author demographics (gender, country, city) extraction in the enrichment worker",
     )
 
     # ---- API server settings ----
