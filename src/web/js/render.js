@@ -25,6 +25,7 @@ const CLAMP_CLASS = "explanation-clamped";
 
 const TONE_LABELS = { expert: "Экспертный", educational: "Обучающий", entertainment: "Развлекательный", provocative: "Провокационный", casual: "Повседневный", analytical: "Аналитический" };
 const HORMONE_LABELS = { dopamine: "Дофамин", serotonin: "Серотонин", oxytocin: "Окситоцин", adrenaline: "Адреналин", cortisol: "Кортизол", endorphin: "Эндорфин" };
+const GENDER_LABELS = { male: "Мужской", female: "Женский", duo: "Дуэт"};
 const HORMONE_HINTS = { dopamine: "Драйв и тренды", serotonin: "Статус и порядок", oxytocin: "Семья и забота", adrenaline: "Экстрим и риск", cortisol: "Боли и проблемы", endorphin: "Юмор и позитив" };
 const TONE_DESCRIPTIONS = {
   expert: "Экспертный: глубокий профессиональный анализ и авторитет",
@@ -186,16 +187,24 @@ export function renderAuthorCards(authors, container, store) {
     const langBadge = item.primary_language && String(item.primary_language).trim() !== ""
       ? `<span class="badge-lang" title="Язык контента: ${escapeHtml(String(item.primary_language).toUpperCase())}">${escapeHtml(String(item.primary_language).toUpperCase())}</span>`
       : "";
+    const genderBadge = item.gender && GENDER_LABELS[item.gender]
+      ? `<span class="badge-gender ${item.gender}" title="Пол автора: ${GENDER_LABELS[item.gender]}">${GENDER_LABELS[item.gender]}</span>`
+      : "";
     const psychoRow = psychoBadges.length > 0 ? `<div class="badges-psycho">${psychoBadges.join("")}</div>` : "";
-    const badgesRow = (matchBadge || langBadge || psychoRow) ? `<div class="author-badges">${matchBadge}${langBadge}${psychoRow}</div>` : "";
+    const badgesRow = (matchBadge || langBadge || genderBadge || psychoRow) ? `<div class="author-badges">${matchBadge}${langBadge}${genderBadge}${psychoRow}</div>` : "";
     let thirdStat = "";
-    if (item.location) {
-      thirdStat = item.location.length > 28 ? item.location.slice(0, 26) + "…" : item.location;
+    const geoText = item.city && item.country
+      ? `${item.city}, ${item.country}`
+      : (item.country || item.city || "");
+    if (geoText) {
+      const shortGeo = geoText.length > 28 ? geoText.slice(0, 26) + "…" : geoText;
+      thirdStat = `<span class="stat-divider"></span><div class="stat-geo" title="${escapeHtml(geoText)}">📍 ${escapeHtml(shortGeo)}</div>`;
     } else if (item.primary_language) {
-      thirdStat = `Язык: ${item.primary_language.toUpperCase()}`;
+      thirdStat = `<span class="stat-divider"></span><div class="stat-geo">Язык: ${escapeHtml(String(item.primary_language).toUpperCase())}</div>`;
     } else if (category) {
       const lastLevel = category.split(">").pop().trim();
-      thirdStat = lastLevel.length > 25 ? lastLevel.slice(0, 25) : lastLevel;
+      const shortCat = lastLevel.length > 25 ? lastLevel.slice(0, 25) : lastLevel;
+      thirdStat = `<span class="stat-divider"></span><div class="stat-geo" title="${escapeHtml(category)}">${escapeHtml(shortCat)}</div>`;
     }
 
     const handleHtml = handle
@@ -245,7 +254,7 @@ export function renderAuthorCards(authors, container, store) {
           <span class="stat-label">ER</span>
           <span class="stat-value">${er}</span>
         </div>
-        ${thirdStat ? `<span class="stat-divider"></span><div class="stat-geo">${escapeHtml(thirdStat)}</div>` : ""}
+        ${thirdStat}
       </div>
 
       <div class="author-actions">
@@ -329,12 +338,15 @@ export function renderShortlist(shortlist, container, store) {
     const er = item.static_avg_er != null ? `${Number(item.static_avg_er).toFixed(1)}%` : "—";
     const rel = `${Math.round((item.final_score || 0) * 100)}%`;
     const color = colorFor(name);
+    const geoText = item.city && item.country
+      ? `${item.city}, ${item.country}`
+      : (item.country || item.city || "");
 
     return `<div class="shortlist-item" data-author-id="${item.account_id}">
       <span class="avatar" style="width:40px;height:40px;background:${color};color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;">${escapeHtml(initials(name))}</span>
       <div class="shortlist-item-info">
         <div class="shortlist-item-name">${escapeHtml(name)}</div>
-        <div class="shortlist-item-sub">${handle ? escapeHtml(handle) : ""}${platform ? ` · ${escapeHtml(platform)}` : ""}${subs !== "—" ? ` · ${subs}` : ""}${er !== "—" ? ` · ER ${er}` : ""}</div>
+        <div class="shortlist-item-sub">${handle ? escapeHtml(handle) : ""}${platform ? ` · ${escapeHtml(platform)}` : ""}${subs !== "—" ? ` · ${subs}` : ""}${er !== "—" ? ` · ER ${er}` : ""}${geoText ? ` · 📍 ${escapeHtml(geoText)}` : ""}</div>
       </div>
       <span class="badge-rel">${rel}</span>
       <button class="btn-solid" data-action="open-chat" data-author-id="${item.account_id}">Написать</button>

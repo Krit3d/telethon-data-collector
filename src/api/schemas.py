@@ -203,7 +203,7 @@ class SearchRequest(BaseModel):
     include_analytics: bool = Field(default=True, description="Include analytics data in response")
     languages: list[str] | None = Field(default=[], description="Optional filter by ISO language codes (e.g. ['ru', 'uk', 'en'])")
     countries: list[str] | None = Field(default=None, description="Filter results by ISO country codes")
-    gender: str = Field(default="both", description="Gender filter: male, female, or both")
+    gender: str | None = Field(default=None, description="Explicit user gender filter: male, female, or both")
     brief: BriefContext | None = Field(default=None, description="Structured campaign brief context")
     target_tone: ToneType | None = Field(default=None, description="Explicit creator tone filter")
     target_hormones: list[HormoneType] = Field(default_factory=list, description="Explicit psychographic hormone filters")
@@ -248,15 +248,15 @@ class SearchRequest(BaseModel):
                     stripped = country.strip().upper()
                     if stripped:
                         normalized_countries.append(stripped)
-            data["countries"] = normalized_countries if normalized_countries else None
+            data["countries"] = normalized_countries
         else:
             data["countries"] = None
         gender = data.get("gender")
         if isinstance(gender, str):
             normalized_gender = gender.strip().lower()
-            data["gender"] = normalized_gender if normalized_gender in ("male", "female", "both") else "both"
+            data["gender"] = normalized_gender if normalized_gender in ("male", "female", "both") else None
         else:
-            data["gender"] = "both"
+            data["gender"] = None
         author_type = data.get("author_type")
         if author_type is None or author_type == "" or (isinstance(author_type, str) and author_type.strip().lower() == "string"):
             data["author_type"] = "expert"

@@ -7,6 +7,7 @@ from openai import AsyncOpenAI
 from src.api.schemas import AudienceCluster, BrandAnalysisRequest, BrandAnalysisResponse, InferredFilters, ReformulatedQuery, SearchPlanRequest, SearchPlanResponse, SearchRequest
 from src.config.config import Settings
 from src.graph.ontology import HormoneType, ToneType
+from src.utils.countries import canonicalize_countries, canonicalize_country
 
 _ALLOWED_PROFILE_TYPES = frozenset({"expert", "business", "any"})
 
@@ -44,7 +45,7 @@ Step 6 - Language Isolation:
 * target_languages: Extract target language ISO 639-1 codes (e.g. ['ru'], ['uk'], ['kk'] (NEVER 'kz'), ['en'], ['uz']). If explicit language request is present (e.g. 'украинские каналы' -> ['uk'], 'на английском' -> ['en'], 'казахоязычные блоги' -> ['kk']), specify it. Otherwise infer from query language or return []. For CIS countries/regions with bilingualism (e.g. Kazakhstan -> ['ru', 'kk'], Belarus -> ['ru', 'be'], Ukraine -> ['uk', 'ru']) add both common languages to target_languages if there is no explicit indication of a single language.
 
 Step 7 - Inferred Filters:
-Form the inferred_filters object with fields country, languages, min_followers, max_followers, target_tone, target_hormones. Infer these values from the query and brief context. country is a country or region name, languages are ISO 639-1 codes, min_followers and max_followers are positive integers. Use null for unknown values.
+Form the inferred_filters object with fields countries, target_gender, languages, min_followers, max_followers, target_tone, target_hormones. Infer these values from the query and brief context. countries is a list of two-letter ISO 3166-1 alpha-2 country codes (e.g. ["KZ", "RU"]) or an empty list []. target_gender must be strictly "male" (if the audience or product is strictly male), "female" (if the audience or product is strictly female), or "both" (if suitable for both genders or gender is not specified). languages are ISO 639-1 codes, min_followers and max_followers are positive integers. Use null for unknown values.
 </decomposition_algorithm>
 
 <response_format>
@@ -68,9 +69,12 @@ Output a strictly valid JSON object matching the KagPlan schema:
   "target_tone": str | None,
   "target_hormones": list[str],
   "target_languages": list[str],
+  "target_countries": list[str],
+  "target_gender": str ("male" | "female" | "both"),
   "resolved_profile_type": str,
   "inferred_filters": {
-    "country": str | None,
+    "countries": list[str],
+    "target_gender": str ("male" | "female" | "both"),
     "languages": list[str] | None,
     "min_followers": int | None,
     "max_followers": int | None,
@@ -105,9 +109,12 @@ Output:
   "target_tone": "educational",
   "target_hormones": ["oxytocin"],
   "target_languages": ["ru"],
+  "target_countries": [],
+  "target_gender": "both",
   "resolved_profile_type": "expert",
   "inferred_filters": {
-    "country": null,
+    "countries": [],
+    "target_gender": "both",
     "languages": ["ru"],
     "min_followers": null,
     "max_followers": null,
@@ -116,25 +123,86 @@ Output:
   }
 }
 
-Example 2 (Finance & Investing):
-User query: "каналы про дивидендные акции и пассивный доход на бирже рф"
+Example 2 (Female intent):
+User query: "уход за проблемной кожей лица сыворотки и косметика для девушек"
 Output:
 {
-  "dense_query": "стратегии инвестирования дивидендные акции пассивный доход фондовый рынок ценные бумаги дивиденды управление капиталом брокерские счета",
-  "graph_entities": ["дивидендные акции", "пассивный доход", "фондовый рынок", "ценные бумаги", "брокерские счета"],
-  "semantic_topics": ["Personal Finance", "Stock Market", "Dividend Investing", "Passive Income", "Financial Markets"],
-  "affinity_dense_query": "личные финансы накопления пенсионные планы недвижимость как инвестиция налоговая оптимизация",
-  "affinity_topics": ["Real Estate", "Retirement Planning", "Tax Planning", "Wealth Management"],
-  "affinity_reason": "Недвижимость и накопления",
-  "negative_topics": ["криптовалюты", "форекс"],
+  "dense_query": "уход за проблемной кожей лица сыворотки для лица косметика для девушек уходовая косметика очищение кожи тоники увлажнение кожи",
+  "graph_entities": ["уход за проблемной кожей", "сыворотки для лица", "косметика для девушек", "уходовая косметика", "очищение кожи"],
+  "semantic_topics": ["Skincare", "Beauty", "Cosmetics", "Facial Care", "Dermatology"],
+  "affinity_dense_query": "женский фитнес пилатес здоровое питание йога велнес стиль жизни",
+  "affinity_topics": ["Women Fitness", "Wellness", "Healthy Eating", "Yoga"],
+  "affinity_reason": "Велнес и женский фитнес",
+  "negative_topics": [],
+  "negative_entities": [],
+  "target_tone": "educational",
+  "target_hormones": ["serotonin"],
+  "target_languages": ["ru"],
+  "target_countries": [],
+  "target_gender": "female",
+  "resolved_profile_type": "expert",
+  "inferred_filters": {
+    "countries": [],
+    "target_gender": "female",
+    "languages": ["ru"],
+    "min_followers": null,
+    "max_followers": null,
+    "target_tone": "educational",
+    "target_hormones": ["serotonin"]
+  }
+}
+
+Example 3 (Male intent & Country):
+User query: "мужские стрижки оформление бороды и барбершопы москвы"
+Output:
+{
+  "dense_query": "мужские стрижки оформление бороды барбершопы мужской уход за волосами укладка бороды барбер сервис",
+  "graph_entities": ["мужские стрижки", "оформление бороды", "барбершопы", "мужской уход за волосами", "укладка бороды"],
+  "semantic_topics": ["Barbering", "Men Grooming", "Hair Care", "Beard Care", "Personal Care Services"],
+  "affinity_dense_query": "мужской спорт единоборства кроссфит мужская мода автомобили и тюнинг",
+  "affinity_topics": ["Martial Arts", "CrossFit", "Men Fashion", "Auto Tuning"],
+  "affinity_reason": "Мужской спорт и мода",
+  "negative_topics": [],
+  "negative_entities": [],
+  "target_tone": "casual",
+  "target_hormones": ["dopamine"],
+  "target_languages": ["ru"],
+  "target_countries": ["RU"],
+  "target_gender": "male",
+  "resolved_profile_type": "business",
+  "inferred_filters": {
+    "countries": ["RU"],
+    "target_gender": "male",
+    "languages": ["ru"],
+    "min_followers": null,
+    "max_followers": null,
+    "target_tone": "casual",
+    "target_hormones": ["dopamine"]
+  }
+}
+
+Example 4 (Multi-country & Both genders):
+User query: "инвестиции и крипта в казахстане и узбекистане"
+Output:
+{
+  "dense_query": "инвестиции криптовалюта трейдинг фондовый рынок цифровые активы криптобиржи управление капиталом",
+  "graph_entities": ["инвестиции", "криптовалюта", "трейдинг", "фондовый рынок", "цифровые активы"],
+  "semantic_topics": ["Investing", "Cryptocurrency", "Trading", "Digital Assets", "Financial Markets"],
+  "affinity_dense_query": "личные финансы накопления предпринимательство малый бизнес недвижимость",
+  "affinity_topics": ["Small Business", "Real Estate", "Entrepreneurship", "Wealth Management"],
+  "affinity_reason": "Бизнес и накопления",
+  "negative_topics": [],
   "negative_entities": [],
   "target_tone": "expert",
   "target_hormones": ["dopamine"],
-  "target_languages": ["ru"],
+  "target_languages": ["ru", "kk", "uz"],
+  "target_countries": ["KZ", "UZ"],
+  "target_gender": "both",
   "resolved_profile_type": "expert",
   "inferred_filters": {
-    "country": "Россия",
-    "languages": ["ru"],
+    "countries": ["KZ", "UZ"],
+    "target_gender": "both",
+    "languages": ["ru", "kk", "uz"],
     "min_followers": null,
     "max_followers": null,
     "target_tone": "expert",
@@ -142,7 +210,7 @@ Output:
   }
 }
 
-Example 3 (Tech & Business services):
+Example 5 (B2B & Business services):
 User query: "курсы и студии по веб дизайну ui ux figma"
 Output:
 {
@@ -157,39 +225,16 @@ Output:
   "target_tone": "educational",
   "target_hormones": ["dopamine"],
   "target_languages": ["ru"],
+  "target_countries": [],
+  "target_gender": "both",
   "resolved_profile_type": "business",
   "inferred_filters": {
-    "country": null,
+    "countries": [],
+    "target_gender": "both",
     "languages": ["ru"],
     "min_followers": null,
     "max_followers": null,
     "target_tone": "educational",
-    "target_hormones": ["dopamine"]
-  }
-}
-
-Example 4 (Regional localization & Bilingualism):
-User query: "авторы про инвестиции из Казахстана"
-Output:
-{
-  "dense_query": "инвестиции акции фондовый рынок брокеры ценные бумаги пассивный доход управление активами дивиденды венчурные инвестиции финансы",
-  "graph_entities": ["инвестиции", "акции", "фондовый рынок", "брокеры", "ценные бумаги", "тенге"],
-  "semantic_topics": ["Personal Finance", "Stock Market", "Investing", "Financial Services"],
-  "affinity_dense_query": "личные финансы накопления предпринимательство малый бизнес недвижимость",
-  "affinity_topics": ["Small Business", "Real Estate", "Entrepreneurship", "Wealth Management"],
-  "affinity_reason": "Бизнес и недвижимость",
-  "negative_topics": [],
-  "negative_entities": [],
-  "target_tone": "expert",
-  "target_hormones": ["dopamine"],
-  "target_languages": ["ru", "kk"],
-  "resolved_profile_type": "expert",
-  "inferred_filters": {
-    "country": "Казахстан",
-    "languages": ["ru", "kk"],
-    "min_followers": null,
-    "max_followers": null,
-    "target_tone": "expert",
     "target_hormones": ["dopamine"]
   }
 }
@@ -233,7 +278,7 @@ Step 6 - Language Isolation:
 Extract target_languages as ISO 639-1 codes (e.g. ['ru'], ['uk'], ['kk'] (NEVER 'kz'), ['en'], ['uz']). If explicit language request is present, specify it. Otherwise infer from brief language or return [].
 
 Step 7 - Inferred Filters:
-Form the inferred_filters object with fields country, languages, min_followers, max_followers, target_tone, target_hormones, search_query, stop_topics. Infer these values from the brief. country is a country or region name, languages are ISO 639-1 codes, min_followers and max_followers are positive integers. Use null for unknown values.
+Form the inferred_filters object with fields countries, target_gender, languages, min_followers, max_followers, target_tone, target_hormones, search_query, stop_topics. Infer these values from the brief. countries is a list of two-letter ISO 3166-1 alpha-2 country codes (e.g. ["KZ", "RU"]) or an empty list []. target_gender must be strictly "male" (if the audience or product is strictly male), "female" (if the audience or product is strictly female), or "both" (if suitable for both genders or gender is not specified). languages are ISO 639-1 codes, min_followers and max_followers are positive integers. Use null for unknown values.
 </decomposition_algorithm>
 
 <response_format>
@@ -257,9 +302,12 @@ Output a strictly valid JSON object matching the Plan schema:
   "target_tone": str | None,
   "target_hormones": list[str],
   "target_languages": list[str],
+  "target_countries": list[str],
+  "target_gender": str ("male" | "female" | "both"),
   "search_query": str,
   "inferred_filters": {
-    "country": str | None,
+    "countries": list[str],
+    "target_gender": str ("male" | "female" | "both"),
     "languages": list[str] | None,
     "min_followers": int | None,
     "max_followers": int | None,
@@ -314,7 +362,7 @@ Determine target_tone from one of: $tones.
 Determine target_hormones as an array of up to 2 hormones from: $hormones.
 
 Step 5 - Inferred Filters:
-Form the inferred_filters object with fields country, languages, min_followers, max_followers, target_tone, target_hormones, stop_topics. country MUST be a strict 2-letter ISO 3166-1 alpha-2 code in lowercase (e.g. "kz", "ru", "by", "uz", "ae", "us") or null if unknown. languages are ISO 639-1 codes (e.g. ['ru'], ['uk'], ['kk'] (NEVER 'kz'), ['en']). min_followers and max_followers are positive integers or null. stop_topics must preserve all stop topics from the request.
+Form the inferred_filters object with fields countries, target_gender, languages, min_followers, max_followers, target_tone, target_hormones, stop_topics. countries MUST be a list of strict 2-letter ISO 3166-1 alpha-2 codes in uppercase (e.g. ["KZ", "RU", "BY", "UZ", "AE", "US"]) or an empty list [] if unknown. target_gender must be strictly "male" (if the audience or product is strictly male), "female" (if the audience or product is strictly female), or "both" (if suitable for both genders or gender is not specified). languages are ISO 639-1 codes (e.g. ['ru'], ['uk'], ['kk'] (NEVER 'kz'), ['en']). min_followers and max_followers are positive integers or null. stop_topics must preserve all stop topics from the request.
 
 Step 6 - Suggested Query:
 Formulate suggested_query as a concise natural search query of 2-4 words in Russian capturing the core product or brand niche without meta-words, creator roles, or media formats.
@@ -338,8 +386,11 @@ Output a strictly valid JSON object matching the BrandAnalysis schema:
   ],
   "target_tone": str | null,
   "target_hormones": list[str],
+  "target_countries": list[str],
+  "target_gender": str ("male" | "female" | "both"),
   "inferred_filters": {
-    "country": str | null,
+    "countries": list[str],
+    "target_gender": str ("male" | "female" | "both"),
     "languages": list[str] | null,
     "min_followers": int | null,
     "max_followers": int | null,
@@ -356,7 +407,8 @@ Output a strictly valid JSON object matching the BrandAnalysis schema:
 - CLUSTER NAME FORMAT: Every cluster name must be a short Russian-language phrase of 2-4 words.
 - STRICT ENGLISH FOR TOPICS: All items in semantic_topics must be in English only.
 - CLUSTER DIVERSITY: audience_clusters must contain 3-4 distinct, non-overlapping lifestyle and interest spheres of the brand's end clients.
-- COUNTRY FORMAT: inferred_filters.country must be a strict 2-letter lowercase ISO 3166-1 alpha-2 code or null.
+- COUNTRY FORMAT: inferred_filters.countries must be a list of strict 2-letter uppercase ISO 3166-1 alpha-2 codes or an empty list [].
+- GENDER FORMAT: target_gender must be strictly "male", "female", or "both".
 - STOP TOPICS: Preserve all stop topics from the request in inferred_filters.stop_topics.
 - SUGGESTED_QUERY LENGTH: suggested_query must be 2-4 words.
 </rules>
@@ -569,7 +621,8 @@ class QueryParser:
             if normalized and normalized not in stop_topics:
                 stop_topics.append(normalized)
 
-        country = _normalize_country(filters_block.get("country"))
+        countries = _normalize_countries(filters_block.get("countries"))
+        target_gender = _normalize_gender(filters_block.get("target_gender"))
         languages = _normalize_strings(filters_block.get("languages", []), max_items=6) or None
 
         min_followers = filters_block.get("min_followers")
@@ -589,7 +642,8 @@ class QueryParser:
             inferred_hormones = list(target_hormones)
 
         inferred_filters = InferredFilters(
-            country=country,
+            countries=countries,
+            target_gender=target_gender,
             languages=languages,
             min_followers=min_followers,
             max_followers=max_followers,
@@ -750,7 +804,8 @@ class QueryParser:
             if normalized and normalized not in stop_topics:
                 stop_topics.append(normalized)
 
-        country = _normalize_text(filters_block.get("country"))
+        countries = _normalize_countries(filters_block.get("countries"))
+        target_gender = _normalize_gender(filters_block.get("target_gender"))
         languages = _normalize_strings(filters_block.get("languages", []), max_items=6) or None
 
         min_followers = filters_block.get("min_followers")
@@ -762,7 +817,8 @@ class QueryParser:
             max_followers = None
 
         inferred_filters = InferredFilters(
-            country=country,
+            countries=countries,
+            target_gender=target_gender,
             languages=languages,
             min_followers=min_followers,
             max_followers=max_followers,
@@ -783,6 +839,8 @@ class QueryParser:
             graph_entities=_normalize_strings(raw.get("graph_entities", []), max_items=6),
             semantic_topics=_normalize_strings(raw.get("semantic_topics", []), max_items=6),
             target_languages=_normalize_strings(raw.get("target_languages", []), max_items=6),
+            target_countries=_normalize_countries(raw.get("target_countries")),
+            target_gender=_normalize_gender(raw.get("target_gender")),
             profile_type_intent="expert",
             affinity_dense_query=_normalize_text(raw.get("affinity_dense_query")),
             affinity_topics=_normalize_strings(raw.get("affinity_topics", []), max_items=6),
@@ -856,12 +914,16 @@ class QueryParser:
 
         target_tone = _normalize_tone(raw.get("target_tone"))
         target_hormones = _normalize_hormones(raw.get("target_hormones"))
+        target_countries = _normalize_countries(raw.get("target_countries"))
+        target_gender = _normalize_gender(raw.get("target_gender"))
 
         parsed = ReformulatedQuery(
             dense_query=_normalize_text(raw.get("dense_query")) or request.query.strip(),
             graph_entities=_normalize_strings(raw.get("graph_entities", []), max_items=6),
             semantic_topics=_normalize_strings(raw.get("semantic_topics", []), max_items=6),
             target_languages=_normalize_strings(raw.get("target_languages", []), max_items=6),
+            target_countries=target_countries,
+            target_gender=target_gender,
             profile_type_intent=resolved_profile_type,
             affinity_dense_query=_normalize_text(raw.get("affinity_dense_query")),
             affinity_topics=_normalize_strings(raw.get("affinity_topics", []), max_items=6),
@@ -910,9 +972,13 @@ class QueryParser:
     def _build_inferred_filters(raw_block: object, request: SearchRequest, target_tone: ToneType | None, target_hormones: list[HormoneType]) -> InferredFilters:
         block = raw_block if isinstance(raw_block, dict) else {}
 
-        country = _normalize_text(block.get("country"))
-        if request.location:
-            country = request.location
+        countries = _normalize_countries(block.get("countries"))
+        if request.countries:
+            countries = _normalize_countries(request.countries)
+
+        target_gender = _normalize_gender(block.get("target_gender"))
+        if request.gender in ("male", "female"):
+            target_gender = request.gender
 
         languages = _normalize_strings(block.get("languages", []), max_items=6) or None
         if request.languages:
@@ -949,7 +1015,8 @@ class QueryParser:
                 stop_topics.append(normalized)
 
         return InferredFilters(
-            country=country,
+            countries=countries,
+            target_gender=target_gender,
             languages=languages,
             min_followers=min_followers,
             max_followers=max_followers,
@@ -961,6 +1028,18 @@ class QueryParser:
 
     @staticmethod
     def _merge_explicit_filters(parsed: ReformulatedQuery, request: SearchRequest) -> None:
+        if request.countries:
+            countries = _normalize_countries(request.countries)
+            if countries:
+                parsed.target_countries = countries
+                if parsed.inferred_filters is not None:
+                    parsed.inferred_filters.countries = list(countries)
+
+        if request.gender is not None and request.gender != "both":
+            parsed.target_gender = request.gender
+            if parsed.inferred_filters is not None:
+                parsed.inferred_filters.target_gender = request.gender
+
         if request.languages:
             for lang in request.languages:
                 if not isinstance(lang, str):
@@ -1017,38 +1096,37 @@ def _normalize_text(value: object) -> str | None:
     return normalized
 
 
-_COUNTRY_ALIASES: dict[str, str] = {
-    "казахстан": "kz",
-    "kazakhstan": "kz",
-    "kz": "kz",
-    "россия": "ru",
-    "russia": "ru",
-    "рф": "ru",
-    "ru": "ru",
-    "беларусь": "by",
-    "belarus": "by",
-    "by": "by",
-    "узбекистан": "uz",
-    "uzbekistan": "uz",
-    "uz": "uz",
-    "оаэ": "ae",
-    "uae": "ae",
-    "эмираты": "ae",
-    "ae": "ae",
-    "сша": "us",
-    "usa": "us",
-    "америка": "us",
-    "us": "us",
+_GENDER_MAP: dict[str, str] = {
+    "мужской": "male",
+    "male": "male",
+    "женский": "female",
+    "female": "female",
+    "оба": "both",
+    "both": "both",
 }
 
 
-def _normalize_country(value: object) -> str | None:
+def _normalize_gender(value: object) -> str:
     if not isinstance(value, str):
-        return None
+        return "both"
     normalized = value.strip().lower()
     if not normalized:
-        return None
-    return _COUNTRY_ALIASES.get(normalized)
+        return "both"
+    return _GENDER_MAP.get(normalized, "both")
+
+
+def _normalize_countries(value: object) -> list[str]:
+    items: list[str] = []
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    items.append(cleaned)
+    result = canonicalize_countries(items)
+    return sorted(result)
 
 
 def _normalize_tone(value: object) -> ToneType | None:

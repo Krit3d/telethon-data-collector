@@ -7,7 +7,7 @@ import {
   renderShortlist,
   showToast,
 } from "./render.js";
-import { AppStore } from "./store.js";
+import { AppStore, DEFAULT_COUNTRIES } from "./store.js";
 
 const store = new AppStore();
 const api = new SearchApiClient();
@@ -36,6 +36,7 @@ const TEXTAREA_MIN_HEIGHT = 80;
 const TEXTAREA_MAX_HEIGHT = 240;
 
 const QUICK_LANG_CODES = ["RU", "KK", "EN", "UZ", "UK", "KY", "TR"];
+const QUICK_COUNTRY_CODES = ["KZ", "RU", "BY", "UZ", "KG", "TJ", "AE", "US"];
 
 function languageName(code) {
   const normalized = String(code || "").trim().toLowerCase();
@@ -101,6 +102,67 @@ function refreshLanguageDropdown() {
   updateLanguageUI();
 }
 
+function countryName(code) {
+  const normalized = String(code || "").trim().toUpperCase();
+  return store.countries[normalized] || DEFAULT_COUNTRIES[normalized] || normalized;
+}
+
+function countryButtonLabel() {
+  const selected = store.selectedCountries;
+  if (selected.length === 0) return "Все страны ▾";
+  if (selected.length === 1) return `${countryName(selected[0])} ▾`;
+  const codes = selected.map((c) => c.toUpperCase()).join(", ");
+  return `Страны (${selected.length}): ${codes} ▾`;
+}
+
+function buildCountryItems() {
+  const entries = Object.entries(store.countries);
+  entries.sort((a, b) => a[1].localeCompare(b[1], "ru"));
+  return entries.map(([code, name]) => {
+    const checked = store.selectedCountries.includes(code) ? " checked" : "";
+    return `<label class="country-item">
+      <input type="checkbox" class="country-checkbox" data-country-code="${escapeText(code)}"${checked}>
+      <span class="country-name">${escapeText(name)}</span>
+      <span class="country-code">${escapeText(code)}</span>
+    </label>`;
+  }).join("");
+}
+
+function buildQuickCountryChips() {
+  const allOn = store.selectedCountries.length === 0 ? " on" : "";
+  const chips = [`<button type="button" class="country-chip${allOn}" data-country-chip="all">Все</button>`];
+  for (const code of QUICK_COUNTRY_CODES) {
+    const on = store.selectedCountries.includes(code) ? " on" : "";
+    chips.push(`<button type="button" class="country-chip${on}" data-country-chip="${escapeText(code)}">${escapeText(code)}</button>`);
+  }
+  return chips.join("");
+}
+
+function updateCountryUI() {
+  const main = app.querySelector(".main");
+  if (!main) return;
+  const toggle = main.querySelector("[data-country-toggle]");
+  if (toggle) toggle.textContent = countryButtonLabel();
+  const chips = main.querySelectorAll("[data-country-chip]");
+  chips.forEach((chip) => {
+    const code = chip.dataset.countryChip;
+    const on = code === "all" ? store.selectedCountries.length === 0 : store.selectedCountries.includes(code);
+    chip.classList.toggle("on", on);
+  });
+  const checkboxes = main.querySelectorAll(".country-checkbox");
+  checkboxes.forEach((cb) => {
+    cb.checked = store.selectedCountries.includes(cb.dataset.countryCode);
+  });
+}
+
+function refreshCountryDropdown() {
+  const main = app.querySelector(".main");
+  if (!main) return;
+  const list = main.querySelector("[data-country-list]");
+  if (list) list.innerHTML = buildCountryItems();
+  updateCountryUI();
+}
+
 function autoResizeTextarea(el) {
   if (!el) return;
   el.style.height = "auto";
@@ -150,15 +212,17 @@ function buildFilterBar() {
   return `
     <div class="search-filters">
       <div class="filter-row filter-row-top">
-        <select class="select-pill" data-country-select>
-          <option value="all" selected>Все страны</option>
-          <option value="kz">Казахстан</option>
-          <option value="ru">Россия</option>
-          <option value="by">Беларусь</option>
-          <option value="uz">Узбекистан</option>
-          <option value="ae">ОАЭ</option>
-          <option value="us">США / Global</option>
-        </select>
+        <div class="country-dropdown">
+          <button type="button" class="country-dropdown-btn" data-country-toggle>${escapeText(countryButtonLabel())}</button>
+          <div class="country-dropdown-menu" data-country-menu style="display:none">
+            <div class="country-search-box">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#8c93a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+              <input type="text" class="country-search-input" data-country-search placeholder="Поиск страны...">
+            </div>
+            <div class="country-quick-chips" data-country-chips>${buildQuickCountryChips()}</div>
+            <div class="country-list" data-country-list>${buildCountryItems()}</div>
+          </div>
+        </div>
         <div class="lang-dropdown">
           <button type="button" class="lang-dropdown-btn" data-lang-toggle>${escapeText(languageButtonLabel())}</button>
           <div class="lang-dropdown-menu" data-lang-menu style="display:none">
@@ -184,6 +248,11 @@ function buildFilterBar() {
           <option value="provocative">Провокационный</option>
           <option value="casual">Повседневный</option>
           <option value="analytical">Аналитический</option>
+        </select>
+        <select class="select-pill" data-gender-select>
+          <option value="both">Оба гендера</option>
+          <option value="male">Мужской</option>
+          <option value="female">Женский</option>
         </select>
         <input type="text" class="stop-topics-input" data-filter="stop-topics" placeholder="Исключить темы...">
       </div>
@@ -277,11 +346,46 @@ function buildCrmTab() {
 }
 
 function bindFilterBar(tab) {
-  const countrySelect = tab.querySelector("[data-country-select]");
-  if (countrySelect) {
-    countrySelect.value = store.selectedCountry || "all";
-    countrySelect.addEventListener("change", () => {
-      store.selectedCountry = countrySelect.value;
+  const countryToggle = tab.querySelector("[data-country-toggle]");
+  const countryMenu = tab.querySelector("[data-country-menu]");
+  if (countryToggle && countryMenu) {
+    countryToggle.addEventListener("click", (e) => {
+      e.stopPropagation();
+      countryMenu.style.display = countryMenu.style.display === "block" ? "none" : "block";
+    });
+  }
+  const countrySearch = tab.querySelector("[data-country-search]");
+  if (countrySearch) {
+    countrySearch.addEventListener("input", () => {
+      const query = countrySearch.value.trim().toLowerCase();
+      const items = tab.querySelectorAll(".country-item");
+      items.forEach((item) => {
+        const name = (item.querySelector(".country-name")?.textContent || "").toLowerCase();
+        const code = (item.querySelector(".country-code")?.textContent || "").toLowerCase();
+        const match = !query || name.includes(query) || code.includes(query);
+        item.style.display = match ? "flex" : "none";
+      });
+    });
+  }
+  const countryChips = tab.querySelectorAll("[data-country-chip]");
+  countryChips.forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const code = chip.dataset.countryChip;
+      if (code === "all") {
+        store.setCountries([]);
+      } else {
+        store.toggleCountry(code);
+      }
+      updateCountryUI();
+    });
+  });
+  const countryList = tab.querySelector("[data-country-list]");
+  if (countryList) {
+    countryList.addEventListener("change", (e) => {
+      const checkbox = e.target.closest(".country-checkbox");
+      if (!checkbox) return;
+      store.toggleCountry(checkbox.dataset.countryCode);
+      updateCountryUI();
     });
   }
   const langToggle = tab.querySelector("[data-lang-toggle]");
@@ -345,6 +449,13 @@ function bindFilterBar(tab) {
     toneSelect.value = store.selectedTone || "all";
     toneSelect.addEventListener("change", () => {
       store.selectedTone = toneSelect.value;
+    });
+  }
+  const genderSelect = tab.querySelector("[data-gender-select]");
+  if (genderSelect) {
+    genderSelect.value = store.selectedGender || "both";
+    genderSelect.addEventListener("change", () => {
+      store.setGender(genderSelect.value);
     });
   }
   const stopTopicsInput = tab.querySelector("[data-filter='stop-topics']");
@@ -668,10 +779,10 @@ async function runSearch() {
 function syncInferredFilters() {
   const main = app.querySelector(".main");
   if (!main) return;
-  const countrySelect = main.querySelector("[data-country-select]");
-  if (countrySelect) {
-    countrySelect.value = store.selectedCountry || "all";
-    flashInferred(countrySelect);
+  const countryToggle = main.querySelector("[data-country-toggle]");
+  if (countryToggle) {
+    updateCountryUI();
+    flashInferred(countryToggle);
   }
   const langToggle = main.querySelector("[data-lang-toggle]");
   if (langToggle) {
@@ -692,6 +803,11 @@ function syncInferredFilters() {
   if (toneSelect) {
     toneSelect.value = store.selectedTone || "all";
     flashInferred(toneSelect);
+  }
+  const genderSelect = main.querySelector("[data-gender-select]");
+  if (genderSelect) {
+    genderSelect.value = store.selectedGender || "both";
+    flashInferred(genderSelect);
   }
   const stopTopicsInput = main.querySelector("[data-filter='stop-topics']");
   if (stopTopicsInput) {
@@ -772,6 +888,7 @@ function resetAudience() {
   render();
   syncInferredFilters();
   refreshLanguageDropdown();
+  refreshCountryDropdown();
 }
 
 app.addEventListener("click", (e) => {
@@ -855,27 +972,35 @@ app.addEventListener("click", (e) => {
 });
 
 document.addEventListener("click", (e) => {
-  const dropdown = e.target.closest(".lang-dropdown");
-  const menus = document.querySelectorAll(".lang-dropdown-menu");
-  menus.forEach((menu) => {
-    if (!dropdown || !dropdown.contains(menu)) {
+  const langDropdown = e.target.closest(".lang-dropdown");
+  const langMenus = document.querySelectorAll(".lang-dropdown-menu");
+  langMenus.forEach((menu) => {
+    if (!langDropdown || !langDropdown.contains(menu)) {
+      menu.style.display = "none";
+    }
+  });
+  const countryDropdown = e.target.closest(".country-dropdown");
+  const countryMenus = document.querySelectorAll(".country-dropdown-menu");
+  countryMenus.forEach((menu) => {
+    if (!countryDropdown || !countryDropdown.contains(menu)) {
       menu.style.display = "none";
     }
   });
 });
 
-async function loadLanguages() {
-  try {
-    const data = await api.getLanguages();
+async function loadDictionaries() {
+  const [languagesResult, countriesResult] = await Promise.allSettled([api.getLanguages(), api.getCountries()]);
+  if (languagesResult.status === "fulfilled") {
+    const data = languagesResult.value;
     availableLanguages = Array.isArray(data.languages) ? data.languages : [];
     languageAliases = data.aliases && typeof data.aliases === "object" ? data.aliases : {};
     refreshLanguageDropdown();
-  } catch (err) {
-    if (err.name === "AbortError") return;
-    availableLanguages = [];
-    languageAliases = {};
+  }
+  if (countriesResult.status === "fulfilled") {
+    store.initCountries(countriesResult.value);
+    refreshCountryDropdown();
   }
 }
 
-loadLanguages();
+loadDictionaries();
 render();

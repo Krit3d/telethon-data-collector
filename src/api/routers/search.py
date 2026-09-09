@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Response
 from src.api.dependencies import get_search_service
 from src.api.schemas import BrandAnalysisRequest, BrandAnalysisResponse, SearchPlanRequest, SearchPlanResponse, SearchRequest, SearchResponse
 from src.api.services.search import SearchService
+from src.utils.countries import get_all_countries
 from src.utils.languages import get_all_languages
 
 router = APIRouter(prefix="/search", tags=["Search"])
@@ -15,6 +16,16 @@ async def list_languages() -> Response:
     data = get_all_languages()
     return Response(
         content=json.dumps({"languages": data.get("languages", []), "aliases": data.get("aliases", {})}, ensure_ascii=False),
+        media_type="application/json",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@router.get("/countries")
+async def list_countries() -> Response:
+    data = get_all_countries()
+    return Response(
+        content=json.dumps({"countries": data.get("countries", []), "aliases": data.get("aliases", {})}, ensure_ascii=False),
         media_type="application/json",
         headers={"Cache-Control": "public, max-age=86400"},
     )

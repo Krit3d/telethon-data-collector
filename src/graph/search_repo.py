@@ -84,7 +84,6 @@ class Neo4jSearchRepository:
                 'promoter' IN prod_subtypes AS is_promoter
             RETURN
                 a.account_id AS account_id,
-                a.location_name AS location_name,
                 a.primary_language AS primary_language,
                 CASE WHEN $negative_tokens IS NOT NULL AND size($negative_tokens) > 0 THEN
                     EXISTS { MATCH (a)-[:COVERS_TOPIC]->(nc) WHERE (nc:Concept OR nc:MicroConcept) AND nc.name_lower IN $negative_tokens }
@@ -131,7 +130,6 @@ class Neo4jSearchRepository:
             is_promoter = bool(row["is_promoter"])
             is_spam_or_gambling = bool(row["is_spam_or_gambling"])
             has_negative_match = bool(row.get("has_negative_match", False))
-            location_name = str(row["location_name"]) if row.get("location_name") else None
             primary_language = str(row["primary_language"]) if row.get("primary_language") else None
             primary_tone = row.get("primary_tone")
             primary_hormone = row.get("primary_hormone")
@@ -158,7 +156,7 @@ class Neo4jSearchRepository:
                 is_promoter=is_promoter,
                 is_spam_or_gambling=is_spam_or_gambling,
                 has_negative_match=has_negative_match,
-                location_name=location_name,
+                location_name=None,
                 primary_language=primary_language,
                 primary_tone=primary_tone,
                 primary_hormone=primary_hormone,

@@ -185,10 +185,18 @@ class SearchService:
             graph_evidences.update(evidences)
 
         hydration_start = time.perf_counter()
+        effective_countries = request.countries if request.countries is not None else (reformulated.target_countries or None)
+        effective_gender = request.gender if request.gender is not None else (reformulated.target_gender or "both")
+        hydration_request = request.model_copy(
+            update={
+                "countries": effective_countries,
+                "gender": effective_gender,
+            }
+        )
         hydrated_pairs = await self._hydrator.hydrate_and_filter_candidates(
             direct_candidates=direct_candidates,
             affinity_candidates=affinity_candidates,
-            request=request,
+            request=hydration_request,
             direct_limit=20,
             affinity_limit=20,
         )
@@ -197,7 +205,14 @@ class SearchService:
         items: list[AuthorSearchResultItem] = []
         for scored, hydrated in hydrated_pairs:
             evidence = graph_evidences.get(hydrated.account_id)
-            location = (evidence.location_name if evidence and evidence.location_name else (hydrated.raw_metadata.get("location") if hydrated.raw_metadata else None))
+            if hydrated.city and hydrated.country:
+                location = f"{hydrated.city}, {hydrated.country}"
+            elif hydrated.city:
+                location = hydrated.city
+            elif hydrated.country:
+                location = hydrated.country
+            else:
+                location = hydrated.raw_metadata.get("location") if hydrated.raw_metadata else None
             primary_language = evidence.primary_language if evidence else None
             items.append(
                 AuthorSearchResultItem(
@@ -215,6 +230,9 @@ class SearchService:
                     contacts=hydrated.contacts,
                     has_contacts=hydrated.has_contacts,
                     subscribers_count=hydrated.subscribers_count,
+                    country=hydrated.country,
+                    city=hydrated.city,
+                    gender=hydrated.gender,
                     location=location,
                     primary_language=primary_language,
                     match_type=scored.match_type,

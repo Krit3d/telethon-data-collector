@@ -81,6 +81,11 @@ class PostgresHydrator:
                 Account.status == "verified",
             )
 
+            if request.gender == "male":
+                stmt = stmt.where(Account.gender.in_(["male", "duo"]))
+            elif request.gender == "female":
+                stmt = stmt.where(Account.gender.in_(["female", "duo"]))
+
             if request.author_type == "expert":
                 stmt = stmt.where(Account.is_author_blog.is_(True))
             elif request.author_type == "business":
@@ -132,6 +137,9 @@ class PostgresHydrator:
                 static_avg_er=acc.static_avg_er,
                 subscribers_count=acc.subscribers_count,
                 is_author_blog=acc.is_author_blog if acc.is_author_blog is not None else False,
+                country=acc.country,
+                city=acc.city,
+                gender=acc.gender,
                 raw_metadata=acc.raw_metadata,
                 contacts=contacts if request.include_contacts else None,
                 has_contacts=has_contacts,
@@ -140,22 +148,32 @@ class PostgresHydrator:
 
             return (candidate, hydrated)
 
+        target_countries: set[str] = {c.strip().upper() for c in request.countries} if request.countries else set()
+
+        def location_key(pair: tuple[DbsfScoredCandidate, HydratedAuthorRecord]) -> tuple[int, float]:
+            country = pair[1].country
+            if not target_countries:
+                return (0, -pair[0].final_score)
+            if country and country.upper() in target_countries:
+                return (0, -pair[0].final_score)
+            return (1, -pair[0].final_score)
+
         direct_pairs: list[tuple[DbsfScoredCandidate, HydratedAuthorRecord]] = []
         for candidate in direct_candidates:
-            if len(direct_pairs) >= direct_limit:
-                break
             pair = build_pair(candidate)
             if pair is not None:
                 direct_pairs.append(pair)
+        direct_pairs.sort(key=location_key)
+        direct_pairs = direct_pairs[:direct_limit]
 
         affinity_pairs: list[tuple[DbsfScoredCandidate, HydratedAuthorRecord]] = []
         for candidate in affinity_candidates:
-            if len(affinity_pairs) >= affinity_limit:
-                break
             pair = build_pair(candidate)
             if pair is not None:
                 affinity_pairs.append(pair)
+        affinity_pairs.sort(key=location_key)
+        affinity_pairs = affinity_pairs[:affinity_limit]
 
         merged = direct_pairs + affinity_pairs
-        merged.sort(key=lambda pair: -pair[0].final_score)
+        merged.sort(key=location_key)
         return merged

@@ -20,34 +20,29 @@ function writeStorage(key, value) {
   }
 }
 
-const COUNTRY_ALIASES = {
-  "казахстан": "kz",
-  "kazakhstan": "kz",
-  "kz": "kz",
-  "россия": "ru",
-  "russia": "ru",
-  "рф": "ru",
-  "ru": "ru",
-  "беларусь": "by",
-  "belarus": "by",
-  "by": "by",
-  "узбекистан": "uz",
-  "uzbekistan": "uz",
-  "uz": "uz",
-  "оаэ": "ae",
-  "uae": "ae",
-  "эмираты": "ae",
-  "ae": "ae",
-  "сша": "us",
-  "usa": "us",
-  "америка": "us",
-  "us": "us",
+export const DEFAULT_COUNTRIES = {
+  RU: "Россия",
+  CN: "Китай",
+  US: "США",
+  AE: "ОАЭ",
+  BY: "Беларусь",
+  KZ: "Казахстан",
+  UZ: "Узбекистан",
+  KG: "Кыргызстан",
+  TJ: "Таджикистан",
+  AM: "Армения",
+  AZ: "Азербайджан",
+  GE: "Грузия",
+  TR: "Турция",
+  DE: "Германия",
+  FR: "Франция",
+  IT: "Италия",
+  ES: "Испания",
+  GB: "Великобритания",
 };
 
-function mapCountry(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (!normalized) return "all";
-  return COUNTRY_ALIASES[normalized] || "all";
+function normalizeCountryCode(value) {
+  return String(value || "").trim().toUpperCase();
 }
 
 export class AppStore {
@@ -61,7 +56,12 @@ export class AppStore {
     this.isAudienceConfirmed = false;
     this.isAnalyzingBrand = false;
     this.currentStep = 1;
-    this.selectedCountry = "all";
+    this.countries = { ...DEFAULT_COUNTRIES };
+    this.countryAliases = {};
+    this.selectedCountries = [];
+    this.selectedGender = "both";
+    this.isGenderManuallySet = false;
+    this.isCountryManuallySet = false;
     this.selectedLanguages = [];
     this.minFollowers = null;
     this.maxFollowers = null;
@@ -113,6 +113,57 @@ export class AppStore {
     this.selectedLanguages = unique;
   }
 
+  initCountries(data) {
+    if (data && Array.isArray(data.countries)) {
+      const map = {};
+      for (const item of data.countries) {
+        const code = normalizeCountryCode(item.code);
+        if (!code) continue;
+        map[code] = item.name_ru || item.name_en || code;
+      }
+      this.countries = { ...DEFAULT_COUNTRIES, ...map };
+    }
+    if (data && data.aliases) {
+      this.countryAliases = data.aliases;
+    }
+  }
+
+  toggleCountry(code) {
+    const normalized = normalizeCountryCode(code);
+    if (!normalized || normalized === "ALL") {
+      this.selectedCountries = [];
+      this.isCountryManuallySet = true;
+      return;
+    }
+    const index = this.selectedCountries.indexOf(normalized);
+    if (index >= 0) {
+      this.selectedCountries.splice(index, 1);
+    } else {
+      this.selectedCountries.push(normalized);
+    }
+    this.isCountryManuallySet = true;
+  }
+
+  setCountries(codes) {
+    if (!Array.isArray(codes)) return;
+    const unique = [];
+    for (const raw of codes) {
+      const normalized = normalizeCountryCode(raw);
+      if (!normalized || normalized === "ALL") continue;
+      if (!this.countries[normalized] && !DEFAULT_COUNTRIES[normalized] && normalized.length !== 2) continue;
+      if (!unique.includes(normalized)) {
+        unique.push(normalized);
+      }
+    }
+    this.selectedCountries = unique;
+  }
+
+  setGender(gender) {
+    const normalized = String(gender || "").trim().toLowerCase();
+    this.selectedGender = ["male", "female", "both"].includes(normalized) ? normalized : "both";
+    this.isGenderManuallySet = true;
+  }
+
   applyBrandAnalysis(data) {
     if (!data) return;
     this.targetAudienceDescription = data.target_audience_description || "";
@@ -135,8 +186,12 @@ export class AppStore {
     if (Array.isArray(filters.stop_topics)) {
       this.stopTopicsInput = filters.stop_topics.join(", ");
     }
-    if (filters.country && String(filters.country).trim() !== "") {
-      this.selectedCountry = mapCountry(String(filters.country));
+    if (!this.isCountryManuallySet && (Array.isArray(filters.countries) || Array.isArray(filters.target_countries))) {
+      this.setCountries(filters.countries || filters.target_countries);
+    }
+    if (!this.isGenderManuallySet && filters.target_gender) {
+      const normalized = String(filters.target_gender).trim().toLowerCase();
+      this.selectedGender = ["male", "female", "both"].includes(normalized) ? normalized : "both";
     }
     if (Array.isArray(filters.languages)) {
       this.setLanguages(filters.languages);
@@ -158,7 +213,8 @@ export class AppStore {
       platform: this.platformFilter || "all",
       min_followers: (this.minFollowers && Number(this.minFollowers) > 0) ? Number(this.minFollowers) : null,
       max_followers: (this.maxFollowers && Number(this.maxFollowers) > 0) ? Number(this.maxFollowers) : null,
-      location: this.selectedCountry !== "all" ? this.selectedCountry : null,
+      countries: this.selectedCountries.length > 0 ? this.selectedCountries : null,
+      gender: this.isGenderManuallySet || this.selectedGender !== "both" ? this.selectedGender : null,
       languages: this.selectedLanguages.length > 0 ? this.selectedLanguages : null,
       target_tone: this.selectedTone !== "all" ? this.selectedTone : null,
       target_hormones: this.selectedHormones,
@@ -180,7 +236,10 @@ export class AppStore {
     this.precomputedPlan = null;
     this.searchResults = [];
     this.queryMetadata = null;
-    this.selectedCountry = "all";
+    this.selectedCountries = [];
+    this.selectedGender = "both";
+    this.isGenderManuallySet = false;
+    this.isCountryManuallySet = false;
     this.selectedLanguages = [];
     this.selectedTone = "all";
     this.selectedHormones = [];
