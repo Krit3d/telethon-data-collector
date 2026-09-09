@@ -1,19 +1,19 @@
 services:
   neo4j:
-    image: neo4j:latest
     container_name: neo4j
+    image: neo4j:latest
     restart: always
-    ports:
-      - "7474:7474"
-      - "7687:7687"
-    volumes:
-      - neo4j_data:/data
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD}
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_server_memory_heap_initial__size: 2g
       NEO4J_server_memory_heap_max__size: 4g
       NEO4J_server_memory_pagecache_size: 4g
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
     networks:
       - api_network
     logging:
@@ -22,19 +22,19 @@ services:
         max-size: "50m"
         max-file: "3"
   qdrant:
-    image: qdrant/qdrant:v1.19.0
     container_name: qdrant
+    image: qdrant/qdrant:v1.19.0
     restart: always
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
     environment:
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
       QDRANT__TELEMETRY_DISABLED: "true"
       QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: "2"
       QDRANT__STORAGE__PERFORMANCE__MAX_OPTIMIZATION_THREADS: "1"
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
     deploy:
       resources:
         limits:
@@ -48,18 +48,14 @@ services:
         max-size: "50m"
         max-file: "3"
   api:
+    container_name: api
     build:
       context: .
       dockerfile: docker/api/Dockerfile
       target: cpu-runner
-    container_name: api
     restart: always
     env_file:
       - .env
-    ports:
-      - "8000:8000"
-    volumes:
-      - fastembed_cache:/app/model_cache
     environment:
       DB_URL: ${DB_URL}
       QDRANT_URL: ${QDRANT_URL}
@@ -72,6 +68,10 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       FASTEMBED_CACHE_PATH: /app/model_cache
       ONNXRUNTIME_PROVIDER: ${ONNXRUNTIME_PROVIDER:-CPUExecutionProvider}
+    ports:
+      - "8000:8000"
+    volumes:
+      - fastembed_cache:/app/model_cache
     depends_on:
       - qdrant
       - neo4j
@@ -83,16 +83,14 @@ services:
         max-size: "50m"
         max-file: "3"
   embedding_worker:
+    container_name: embedding_worker
     build:
       context: .
       dockerfile: docker/api/Dockerfile
       target: cpu-runner
-    container_name: embedding_worker
     restart: always
     env_file:
       - .env
-    volumes:
-      - fastembed_cache:/app/model_cache
     environment:
       DB_URL: ${DB_URL}
       QDRANT_URL: ${QDRANT_URL}
@@ -107,28 +105,28 @@ services:
       ONNXRUNTIME_PROVIDER: ${ONNXRUNTIME_PROVIDER:-CPUExecutionProvider}
       EMBEDDING_CONCURRENCY: ${EMBEDDING_CONCURRENCY:-5}
       EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-64}
+    volumes:
+      - fastembed_cache:/app/model_cache
     depends_on:
       - qdrant
       - neo4j
+    command: python -m src.workers.embedding_worker
     networks:
       - api_network
-    command: python -m src.workers.embedding_worker
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "3"
   graph_worker:
+    container_name: graph_worker
     build:
       context: .
       dockerfile: docker/api/Dockerfile
       target: cpu-runner
-    # container_name: graph_worker
     restart: always
     env_file:
       - .env
-    volumes:
-      - fastembed_cache:/app/model_cache
     environment:
       DB_URL: ${DB_URL}
       QDRANT_URL: ${QDRANT_URL}
@@ -142,28 +140,28 @@ services:
       FASTEMBED_CACHE_PATH: /app/model_cache
       GRAPH_CONCURRENCY: ${GRAPH_CONCURRENCY:-15}
       GRAPH_BATCH_SIZE: ${GRAPH_BATCH_SIZE:-50}
+    volumes:
+      - fastembed_cache:/app/model_cache
     depends_on:
       - qdrant
       - neo4j
+    command: python -m src.workers.kag_builder_worker
     networks:
       - api_network
-    command: python -m src.workers.kag_builder_worker
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "3"
   enrichment_worker:
+    container_name: enrichment_worker
     build:
       context: .
       dockerfile: docker/api/Dockerfile
       target: cpu-runner
-    container_name: enrichment_worker
     restart: always
     env_file:
       - .env
-    volumes:
-      - fastembed_cache:/app/model_cache
     environment:
       DB_URL: ${DB_URL}
       CLOUD_RU_API_KEY: ${CLOUD_RU_API_KEY}
@@ -172,9 +170,11 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       ENRICHMENT_CONCURRENCY: ${ENRICHMENT_CONCURRENCY:-15}
+    volumes:
+      - fastembed_cache:/app/model_cache
+    command: python -m src.workers.enrichment_worker
     networks:
       - api_network
-    command: python -m src.workers.enrichment_worker
     logging:
       driver: json-file
       options:

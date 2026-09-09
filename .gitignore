@@ -13,15 +13,20 @@ lib/
 .pytest_cache/
 
 # Ignoring secrets
+.env
+.env.*
+!.env.example
 sessions/
 raw_sessions/
-.env
 *.session
 *.session-journal
+proxies.txt
+.local-storage/
+dist/
+node_modules/
 
 # TXT docs with data
 channels.txt
-proxies.txt
 
 # Other data
 avatars/

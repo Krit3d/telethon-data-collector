@@ -20,7 +20,7 @@ from src.api.routers import search, health
 
 logger = logging.getLogger(__name__)
 
-WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+WEB_DIR = Path(__file__).resolve().parent.parent / "web" / "search"
 INDEX_FILE = WEB_DIR / "index.html"
 CSS_FILE = WEB_DIR / "css" / "style.css"
 JS_FILE = WEB_DIR / "js" / "app.js"
@@ -124,5 +124,13 @@ async def index() -> HTMLResponse:
 
 
 if WEB_DIR.exists():
-    app.mount("/css", NoCacheStaticFiles(directory=str(WEB_DIR / "css")), name="css")
-    app.mount("/js", NoCacheStaticFiles(directory=str(WEB_DIR / "js")), name="js")
+    app.mount(
+        "/css",
+        NoCacheStaticFiles(directory=str(WEB_DIR / "css"), html=True),
+        name="css",
+    )
+    app.mount(
+        "/js",
+        NoCacheStaticFiles(directory=str(WEB_DIR / "js"), html=True),
+        name="js",
+    )

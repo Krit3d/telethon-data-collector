@@ -1,9 +1,8 @@
 services:
   db:
-    image: postgres:18-alpine
     container_name: tg_parser_db
+    image: postgres:18-alpine
     restart: always
-    shm_size: 1gb
     env_file:
       - .env
     environment:
@@ -11,11 +10,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-tg_parser}
       POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
-    command: postgres -c listen_addresses='*' -c max_connections=300
-    volumes:
-      - postgres_data:/var/lib/postgresql
     ports:
       - "${TS_IP_SCRAPER}:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
     healthcheck:
       test:
         - CMD-SHELL
@@ -24,6 +22,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
+    command: postgres -c listen_addresses='*' -c max_connections=300
+    shm_size: 1gb
     networks:
       - scraper_network
     logging:
@@ -33,8 +33,8 @@ services:
         max-file: "3"
 
   crawler:
-    image: tg_parser_crawler_base:latest
     container_name: tg_parser_crawler
+    image: tg_parser_crawler_base:latest
     restart: always
     env_file:
       - .env
@@ -45,14 +45,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       SESSION_DIR: /app/sessions/crawler
-    depends_on:
-      db:
-        condition: service_healthy
-    command: python -m src.parser.telegram.crawler
     volumes:
       - .:/app
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.telegram.crawler
     networks:
       - scraper_network
     logging:
@@ -62,11 +62,11 @@ services:
         max-file: "3"
 
   parser:
+    container_name: tg_parser_app
     build:
       context: .
       dockerfile: docker/scraper/Dockerfile
     image: tg_parser_crawler_base:latest
-    container_name: tg_parser_app
     restart: always
     env_file:
       - .env
@@ -77,14 +77,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       SESSION_DIR: /app/sessions/parser
-    depends_on:
-      db:
-        condition: service_healthy
-    command: python -m src.parser.telegram.parser
     volumes:
       - .:/app
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.telegram.parser
     networks:
       - scraper_network
     logging:
@@ -94,8 +94,8 @@ services:
         max-file: "3"
 
   creators_instagram:
-    image: tg_parser_crawler_base:latest
     container_name: tg_parser_creators_instagram
+    image: tg_parser_crawler_base:latest
     restart: always
     env_file:
       - .env
@@ -104,14 +104,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       PYTHONUNBUFFERED: "1"
-    depends_on:
-      db:
-        condition: service_healthy
-    command: python -m src.parser.creators.coordinator --platform INSTAGRAM
     volumes:
       - .:/app
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.creators.coordinator --platform INSTAGRAM
     networks:
       - scraper_network
     logging:
@@ -121,8 +121,8 @@ services:
         max-file: "3"
 
   creators_tiktok:
-    image: tg_parser_crawler_base:latest
     container_name: tg_parser_creators_tiktok
+    image: tg_parser_crawler_base:latest
     restart: always
     env_file:
       - .env
@@ -131,14 +131,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       PYTHONUNBUFFERED: "1"
-    depends_on:
-      db:
-        condition: service_healthy
-    command: python -m src.parser.creators.coordinator --platform TIKTOK
     volumes:
       - .:/app
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.creators.coordinator --platform TIKTOK
     networks:
       - scraper_network
     logging:
@@ -148,8 +148,8 @@ services:
         max-file: "3"
 
   creators_threads:
-    image: tg_parser_crawler_base:latest
     container_name: tg_parser_creators_threads
+    image: tg_parser_crawler_base:latest
     restart: always
     env_file:
       - .env
@@ -158,14 +158,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       PYTHONUNBUFFERED: "1"
-    depends_on:
-      db:
-        condition: service_healthy
-    command: python -m src.parser.creators.coordinator --platform THREADS
     volumes:
       - .:/app
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.creators.coordinator --platform THREADS
     networks:
       - scraper_network
     logging:
@@ -175,8 +175,8 @@ services:
         max-file: "3"
 
   creators_youtube:
-    image: tg_parser_crawler_base:latest
     container_name: tg_parser_creators_youtube
+    image: tg_parser_crawler_base:latest
     restart: always
     env_file:
       - .env
@@ -185,14 +185,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-TEXT}
       PYTHONUNBUFFERED: "1"
-    depends_on:
-      db:
-        condition: service_healthy
-    command: python -m src.parser.creators.coordinator --platform YOUTUBE
     volumes:
       - .:/app
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.parser.creators.coordinator --platform YOUTUBE
     networks:
       - scraper_network
     logging:
@@ -200,7 +200,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
 
 networks:
   scraper_network:
