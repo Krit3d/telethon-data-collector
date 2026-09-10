@@ -1,14 +1,38 @@
+import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpDown, Briefcase, ChevronLeft, ChevronRight, MessageSquare, MoreVertical, RefreshCw, Search, Sparkles, Trash2, Users, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { Search, MoreVertical, Filter, Upload, Briefcase, MessageSquare, Archive, ChevronLeft, ChevronRight, X, Users, RefreshCw } from 'lucide-react';
-import { fmtNum, fmtMoney, type Author, type Social } from '../data';
-import { Badge, Avatar, Card, Btn, Modal, Field, inputCls, useToast, Toggle } from '../components/ui';
 import { SocialIcon } from '../components/icons';
+import { Avatar, Badge, Btn, Card, inputCls, Toggle, useToast } from '../components/ui';
+import { type Author, type Social } from '../data';
 import { api, normalizeSocial, STATUS_OPTIONS, type CreatorRecord } from '../services/api';
 
-const statusTone: Record<Author['status'], string> = { 'Свободен': 'green', 'В сделке': 'blue', 'На паузе': 'gray' };
+type SortKey = 'nick' | 'social' | 'followers' | 'niche' | 'reach' | 'er' | 'cpm' | 'status';
+type SortOrder = 'asc' | 'desc';
+
+const statusTone: Record<Author['status'], string> = { 'Свободен': 'green', 'В сделке': 'blue', 'На паузе': 'gray', 'В архиве': 'gray' };
 const SOCIALS: Social[] = ['Instagram', 'VK', 'Telegram', 'TikTok', 'YouTube', 'Дзен'];
-const NICHES = ['Красота', 'Технологии', 'Еда', 'Путешествия', 'Фитнес', 'Мода', 'Финансы', 'Семья', 'Авто', 'Игры'];
 const PAGE = 15;
+const DEFAULT_SEARCH_PORT = 8000;
+
+function getSearchBaseUrl(): string {
+  const configured = import.meta.env.VITE_SEARCH_URL;
+  if (configured) {
+    let base = configured;
+    while (base.endsWith('/')) base = base.slice(0, -1);
+    return base;
+  }
+  const host = window.location.hostname;
+  if (host) return `${window.location.protocol}//${host}:${DEFAULT_SEARCH_PORT}`;
+  return `http://localhost:${DEFAULT_SEARCH_PORT}`;
+}
+
+const fmtER = (n: number) => `${n.toFixed(1).replace('.', ',')}%`;
+const fmtBig = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1).replace('.0', '').replace('.', ',')}M` : n.toLocaleString('ru-RU');
+
+function formatNiche(niche: string): string {
+  const parts = niche.split('>');
+  if (parts.length <= 1) return niche;
+  return parts.slice(-2).map((p: string) => p.trim()).join(' › ');
+}
 
 function hashHue(seed: string): number {
   let h = 0;
@@ -22,7 +46,7 @@ function toAuthor(rec: CreatorRecord): Author {
   const er = Number(rec.er ?? rec.static_avg_er ?? 0);
   const status = STATUS_OPTIONS.includes(rec.status ?? '') ? (rec.status as Author['status']) : 'Свободен';
   return {
-    id: rec.accountid ?? rec.accountId ?? rec.id,
+    id: rec.id || rec.accountid || rec.accountId || '',
     nick: rec.name || rec.Name || rec.handle || rec.username || 'Без имени',
     social,
     followers,
@@ -37,6 +61,17 @@ function toAuthor(rec: CreatorRecord): Author {
   };
 }
 
+function getPendingImportIds(): string[] {
+  const hash = window.location.hash;
+  const search = window.location.search;
+  const fromSearch = new URLSearchParams(search).get('import_ids');
+  const raw = fromSearch ?? (hash.includes('?') ? new URLSearchParams(hash.substring(hash.indexOf('?'))).get('import_ids') : null);
+  if (!raw) return [];
+  const decoded = decodeURIComponent(raw);
+  const ids = decoded.split(',').map((item: string) => decodeURIComponent(item).trim().replace(/^@/, '')).filter(Boolean);
+  return Array.from(new Set(ids));
+}
+
 export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (id: string) => void; onNewDeal: (authorId: string) => void }) {
   const toast = useToast();
   const [authors, setAuthors] = useState<Author[]>([]);
@@ -44,14 +79,14 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
   const [loadError, setLoadError] = useState('');
   const [q, setQ] = useState('');
   const [fSocial, setFSocial] = useState('all');
-  const [fNiche, setFNiche] = useState<string[]>([]);
   const [fMin, setFMin] = useState('');
   const [fMax, setFMax] = useState('');
   const [onlyFree, setOnlyFree] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   const [page, setPage] = useState(0);
-  const [archived, setArchived] = useState<string[]>([]);
+  const [sortKey, setSortKey] = useState<SortKey | null>(null);
+  const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   const [menu, setMenu] = useState<string | null>(null);
-  const [picker, setPicker] = useState(false);
   const [updating, setUpdating] = useState<string | null>(null);
 
   const load = async () => {
@@ -69,6 +104,27 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
 
   useEffect(() => { void load(); }, []);
 
+  const openSearch = () => {
+    window.open(getSearchBaseUrl(), '_blank');
+  };
+
+  useEffect(() => {
+    const ids = getPendingImportIds();
+    if (ids.length === 0) return;
+    const run = async () => {
+      try {
+        const res = await api.exportShortlist(ids);
+        await load();
+        toast('ok', `Успешно импортировано авторов: ${res?.added_count ?? ids.length}`);
+      } catch (err) {
+        toast('err', err instanceof Error ? err.message : 'Ошибка импорта');
+      } finally {
+        window.history.replaceState(null, '', `${window.location.pathname}#/authors`);
+      }
+    };
+    void run();
+  }, []);
+
   const changeStatus = async (a: Author, status: Author['status']) => {
     setUpdating(a.id);
     try {
@@ -82,15 +138,54 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
     }
   };
 
-  const list = useMemo(() => authors.filter(a =>
-    !archived.includes(a.id) &&
-    (!q || a.nick.toLowerCase().includes(q.toLowerCase())) &&
-    (fSocial === 'all' || a.social === fSocial) &&
-    (fNiche.length === 0 || fNiche.includes(a.niche)) &&
-    (!fMin || a.followers >= Number(fMin) * 1000) &&
-    (!fMax || a.followers <= Number(fMax) * 1000) &&
-    (!onlyFree || a.status === 'Свободен')
-  ), [authors, q, fSocial, fNiche, fMin, fMax, onlyFree, archived]);
+  const handleDeleteAuthor = async (a: Author) => {
+    if (a.deals > 0) {
+      setMenu(null);
+      toast('err', 'Нельзя удалить автора со сделками или перепиской. Отправьте его в архив.');
+      return;
+    }
+    setMenu(null);
+    try {
+      await api.deleteCreator(a.id);
+      setAuthors(prev => prev.filter(x => x.id !== a.id));
+      toast('ok', `${a.nick} удалён из шортлиста`);
+    } catch (err) {
+      toast('err', err instanceof Error && err.message ? err.message : 'Не удалось удалить автора');
+    }
+  };
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortOrder(o => o === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      setSortOrder(['followers', 'reach', 'er', 'cpm'].includes(key) ? 'desc' : 'asc');
+    }
+    setPage(0);
+  };
+
+  const list = useMemo(() => {
+    const filtered = authors.filter(a =>
+      (showArchived ? a.status === 'В архиве' : a.status !== 'В архиве') &&
+      (!q || a.nick.toLowerCase().includes(q.toLowerCase()) || a.niche.toLowerCase().includes(q.toLowerCase())) &&
+      (fSocial === 'all' || a.social === fSocial) &&
+      (!fMin || a.followers >= Number(fMin) * 1000) &&
+      (!fMax || a.followers <= Number(fMax) * 1000) &&
+      (!onlyFree || a.status === 'Свободен')
+    );
+    if (!sortKey) return filtered;
+    const numeric = ['followers', 'reach', 'er', 'cpm'].includes(sortKey);
+    return [...filtered].sort((x, y) => {
+      if (numeric) {
+        const vA = x[sortKey] as number;
+        const vB = y[sortKey] as number;
+        return sortOrder === 'asc' ? vA - vB : vB - vA;
+      }
+      const sA = String(x[sortKey]);
+      const sB = String(y[sortKey]);
+      return sortOrder === 'asc' ? sA.localeCompare(sB, 'ru') : sB.localeCompare(sA, 'ru');
+    });
+  }, [authors, q, fSocial, fMin, fMax, onlyFree, showArchived, sortKey, sortOrder]);
 
   const pages = Math.max(1, Math.ceil(list.length / PAGE));
   const pageItems = list.slice(page * PAGE, (page + 1) * PAGE);
@@ -106,15 +201,14 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
           </div>
           <div className="flex items-center gap-2">
             <Btn variant="secondary" onClick={() => void load()}><RefreshCw size={14} />Обновить</Btn>
-            <Btn variant="secondary" onClick={() => toast('ok', 'Импортировано 34 автора из csv-файла')}><Upload size={14} />Импорт из CSV</Btn>
-            <Btn onClick={() => setPicker(true)}><Filter size={14} />Подбор авторов</Btn>
+            <Btn onClick={openSearch}><Sparkles size={14} />AI-подбор авторов</Btn>
           </div>
         </div>
 
         <div className="flex items-center gap-2 mt-4 flex-wrap">
           <div className="relative">
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-300" />
-            <input className={inputCls + ' !w-56 !pl-9'} placeholder="Поиск по никнейму…" value={q} onChange={e => { setQ(e.target.value); setPage(0); }} />
+            <input className={inputCls + ' !w-56 !pl-9'} placeholder="Поиск по автору или нише…" value={q} onChange={e => { setQ(e.target.value); setPage(0); }} />
           </div>
           <select className={selCls} value={fSocial} onChange={e => { setFSocial(e.target.value); setPage(0); }}>
             <option value="all">Все соцсети</option>
@@ -128,23 +222,15 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
           <label className="flex items-center gap-2 text-[12px] font-bold text-gray-500 cursor-pointer pl-1">
             <Toggle on={onlyFree} onChange={v => { setOnlyFree(v); setPage(0); }} />Только свободные
           </label>
-          {(q || fSocial !== 'all' || fNiche.length > 0 || fMin || fMax || onlyFree) && (
+          <label className="flex items-center gap-2 text-[12px] font-bold text-gray-500 cursor-pointer pl-1">
+            <Toggle on={showArchived} onChange={v => { setShowArchived(v); setPage(0); }} />Архив
+          </label>
+          {(q || fSocial !== 'all' || fMin || fMax || onlyFree || showArchived) && (
             <button className="text-[12px] font-bold text-indigo-600 hover:text-indigo-700 inline-flex items-center gap-1"
-              onClick={() => { setQ(''); setFSocial('all'); setFNiche([]); setFMin(''); setFMax(''); setOnlyFree(false); setPage(0); }}>
+              onClick={() => { setQ(''); setFSocial('all'); setFMin(''); setFMax(''); setOnlyFree(false); setShowArchived(false); setPage(0); }}>
               <X size={12} />Сбросить
             </button>
           )}
-        </div>
-        <div className="flex items-center gap-1.5 mt-3 flex-wrap">
-          {NICHES.map(n => {
-            const on = fNiche.includes(n);
-            return (
-              <button key={n} onClick={() => { setFNiche(x => on ? x.filter(v => v !== n) : [...x, n]); setPage(0); }}
-                className={`px-2.5 h-7.5 rounded-full border text-[11.5px] font-bold transition-all active:scale-95 ${on ? 'bg-gray-900 border-gray-900 text-white' : 'bg-white border-gray-200 text-gray-500 hover:border-gray-400'}`}>
-                {n}
-              </button>
-            );
-          })}
         </div>
       </div>
 
@@ -176,7 +262,34 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
               <table className="w-full text-[12.5px] min-w-[960px]">
                 <thead>
                   <tr className="text-left text-[11px] font-bold text-gray-400 uppercase tracking-wide border-b border-gray-100 bg-slate-50/60">
-                    {['Автор', 'Соцсеть', 'Подписчики', 'Ниша', 'Ср. охват', 'ER', 'CPM', 'Статус', ''].map((h, i) => <th key={i} className="px-4 py-2.5 whitespace-nowrap">{h}</th>)}
+                    {([
+                      { key: 'nick', label: 'Автор' },
+                      { key: 'social', label: 'Соцсеть' },
+                      { key: 'followers', label: 'Подписчики' },
+                      { key: 'niche', label: 'Ниша' },
+                      { key: 'reach', label: 'Ср. охват' },
+                      { key: 'er', label: 'ER' },
+                      { key: 'cpm', label: 'CPM' },
+                      { key: 'status', label: 'Статус' },
+                    ] as { key: SortKey; label: string }[]).map(col => {
+                      const active = sortKey === col.key;
+                      return (
+                        <th key={col.key} className="px-4 py-2.5 whitespace-nowrap">
+                          <button onClick={() => toggleSort(col.key)}
+                            className="inline-flex items-center gap-1 cursor-pointer select-none group/th hover:text-gray-700">
+                            {col.label}
+                            {active ? (
+                              sortOrder === 'asc'
+                                ? <ArrowUp size={12} className="text-indigo-600" />
+                                : <ArrowDown size={12} className="text-indigo-600" />
+                            ) : (
+                              <ArrowUpDown size={12} className="text-gray-300 opacity-0 group-hover/th:opacity-100 transition-opacity" />
+                            )}
+                          </button>
+                        </th>
+                      );
+                    })}
+                    <th className="px-4 py-2.5 whitespace-nowrap" />
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
@@ -187,15 +300,15 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
                           <Avatar nick={a.nick} hue={a.hue} size={30} />
                           <span className="text-left">
                             <span className="block font-bold text-gray-800 group-hover:text-indigo-600">{a.nick}</span>
-                            <span className="block text-[10.5px] font-semibold text-gray-400">{a.deals} сделок · ER {a.er}%</span>
+                            <span className="block text-[10.5px] font-semibold text-gray-400">{a.deals} сделок · ER {fmtER(a.er)}</span>
                           </span>
                         </button>
                       </td>
                       <td className="px-4 py-2.5"><span className="inline-flex items-center gap-1.5 font-semibold text-gray-600"><SocialIcon social={a.social} size={14} />{a.social}</span></td>
-                      <td className="px-4 py-2.5 font-bold text-gray-800 tabular-nums">{fmtNum(a.followers)}</td>
-                      <td className="px-4 py-2.5"><Badge tone="violet">{a.niche}</Badge></td>
-                      <td className="px-4 py-2.5 font-semibold text-gray-500 tabular-nums">{fmtNum(a.reach)}</td>
-                      <td className="px-4 py-2.5 font-bold text-emerald-600 tabular-nums">{a.er}%</td>
+                      <td className="px-4 py-2.5 font-bold text-gray-800 tabular-nums">{fmtBig(a.followers)}</td>
+                      <td className="px-4 py-2.5"><span title={a.niche}><Badge tone="violet">{formatNiche(a.niche)}</Badge></span></td>
+                      <td className="px-4 py-2.5 font-semibold text-gray-500 tabular-nums">{fmtBig(a.reach)}</td>
+                      <td className="px-4 py-2.5 font-bold text-emerald-600 tabular-nums">{fmtER(a.er)}</td>
                       <td className="px-4 py-2.5 font-bold text-gray-800 tabular-nums">{a.cpm} ₽</td>
                       <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
                         <select
@@ -213,7 +326,12 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
                           <div className="absolute right-4 top-9 z-30 w-48 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5 pop-in text-left">
                             <MenuItem icon={<Briefcase size={14} />} label="Новая сделка" onClick={() => { setMenu(null); onNewDeal(a.id); }} />
                             <MenuItem icon={<MessageSquare size={14} />} label="Написать" onClick={() => { setMenu(null); toast('ok', `Чат с ${a.nick} открыт в Коммуникациях`); }} />
-                            <MenuItem icon={<Archive size={14} />} label="Архивировать" danger onClick={() => { setMenu(null); setArchived(x => [...x, a.id]); toast('info', `${a.nick} перемещён в архив`); }} />
+                            {a.status !== 'В архиве' ? (
+                              <MenuItem icon={<Archive size={14} />} label="В архив" onClick={() => void changeStatus(a, 'В архиве')} />
+                            ) : (
+                              <MenuItem icon={<ArchiveRestore size={14} />} label="Восстановить" onClick={() => void changeStatus(a, 'Свободен')} />
+                            )}
+                            <MenuItem icon={<Trash2 size={14} />} label="Удалить из шортлиста" danger onClick={() => void handleDeleteAuthor(a)} />
                           </div>
                         )}
                       </td>
@@ -239,7 +357,6 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
         )}
       </div>
 
-      {picker && <PickerModal authors={authors} onClose={() => setPicker(false)} onDeal={id => { setPicker(false); onNewDeal(id); }} />}
     </div>
   );
 }
@@ -252,66 +369,5 @@ function MenuItem({ icon, label, onClick, danger }: { icon: React.ReactNode; lab
   );
 }
 
-function PickerModal({ authors, onClose, onDeal }: { authors: Author[]; onClose: () => void; onDeal: (id: string) => void }) {
-  const toast = useToast();
-  const [niche, setNiche] = useState<string[]>(['Красота', 'Технологии']);
-  const [minEr, setMinEr] = useState(3);
-  const [maxCpm, setMaxCpm] = useState(250);
-  const [onlyFree, setOnlyFree] = useState(true);
-
-  const results = useMemo(() => authors.filter(a =>
-    (niche.length === 0 || niche.includes(a.niche)) && a.er >= minEr && a.cpm <= maxCpm && (!onlyFree || a.status === 'Свободен')
-  ).sort((x, y) => y.roas - x.roas).slice(0, 8), [authors, niche, minEr, maxCpm, onlyFree]);
-
-  return (
-    <Modal onClose={onClose} w="max-w-[760px]">
-      <div className="px-5 py-4 border-b border-gray-100 flex items-center">
-        <div>
-          <h2 className="text-[15.5px] font-bold text-gray-900">Подбор авторов</h2>
-          <p className="text-[12px] font-medium text-gray-400 mt-0.5">Расширенные фильтры по базе из {authors.length} авторов</p>
-        </div>
-        <button onClick={onClose} className="ml-auto text-gray-300 hover:text-gray-600"><X size={18} /></button>
-      </div>
-      <div className="p-5 grid grid-cols-[240px_1fr] gap-5">
-        <div className="flex flex-col gap-4">
-          <Field label="Ниша">
-            <div className="flex flex-wrap gap-1.5">
-              {NICHES.slice(0, 8).map(n => {
-                const on = niche.includes(n);
-                return (
-                  <button key={n} onClick={() => setNiche(x => on ? x.filter(v => v !== n) : [...x, n])}
-                    className={`px-2 h-7 rounded-full border text-[11px] font-bold transition-all ${on ? 'bg-indigo-500 border-indigo-500 text-white' : 'bg-white border-gray-200 text-gray-500'}`}>{n}</button>
-                );
-              })}
-            </div>
-          </Field>
-          <Field label={`ER не ниже: ${minEr}%`}>
-            <input type="range" min={0} max={8} step={0.5} value={minEr} onChange={e => setMinEr(Number(e.target.value))} className="w-full accent-indigo-500" />
-          </Field>
-          <Field label={`CPM не выше: ${maxCpm} ₽`}>
-            <input type="range" min={90} max={350} step={10} value={maxCpm} onChange={e => setMaxCpm(Number(e.target.value))} className="w-full accent-indigo-500" />
-          </Field>
-          <label className="flex items-center gap-2 text-[12px] font-bold text-gray-500 cursor-pointer"><Toggle on={onlyFree} onChange={setOnlyFree} />Только свободные</label>
-        </div>
-        <div className="min-h-[300px]">
-          <div className="text-[11.5px] font-bold text-gray-400 uppercase tracking-wide mb-2">Результаты · {results.length}</div>
-          <div className="flex flex-col gap-2 max-h-[380px] overflow-y-auto scroll-thin pr-1">
-            {results.map(a => (
-              <div key={a.id} className="flex items-center gap-3 rounded-xl border border-gray-200 px-3.5 py-2.5 hover:border-indigo-300 hover:shadow-sm transition-all">
-                <Avatar nick={a.nick} hue={a.hue} size={34} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5"><span className="text-[13px] font-bold text-gray-900">{a.nick}</span><SocialIcon social={a.social} size={12} /></div>
-                  <div className="text-[11px] font-semibold text-gray-400">{fmtNum(a.followers)} · {a.niche} · CPM {a.cpm} ₽ · ER {a.er}%</div>
-                </div>
-                <Badge tone="green">ER {a.er}%</Badge>
-                <Btn size="xs" variant="outline" onClick={() => { toast('ok', `Сделка с ${a.nick} создаётся…`); onDeal(a.id); }}>Сделка</Btn>
-              </div>
-            ))}
-            {results.length === 0 && <div className="py-14 text-center text-[12.5px] font-semibold text-gray-400">Нет авторов под эти критерии</div>}
-          </div>
-        </div>
-      </div>
-    </Modal>
-  );
-}
 const selCls = inputCls + ' !w-44 !h-9.5 text-[12.5px] font-semibold';
+

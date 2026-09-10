@@ -843,17 +843,10 @@ async function exportToCrm(accountIds) {
     showToast("Нет авторов для экспорта", "error");
     return;
   }
-  try {
-    const response = await api.exportToCrmShortlist(ids);
-    if (response && response.redirect_url) {
-      window.open(response.redirect_url, "_blank");
-      showToast("Шортлист открыт в CreatorFlow");
-    } else {
-      showToast("Авторы экспортированы в CRM");
-    }
-  } catch (err) {
-    showToast(err.message || "Ошибка экспорта в CRM", "error");
-  }
+  const crmUrl = `${window.location.protocol}//${window.location.hostname}:3001`;
+  const targetUrl = `${crmUrl}/#/authors?import_ids=${ids.join(",")}`;
+  window.open(targetUrl, "_blank");
+  showToast("Авторы экспортированы в CRM");
 }
 
 function sendMessage() {
@@ -964,14 +957,11 @@ app.addEventListener("click", (e) => {
     }
     showToast(adding ? "Добавлено в шортлист" : "Убрано из шортлиста");
   } else if (action === "export-shortlist") {
-    const ids = [];
-    for (const a of store.shortlist) {
-      if (a.account_id != null) ids.push(String(a.account_id));
-      if (a.id != null) ids.push(String(a.id));
-      if (a.platform_id != null) ids.push(String(a.platform_id));
-      if (a.username) ids.push(String(a.username));
-    }
-    exportToCrm(Array.from(new Set(ids.filter(Boolean))));
+    const ids = store.shortlist
+      .map((a) => (a.username || a.handle || a.account_id || a.id || a.platform_id))
+      .filter((id) => id != null && String(id).trim() !== "")
+      .map((id) => String(id).trim().replace(/^@/, ""));
+    exportToCrm(Array.from(new Set(ids)));
   } else if (action === "remove-shortlist") {
     const author = store.shortlist.find((a) => a.account_id === Number(target.dataset.authorId));
     if (author) {

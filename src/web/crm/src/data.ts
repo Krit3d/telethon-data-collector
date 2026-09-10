@@ -5,7 +5,7 @@ export type Social = 'Instagram' | 'VK' | 'Telegram' | 'TikTok' | 'YouTube' | '�
 export interface Author {
   id: string; nick: string; social: Social; followers: number; niche: string;
   reach: number; cpm: number; er: number; roas: number;
-  status: 'Свободен' | 'В сделке' | 'На паузе'; hue: number; deals: number;
+  status: 'Свободен' | 'В сделке' | 'На паузе' | 'В архиве'; hue: number; deals: number;
 }
 
 export interface Product { name: string; desc: string; tags: string[]; hue: number }

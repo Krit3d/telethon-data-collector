@@ -453,6 +453,7 @@ class SearchResponse(BaseModel):
 
 class CrmShortlistRequest(BaseModel):
     account_ids: list[str] = Field(description="List of account identifiers to export to Twenty CRM")
+    user_email: str | None = Field(default=None, description="Email of the CRM user initiating the export")
 
 
 class CrmShortlistResponse(BaseModel):
@@ -463,6 +464,12 @@ class CrmShortlistResponse(BaseModel):
 class CrmLoginRequest(BaseModel):
     email: str = Field(description="Email of the CRM user")
     password: str = Field(description="Password of the CRM user")
+
+
+class CrmRegisterRequest(BaseModel):
+    email: str = Field(description="Email of the CRM user")
+    password: str = Field(description="Password of the CRM user")
+    name: str | None = Field(default=None, description="Display name of the CRM user")
 
 
 class CrmLoginResponse(BaseModel):

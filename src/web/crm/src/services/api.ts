@@ -95,15 +95,47 @@ export const api = {
     return data;
   },
 
+  async register(email: string, password: string, name?: string): Promise<LoginResponse> {
+    const data = await request<LoginResponse>('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, name }),
+    });
+    localStorage.setItem(TOKEN_KEY, data.token);
+    localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+    return data;
+  },
+
   async getCreators(): Promise<CreatorRecord[]> {
     const data = await request<CreatorsResponse>('/creators');
     return data.data;
+  },
+
+  async exportToCrmShortlist(accountIds: string[], userEmail: string): Promise<{ added_count: number; redirect_url: string }> {
+    return request<{ added_count: number; redirect_url: string }>('/shortlist', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: accountIds, user_email: userEmail }),
+    });
+  },
+
+  async exportShortlist(accountIds: string[], userEmail?: string): Promise<{ added_count: number; redirect_url: string }> {
+    const currentUser = getStoredUser();
+    const email = userEmail || (typeof currentUser?.email === 'string' ? currentUser.email : '');
+    return request<{ added_count: number; redirect_url: string }>('/shortlist', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: accountIds, user_email: email }),
+    });
   },
 
   async updateCreatorStatus(creatorId: string, status: string): Promise<CreatorRecord> {
     return request<CreatorRecord>(`/creators/${encodeURIComponent(creatorId)}`, {
       method: 'PATCH',
       body: JSON.stringify({ status }),
+    });
+  },
+
+  async deleteCreator(creatorId: string): Promise<{ status: string; creator_id: string }> {
+    return request<{ status: string; creator_id: string }>(`/creators/${encodeURIComponent(creatorId)}`, {
+      method: 'DELETE',
     });
   },
 
@@ -119,6 +151,10 @@ export const api = {
   getCurrentUser(): Record<string, unknown> | null {
     return getStoredUser();
   },
+
+  getToken(): string {
+    return localStorage.getItem(TOKEN_KEY) ?? '';
+  },
 };
 
 export function userName(user: Record<string, unknown> | null): string {
@@ -133,7 +169,7 @@ export function userHandle(user: Record<string, unknown> | null): string {
   return email ? '@' + email.split('@')[0] : '';
 }
 
-export const STATUS_OPTIONS: string[] = ['Свободен', 'В сделке', 'На паузе'];
+export const STATUS_OPTIONS: string[] = ['Свободен', 'В сделке', 'На паузе', 'В архиве'];
 
 export function normalizeSocial(raw: string | null | undefined): Social {
   const value = (raw ?? '').trim();

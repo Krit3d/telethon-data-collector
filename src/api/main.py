@@ -123,11 +123,13 @@ async def health_check() -> dict[str, str]:
 @app.get("/", response_class=HTMLResponse)
 @app.get("/index.html", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
+    settings = load_settings()
     html = INDEX_FILE.read_text(encoding="utf-8")
     css_mtime = int(os.path.getmtime(CSS_FILE))
     js_mtime = int(os.path.getmtime(JS_FILE))
     html = html.replace(CSS_ASSET, f"{CSS_ASSET}?t={css_mtime}")
     html = html.replace(JS_ASSET, f"{JS_ASSET}?t={js_mtime}")
+    html = html.replace("__CRM_URL__", settings.crm_frontend_url)
     return HTMLResponse(content=html, headers=NO_CACHE_HEADERS)
 
 

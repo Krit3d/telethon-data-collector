@@ -1,11 +1,13 @@
 import { useState, type FormEvent } from 'react';
-import { Zap, Mail, Lock, Eye, EyeOff, LogIn, AlertTriangle } from 'lucide-react';
-import { api, userName } from '../services/api';
-import { Btn, Field, inputCls } from './ui';
+import { Zap, Mail, Lock, Eye, EyeOff, LogIn, UserPlus, AlertTriangle } from 'lucide-react';
+import { api } from '../services/api';
+import { Btn, Field, inputCls, Tabs } from './ui';
 
 export default function LoginModal({ onLogin }: { onLogin: (user: Record<string, unknown>) => void }) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [name, setName] = useState('');
   const [show, setShow] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -17,13 +19,19 @@ export default function LoginModal({ onLogin }: { onLogin: (user: Record<string,
       setError('Введите email и пароль');
       return;
     }
+    if (mode === 'register' && password.length < 6) {
+      setError('Пароль должен содержать не менее 6 символов');
+      return;
+    }
     setBusy(true);
     setError('');
     try {
-      const data = await api.login(trimmed, password);
+      const data = mode === 'register'
+        ? await api.register(trimmed, password, name.trim() || undefined)
+        : await api.login(trimmed, password);
       onLogin(data.user);
     } catch (err) {
-      setError(err instanceof Error && err.message ? err.message : 'Не удалось войти. Проверьте подключение к серверу');
+      setError(err instanceof Error && err.message ? err.message : 'Не удалось выполнить операцию. Проверьте подключение к серверу');
     } finally {
       setBusy(false);
     }
@@ -42,10 +50,29 @@ export default function LoginModal({ onLogin }: { onLogin: (user: Record<string,
           </div>
 
           <form onSubmit={submit} className="bg-white rounded-2xl border border-gray-200 shadow-xl p-6 flex flex-col gap-4">
+            <Tabs
+              items={[
+                { id: 'login', label: 'Вход', icon: <LogIn size={14} /> },
+                { id: 'register', label: 'Регистрация', icon: <UserPlus size={14} /> },
+              ]}
+              active={mode}
+              onChange={id => { setMode(id === 'register' ? 'register' : 'login'); setError(''); }}
+            />
+
             <div>
-              <h1 className="text-[17px] font-bold text-gray-900">Вход в CRM</h1>
-              <p className="text-[12.5px] font-medium text-gray-400 mt-1">Используйте учётную запись Twenty CRM</p>
+              <h1 className="text-[17px] font-bold text-gray-900">{mode === 'register' ? 'Создание аккаунта' : 'Вход в CRM'}</h1>
+              <p className="text-[12.5px] font-medium text-gray-400 mt-1">{mode === 'register' ? 'Получите персональный кабинет CreatorFlow' : 'Используйте учётную запись Twenty CRM'}</p>
             </div>
+
+            {mode === 'register' && (
+              <Field label="Имя (необязательно)">
+                <div className="relative">
+                  <UserPlus size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-300" />
+                  <input className={inputCls + ' !pl-9'} type="text" autoComplete="name"
+                    placeholder="Иван Иванов" value={name} onChange={e => { setName(e.target.value); setError(''); }} />
+                </div>
+              </Field>
+            )}
 
             <Field label="Email">
               <div className="relative">
@@ -58,7 +85,7 @@ export default function LoginModal({ onLogin }: { onLogin: (user: Record<string,
             <Field label="Пароль">
               <div className="relative">
                 <Lock size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-300" />
-                <input className={inputCls + ' !pl-9 !pr-9'} type={show ? 'text' : 'password'} autoComplete="current-password"
+                <input className={inputCls + ' !pl-9 !pr-9'} type={show ? 'text' : 'password'} autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
                   placeholder="••••••••" value={password} onChange={e => { setPassword(e.target.value); setError(''); }} />
                 <button type="button" onClick={() => setShow(s => !s)} tabIndex={-1}
                   className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
@@ -66,6 +93,10 @@ export default function LoginModal({ onLogin }: { onLogin: (user: Record<string,
                 </button>
               </div>
             </Field>
+
+            {mode === 'register' && (
+              <p className="text-[11px] font-medium text-gray-400">Пароль должен содержать не менее 6 символов</p>
+            )}
 
             {error && (
               <div className="flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-[12.5px] font-semibold text-red-600">
@@ -75,11 +106,11 @@ export default function LoginModal({ onLogin }: { onLogin: (user: Record<string,
 
             <Btn type="submit" disabled={busy} className="w-full justify-center">
               {busy ? <span className="w-4 h-4 rounded-full border-2 border-white/40 border-t-white animate-spin" /> : <LogIn size={15} />}
-              {busy ? 'Входим…' : 'Войти'}
+              {busy ? (mode === 'register' ? 'Регистрируем…' : 'Входим…') : (mode === 'register' ? 'Зарегистрироваться' : 'Войти')}
             </Btn>
           </form>
 
-          <p className="text-[11.5px] font-medium text-gray-400 mt-5 text-center">Доступ предоставляется администратором Twenty CRM</p>
+          <p className="text-[11.5px] font-medium text-gray-400 mt-5 text-center">{mode === 'register' ? 'После регистрации вы попадёте в свой персональный кабинет' : 'Доступ предоставляется администратором Twenty CRM'}</p>
         </div>
       </div>
 

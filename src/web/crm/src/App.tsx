@@ -17,6 +17,15 @@ import { DealsList, CommsList } from './screens/Lists';
 
 type Screen = 'kanban' | 'deals' | 'authors' | 'author' | 'comms' | 'erid' | 'kb' | 'analytics' | 'pubs';
 
+const SCREENS: Screen[] = ['kanban', 'deals', 'authors', 'comms', 'erid', 'kb', 'pubs', 'analytics'];
+
+const screenFromHash = (): Screen => {
+  let seg = window.location.hash;
+  if (seg.startsWith('#')) seg = seg.slice(1);
+  if (seg.startsWith('/')) seg = seg.slice(1);
+  return SCREENS.includes(seg as Screen) ? (seg as Screen) : 'authors';
+};
+
 const MENU: { id: Screen; label: string; icon: React.ReactNode }[] = [
   { id: 'kanban', label: 'Воронка сделок', icon: <KanbanSquare size={16} /> },
   { id: 'deals', label: 'Сделки', icon: <Briefcase size={16} /> },
@@ -36,7 +45,7 @@ const NOTIFS = [
 
 function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLogout: () => void }) {
   const toast = useToast();
-  const [screen, setScreen] = useState<Screen>('kanban');
+  const [screen, setScreen] = useState<Screen>(screenFromHash);
   const [deals, setDeals] = useState<Deal[]>(DEALS_INIT);
   const [dealId, setDealId] = useState<string | null>(null);
   const [dealTab, setDealTab] = useState<string | undefined>(undefined);
@@ -56,6 +65,19 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
     return () => window.removeEventListener('keydown', h);
   }, []);
 
+  useEffect(() => {
+    const sync = () => {
+      const next = screenFromHash();
+      if (window.location.hash === '' || window.location.hash === '#' || window.location.hash === '#/') {
+        window.location.hash = '#/authors';
+      }
+      setScreen(next);
+    };
+    sync();
+    window.addEventListener('hashchange', sync);
+    return () => window.removeEventListener('hashchange', sync);
+  }, []);
+
   const openDeal = (id: string, tab?: string) => { setDealTab(tab); setDealId(id); };
   const deal = dealId ? deals.find(d => d.id === dealId) ?? null : null;
   const openKB = (brandId?: string) => { setKbBrand(brandId); setScreen('kb'); setDealId(null); };
@@ -73,7 +95,7 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
         </div>
         <nav className="flex-1 min-h-0 overflow-y-auto scroll-thin px-3 flex flex-col gap-0.5">
           {MENU.map(m => (
-            <button key={m.id} onClick={() => { setScreen(m.id); if (m.id !== 'kb') setKbBrand(undefined); if (m.id !== 'author') setProfileId(p => p); }}
+            <button key={m.id} onClick={() => { window.location.hash = '#/' + m.id; setScreen(m.id); if (m.id !== 'kb') setKbBrand(undefined); if (m.id !== 'author') setProfileId(p => p); }}
               className={`flex items-center gap-2.5 px-3 h-9.5 rounded-lg text-[13px] font-semibold transition-all ${
                 screen === m.id ? 'bg-indigo-50 text-indigo-700 shadow-sm shadow-indigo-100' : 'text-gray-500 hover:bg-slate-50 hover:text-gray-800'}`}>
               <span className={screen === m.id ? 'text-indigo-500' : 'text-gray-400'}>{m.icon}</span>{m.label}

@@ -52,11 +52,16 @@ export class SearchApiClient {
     return this._post("/api/v1/search/analyze-brand", payload, signal);
   }
 
-  async exportToCrmShortlist(accountIds) {
-    return this._post("/api/v1/crm/shortlist", { account_ids: accountIds });
+  async exportToCrmShortlist(accountIds, userEmail) {
+    const headers = { "Content-Type": "application/json" };
+    const token = localStorage.getItem("cf_token");
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    return this._post("/api/v1/crm/shortlist", { account_ids: accountIds, user_email: userEmail }, null, headers);
   }
 
-  async _post(path, payload, signal) {
+  async _post(path, payload, signal, extraHeaders) {
     if (this.controller && !signal) {
       this.controller.abort();
     }
@@ -70,7 +75,7 @@ export class SearchApiClient {
     try {
       response = await fetch(`${this.baseUrl}${path}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
         body: JSON.stringify(payload),
         signal: effectiveSignal,
       });
