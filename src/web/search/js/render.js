@@ -154,7 +154,7 @@ export function renderAuthorCards(authors, container, store) {
   }
 
   const cards = authors.map((item) => {
-    const id = item.account_id;
+    const id = item.account_id ?? item.id ?? item.author_id ?? item.username;
     const name = item.title || item.username || "Автор";
     const handle = item.username ? `@${item.username}` : "";
     const url = item.url || "#";
@@ -238,7 +238,7 @@ export function renderAuthorCards(authors, container, store) {
 
       ${explanation ? `<div class="author-bio">
         <div class="explanation-text ${CLAMP_CLASS}" data-explanation>${escapeHtml(explanation)}</div>
-        <button class="btn-link" data-action="toggle-explanation" data-author-id="${id}">
+        <button type="button" class="btn-link" data-action="toggle-explanation" data-author-id="${id}">
           <span data-explanation-label>подробнее</span>
           <svg class="chevron" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
         </button>
@@ -258,11 +258,11 @@ export function renderAuthorCards(authors, container, store) {
       </div>
 
       <div class="author-actions">
-        <button class="${shortCls}" data-action="toggle-shortlist" data-author-id="${id}">
+        <button type="button" class="${shortCls}" data-action="toggle-shortlist" data-author-id="${id}">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4h9l3 3v13l-6-3-6 3z" fill="currentColor" fill-opacity=".14"></path></svg>
-          <span>${shortLabel}</span>
+          <span data-short-text>${shortLabel}</span>
         </button>
-        <button class="btn-chat" data-action="open-chat" data-author-id="${id}" title="Написать автору">
+        <button type="button" class="btn-chat" data-action="open-chat" data-author-id="${id}" title="Написать автору">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6.5C4 5.7 4.7 5 5.5 5h13c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H9l-4 3v-3H5.5C4.7 16 4 15.3 4 14.5z" fill="currentColor" fill-opacity=".14"></path></svg>
           <span>Диалог</span>
         </button>
@@ -331,6 +331,7 @@ export function renderShortlist(shortlist, container, store) {
   }
 
   const items = shortlist.map((item) => {
+    const id = item.account_id ?? item.id ?? item.author_id ?? item.username;
     const name = item.title || item.username || "Автор";
     const handle = item.username ? `@${item.username}` : "";
     const platform = item.platform || "";
@@ -342,15 +343,15 @@ export function renderShortlist(shortlist, container, store) {
       ? `${item.city}, ${item.country}`
       : (item.country || item.city || "");
 
-    return `<div class="shortlist-item" data-author-id="${item.account_id}">
+    return `<div class="shortlist-item" data-author-id="${id}">
       <span class="avatar" style="width:40px;height:40px;background:${color};color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;">${escapeHtml(initials(name))}</span>
       <div class="shortlist-item-info">
         <div class="shortlist-item-name">${escapeHtml(name)}</div>
         <div class="shortlist-item-sub">${handle ? escapeHtml(handle) : ""}${platform ? ` · ${escapeHtml(platform)}` : ""}${subs !== "—" ? ` · ${subs}` : ""}${er !== "—" ? ` · ER ${er}` : ""}${geoText ? ` · 📍 ${escapeHtml(geoText)}` : ""}</div>
       </div>
       <span class="badge-rel">${rel}</span>
-      <button class="btn-solid" data-action="open-chat" data-author-id="${item.account_id}">Написать</button>
-      <button class="btn-soft" data-action="remove-shortlist" data-author-id="${item.account_id}">Убрать</button>
+      <button type="button" class="btn-solid" data-action="open-chat" data-author-id="${id}">Написать</button>
+      <button type="button" class="btn-soft" data-action="remove-shortlist" data-author-id="${id}">Убрать</button>
     </div>`;
   }).join("");
 

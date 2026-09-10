@@ -337,6 +337,20 @@ class Settings(BaseSettings):
         description="FastAPI server port",
     )
 
+    # ---- Twenty CRM integration settings ----
+    twenty_api_url: str = Field(
+        default="http://twenty-server:3000",
+        description="Internal Twenty CRM API URL inside the Docker network",
+    )
+    twenty_api_key: str = Field(
+        default="",
+        description="API key for Twenty CRM authentication",
+    )
+    crm_frontend_url: str = Field(
+        default="http://localhost:3001",
+        description="Public URL of the CRM frontend interface",
+    )
+
     # ---- Channel sourcing ----
     channels_file: Path = Field(
         default=Path("channels.txt"),

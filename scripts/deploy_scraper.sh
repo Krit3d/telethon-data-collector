@@ -39,8 +39,27 @@ EOF
 
 echo "Syncing source files..."
 rsync -avz --delete \
-    --exclude='.git/' --exclude='__pycache__/' --exclude='.venv/' --exclude='backups/' \
-    --exclude='*.pyc' --exclude='sessions/' --exclude='.env' \
+    --exclude='.git/' \
+    --exclude='__pycache__/' \
+    --exclude='.venv/' \
+    --exclude='*.pyc' \
+    --exclude='sessions/' \
+    --exclude='.env' \
+    --exclude='backups/' \
+    --exclude='tests/' \
+    --exclude='node_modules/' \
+    --exclude='dist/' \
+    --exclude='.vite/' \
+    --exclude='.pytest_cache/' \
+    --exclude='*.log' \
+    --exclude='src/web/' \
+    --exclude='src/embeddings/' \
+    --exclude='src/graph/' \
+    --exclude='docker/api/' \
+    --exclude='docker/crm/' \
+    --exclude='docker/neo4j/' \
+    --exclude='docker-compose.api.yml' \
+    --exclude='docker-compose.crm.yml' \
     ./ "$SSH_USER@$SSH_HOST:/opt/telethon-scraper"
 
 sleep 2

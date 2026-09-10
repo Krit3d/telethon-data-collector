@@ -43,8 +43,23 @@ EOF
 
 echo "Syncing source files..."
 rsync -avz --delete \
-    --exclude='.git/' --exclude='__pycache__/' --exclude='.venv/' \
-    --exclude='*.pyc' --exclude='sessions/' --exclude='.env' \
+    --exclude='.git/' \
+    --exclude='__pycache__/' \
+    --exclude='.venv/' \
+    --exclude='*.pyc' \
+    --exclude='sessions/' \
+    --exclude='.env' \
+    --exclude='backups/' \
+    --exclude='tests/' \
+    --exclude='node_modules/' \
+    --exclude='dist/' \
+    --exclude='.vite/' \
+    --exclude='src/parser/' \
+    --exclude='src/web/crm/' \
+    --exclude='docker/scraper/' \
+    --exclude='docker/crm/' \
+    --exclude='docker-compose.scraper.yml' \
+    --exclude='docker-compose.crm.yml' \
     ./ "$SSH_USER@$SSH_HOST:/opt/telethon-api"
 
 sleep 2
@@ -54,7 +69,7 @@ ssh "$SSH_USER@$SSH_HOST" "docker image prune -f" || echo "Warning: Docker prune
 
 if [ "$DEPLOY_MODE" = "build-only" ]; then
     echo "Building Docker images (build-only mode)..."
-    ssh "$SSH_USER@$SSH_HOST" "cd /opt/telethon-api && docker compose -f $COMPOSE_FILE build"
+    ssh "$SSH_USER@$SSH_HOST" "cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE build"
 
     echo ""
     echo "=========================================="
@@ -64,42 +79,42 @@ if [ "$DEPLOY_MODE" = "build-only" ]; then
     echo "Follow the steps below to start and verify each service manually:"
     echo ""
     echo "  Step 1 - Start Qdrant (vector database):"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d qdrant'"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE logs -f --tail=20 qdrant'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE up -d qdrant'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE logs -f --tail=20 qdrant'"
     echo ""
     echo "  Step 2 - Verify Qdrant is healthy:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'docker inspect --format=\"{{.State.Status}}\" \$(docker compose -f $COMPOSE_FILE ps -q qdrant)'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'docker inspect --format=\"{{.State.Status}}\" \$(docker compose -p telethon-api -f $COMPOSE_FILE ps -q qdrant)'"
     echo ""
     echo "  Step 3 - Start API service:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d api'"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE logs -f --tail=50 api'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE up -d api'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE logs -f --tail=50 api'"
     echo ""
     echo "  Step 4 - Verify API is healthy:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'docker inspect --format=\"{{.State.Status}}\" \$(docker compose -f $COMPOSE_FILE ps -q api)'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'docker inspect --format=\"{{.State.Status}}\" \$(docker compose -p telethon-api -f $COMPOSE_FILE ps -q api)'"
     echo ""
     echo "  Step 5 - Start Embedding Worker:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d embedding_worker'"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE logs -f --tail=50 embedding_worker'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE up -d embedding_worker'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE logs -f --tail=50 embedding_worker'"
     echo ""
     echo "  Step 6 - Verify Embedding Worker is healthy:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'docker inspect --format=\"{{.State.Status}}\" \$(docker compose -f $COMPOSE_FILE ps -q embedding_worker)'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'docker inspect --format=\"{{.State.Status}}\" \$(docker compose -p telethon-api -f $COMPOSE_FILE ps -q embedding_worker)'"
     echo ""
     echo "  Step 7 - Start Graph Worker:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d graph_worker'"
-    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE logs -f --tail=50 graph_worker'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE up -d graph_worker'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE logs -f --tail=50 graph_worker'"
     echo ""
     echo "  Step 8 - Verify Graph Worker is healthy:"
-    echo "    ssh $SSH_USER@$SSH_HOST 'docker inspect --format=\"{{.State.Status}}\" \$(docker compose -f $COMPOSE_FILE ps -q graph_worker)'"
+    echo "    ssh $SSH_USER@$SSH_HOST 'docker inspect --format=\"{{.State.Status}}\" \$(docker compose -p telethon-api -f $COMPOSE_FILE ps -q graph_worker)'"
     echo ""
     echo "  Useful commands:"
-    echo "    Stop a service:     ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE stop <service>'"
-    echo "    Stop all services:  ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE down'"
-    echo "    List all services:  ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE ps'"
-    echo "    All logs:           ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -f $COMPOSE_FILE logs --tail=100'"
+    echo "    Stop a service:     ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE stop <service>'"
+    echo "    Stop all services:  ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE down'"
+    echo "    List all services:  ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE ps'"
+    echo "    All logs:           ssh $SSH_USER@$SSH_HOST 'cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE logs --tail=100'"
     echo "=========================================="
 else
     echo "Starting core API infrastructure and services (qdrant, api) without recreating running containers..."
-    ssh "$SSH_USER@$SSH_HOST" "cd /opt/telethon-api && docker compose -f $COMPOSE_FILE up -d --no-recreate qdrant api"
+    ssh "$SSH_USER@$SSH_HOST" "cd /opt/telethon-api && docker compose -p telethon-api -f $COMPOSE_FILE up -d --no-recreate qdrant api"
 
     echo "Waiting for services to become ready..."
 
@@ -112,7 +127,7 @@ else
 
     for SERVICE_NAME in \$SERVICES; do
         while [ \$ELAPSED -lt \$MAX_WAIT ]; do
-            CONTAINER_ID=\$(docker compose -f $COMPOSE_FILE ps -q \$SERVICE_NAME 2>/dev/null)
+            CONTAINER_ID=\$(docker compose -p telethon-api -f $COMPOSE_FILE ps -q \$SERVICE_NAME 2>/dev/null)
 
             if [ -z \"\$CONTAINER_ID\" ]; then
                 echo \"Container for \$SERVICE_NAME not found, waiting...\"
@@ -147,15 +162,9 @@ else
 
         echo \"\"
         echo \"=== Last 20 lines of \$SERVICE_NAME logs ===\"
-        docker compose -f $COMPOSE_FILE logs --tail=20 \$SERVICE_NAME
+        docker compose -p telethon-api -f $COMPOSE_FILE logs --tail=20 \$SERVICE_NAME
     done
 
-    echo \"Applying Neo4j schema migrations...\"
-    set -a
-    . /opt/telethon-api/.env
-    set +a
-    docker exec -i neo4j cypher-shell -u \"\$NEO4J_USER\" -p \"\$NEO4J_PASSWORD\" < docker/neo4j/v1_init_openspg_schema.cypher
-    echo \"Neo4j schema migrations applied successfully.\"
     '"
 
     echo ""

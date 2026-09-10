@@ -323,6 +323,7 @@ function buildShortlistTab() {
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#6366f1" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1.5"></rect><rect x="10" y="4" width="5" height="11" rx="1.5"></rect><rect x="17" y="4" width="4" height="7" rx="1.5"></rect></svg>
         <h2 class="shortlist-title">Мой шортлист</h2>
         <span class="badge-soft" data-short-count>0 авторов</span>
+        <button class="btn-primary" data-action="export-shortlist">Открыть в CreatorFlow</button>
       </div>
       <div data-shortlist></div>
     </div>`;
@@ -827,8 +828,32 @@ function flashInferred(el) {
   setTimeout(() => el.classList.remove("ai-inferred"), 2000);
 }
 
-function findAuthor(accountId) {
-  return store.searchResults.find((a) => a.account_id === accountId) || null;
+function findAuthor(id) {
+  const strId = String(id || "").toLowerCase().replace(/^@/, "");
+  return store.searchResults.find((a) =>
+    String(a.account_id || "") === strId ||
+    String(a.id || "") === strId ||
+    String(a.username || "").toLowerCase().replace(/^@/, "") === strId
+  ) || null;
+}
+
+async function exportToCrm(accountIds) {
+  const ids = Array.isArray(accountIds) ? accountIds.map((id) => String(id)).filter(Boolean) : [];
+  if (ids.length === 0) {
+    showToast("Нет авторов для экспорта", "error");
+    return;
+  }
+  try {
+    const response = await api.exportToCrmShortlist(ids);
+    if (response && response.redirect_url) {
+      window.open(response.redirect_url, "_blank");
+      showToast("Шортлист открыт в CreatorFlow");
+    } else {
+      showToast("Авторы экспортированы в CRM");
+    }
+  } catch (err) {
+    showToast(err.message || "Ошибка экспорта в CRM", "error");
+  }
 }
 
 function sendMessage() {
@@ -921,12 +946,32 @@ app.addEventListener("click", (e) => {
     store.matchTypeFilter = target.dataset.matchType || "all";
     renderResults();
   } else if (action === "toggle-shortlist") {
-    const author = findAuthor(Number(target.dataset.authorId));
-    if (author) {
-      store.toggleShortlist(author);
-      render();
-      showToast(store.isInShortlist(author.account_id) ? "Добавлено в шортлист" : "Убрано из шортлиста");
+    e.preventDefault();
+    e.stopPropagation();
+    const author = findAuthor(target.dataset.authorId);
+    if (!author) return;
+    const adding = !store.isInShortlist(author.account_id ?? author.id ?? author.author_id ?? author.username);
+    store.toggleShortlist(author);
+    target.classList.toggle("in", adding);
+    const label = target.querySelector("[data-short-text]") || target.querySelector("span:last-child");
+    if (label) {
+      label.textContent = adding ? "В шортлисте" : "В шортлист";
     }
+    const badge = document.querySelector("[data-short-badge]");
+    if (badge) {
+      badge.textContent = String(store.shortlist.length);
+      badge.style.display = store.shortlist.length > 0 ? "flex" : "none";
+    }
+    showToast(adding ? "Добавлено в шортлист" : "Убрано из шортлиста");
+  } else if (action === "export-shortlist") {
+    const ids = [];
+    for (const a of store.shortlist) {
+      if (a.account_id != null) ids.push(String(a.account_id));
+      if (a.id != null) ids.push(String(a.id));
+      if (a.platform_id != null) ids.push(String(a.platform_id));
+      if (a.username) ids.push(String(a.username));
+    }
+    exportToCrm(Array.from(new Set(ids.filter(Boolean))));
   } else if (action === "remove-shortlist") {
     const author = store.shortlist.find((a) => a.account_id === Number(target.dataset.authorId));
     if (author) {

@@ -1,41 +1,40 @@
+name: telethon-crm
+
 services:
   twenty-db:
-    container_name: twenty-db
     image: postgres:16-alpine
     restart: always
-    env_file: [.env]
+    env_file: [ .env ]
     environment:
       POSTGRES_USER: ${TWENTY_PG_USER:-twenty}
       POSTGRES_PASSWORD: ${TWENTY_PG_PASSWORD:-change_me_strong_password}
       POSTGRES_DB: ${TWENTY_PG_DB:-twenty}
-    volumes: [twenty_pg_data:/var/lib/postgresql/data]
+    volumes: [ twenty_pg_data:/var/lib/postgresql/data ]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-twenty} -d $${POSTGRES_DB:-twenty}"]
+      test: [ "CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-twenty} -d $${POSTGRES_DB:-twenty}" ]
       interval: 5s
       timeout: 5s
       retries: 5
       start_period: 10s
-    networks: [crm_network]
-    logging: {driver: local, options: {max-size: "10m", max-file: "3"}}
+    networks: [ crm-network ]
+    logging: { driver: local, options: { max-size: "10m", max-file: "3" } }
   twenty-redis:
-    container_name: twenty-redis
     image: redis:7-alpine
     restart: always
-    env_file: [.env]
-    volumes: [twenty_redis_data:/data]
+    env_file: [ .env ]
+    volumes: [ twenty_redis_data:/data ]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 5s
       retries: 5
       start_period: 10s
-    networks: [crm_network]
-    logging: {driver: local, options: {max-size: "10m", max-file: "3"}}
+    networks: [ crm-network ]
+    logging: { driver: local, options: { max-size: "10m", max-file: "3" } }
   twenty-server:
-    container_name: twenty-server
     image: twentycrm/twenty:latest
     restart: always
-    env_file: [.env]
+    env_file: [ .env ]
     environment:
       NODE_PORT: 3000
       PG_DATABASE_URL: postgres://${TWENTY_PG_USER:-twenty}:${TWENTY_PG_PASSWORD:-change_me_strong_password}@twenty-db:5432/${TWENTY_PG_DB:-twenty}
@@ -49,15 +48,14 @@ services:
     volumes:
       - twenty_storage_data:/app/packages/twenty-server/.local-storage
     depends_on:
-      twenty-db: {condition: service_healthy}
-      twenty-redis: {condition: service_healthy}
-    networks: [crm_network]
-    logging: {driver: local, options: {max-size: "10m", max-file: "3"}}
+      twenty-db: { condition: service_healthy }
+      twenty-redis: { condition: service_healthy }
+    networks: [ crm-network ]
+    logging: { driver: local, options: { max-size: "10m", max-file: "3" } }
   twenty-worker:
-    container_name: twenty-worker
     image: twentycrm/twenty:latest
     restart: always
-    env_file: [.env]
+    env_file: [ .env ]
     environment:
       PG_DATABASE_URL: postgres://${TWENTY_PG_USER:-twenty}:${TWENTY_PG_PASSWORD:-change_me_strong_password}@twenty-db:5432/${TWENTY_PG_DB:-twenty}
       SERVER_URL: ${TWENTY_SERVER_URL:-http://localhost:3000}
@@ -68,30 +66,35 @@ services:
     volumes:
       - twenty_storage_data:/app/packages/twenty-server/.local-storage
     depends_on:
-      twenty-db: {condition: service_healthy}
-      twenty-redis: {condition: service_healthy}
-    command: ["yarn", "worker:prod"]
-    networks: [crm_network]
-    logging: {driver: local, options: {max-size: "10m", max-file: "3"}}
+      twenty-db: { condition: service_healthy }
+      twenty-redis: { condition: service_healthy }
+    command: [ "yarn", "worker:prod" ]
+    networks: [ crm-network ]
+    logging: { driver: local, options: { max-size: "10m", max-file: "3" } }
   crm-frontend:
-    container_name: crm-frontend
     build:
       context: .
       dockerfile: docker/crm/Dockerfile
     restart: always
-    env_file: [.env]
+    env_file: [ .env ]
     ports:
       - "${CRM_FRONTEND_PORT:-3001}:80"
     depends_on:
       - twenty-server
-    networks: [crm_network]
-    logging: {driver: local, options: {max-size: "10m", max-file: "3"}}
+    networks: [ crm-network ]
+    logging: { driver: local, options: { max-size: "10m", max-file: "3" } }
 
 networks:
-  crm_network:
-    driver: bridge
+  crm-network:
+    name: creatorflow-network
 
 volumes:
   twenty_pg_data:
+    name: telethon-crm_twenty_pg_data
+    external: true
   twenty_redis_data:
+    name: telethon-crm_twenty_redis_data
+    external: true
   twenty_storage_data:
+    name: telethon-crm_twenty_storage_data
+    external: true

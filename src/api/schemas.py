@@ -449,3 +449,26 @@ class SearchResponse(BaseModel):
     confidence_level: str = Field(default="HIGH", description="Confidence level of returned search items: HIGH, LOW, or NONE")
     warning_message: str | None = Field(default=None, description="Human-readable notification message explaining result relevance or domain coverage")
     inferred_filters: InferredFilters | None = Field(default=None, description="AI-inferred UI filter values")
+
+
+class CrmShortlistRequest(BaseModel):
+    account_ids: list[str] = Field(description="List of account identifiers to export to Twenty CRM")
+
+
+class CrmShortlistResponse(BaseModel):
+    added_count: int = Field(description="Number of accounts successfully exported to Twenty CRM")
+    redirect_url: str = Field(description="URL of the CRM frontend authors page for redirect")
+
+
+class CrmLoginRequest(BaseModel):
+    email: str = Field(description="Email of the CRM user")
+    password: str = Field(description="Password of the CRM user")
+
+
+class CrmLoginResponse(BaseModel):
+    token: str = Field(description="Session token returned by Twenty CRM")
+    user: dict[str, Any] = Field(description="Authenticated user record")
+
+
+class CrmUpdateStatusRequest(BaseModel):
+    status: str = Field(description="New status value for the creator")

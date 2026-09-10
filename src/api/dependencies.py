@@ -3,6 +3,7 @@ from collections.abc import AsyncGenerator
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.services.crm_client import TwentyCrmClient
 from src.api.services.search.dbsf_engine import DbsfRankingEngine
 from src.api.services.search.graph_reasoner import GraphReasoner
 from src.api.services.search.hydrator import PostgresHydrator
@@ -50,4 +51,12 @@ def get_search_service(request: Request) -> SearchService:
         graph_reasoner=graph_reasoner,
         dbsf_engine=dbsf_engine,
         hydrator=hydrator,
+    )
+
+
+def get_crm_client(request: Request) -> TwentyCrmClient:
+    settings = request.app.state.settings
+    return TwentyCrmClient(
+        base_url=settings.twenty_api_url,
+        api_key=settings.twenty_api_key,
     )

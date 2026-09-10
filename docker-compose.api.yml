@@ -1,3 +1,5 @@
+name: telethon-api
+
 services:
   neo4j:
     container_name: neo4j
@@ -77,6 +79,7 @@ services:
       - neo4j
     networks:
       - api_network
+      - crm-network
     logging:
       driver: json-file
       options:
@@ -182,8 +185,12 @@ services:
         max-file: "3"
 
 networks:
+  default:
   api_network:
     driver: bridge
+  crm-network:
+    name: creatorflow-network
+    external: true
 
 volumes:
   qdrant_data:

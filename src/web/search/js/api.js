@@ -52,6 +52,10 @@ export class SearchApiClient {
     return this._post("/api/v1/search/analyze-brand", payload, signal);
   }
 
+  async exportToCrmShortlist(accountIds) {
+    return this._post("/api/v1/crm/shortlist", { account_ids: accountIds });
+  }
+
   async _post(path, payload, signal) {
     if (this.controller && !signal) {
       this.controller.abort();

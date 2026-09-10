@@ -12,11 +12,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.api.routers import search, health, crm
+from src.api.services.crm_client import TwentyCrmClient
 from src.config.config import load_settings
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.client import Neo4jClient
-from src.api.routers import search, health
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,10 @@ async def lifespan(app: FastAPI):
     db = Database(settings.db_url)
     qdrant = QdrantService(settings)
     neo4j = Neo4jClient(settings)
+    crm_client = TwentyCrmClient(
+        base_url=settings.twenty_api_url,
+        api_key=settings.twenty_api_key,
+    )
 
     # Initialize database with retry logic and timeout
     try:
@@ -57,10 +62,12 @@ async def lifespan(app: FastAPI):
     app.state.qdrant = qdrant
     app.state.neo4j = neo4j
     app.state.settings = settings
+    app.state.crm_client = crm_client
 
     logger.info("FastAPI application started successfully.")
     yield
 
+    await crm_client.aclose()
     await neo4j.close()
     await db.close()
     await qdrant.close()
@@ -95,7 +102,7 @@ app.add_middleware(NoCacheMiddleware)
 # Add CORS middleware for internal production APIs
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -104,6 +111,7 @@ app.add_middleware(
 # API v1 routing
 app.include_router(search.router, prefix="/api/v1")
 app.include_router(health.router, prefix="/api/v1")
+app.include_router(crm.router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["System"])
