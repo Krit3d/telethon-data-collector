@@ -480,6 +480,7 @@ class CrmLoginResponse(BaseModel):
 
 class CrmUpdateStatusRequest(BaseModel):
     status: str = Field(description="New status value for the creator")
+    archive_active_deals: bool = Field(default=False, description="Archive active deals when archiving the creator")
 
 
 class DealAuthorSummary(BaseModel):
@@ -492,9 +493,11 @@ class DealAuthorSummary(BaseModel):
     category_path: str | None = None
 
 
-class DealMessageItem(BaseModel):
+class CreatorMessageItem(BaseModel):
     id: int
-    deal_id: int
+    user_id: int
+    account_id: int
+    deal_id: int | None = None
     sender_type: str
     text: str
     is_read: bool
@@ -515,7 +518,7 @@ class DealItem(BaseModel):
     created_at: datetime
     updated_at: datetime
     author: DealAuthorSummary | None = None
-    last_message: DealMessageItem | None = None
+    last_message: CreatorMessageItem | None = None
     unread_count: int = 0
 
 
@@ -540,19 +543,54 @@ class DealUpdateRequest(BaseModel):
     terms: str | None = None
 
 
-class DealSendMessageRequest(BaseModel):
+class CreatorSendMessageRequest(BaseModel):
     text: str
     sender_type: str = "user"
 
 
 class CommunicationChannelItem(BaseModel):
-    deal_id: int
+    deal_id: int | None = None
     author_id: int
     author_name: str
     author_handle: str
     platform: str
-    deal_title: str
-    stage: int
+    deal_title: str | None = None
+    stage: int | None = None
     last_message: str
     last_message_time: datetime
     unread_count: int
+    is_archived: bool = False
+
+
+class CreatorPostItem(BaseModel):
+    id: int
+    platform_content_id: str
+    text: str | None = None
+    published_at: datetime
+    views: int = 0
+    likes: int = 0
+    comments: int = 0
+    shares: int = 0
+    er: float = 0.0
+    post_type: str = "Пост"
+    url: str | None = None
+
+
+class CreatorProfileDetail(BaseModel):
+    id: int
+    platform: str
+    username: str | None = None
+    title: str
+    description: str | None = None
+    subscribers_count: int = 0
+    static_avg_er: float = 0.0
+    category_path: str | None = None
+    country: str | None = None
+    city: str | None = None
+    gender: str | None = None
+    status: str
+    profile_url: str = ""
+    cpm: int = 0
+    avg_reach: int = 0
+    deals_count: int = 0
+    posts: list[CreatorPostItem] = Field(default_factory=list)

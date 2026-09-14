@@ -162,6 +162,9 @@ class Account(Base):
     comments: Mapped[list["Comment"]] = relationship(
         back_populates="account"
     )
+    messages: Mapped[list["CreatorMessage"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<Account(id={self.id}, platform={self.platform}, platform_id={self.platform_id})>"
@@ -404,7 +407,7 @@ class User(Base):
         nullable=False,
     )
 
-    deals: Mapped[list["Deal"]] = relationship(
+    messages: Mapped[list["CreatorMessage"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -471,27 +474,40 @@ class Deal(Base):
         nullable=False,
     )
 
-    user: Mapped["User"] = relationship(back_populates="deals")
+    user: Mapped["User"] = relationship()
     account: Mapped["Account"] = relationship(lazy="joined")
-    messages: Mapped[list["DealMessage"]] = relationship(
-        back_populates="deal",
-        cascade="all, delete-orphan",
-        order_by="DealMessage.created_at.asc()",
-    )
+    messages: Mapped[list["CreatorMessage"]] = relationship(back_populates="deal")
 
 
-class DealMessage(Base):
-    __tablename__ = "deal_messages"
+class CreatorMessage(Base):
+    __tablename__ = "creator_messages"
     __table_args__ = (
-        Index("ix_deal_messages_deal_id_created_at", "deal_id", "created_at"),
-        Index("ix_deal_messages_deal_unread", "deal_id", "is_read"),
+        Index(
+            "ix_creator_messages_user_account_created",
+            "user_id",
+            "account_id",
+            "created_at",
+        ),
+        Index("ix_creator_messages_deal_id", "deal_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    deal_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("deals.id", ondelete="CASCADE"),
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
+    )
+    account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    deal_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("deals.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
     sender_type: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -509,7 +525,9 @@ class DealMessage(Base):
         index=True,
     )
 
-    deal: Mapped["Deal"] = relationship(back_populates="messages")
+    user: Mapped["User"] = relationship(back_populates="messages")
+    account: Mapped["Account"] = relationship(back_populates="messages")
+    deal: Mapped["Deal | None"] = relationship(back_populates="messages")
 
 
 # Backward compatibility alias for legacy Channel class references

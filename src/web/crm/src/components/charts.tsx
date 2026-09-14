@@ -18,7 +18,7 @@ function useWidth(initial: number) {
   return { ref, w };
 }
 
-const fmt = (v: number) => v >= 1_000_000 ? (v / 1_000_000).toFixed(1).replace('.', ',') + 'M' : v >= 1000 ? Math.round(v / 1000) + 'K' : String(v);
+const fmt = (v: number) => v >= 1_000_000 ? (v / 1_000_000).toFixed(1).replace('.', ',') + 'M' : v >= 1000 ? Math.round(v / 1000) + 'K' : Number.isInteger(v) ? String(v) : v.toFixed(1);
 
 export interface Series { name: string; color: string; data: number[]; dash?: boolean; fill?: boolean; }
 
@@ -28,7 +28,7 @@ export function LineChart({ labels, series, h = 190, unit = '', money }: { label
   const W = Math.round(w), H = h, PL = 44, PR = 14, PT = 12, PB = 26;
   const n = labels.length;
   const all = series.flatMap(s => s.data);
-  const max = Math.max(...all) * 1.15, min = 0;
+  const max = Math.max(...all, 0.5) * 1.15, min = 0;
   const X = (i: number) => PL + (i / (n - 1)) * (W - PL - PR);
   const Y = (v: number) => PT + (1 - (v - min) / (max - min)) * (H - PT - PB);
   const onMove = (e: React.MouseEvent) => {
@@ -38,7 +38,7 @@ export function LineChart({ labels, series, h = 190, unit = '', money }: { label
     setIdx(Math.min(n - 1, Math.max(0, Math.round(x * (n - 1)))));
   };
   const path = (s: Series) => s.data.map((v, i) => `${i ? 'L' : 'M'}${X(i)},${Y(v)}`).join(' ');
-  const val = (v: number) => money ? Math.round(v).toLocaleString('ru-RU') + ' ₽' : fmt(v) + unit;
+  const val = (v: number) => money ? Math.round(v).toLocaleString('ru-RU') + ' ₽' : (Number.isInteger(v) ? String(v) : v.toFixed(1)) + unit;
   return (
     <div className="relative" ref={ref} onMouseMove={onMove} onMouseLeave={() => setIdx(null)} style={{ height: h }}>
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full">
@@ -46,7 +46,7 @@ export function LineChart({ labels, series, h = 190, unit = '', money }: { label
           const y = PT + t * (H - PT - PB);
           return <g key={t}>
             <line x1={PL} x2={W - PR} y1={y} y2={y} stroke="#EEF2F7" strokeWidth="1" />
-            <text x={PL - 7} y={y + 3.5} textAnchor="end" fontSize="9.5" fill="#9CA3AF" fontFamily="Inter">{fmt(max - t * max)}</text>
+            <text x={PL - 7} y={y + 3.5} textAnchor="end" fontSize="9.5" fill="#9CA3AF" fontFamily="Inter">{fmt(max - t * max) + (unit && t === 0 ? unit : '')}</text>
           </g>;
         })}
         {labels.map((l, i) => (i % Math.ceil(n / 7) === 0 || i === n - 1) && (
@@ -55,7 +55,7 @@ export function LineChart({ labels, series, h = 190, unit = '', money }: { label
         {series.map((s, si) => (
           <g key={si}>
             {s.fill && <path d={`${path(s)} L${X(n - 1)},${H - PB} L${X(0)},${H - PB} Z`} fill={s.color} opacity=".09" />}
-            <path d={path(s)} fill="none" stroke={s.color} strokeWidth="2.2" strokeLinecap="round" strokeDasharray={s.dash ? '5 5' : undefined} className={s.dash ? '' : 'line-draw'} />
+            <path d={path(s)} fill="none" stroke={s.color} strokeWidth="2.2" strokeLinecap="round" strokeDasharray={s.dash ? '5 5' : undefined} />
           </g>
         ))}
         {idx !== null && <line x1={X(idx)} x2={X(idx)} y1={PT} y2={H - PB} stroke="#C7D2FE" strokeWidth="1" />}

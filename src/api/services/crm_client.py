@@ -175,6 +175,22 @@ class TwentyCrmClient:
         logger.info("Twenty CRM: found 0 creators")
         return []
 
+    async def get_creator_by_id(self, creator_id: str) -> dict[str, Any] | None:
+        try:
+            response = await self._client.get(f"/rest/creators/{creator_id.strip()}")
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        record = data.get("data")
+        if isinstance(record, dict):
+            creator = record.get("creator")
+            if isinstance(creator, dict):
+                return creator
+            return record
+        return None
+
     async def update_creator_status(self, creator_id: str, status: str) -> dict[str, Any]:
         response = await self._client.patch(
             f"/rest/creators/{creator_id}",

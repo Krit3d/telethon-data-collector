@@ -26,6 +26,40 @@ export interface CreatorRecord {
   dealsCount?: number | null;
 }
 
+export interface CreatorPostItem {
+  id: number;
+  platform_content_id: string;
+  text: string | null;
+  published_at: string;
+  views: number;
+  likes: number;
+  comments: number;
+  shares: number;
+  er: number;
+  post_type: string;
+  url: string | null;
+}
+
+export interface CreatorProfileDetail {
+  id: number;
+  platform: string;
+  username: string | null;
+  title: string;
+  description: string | null;
+  subscribers_count: number;
+  static_avg_er: number;
+  category_path: string | null;
+  country: string | null;
+  city: string | null;
+  gender: string | null;
+  status: string;
+  profile_url: string;
+  cpm: number;
+  avg_reach: number;
+  deals_count: number;
+  posts: CreatorPostItem[];
+}
+
 export interface LoginResponse {
   token: string;
   user: Record<string, unknown>;
@@ -105,6 +139,7 @@ export interface CommunicationChannelItem {
   last_message: string;
   last_message_time: string;
   unread_count: number;
+  is_archived: boolean;
 }
 
 const TOKEN_KEY = 'creatorflow_token';
@@ -180,6 +215,10 @@ export const api = {
     return data.data;
   },
 
+  async getCreatorProfile(creatorId: string): Promise<CreatorProfileDetail> {
+    return request<CreatorProfileDetail>(`/creators/${encodeURIComponent(creatorId)}`);
+  },
+
   async exportToCrmShortlist(accountIds: string[], userEmail: string): Promise<{ added_count: number; redirect_url: string }> {
     return request<{ added_count: number; redirect_url: string }>('/shortlist', {
       method: 'POST',
@@ -196,10 +235,10 @@ export const api = {
     });
   },
 
-  async updateCreatorStatus(creatorId: string, status: string): Promise<CreatorRecord> {
+  async updateCreatorStatus(creatorId: string, status: string, archiveActiveDeals?: boolean): Promise<CreatorRecord> {
     return request<CreatorRecord>(`/creators/${encodeURIComponent(creatorId)}`, {
       method: 'PATCH',
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({ status, archive_active_deals: archiveActiveDeals ?? false }),
     });
   },
 
@@ -254,6 +293,24 @@ export const api = {
 
   async getCommunications(): Promise<CommunicationChannelItem[]> {
     return request<CommunicationChannelItem[]>('/communications');
+  },
+
+  async initCommunication(creatorId: string): Promise<CommunicationChannelItem> {
+    return request<CommunicationChannelItem>('/communications/init', {
+      method: 'POST',
+      body: JSON.stringify({ creator_id: creatorId }),
+    });
+  },
+
+  async getCreatorMessages(creatorId: string): Promise<DealMessageItem[]> {
+    return request<DealMessageItem[]>(`/creators/${encodeURIComponent(creatorId)}/messages`);
+  },
+
+  async sendCreatorMessage(creatorId: string, text: string, senderType: string = 'user'): Promise<DealMessageItem> {
+    return request<DealMessageItem>(`/creators/${encodeURIComponent(creatorId)}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ text, sender_type: senderType }),
+    });
   },
 
   logout(): void {

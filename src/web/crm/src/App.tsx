@@ -55,6 +55,7 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
   const [searchOpen, setSearchOpen] = useState(false);
   const [kbBrand, setKbBrand] = useState<string | undefined>(undefined);
   const [profileId, setProfileId] = useState<string>('a1');
+  const [commsAuthorId, setCommsAuthorId] = useState<string | null>(null);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -85,6 +86,11 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
   }, []);
 
   const openDeal = (id: string, tab?: string) => { setDealTab(tab); setDealId(id); };
+  const handleAuthorChat = (authorId: string) => {
+    setCommsAuthorId(authorId);
+    setScreen('comms');
+    window.location.hash = '#/comms';
+  };
   const deal = dealId ? deals.find(d => d.id === dealId) ?? null : null;
   const openKB = (brandId?: string) => { setKbBrand(brandId); setScreen('kb'); setDealId(null); };
 
@@ -167,9 +173,9 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
         <main className="flex-1 min-h-0 relative">
           {screen === 'kanban' && <Kanban deals={deals} setDeals={setDeals} onOpenDeal={openDeal} onNewDeal={() => setNewDeal({})} onOpenKB={openKB} />}
           {screen === 'deals' && <DealsList deals={deals} onOpenDeal={openDeal} />}
-          {screen === 'authors' && <Authors onOpenProfile={id => { setProfileId(id); setScreen('author'); }} onNewDeal={id => setNewDeal({ authorId: id })} />}
-          {screen === 'author' && <AuthorProfile authorId={profileId} deals={deals} onBack={() => setScreen('authors')} onNewDeal={id => setNewDeal({ authorId: id })} onOpenDeal={openDeal} />}
-          {screen === 'comms' && <CommsList deals={deals} onOpenDeal={openDeal} />}
+          {screen === 'authors' && <Authors deals={deals} onOpenProfile={id => { setProfileId(id); setScreen('author'); }} onNewDeal={id => setNewDeal({ authorId: id })} onOpenComms={(authorId?: string) => handleAuthorChat(authorId || profileId)} />}
+          {screen === 'author' && <AuthorProfile authorId={profileId} deals={deals} onBack={() => setScreen('authors')} onNewDeal={id => setNewDeal({ authorId: id })} onOpenDeal={(id, tab) => openDeal(id, tab ?? 'comms')} onOpenComms={(authorId?: string) => handleAuthorChat(authorId || profileId)} />}
+          {screen === 'comms' && <CommsList deals={deals} initialAuthorId={commsAuthorId} onOpenDeal={openDeal} onNewDeal={id => setNewDeal({ authorId: id })} />}
           {screen === 'erid' && <Erid deals={deals} onOpenDeal={openDeal} />}
           {screen === 'kb' && <KnowledgeBase initialBrandId={kbBrand} key={kbBrand ?? 'kb'} />}
           {screen === 'pubs' && <Publications onOpenDeal={openDeal} />}
@@ -232,6 +238,7 @@ function NewDealModal({ initialAuthor, onClose, onCreate }: { initialAuthor?: st
   const toast = useToast();
   const [title, setTitle] = useState('');
   const [creators, setCreators] = useState<CreatorRecord[]>([]);
+  const [extraAuthorOption, setExtraAuthorOption] = useState<{ id: string; label: string; handle: string } | null>(null);
   const [authorId, setAuthorId] = useState(initialAuthor ?? '');
   const [brandId, setBrandId] = useState(BRANDS[0].id);
   const [budget, setBudget] = useState('50000');
@@ -246,15 +253,33 @@ function NewDealModal({ initialAuthor, onClose, onCreate }: { initialAuthor?: st
     api.getCreators()
       .then(records => {
         setCreators(records);
-        const options = buildAuthorOptions(records);
-        if (options.length > 0 && !options.some(o => o.id === authorId)) {
-          setAuthorId(options[0].id);
+        if (!initialAuthor) {
+          const options = buildAuthorOptions(records);
+          if (options.length > 0) {
+            setAuthorId(options[0].id);
+          }
         }
       })
       .catch(() => toast('err', 'Не удалось загрузить авторов'));
   }, []);
 
-  const authorOptions = buildAuthorOptions(creators);
+  useEffect(() => {
+    if (!initialAuthor) return;
+    api.getCreatorProfile(String(initialAuthor))
+      .then(profile => {
+        const resolvedId = String(profile.id);
+        const handle = profile.username ? (profile.username.startsWith('@') ? profile.username : `@${profile.username}`) : `@${profile.title}`;
+        const label = `${handle} (${profile.title || 'Автор'})`;
+        setExtraAuthorOption({ id: resolvedId, label, handle });
+        setAuthorId(resolvedId);
+      })
+      .catch(() => {});
+  }, [initialAuthor]);
+
+  const baseOptions = buildAuthorOptions(creators);
+  const authorOptions = extraAuthorOption && !baseOptions.some(o => o.id === extraAuthorOption.id)
+    ? [extraAuthorOption, ...baseOptions]
+    : baseOptions;
   const currentOption = authorOptions.find(o => o.id === authorId);
   const fallbackTitle = `${finalBrandName} · ${type} · ${currentOption?.handle || currentOption?.label || 'Автор'}`.slice(0, 250);
 

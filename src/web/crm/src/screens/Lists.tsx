@@ -1,9 +1,9 @@
+import { Archive, ArchiveRestore, Briefcase, Eye, MessageSquare, Paperclip, Plus, Search, Send, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Search, Send, Paperclip, Eye, Briefcase, Archive } from 'lucide-react';
-import { BRANDS, STAGES, fmtMoney, resolveAuthor, brandById, type Author, type Deal, type DealMsg, type Social } from '../data';
-import { Badge, Avatar, Card, Btn, useToast, inputCls } from '../components/ui';
 import { SocialIcon } from '../components/icons';
-import { api, type CommunicationChannelItem, type DealMessageItem } from '../services/api';
+import { Avatar, Badge, Btn, Card, inputCls, Modal, Tip, useToast } from '../components/ui';
+import { brandById, BRANDS, fmtMoney, resolveAuthor, STAGES, type Author, type Deal, type DealMsg, type Social } from '../data';
+import { api, normalizeSocial, type CommunicationChannelItem, type CreatorRecord, type DealMessageItem } from '../services/api';
 
 /* ================= СДЕЛКИ ================= */
 export function DealsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal: (id: string) => void }) {
@@ -75,33 +75,82 @@ export function DealsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal: (i
 }
 
 /* ================= КОММУНИКАЦИИ ================= */
-export function CommsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal?: (id: string) => void }) {
+export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { deals: Deal[]; onOpenDeal?: (id: string) => void; initialAuthorId?: string | null; onNewDeal?: (id: string) => void }) {
   const toast = useToast();
   const [channels, setChannels] = useState<CommunicationChannelItem[]>([]);
   const [selectedDealId, setSelectedDealId] = useState<number | null>(null);
   const [msgs, setMsgs] = useState<DealMsg[]>([]);
   const [draft, setDraft] = useState('');
   const [q, setQ] = useState('');
+  const [chatTab, setChatTab] = useState<'active' | 'archived'>('active');
+  const [newChatOpen, setNewChatOpen] = useState(false);
+  const [confirmArchive, setConfirmArchive] = useState(false);
+  const [closeDeals, setCloseDeals] = useState(true);
 
   useEffect(() => {
+    let cancelled = false;
     api.getCommunications()
       .then(items => {
-        setChannels(items);
-        if (selectedDealId === null && items.length > 0) {
-          setSelectedDealId(items[0].deal_id);
+        if (cancelled) return;
+        if (initialAuthorId) {
+          const target = items.find(c => c.author_id === Number(initialAuthorId));
+          if (target) {
+            setChannels(items);
+            setSelectedDealId(target.deal_id);
+          } else {
+            api.getCreatorProfile(initialAuthorId)
+              .then(profile => {
+                if (cancelled) return;
+                const temp: CommunicationChannelItem = {
+                  deal_id: -Number(initialAuthorId),
+                  author_id: Number(initialAuthorId),
+                  author_name: profile.title,
+                  author_handle: profile.username ? `@${profile.username.replace(/^@/, '')}` : `@${profile.title}`,
+                  platform: profile.platform,
+                  deal_title: 'Новый контакт',
+                  stage: 1,
+                  last_message: 'Диалог не начат',
+                  last_message_time: new Date().toISOString(),
+                  unread_count: 0,
+                  is_archived: false,
+                };
+                setChannels([temp, ...items]);
+                setSelectedDealId(temp.deal_id);
+              })
+              .catch(() => {
+                if (cancelled) return;
+                setChannels(items);
+                setSelectedDealId(items.length > 0 ? items[0].deal_id : null);
+              });
+          }
+        } else {
+          setChannels(items);
+          setSelectedDealId(prev => prev ?? (items.length > 0 ? items[0].deal_id : null));
         }
       })
-      .catch(() => toast('err', 'Не удалось загрузить каналы'));
-  }, []);
+      .catch(() => {
+        if (!cancelled) toast('err', 'Не удалось загрузить каналы');
+      });
+    return () => { cancelled = true; };
+  }, [initialAuthorId]);
 
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();
-    if (!s) return channels;
-    return channels.filter(c => c.author_name.toLowerCase().includes(s) || c.author_handle.toLowerCase().includes(s));
-  }, [channels, q]);
+    return channels.filter(c => {
+      if (chatTab === 'active' ? c.is_archived : !c.is_archived) return false;
+      if (!s) return true;
+      return c.author_name.toLowerCase().includes(s) || c.author_handle.toLowerCase().includes(s);
+    });
+  }, [channels, q, chatTab]);
+
+  const activeCount = useMemo(() => channels.filter(c => !c.is_archived).length, [channels]);
+  const archivedCount = useMemo(() => channels.filter(c => c.is_archived).length, [channels]);
 
   const ch = filtered.find(c => c.deal_id === selectedDealId) ?? filtered[0] ?? null;
   const a = ch ? channelAuthor(ch) : null;
+  const targetDeal = ch ? deals.find(d => d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) : undefined;
+  const activeDeals = ch ? deals.filter(d => (d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) && d.stage >= 1 && d.stage <= 4) : [];
+  const activeBudget = activeDeals.reduce((a, d) => a + d.budget, 0);
 
   const chatRef = useRef<HTMLDivElement>(null);
 
@@ -111,7 +160,10 @@ export function CommsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal?: (
 
   useEffect(() => {
     if (!ch) return;
-    api.getDealMessages(ch.deal_id)
+    const load = ch.deal_id > 0
+      ? api.getDealMessages(ch.deal_id)
+      : api.getCreatorMessages(String(ch.author_id));
+    load
       .then(items => {
         setMsgs(items.map(toDealMsg));
         setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, unread_count: 0 } : c));
@@ -123,21 +175,76 @@ export function CommsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal?: (
     if (!draft.trim() || !ch) return;
     const text = draft.trim();
     setDraft('');
-    api.sendDealMessage(ch.deal_id, text)
+    const sendReq = ch.deal_id > 0
+      ? api.sendDealMessage(ch.deal_id, text)
+      : api.sendCreatorMessage(String(ch.author_id), text);
+    sendReq
       .then(m => {
         const dm = toDealMsg(m);
         setMsgs(prev => [...prev, dm]);
-        setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, last_message: dm.text, last_message_time: dm.time } : c));
+        setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, last_message: dm.text, last_message_time: dm.time, deal_id: m.deal_id } : c));
+        if (ch.deal_id <= 0) setSelectedDealId(m.deal_id);
       })
       .catch(() => toast('err', 'Не удалось отправить сообщение'));
+  };
+
+  const handleStartChat = (creator: CreatorRecord) => {
+    const targetId = (creator.handle || creator.username || creator.name || creator.Name || creator.accountid || creator.id || '').toString().replace(/^@/, '');
+    api.initCommunication(targetId)
+      .then(channel => {
+        setChannels(prev => prev.some(c => c.deal_id === channel.deal_id) ? prev : [channel, ...prev]);
+        setSelectedDealId(channel.deal_id);
+        setNewChatOpen(false);
+        setChatTab('active');
+      })
+      .catch(() => toast('err', 'Не удалось начать диалог'));
+  };
+
+  const handleArchiveConfirm = () => {
+    if (!ch) return;
+    const targetId = ch.author_handle ? ch.author_handle.replace(/^@/, '') : String(Math.abs(ch.author_id));
+    api.updateCreatorStatus(targetId, 'В архиве', activeDeals.length > 0 ? closeDeals : false)
+      .then(() => {
+        setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, is_archived: true } : c));
+        setConfirmArchive(false);
+        toast('info', 'Чат перемещён в архив');
+      })
+      .catch(() => toast('err', 'Не удалось архивировать чат'));
+  };
+
+  const handleRestoreChat = () => {
+    if (!ch) return;
+    const targetId = ch.author_handle ? ch.author_handle.replace(/^@/, '') : String(Math.abs(ch.author_id));
+    api.updateCreatorStatus(targetId, 'Свободен')
+      .then(() => {
+        setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, is_archived: false } : c));
+        setChatTab('active');
+        toast('ok', 'Чат восстановлен из архива');
+      })
+      .catch(() => toast('err', 'Не удалось восстановить чат'));
   };
 
   return (
     <div className="h-full flex">
       <aside className="w-[320px] shrink-0 border-r border-gray-200 bg-white flex flex-col">
-        <div className="px-4 pt-5 pb-3">
-          <h1 className="text-[17px] font-display font-semibold text-gray-900">Коммуникации</h1>
-          <p className="text-[11.5px] font-medium text-gray-400 mt-0.5">Чаты сделок · {channels.length} активных</p>
+        <div className="px-4 pt-4 pb-3 flex items-center justify-between gap-2 shrink-0">
+          <div className="min-w-0 flex-1">
+            <h1 className="text-[17px] font-display font-bold text-gray-900 leading-tight truncate">Коммуникации</h1>
+            <p className="text-[11.5px] font-medium text-gray-400 mt-0.5 truncate">Чаты сделок · {activeCount} активных</p>
+          </div>
+          <Btn size="sm" onClick={() => setNewChatOpen(true)} className="!h-8 !px-2.5 !text-[12px] shrink-0 font-semibold whitespace-nowrap">
+            <Plus size={13} className="shrink-0" />Новый чат
+          </Btn>
+        </div>
+        <div className="px-3 pb-2 flex items-center gap-1">
+          <button onClick={() => setChatTab('active')}
+            className={'flex-1 flex items-center justify-center gap-1.5 h-8 rounded-lg text-[12.5px] font-semibold transition-colors ' + (chatTab === 'active' ? 'bg-indigo-50 text-indigo-600' : 'text-gray-500 hover:bg-slate-50')}>
+            Активные ({activeCount})
+          </button>
+          <button onClick={() => setChatTab('archived')}
+            className={'flex-1 flex items-center justify-center gap-1.5 h-8 rounded-lg text-[12.5px] font-semibold transition-colors ' + (chatTab === 'archived' ? 'bg-indigo-50 text-indigo-600' : 'text-gray-500 hover:bg-slate-50')}>
+            Архив ({archivedCount})
+          </button>
         </div>
         <div className="px-3 pb-2">
           <div className="relative">
@@ -163,6 +270,7 @@ export function CommsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal?: (
               </button>
             );
           })}
+          {filtered.length === 0 && <div className="text-center text-[12.5px] font-semibold text-gray-400 py-10">{chatTab === 'active' ? 'Нет активных чатов' : 'Архив пуст'}</div>}
         </div>
       </aside>
       <div className="flex-1 min-w-0 flex flex-col bg-slate-50/60">
@@ -172,8 +280,22 @@ export function CommsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal?: (
             <div className="flex items-center gap-2"><span className="text-[14px] font-bold text-gray-900">{a?.nick ?? ''}</span>{a && <SocialIcon social={a.social} size={13} />}</div>
             <div className="text-[11px] font-semibold text-gray-400 truncate">Сделка: {ch?.deal_title}</div>
           </div>
-          <Btn variant="secondary" size="sm" className="ml-auto" onClick={() => ch && onOpenDeal?.(String(ch.deal_id))}><Briefcase size={13} />Сделка</Btn>
-          <Btn variant="ghost" size="sm" onClick={() => toast('info', (a?.nick ?? '') + ' перемещён в архив чатов')}><Archive size={14} /></Btn>
+          {targetDeal && targetDeal.budget > 0 ? (
+            <>
+              <Badge tone={targetDeal.stage === 5 ? 'green' : targetDeal.stage === 4 ? 'indigo' : targetDeal.stage === 2 ? 'orange' : targetDeal.stage === 3 ? 'amber' : 'gray'} dot>{STAGES.find(x => x.id === targetDeal.stage)?.name ?? 'Этап'}</Badge>
+              <Btn variant="secondary" size="sm" className="ml-auto" onClick={() => onOpenDeal?.(String(targetDeal.id))}><Briefcase size={13} />К сделке</Btn>
+            </>
+          ) : (
+            <>
+              <Badge tone="violet">Аутрич / Переговоры</Badge>
+              <Btn size="sm" className="ml-auto" onClick={() => ch && onNewDeal?.(String(ch.author_id))}><Plus size={13} />Оформить сделку</Btn>
+            </>
+          )}
+          {ch && !ch.is_archived ? (
+            <Tip label="В архив"><Btn variant="ghost" size="sm" onClick={() => { setCloseDeals(true); setConfirmArchive(true); }}><Archive size={14} /></Btn></Tip>
+          ) : (
+            <Btn variant="secondary" size="sm" onClick={handleRestoreChat}><ArchiveRestore size={13} />Восстановить из архива</Btn>
+          )}
         </div>
         <div ref={chatRef} className="flex-1 min-h-0 overflow-y-auto scroll-thin p-5 flex flex-col gap-3">
           {msgs.length === 0 && <div className="m-auto text-[12.5px] font-semibold text-gray-400">Начните диалог — автор увидит сообщение в {a?.social ?? ''}</div>}
@@ -196,10 +318,114 @@ export function CommsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal?: (
           <Btn onClick={send} disabled={!draft.trim()} className="!rounded-xl !w-9 !h-9.5 !p-0 shrink-0"><Send size={15} /></Btn>
         </div>
       </div>
+      {newChatOpen && <NewChatModal channels={channels} onClose={() => setNewChatOpen(false)} onStart={handleStartChat} />}
+      {confirmArchive && ch && (
+        <Modal onClose={() => setConfirmArchive(false)} w="max-w-sm">
+          <div className="px-5 py-4 border-b border-gray-200">
+            <h2 className="text-[16px] font-display font-semibold text-gray-900">Архивировать диалог?</h2>
+          </div>
+          {activeDeals.length === 0 ? (
+            <div className="px-5 py-4 text-[13px] font-medium text-gray-600 leading-relaxed">
+              Чат и автор @{a?.nick ?? ''} будут перемещены в архив. Вы сможете восстановить их в любой момент.
+            </div>
+          ) : (
+            <div className="px-5 py-4">
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-[12.5px] font-medium text-amber-800 leading-relaxed">
+                У автора {activeDeals.length} {activeDeals.length % 10 === 1 && activeDeals.length % 100 !== 11 ? 'открытая сделка' : activeDeals.length % 10 >= 2 && activeDeals.length % 10 <= 4 && (activeDeals.length % 100 < 10 || activeDeals.length % 100 >= 20) ? 'открытые сделки' : 'открытых сделок'} на сумму {fmtMoney(activeBudget)}.
+              </div>
+              <label className="mt-3 flex items-center gap-2.5 cursor-pointer select-none">
+                <input type="checkbox" checked={closeDeals} onChange={e => setCloseDeals(e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-200" />
+                <span className="text-[13px] font-medium text-gray-700">Перевести активные сделки в архив (сорваны)</span>
+              </label>
+            </div>
+          )}
+          <div className="px-5 py-4 border-t border-gray-200 flex items-center justify-end gap-2">
+            <Btn variant="secondary" size="sm" onClick={() => setConfirmArchive(false)}>Отмена</Btn>
+            <Btn size="sm" onClick={handleArchiveConfirm}><Archive size={13} />В архив</Btn>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
+
+function NewChatModal({ channels, onClose, onStart }: {
+  channels: CommunicationChannelItem[];
+  onClose: () => void;
+  onStart: (creator: CreatorRecord) => void;
+}) {
+  const [creators, setCreators] = useState<CreatorRecord[]>([]);
+  const [q, setQ] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getCreators()
+      .then(records => { if (!cancelled) { setCreators(records); setLoading(false); } })
+      .catch(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const list = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    if (!s) return creators;
+    return creators.filter(c => (c.name || c.Name || c.handle || c.username || '').toLowerCase().includes(s));
+  }, [creators, q]);
+
+  return (
+    <Modal onClose={onClose} w="max-w-xl">
+      <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
+        <h2 className="text-[16px] font-display font-semibold text-gray-900">Новый чат</h2>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
+      </div>
+      <div className="px-5 py-3 border-b border-gray-200">
+        <div className="relative">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-300" />
+          <input className={inputCls + ' !pl-9'} placeholder="Поиск по нику или имени…" value={q} onChange={e => setQ(e.target.value)} />
+        </div>
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto scroll-thin p-3 flex flex-col gap-1.5">
+        {loading && <div className="text-center text-[13px] font-semibold text-gray-400 py-10">Загрузка авторов…</div>}
+        {!loading && list.length === 0 && <div className="text-center text-[13px] font-semibold text-gray-400 py-10">Авторы не найдены</div>}
+        {list.map(creator => {
+          const id = String(creator.accountid || creator.accountId || creator.id || '');
+          const hasChat = channels.some(c => String(c.author_id) === id);
+          const nick = creator.name || creator.Name || creator.handle || creator.username || 'Без имени';
+          const social = normalizeSocial(creator.platform || creator.Platform || 'Instagram');
+          const followers = Number(creator.followers ?? creator.subscribers_count ?? 0);
+          const hue = hashHue(id);
+          return (
+            <div key={id} className="flex items-center gap-3 px-3 py-2.5 rounded-xl border border-gray-100 hover:border-indigo-200 transition-colors">
+              <Avatar nick={nick} hue={hue} size={38} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[13.5px] font-bold text-gray-900 truncate">{nick}</span>
+                  <SocialIcon social={social} size={13} />
+                </div>
+                <div className="text-[11.5px] font-semibold text-gray-400">{social} · {fmtBig(followers)} подписчиков</div>
+              </div>
+              {hasChat ? (
+                <Badge tone="gray">Чат начат</Badge>
+              ) : (
+                <Btn size="sm" onClick={() => onStart(creator)}><MessageSquare size={13} />Написать</Btn>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Modal>
+  );
+}
+
 const selCls = inputCls + ' !w-44 !h-9.5 text-[12.5px] font-semibold';
+
+const fmtBig = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1).replace('.0', '').replace('.', ',')}M` : n.toLocaleString('ru-RU');
+
+const hashHue = (seed: string): number => {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) & 0x7fffffff;
+  return h % 360;
+};
 
 const formatMessageTime = (isoString: string): string => {
   const date = new Date(isoString);

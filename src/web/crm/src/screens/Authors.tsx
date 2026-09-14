@@ -1,14 +1,15 @@
 import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpDown, Briefcase, ChevronLeft, ChevronRight, MessageSquare, MoreVertical, RefreshCw, Search, Sparkles, Trash2, Users, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { SocialIcon } from '../components/icons';
-import { Avatar, Badge, Btn, Card, inputCls, Toggle, useToast } from '../components/ui';
-import { type Author, type Social } from '../data';
+import { Avatar, Badge, Btn, Card, inputCls, Modal, Toggle, useToast } from '../components/ui';
+import { type Author, type Deal, type Social } from '../data';
 import { api, normalizeSocial, STATUS_OPTIONS, type CreatorRecord } from '../services/api';
 
 type SortKey = 'nick' | 'social' | 'followers' | 'niche' | 'reach' | 'er' | 'cpm' | 'status';
 type SortOrder = 'asc' | 'desc';
 
-const statusTone: Record<Author['status'], string> = { 'Свободен': 'green', 'В сделке': 'blue', 'На паузе': 'gray', 'В архиве': 'gray' };
+type ActiveStatus = Exclude<Author['status'], 'На паузе'>;
+const statusTone: Record<ActiveStatus, string> = { 'Свободен': 'green', 'В сделке': 'blue', 'В архиве': 'gray' };
 const SOCIALS: Social[] = ['Instagram', 'VK', 'Telegram', 'TikTok', 'YouTube', 'Дзен'];
 const PAGE = 15;
 const DEFAULT_SEARCH_PORT = 8000;
@@ -21,6 +22,12 @@ function getSearchBaseUrl(): string {
 
 const fmtER = (n: number) => `${n.toFixed(1).replace('.', ',')}%`;
 const fmtBig = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1).replace('.0', '').replace('.', ',')}M` : n.toLocaleString('ru-RU');
+
+function computedStatus(a: Author, dealsCount: number): ActiveStatus {
+  if (a.status === 'В архиве') return 'В архиве';
+  if (dealsCount > 0) return 'В сделке';
+  return 'Свободен';
+}
 
 function formatNiche(niche: string): string {
   const parts = niche.split('>');
@@ -39,8 +46,10 @@ function toAuthor(rec: CreatorRecord): Author {
   const followers = Number(rec.followers ?? rec.subscribers_count ?? 0);
   const er = Number(rec.er ?? rec.static_avg_er ?? 0);
   const status = STATUS_OPTIONS.includes(rec.status ?? '') ? (rec.status as Author['status']) : 'Свободен';
+  const accountId = String(rec.accountid || rec.accountId || rec.id || '');
   return {
-    id: rec.id || rec.accountid || rec.accountId || '',
+    id: accountId,
+    twentyId: rec.id,
     nick: rec.name || rec.Name || rec.handle || rec.username || 'Без имени',
     social,
     followers,
@@ -66,7 +75,7 @@ function getPendingImportIds(): string[] {
   return Array.from(new Set(ids));
 }
 
-export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (id: string) => void; onNewDeal: (authorId: string) => void }) {
+export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }: { deals: Deal[]; onOpenProfile: (id: string) => void; onNewDeal: (authorId: string) => void; onOpenComms: () => void }) {
   const toast = useToast();
   const [authors, setAuthors] = useState<Author[]>([]);
   const [loading, setLoading] = useState(true);
@@ -81,7 +90,7 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   const [menu, setMenu] = useState<string | null>(null);
-  const [updating, setUpdating] = useState<string | null>(null);
+  const [confirmDeleteAuthor, setConfirmDeleteAuthor] = useState<Author | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -119,28 +128,27 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
     void run();
   }, []);
 
+  const dealsCountFor = (a: Author): number => deals.filter(d => String(d.authorId) === String(a.id) || (a.twentyId && String(d.authorId) === String(a.twentyId))).length;
+
   const changeStatus = async (a: Author, status: Author['status']) => {
-    setUpdating(a.id);
     try {
-      await api.updateCreatorStatus(a.id, status);
+      await api.updateCreatorStatus(a.twentyId || a.id, status);
       setAuthors(prev => prev.map(x => x.id === a.id ? { ...x, status } : x));
       toast('ok', `Статус ${a.nick} обновлён: ${status}`);
     } catch (err) {
       toast('err', err instanceof Error && err.message ? err.message : 'Не удалось обновить статус');
-    } finally {
-      setUpdating(null);
     }
   };
 
   const handleDeleteAuthor = async (a: Author) => {
-    if (a.deals > 0) {
-      setMenu(null);
+    setMenu(null);
+    setConfirmDeleteAuthor(null);
+    if (dealsCountFor(a) > 0) {
       toast('err', 'Нельзя удалить автора со сделками или перепиской. Отправьте его в архив.');
       return;
     }
-    setMenu(null);
     try {
-      await api.deleteCreator(a.id);
+      await api.deleteCreator(a.twentyId || a.id);
       setAuthors(prev => prev.filter(x => x.id !== a.id));
       toast('ok', `${a.nick} удалён из шортлиста`);
     } catch (err) {
@@ -251,7 +259,7 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
             <div className="text-[13px] font-medium text-gray-400 mt-1">Найдите авторов через сервис поиска и добавьте их в шортлист</div>
           </Card>
         ) : (
-          <Card className="overflow-hidden">
+          <Card className="overflow-visible">
             <div className="overflow-x-auto scroll-thin">
               <table className="w-full text-[12.5px] min-w-[960px]">
                 <thead>
@@ -287,14 +295,17 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
-                  {pageItems.map(a => (
+                  {pageItems.map((a, idx) => {
+                    const dealsCount = dealsCountFor(a);
+                    const openUp = pageItems.length > 2 && idx >= pageItems.length - 2;
+                    return (
                     <tr key={a.id} className="group hover:bg-indigo-50/40 transition-colors">
                       <td className="px-4 py-2.5">
                         <button onClick={e => { e.stopPropagation(); onOpenProfile(a.id); }} className="flex items-center gap-2.5 hover:text-indigo-600 transition-colors">
                           <Avatar nick={a.nick} hue={a.hue} size={30} />
                           <span className="text-left">
                             <span className="block font-bold text-gray-800 group-hover:text-indigo-600">{a.nick}</span>
-                            <span className="block text-[10.5px] font-semibold text-gray-400">{a.deals} сделок · ER {fmtER(a.er)}</span>
+                            <span className="block text-[10.5px] font-semibold text-gray-400">{dealsCount} сделок · ER {fmtER(a.er)}</span>
                           </span>
                         </button>
                       </td>
@@ -305,32 +316,39 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
                       <td className="px-4 py-2.5 font-bold text-emerald-600 tabular-nums">{fmtER(a.er)}</td>
                       <td className="px-4 py-2.5 font-bold text-gray-800 tabular-nums">{a.cpm} ₽</td>
                       <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
-                        <select
-                          value={a.status}
-                          disabled={updating === a.id}
-                          onChange={e => void changeStatus(a, e.target.value as Author['status'])}
-                          className="h-7.5 pl-2 pr-1 rounded-lg border border-gray-200 bg-white text-[11.5px] font-semibold text-gray-700 outline-none focus:border-indigo-400 disabled:opacity-50">
-                          {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
-                        </select>
+                        <Badge tone={statusTone[computedStatus(a, dealsCount)]}>{computedStatus(a, dealsCount)}</Badge>
                       </td>
                       <td className="px-4 py-2.5 text-right relative" onClick={e => e.stopPropagation()}>
                         <button className="w-7 h-7 rounded-lg text-gray-300 group-hover:text-gray-500 hover:bg-gray-100 inline-flex items-center justify-center transition-colors"
                           onClick={() => setMenu(m => m === a.id ? null : a.id)}><MoreVertical size={15} /></button>
                         {menu === a.id && (
-                          <div className="absolute right-4 top-9 z-30 w-48 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5 pop-in text-left">
+                          <div className={openUp
+                            ? "absolute right-4 bottom-8 z-30 w-48 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5 text-left origin-bottom-right"
+                            : "absolute right-4 top-9 z-30 w-48 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5 text-left origin-top-right"}>
                             <MenuItem icon={<Briefcase size={14} />} label="Новая сделка" onClick={() => { setMenu(null); onNewDeal(a.id); }} />
-                            <MenuItem icon={<MessageSquare size={14} />} label="Написать" onClick={() => { setMenu(null); toast('ok', `Чат с ${a.nick} открыт в Коммуникациях`); }} />
-                            {a.status !== 'В архиве' ? (
-                              <MenuItem icon={<Archive size={14} />} label="В архив" onClick={() => void changeStatus(a, 'В архиве')} />
-                            ) : (
+                            <MenuItem icon={<MessageSquare size={14} />} label="Написать" onClick={() => { setMenu(null); onOpenComms(); }} />
+                            <div className="h-px bg-gray-100 my-1" />
+                            {a.status === 'В архиве' ? (
                               <MenuItem icon={<ArchiveRestore size={14} />} label="Восстановить" onClick={() => void changeStatus(a, 'Свободен')} />
+                            ) : (
+                              <MenuItem icon={<Archive size={14} />} label="В архив" onClick={() => void changeStatus(a, 'В архиве')} />
                             )}
-                            <MenuItem icon={<Trash2 size={14} />} label="Удалить из шортлиста" danger onClick={() => void handleDeleteAuthor(a)} />
+                            <div className="h-px bg-gray-100 my-1" />
+                            <MenuItem icon={<Trash2 size={14} />} label="Удалить из шортлиста" danger blocked={dealsCount > 0}
+                              onClick={() => {
+                                setMenu(null);
+                                if (dealsCount > 0) {
+                                  toast('err', 'Нельзя удалить автора с историей сделок. Отправьте его в архив.');
+                                } else {
+                                  setConfirmDeleteAuthor(a);
+                                }
+                              }} />
                           </div>
                         )}
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                   {pageItems.length === 0 && (
                     <tr><td colSpan={9} className="px-4 py-14 text-center text-[13px] font-semibold text-gray-400">Никого не нашли — попробуйте смягчить фильтры</td></tr>
                   )}
@@ -351,13 +369,25 @@ export default function Authors({ onOpenProfile, onNewDeal }: { onOpenProfile: (
         )}
       </div>
 
+      {confirmDeleteAuthor && (
+        <Modal onClose={() => setConfirmDeleteAuthor(null)} w="max-w-md">
+          <div className="px-5 py-4">
+            <h3 className="text-[16px] font-bold text-gray-900">Удалить автора из шортлиста?</h3>
+            <p className="text-[13px] font-medium text-gray-500 mt-2">Автор @{confirmDeleteAuthor.nick} будет удален из рабочей базы. Это действие нельзя отменить.</p>
+          </div>
+          <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-gray-100">
+            <Btn variant="secondary" onClick={() => setConfirmDeleteAuthor(null)}>Отмена</Btn>
+            <Btn variant="danger" onClick={() => void handleDeleteAuthor(confirmDeleteAuthor)}>Удалить</Btn>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
 
-function MenuItem({ icon, label, onClick, danger }: { icon: React.ReactNode; label: string; onClick: () => void; danger?: boolean }) {
+function MenuItem({ icon, label, onClick, danger, blocked }: { icon: React.ReactNode; label: string; onClick: () => void; danger?: boolean; blocked?: boolean }) {
   return (
-    <button onClick={onClick} className={`w-full flex items-center gap-2.5 px-3.5 py-2 text-[12.5px] font-semibold text-left hover:bg-slate-50 transition-colors ${danger ? 'text-red-500' : 'text-gray-700'}`}>
+    <button onClick={onClick} className={`w-full flex items-center gap-2.5 px-3.5 py-2 text-[12.5px] font-semibold text-left hover:bg-slate-50 transition-colors ${danger ? 'text-red-500' : 'text-gray-700'} ${blocked ? 'opacity-40 cursor-not-allowed' : ''}`}>
       {icon}{label}
     </button>
   );

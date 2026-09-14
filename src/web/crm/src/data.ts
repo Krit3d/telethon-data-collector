@@ -6,6 +6,7 @@ export interface Author {
   id: string; nick: string; social: Social; followers: number; niche: string;
   reach: number; cpm: number; er: number; roas: number;
   status: 'Свободен' | 'В сделке' | 'На паузе' | 'В архиве'; hue: number; deals: number;
+  twentyId?: string;
 }
 
 export interface Product { name: string; desc: string; tags: string[]; hue: number }
