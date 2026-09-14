@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -479,3 +480,79 @@ class CrmLoginResponse(BaseModel):
 
 class CrmUpdateStatusRequest(BaseModel):
     status: str = Field(description="New status value for the creator")
+
+
+class DealAuthorSummary(BaseModel):
+    id: int
+    platform: str
+    username: str | None = None
+    title: str
+    subscribers_count: int | None = None
+    static_avg_er: float | None = None
+    category_path: str | None = None
+
+
+class DealMessageItem(BaseModel):
+    id: int
+    deal_id: int
+    sender_type: str
+    text: str
+    is_read: bool
+    created_at: datetime
+
+
+class DealItem(BaseModel):
+    id: int
+    user_id: int
+    account_id: int
+    title: str
+    stage: int
+    budget: int
+    type: str
+    brand_name: str | None = None
+    pub_date: str | None = None
+    terms: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    author: DealAuthorSummary | None = None
+    last_message: DealMessageItem | None = None
+    unread_count: int = 0
+
+
+class DealCreateRequest(BaseModel):
+    account_id: int | str
+    title: str
+    budget: int = 0
+    type: str = "Stories"
+    brand_name: str | None = None
+    pub_date: str | None = None
+    terms: str | None = None
+    initial_message: str | None = None
+
+
+class DealUpdateRequest(BaseModel):
+    title: str | None = None
+    stage: int | None = None
+    budget: int | None = None
+    type: str | None = None
+    brand_name: str | None = None
+    pub_date: str | None = None
+    terms: str | None = None
+
+
+class DealSendMessageRequest(BaseModel):
+    text: str
+    sender_type: str = "user"
+
+
+class CommunicationChannelItem(BaseModel):
+    deal_id: int
+    author_id: int
+    author_name: str
+    author_handle: str
+    platform: str
+    deal_title: str
+    stage: int
+    last_message: str
+    last_message_time: datetime
+    unread_count: int

@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { KanbanSquare, Briefcase, Users, MessageCircle, Tag, BookOpen, BarChart3, Bell, Plus, Search, Zap, X, Clapperboard, BellRing, ShieldAlert, PenTool, LogOut } from 'lucide-react';
-import { DEALS_INIT, BRANDS, AUTHORS, STAGES, authorById, brandById, fmtMoney, type Deal } from './data';
+import { BRANDS, AUTHORS, STAGES, authorById, brandById, fmtMoney, type Deal } from './data';
 import { ToastProvider, useToast, Badge, Avatar, Btn, Modal, Field, inputCls } from './components/ui';
 import LoginModal from './components/LoginModal';
-import { api, userName, userHandle } from './services/api';
+import { api, mapDealItemToDeal, userName, userHandle, type CreatorRecord } from './services/api';
 import Kanban from './screens/Kanban';
 import DealPanel from './screens/DealPanel';
 import KnowledgeBase from './screens/KnowledgeBase';
@@ -46,7 +46,7 @@ const NOTIFS = [
 function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLogout: () => void }) {
   const toast = useToast();
   const [screen, setScreen] = useState<Screen>(screenFromHash);
-  const [deals, setDeals] = useState<Deal[]>(DEALS_INIT);
+  const [deals, setDeals] = useState<Deal[]>([]);
   const [dealId, setDealId] = useState<string | null>(null);
   const [dealTab, setDealTab] = useState<string | undefined>(undefined);
   const [wizardDeal, setWizardDeal] = useState<Deal | null>(null);
@@ -76,6 +76,12 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
     sync();
     window.addEventListener('hashchange', sync);
     return () => window.removeEventListener('hashchange', sync);
+  }, []);
+
+  useEffect(() => {
+    api.getDeals()
+      .then(items => setDeals(items.map(mapDealItemToDeal)))
+      .catch(() => toast('err', 'Не удалось загрузить сделки'));
   }, []);
 
   const openDeal = (id: string, tab?: string) => { setDealTab(tab); setDealId(id); };
@@ -163,7 +169,7 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
           {screen === 'deals' && <DealsList deals={deals} onOpenDeal={openDeal} />}
           {screen === 'authors' && <Authors onOpenProfile={id => { setProfileId(id); setScreen('author'); }} onNewDeal={id => setNewDeal({ authorId: id })} />}
           {screen === 'author' && <AuthorProfile authorId={profileId} deals={deals} onBack={() => setScreen('authors')} onNewDeal={id => setNewDeal({ authorId: id })} onOpenDeal={openDeal} />}
-          {screen === 'comms' && <CommsList deals={deals} />}
+          {screen === 'comms' && <CommsList deals={deals} onOpenDeal={openDeal} />}
           {screen === 'erid' && <Erid deals={deals} onOpenDeal={openDeal} />}
           {screen === 'kb' && <KnowledgeBase initialBrandId={kbBrand} key={kbBrand ?? 'kb'} />}
           {screen === 'pubs' && <Publications onOpenDeal={openDeal} />}
@@ -176,7 +182,12 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
         <DealPanel deal={deal} deals={deals} initialTab={dealTab} key={deal.id + (dealTab ?? '')} onClose={() => setDealId(null)}
           onUpdate={patch => setDeals(prev => prev.map(d => d.id === deal.id ? { ...d, ...patch } : d))}
           onOpenKB={openKB}
-          onGenerateContract={d => { setDealId(null); setWizardDeal(d); }} />
+          onGenerateContract={d => { setDealId(null); setWizardDeal(d); }}
+          onDelete={deletedId => {
+            setDeals(prev => prev.filter(d => d.id !== deletedId));
+            setDealId(null);
+            toast('ok', 'Сделка успешно удалена');
+          }} />
       )}
       {wizardDeal && <ContractWizard deal={wizardDeal} onClose={() => setWizardDeal(null)} onDone={() => setWizardDeal(null)} />}
       {newDeal && <NewDealModal initialAuthor={newDeal.authorId} onClose={() => setNewDeal(null)} onCreate={d => {
@@ -198,24 +209,74 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
 }
 
 /* ===== Модальное окно «Новая сделка» ===== */
+const getDefaultPubDate = (daysAhead: number = 14): string => {
+  const d = new Date();
+  d.setDate(d.getDate() + daysAhead);
+  return d.toISOString().split('T')[0];
+};
+
+const buildAuthorOptions = (records: CreatorRecord[]): { id: string; label: string; handle: string }[] => {
+  return records.flatMap(c => {
+    const rawId = String(c.accountid ?? c.accountId ?? c.id ?? '').trim();
+    if (!rawId || rawId === 'undefined' || rawId === 'null') return [];
+    const rawHandle = c.handle ?? c.username;
+    const handle = rawHandle ? (rawHandle.startsWith('@') ? rawHandle : `@${rawHandle}`) : '';
+    const label = handle
+      ? `${handle}${c.name ? ` (${c.name.slice(0, 30)})` : ''}`
+      : (c.name ?? 'Автор без имени');
+    return [{ id: rawId, label, handle }];
+  });
+};
+
 function NewDealModal({ initialAuthor, onClose, onCreate }: { initialAuthor?: string; onClose: () => void; onCreate: (d: Deal) => void }) {
+  const toast = useToast();
   const [title, setTitle] = useState('');
-  const [authorId, setAuthorId] = useState(initialAuthor ?? AUTHORS[0].id);
+  const [creators, setCreators] = useState<CreatorRecord[]>([]);
+  const [authorId, setAuthorId] = useState(initialAuthor ?? '');
   const [brandId, setBrandId] = useState(BRANDS[0].id);
   const [budget, setBudget] = useState('50000');
   const [type, setType] = useState<Deal['type']>('Stories');
-  const [pubDate, setPubDate] = useState('2024-10-15');
-  const a = authorById(authorId), b = brandById(brandId);
+  const [pubDate, setPubDate] = useState(getDefaultPubDate(14));
+  const [customBrand, setCustomBrand] = useState('');
+  const [isCustomBrand, setIsCustomBrand] = useState(false);
+  const b = brandById(brandId);
+  const finalBrandName = isCustomBrand ? (customBrand.trim() || 'Свой бренд') : b.name;
 
-  const create = () => {
-    onCreate({
-      id: 'd' + Date.now(),
-      title: title.trim() || `Интеграция с ${a.nick} — ${b.name}`,
-      brandId, authorId, budget: Number(budget) || 50000, type,
-      stage: 1, date: new Date().toLocaleDateString('ru-RU'), pubDate: new Date(pubDate).toLocaleDateString('ru-RU'),
-      msgs: [], desc: 'Описание и ТЗ будут добавлены на этапе согласования.', terms: `Фиксированная оплата ${fmtMoney(Number(budget) || 50000)}`,
-      exclusive: false, edits: 2,
-    });
+  useEffect(() => {
+    api.getCreators()
+      .then(records => {
+        setCreators(records);
+        const options = buildAuthorOptions(records);
+        if (options.length > 0 && !options.some(o => o.id === authorId)) {
+          setAuthorId(options[0].id);
+        }
+      })
+      .catch(() => toast('err', 'Не удалось загрузить авторов'));
+  }, []);
+
+  const authorOptions = buildAuthorOptions(creators);
+  const currentOption = authorOptions.find(o => o.id === authorId);
+  const fallbackTitle = `${finalBrandName} · ${type} · ${currentOption?.handle || currentOption?.label || 'Автор'}`.slice(0, 250);
+
+  const create = async () => {
+    if (!authorId.trim()) {
+      toast('err', 'Выберите автора');
+      return;
+    }
+    try {
+      const item = await api.createDeal({
+        account_id: authorId.trim(),
+        title: title.trim() ? title.trim().slice(0, 250) : fallbackTitle,
+        budget: Number(budget) || 0,
+        type,
+        brand_name: finalBrandName,
+        pub_date: pubDate,
+        terms: `${b.payTypes.find(p => p.def)?.label ?? 'Фиксированная оплата'} ${budget} ₽`,
+      });
+      onCreate(mapDealItemToDeal(item));
+    } catch {
+      toast('err', 'Не удалось создать сделку');
+    }
   };
 
   return (
@@ -225,18 +286,24 @@ function NewDealModal({ initialAuthor, onClose, onCreate }: { initialAuthor?: st
         <button onClick={onClose} className="ml-auto text-gray-300 hover:text-gray-600"><X size={18} /></button>
       </div>
       <div className="p-5 flex flex-col gap-4">
-        <Field label="Название"><input className={inputCls} autoFocus placeholder={`Интеграция с ${a.nick}…`} value={title} onChange={e => setTitle(e.target.value)} /></Field>
+        <Field label="Название"><input className={inputCls} autoFocus placeholder={fallbackTitle} value={title} onChange={e => setTitle(e.target.value)} /></Field>
         <div className="grid grid-cols-2 gap-4">
           <Field label="Автор">
             <select className={inputCls} value={authorId} onChange={e => setAuthorId(e.target.value)}>
-              {AUTHORS.slice(0, 20).map(x => <option key={x.id} value={x.id}>{x.nick} · {x.social}</option>)}
+              {authorOptions.map(x => <option key={x.id} value={x.id}>{x.label}</option>)}
             </select>
           </Field>
           <Field label="Бренд">
-            <select className={inputCls} value={brandId} onChange={e => setBrandId(e.target.value)}>
+            <select className={inputCls} value={brandId} onChange={e => { setBrandId(e.target.value); setIsCustomBrand(e.target.value === 'custom'); }}>
               {BRANDS.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+              <option value="custom">+ Свой бренд...</option>
             </select>
           </Field>
+          {isCustomBrand && (
+            <Field label="Название бренда">
+              <input className={inputCls} placeholder="Введите название бренда или кампании..." value={customBrand} onChange={e => setCustomBrand(e.target.value)} />
+            </Field>
+          )}
           <Field label="Бюджет, ₽"><input className={inputCls + ' tabular-nums'} type="number" value={budget} onChange={e => setBudget(e.target.value)} /></Field>
           <Field label="Тип контента">
             <select className={inputCls} value={type} onChange={e => setType(e.target.value as Deal['type'])}>
@@ -251,7 +318,7 @@ function NewDealModal({ initialAuthor, onClose, onCreate }: { initialAuthor?: st
       </div>
       <div className="px-5 py-4 border-t border-gray-100 flex justify-end gap-2 bg-slate-50/50">
         <Btn variant="ghost" onClick={onClose}>Отмена</Btn>
-        <Btn onClick={create}><Plus size={14} />Создать сделку</Btn>
+        <Btn onClick={create} disabled={authorOptions.length === 0}><Plus size={14} />Создать сделку</Btn>
       </div>
     </Modal>
   );
@@ -323,6 +390,16 @@ function Row({ left, main, sub, onClick }: { left: React.ReactNode; main: string
 export default function App() {
   const [user, setUser] = useState<Record<string, unknown> | null>(() => api.getCurrentUser());
   const [authed, setAuthed] = useState<boolean>(() => api.isAuthenticated());
+
+  useEffect(() => {
+    const onAuthExpired = () => {
+      setUser(null);
+      setAuthed(false);
+      window.location.hash = '';
+    };
+    window.addEventListener('creatorflow:auth_expired', onAuthExpired);
+    return () => window.removeEventListener('creatorflow:auth_expired', onAuthExpired);
+  }, []);
 
   const handleLogin = (loggedIn: Record<string, unknown>) => {
     setUser(loggedIn);

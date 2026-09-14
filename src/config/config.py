@@ -350,6 +350,10 @@ class Settings(BaseSettings):
         default="http://localhost:3001",
         description="Public URL of the CRM frontend interface",
     )
+    secret_key: str = Field(
+        default="",
+        description="Secret key used to sign and verify JWT access tokens",
+    )
 
     # ---- Channel sourcing ----
     channels_file: Path = Field(

@@ -404,8 +404,112 @@ class User(Base):
         nullable=False,
     )
 
+    deals: Mapped[list["Deal"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email})>"
+
+
+class Deal(Base):
+    __tablename__ = "deals"
+    __table_args__ = (
+        Index("ix_deals_user_stage", "user_id", "stage"),
+        Index("ix_deals_user_account", "user_id", "account_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    stage: Mapped[int] = mapped_column(
+        SmallInteger,
+        default=1,
+        server_default="1",
+        nullable=False,
+        index=True,
+    )
+    budget: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    type: Mapped[str] = mapped_column(
+        String(50),
+        default="Stories",
+        server_default="Stories",
+        nullable=False,
+    )
+    brand_name: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, default=None
+    )
+    pub_date: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, default=None
+    )
+    terms: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    user: Mapped["User"] = relationship(back_populates="deals")
+    account: Mapped["Account"] = relationship(lazy="joined")
+    messages: Mapped[list["DealMessage"]] = relationship(
+        back_populates="deal",
+        cascade="all, delete-orphan",
+        order_by="DealMessage.created_at.asc()",
+    )
+
+
+class DealMessage(Base):
+    __tablename__ = "deal_messages"
+    __table_args__ = (
+        Index("ix_deal_messages_deal_id_created_at", "deal_id", "created_at"),
+        Index("ix_deal_messages_deal_unread", "deal_id", "is_read"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    deal_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("deals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sender_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    is_read: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+
+    deal: Mapped["Deal"] = relationship(back_populates="messages")
 
 
 # Backward compatibility alias for legacy Channel class references

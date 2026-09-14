@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { X, Share2, MoreHorizontal, Pencil, Paperclip, Send, Upload, FileText, Check, ShieldCheck, BookOpen, Bold, Italic, List, Image as ImageIcon, FilePlus2, MessageCircle } from 'lucide-react';
-import { STAGES, fmtMoney, authorById, brandById, type Deal, type DealMsg } from '../data';
-import { SidePanel, Badge, Avatar, Btn, Tabs, useToast, Tip, CopyBtn, Field, inputCls } from '../components/ui';
+import { X, Share2, MoreHorizontal, Trash2, Paperclip, Send, Upload, Check, ShieldCheck, BookOpen, Bold, Italic, List, Image as ImageIcon, FilePlus2, MessageCircle } from 'lucide-react';
+import { STAGES, fmtMoney, resolveAuthor, brandById, type Deal, type DealMsg } from '../data';
+import { SidePanel, Badge, Avatar, Btn, Tabs, useToast, Tip, CopyBtn, Field, inputCls, Modal } from '../components/ui';
 import { SocialIcon, FakeQR } from '../components/icons';
+import { api, type DealMessageItem } from '../services/api';
 
-export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, onOpenKB, onGenerateContract }: {
+export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, onOpenKB, onGenerateContract, onDelete }: {
   deal: Deal;
   deals: Deal[];
   initialTab?: string;
@@ -12,25 +13,43 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
   onUpdate: (patch: Partial<Deal>) => void;
   onOpenKB: (brandId?: string) => void;
   onGenerateContract: (deal: Deal) => void;
+  onDelete?: (dealId: string) => void;
 }) {
   const toast = useToast();
   const [tab, setTab] = useState(initialTab ?? 'overview');
   const [msg, setMsg] = useState('');
   const [uploading, setUploading] = useState<number | null>(null);
   const [checkOk, setCheckOk] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const chatRef = useRef<HTMLDivElement>(null);
-  const a = authorById(deal.authorId), b = brandById(deal.brandId);
+  const a = resolveAuthor(deal), b = brandById(deal.brandId);
   const stage = STAGES.find(s => s.id === deal.stage)!;
 
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: 'smooth' }); }, [deal.msgs.length, tab]);
 
+  useEffect(() => {
+    if (tab !== 'comms') return;
+    api.getDealMessages(Number(deal.id))
+      .then(items => onUpdate({ msgs: items.map(toDealMsg) }))
+      .catch(() => toast('err', 'Не удалось загрузить сообщения'));
+  }, [tab, deal.id]);
+
   const send = () => {
     if (!msg.trim()) return;
-    const t = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-    const m: DealMsg = { id: 'm' + Date.now(), kind: 'out', text: msg.trim(), time: t };
-    onUpdate({ msgs: [...deal.msgs, m] });
+    const text = msg.trim();
     setMsg('');
-    toast('ok', 'Сообщение отправлено автору');
+    api.sendDealMessage(Number(deal.id), text)
+      .then(m => onUpdate({ msgs: [...deal.msgs, toDealMsg(m)] }))
+      .catch(() => toast('err', 'Не удалось отправить сообщение'));
+  };
+
+  const confirmDelete = () => {
+    setDeleting(true);
+    api.deleteDeal(Number(deal.id))
+      .then(() => { onDelete?.(deal.id); onClose(); })
+      .catch(() => { setDeleting(false); setConfirmDeleteOpen(false); toast('err', 'Не удалось удалить сделку'); });
   };
 
   const startUpload = () => {
@@ -51,29 +70,43 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
       {/* Шапка */}
       <div className="px-5 py-4 border-b border-gray-100 shrink-0">
         <div className="flex items-start gap-3">
-          <div className="min-w-0 flex-1">
-            <h2 className="text-[16px] font-bold text-gray-900 leading-snug">{deal.title}</h2>
-            <div className="flex items-center gap-2 mt-2">
-              <div className="relative">
-                <select
-                  value={deal.stage}
-                  onChange={e => { onUpdate({ stage: Number(e.target.value) }); toast('ok', `Статус: «${STAGES.find(s => s.id === Number(e.target.value))?.name}»`); }}
-                  className="appearance-none pl-6.5 pr-7 h-8 rounded-lg border border-gray-200 bg-white text-[12.5px] font-bold text-gray-800 cursor-pointer hover:border-gray-300 transition-colors outline-none">
-                  {STAGES.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                </select>
-                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 w-2 h-2 rounded-full pointer-events-none" style={{ background: stage.color }} />
-                <span className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none text-[10px]">▾</span>
-              </div>
-              <Badge tone="gray">{deal.date}</Badge>
-              <Badge tone={deal.type === 'Stories' ? 'violet' : deal.type === 'Reels' ? 'sky' : deal.type === 'Видео' ? 'red' : 'indigo'}>{deal.type}</Badge>
-            </div>
+          <h2 className="flex-1 min-w-0 text-[17px] font-bold text-gray-900 leading-snug break-words">{deal.title}</h2>
+          <button onClick={onClose} className="w-8 h-8 rounded-lg text-gray-300 hover:text-gray-600 hover:bg-gray-100 flex items-center justify-center shrink-0"><X size={18} /></button>
+        </div>
+        <div className="flex items-center gap-2 mt-2">
+          <div className="relative">
+            <select
+              value={deal.stage}
+              onChange={e => {
+                const newStage = Number(e.target.value);
+                const oldStage = deal.stage;
+                onUpdate({ stage: newStage });
+                api.updateDeal(Number(deal.id), { stage: newStage })
+                  .then(() => toast('ok', `Статус: «${STAGES.find(s => s.id === newStage)?.name}»`))
+                  .catch(() => { onUpdate({ stage: oldStage }); toast('err', 'Не удалось обновить стадию'); });
+              }}
+              className="appearance-none pl-6.5 pr-7 h-8 rounded-lg border border-gray-200 bg-white text-[12.5px] font-bold text-gray-800 cursor-pointer hover:border-gray-300 transition-colors outline-none">
+              {STAGES.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+            <span className="absolute left-2.5 top-1/2 -translate-y-1/2 w-2 h-2 rounded-full pointer-events-none" style={{ background: stage.color }} />
+            <span className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none text-[10px]">▾</span>
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          <Badge tone="gray">{deal.date}</Badge>
+          <Badge tone={deal.type === 'Stories' ? 'violet' : deal.type === 'Reels' ? 'sky' : deal.type === 'Видео' ? 'red' : 'indigo'}>{deal.type}</Badge>
+          <div className="flex items-center gap-1 ml-auto shrink-0">
             <Btn variant="outline" size="sm" onClick={() => setTab('comms')}><MessageCircle size={14} />Написать автору</Btn>
-            <Btn variant="ghost" size="sm" onClick={() => toast('info', 'Режим редактирования включён')}><Pencil size={14} />Редактировать</Btn>
-            <Btn variant="ghost" size="sm" onClick={() => { navigator.clipboard?.writeText(location.href + '#' + deal.id).catch(() => {}); toast('ok', 'Ссылка на сделку скопирована'); }}><Share2 size={14} />Поделиться</Btn>
-            <button className="w-8 h-8 rounded-lg text-gray-400 hover:bg-gray-100 flex items-center justify-center" onClick={() => toast('info', 'Действия: в архив, дублировать, удалить')}><MoreHorizontal size={16} /></button>
-            <button onClick={onClose} className="w-8 h-8 rounded-lg text-gray-300 hover:text-gray-600 hover:bg-gray-100 flex items-center justify-center"><X size={18} /></button>
+            <div className="relative">
+              <button className="w-8 h-8 rounded-lg text-gray-400 hover:bg-gray-100 flex items-center justify-center" onClick={() => setMenuOpen(!menuOpen)}><MoreHorizontal size={16} /></button>
+              {menuOpen && (
+                <>
+                  <div className="fixed inset-0 z-20" onClick={() => setMenuOpen(false)} />
+                  <div className="absolute right-0 top-full mt-1 z-30 bg-white rounded-xl border border-gray-200 shadow-lg min-w-[210px] py-1">
+                    <button onClick={() => { setMenuOpen(false); navigator.clipboard?.writeText(location.href + '#' + deal.id).catch(() => {}); toast('ok', 'Ссылка скопирована'); }} className="w-full flex items-center gap-2 px-3 py-2 text-[13px] font-medium text-gray-700 hover:bg-gray-50 transition-colors"><Share2 size={14} />Копировать ссылку</button>
+                    <button onClick={() => { setMenuOpen(false); setConfirmDeleteOpen(true); }} className="w-full flex items-center gap-2 px-3 py-2 text-[13px] font-medium text-red-600 hover:bg-red-50 transition-colors"><Trash2 size={14} />Удалить сделку</button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -166,18 +199,12 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
             </div>
             <div ref={chatRef} className="flex-1 min-h-0 overflow-y-auto scroll-thin p-5 flex flex-col gap-3 bg-slate-50/50">
               {deal.msgs.length === 0 && <div className="m-auto text-center text-[12.5px] font-semibold text-gray-400">Сообщений пока нет — напишите автору первым</div>}
-              {deal.msgs.map(m => m.kind === 'sys' ? (
-                <div key={m.id} className="self-center max-w-[80%] text-center">
-                  <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-violet-600 bg-violet-50 border border-violet-100 rounded-full px-3 py-1">
-                    <FileText size={11} />{m.text} · {m.time}
-                  </span>
-                </div>
-              ) : (
-                <div key={m.id} className={`flex ${m.kind === 'out' ? 'justify-end' : 'justify-start'}`}>
+              {deal.msgs.map(m => (
+                <div key={m.id} className={`flex ${m.from === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <div className={`relative max-w-[75%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ${
-                    m.kind === 'out' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md'}`}>
+                    m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md'}`}>
                     {m.text}
-                    <span className={`block text-[10px] font-semibold mt-1 text-right ${m.kind === 'out' ? 'text-indigo-200' : 'text-gray-300'}`}>{m.time} {m.kind === 'out' && '✓✓'}</span>
+                    <span className={`block text-[10px] font-semibold mt-1 text-right ${m.from === 'user' ? 'text-indigo-200' : 'text-gray-300'}`}>{m.time} {m.from === 'user' && '✓✓'}</span>
                   </div>
                 </div>
               ))}
@@ -339,9 +366,28 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
           </div>
         )}
       </div>
+      {confirmDeleteOpen && (
+        <Modal onClose={() => setConfirmDeleteOpen(false)}>
+          <div className="px-5 py-4">
+            <h3 className="text-[16px] font-bold text-gray-900">Удалить сделку?</h3>
+            <p className="text-[13px] font-medium text-gray-600 leading-relaxed mt-2">Вы уверены, что хотите удалить сделку «{deal.title}»? Вся переписка и условия будут удалены безвозвратно.</p>
+          </div>
+          <div className="flex justify-end gap-2 px-5 py-3 border-t border-gray-100 shrink-0">
+            <Btn variant="secondary" onClick={() => setConfirmDeleteOpen(false)}>Отмена</Btn>
+            <Btn variant="danger" disabled={deleting} onClick={confirmDelete}>Удалить</Btn>
+          </div>
+        </Modal>
+      )}
     </SidePanel>
   );
 }
+
+const toDealMsg = (m: DealMessageItem): DealMsg => ({
+  id: String(m.id),
+  from: m.sender_type === 'creator' ? 'author' : 'user',
+  text: m.text,
+  time: new Date(m.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+});
 
 function Info({ label, v }: { label: string; v: React.ReactNode }) {
   return (

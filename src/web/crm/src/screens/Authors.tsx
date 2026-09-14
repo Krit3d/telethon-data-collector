@@ -14,12 +14,6 @@ const PAGE = 15;
 const DEFAULT_SEARCH_PORT = 8000;
 
 function getSearchBaseUrl(): string {
-  const configured = import.meta.env.VITE_SEARCH_URL;
-  if (configured) {
-    let base = configured;
-    while (base.endsWith('/')) base = base.slice(0, -1);
-    return base;
-  }
   const host = window.location.hostname;
   if (host) return `${window.location.protocol}//${host}:${DEFAULT_SEARCH_PORT}`;
   return `http://localhost:${DEFAULT_SEARCH_PORT}`;

@@ -19,7 +19,7 @@ export interface Brand {
   allowed: string[]; forbidden: string[]; mentions: string[]; payTypes: PayType[];
 }
 
-export interface DealMsg { id: string; kind: 'in' | 'out' | 'sys'; text: string; time: string }
+export interface DealMsg { id: string; from: 'author' | 'user'; text: string; time: string }
 
 export interface Deal {
   id: string; title: string; brandId: string; authorId: string; budget: number;
@@ -27,6 +27,7 @@ export interface Deal {
   stage: number; date: string; pubDate: string;
   msgs: DealMsg[]; file?: string; erid?: string;
   desc: string; terms: string; exclusive: boolean; edits: number;
+  authorSummary?: { id: number; platform: string; username: string | null; title: string; subscribers_count: number | null; static_avg_er: number | null; category_path: string | null } | null;
 }
 
 export interface EridRec {
@@ -280,20 +281,20 @@ export const BRANDS: Brand[] = [
 ];
 
 /* ================= СДЕЛКИ ================= */
-const M = (id: string, kind: DealMsg['kind'], text: string, time: string): DealMsg => ({ id, kind, text, time });
+const M = (id: string, from: DealMsg['from'], text: string, time: string): DealMsg => ({ id, from, text, time });
 
 export const DEALS_INIT: Deal[] = [
   {
     id: 'd1', title: 'Промо кроссовок Air Max — Reels', brandId: 'b2', authorId: 'a4', budget: 120000,
     type: 'Reels', stage: 1, date: '19.09.2024', pubDate: '10.10.2024',
-    msgs: [M('m1', 'in', 'Здравствуйте! Какие сроки по интеграции Air Max?', '12:04')],
+    msgs: [M('m1', 'author', 'Здравствуйте! Какие сроки по интеграции Air Max?', '12:04')],
     desc: 'Reels 30–45 секунд с демонстрацией новой расцветки Air Max Dn. Акцент на комфорт в путешествиях, съёмка в аэропорту и городе.',
     terms: 'Фиксированная оплата 120 000 ₽', exclusive: false, edits: 2,
   },
   {
     id: 'd2', title: 'Детская линия шампуней — подборка', brandId: 'b4', authorId: 'a5', budget: 35000,
     type: 'Пост', stage: 1, date: '18.09.2024', pubDate: '05.10.2024',
-    msgs: [M('m1', 'in', 'Добрый день! Интересует формат поста с подборкой для мам', '09:12')],
+    msgs: [M('m1', 'author', 'Добрый день! Интересует формат поста с подборкой для мам', '09:12')],
     desc: 'Пост-подборка «5 средств для купания малышей» с органичным включением Botanic Therapy Kids.',
     terms: 'Фиксированная оплата 35 000 ₽', exclusive: false, edits: 1,
   },
@@ -307,7 +308,7 @@ export const DEALS_INIT: Deal[] = [
   {
     id: 'd4', title: 'Подборка ПП-продуктов в Stories', brandId: 'b6', authorId: 'a7', budget: 28000,
     type: 'Stories', stage: 1, date: '16.09.2024', pubDate: '28.09.2024',
-    msgs: [M('m1', 'out', 'Добрый день! Отправили бриф по подборке продуктов, посмотрите 🙌', '15:40')],
+    msgs: [M('m1', 'user', 'Добрый день! Отправили бриф по подборке продуктов, посмотрите 🙌', '15:40')],
     desc: 'Серия из 5 Stories: заказ ПП-продуктов в Ozon Fresh, распаковка, приготовление.',
     terms: 'Фиксированная оплата 28 000 ₽ + промокод VEGAN10', exclusive: false, edits: 1,
   },
@@ -315,9 +316,9 @@ export const DEALS_INIT: Deal[] = [
     id: 'd5', title: 'Рекламная интеграция — крем для лица', brandId: 'b1', authorId: 'a1', budget: 45000,
     type: 'Stories', stage: 2, date: '15.09.2024', pubDate: '30.09.2024', file: 'Договор_2024.docx',
     msgs: [
-      M('m1', 'in', 'Добрый день! Готова обсудить условия', '10:30'),
-      M('m2', 'out', 'Отлично, высылаю ТЗ и бюджет', '10:45'),
-      M('m3', 'sys', 'Менеджер прикрепил файл договора', '10:46'),
+      M('m1', 'author', 'Добрый день! Готова обсудить условия', '10:30'),
+      M('m2', 'user', 'Отлично, высылаю ТЗ и бюджет', '10:45'),
+      M('m3', 'author', 'Менеджер прикрепил файл договора', '10:46'),
     ],
     desc: 'Серия из 4 Stories: проблема → знакомство с Revitalift Филлер → нанесение → результат через 4 недели (архивные кадры). ERID в первых 3 кадрах.',
     terms: 'Фиксированная оплата 45 000 ₽ + 2 ₽ за просмотр свыше 100K', exclusive: false, edits: 2,
@@ -326,8 +327,8 @@ export const DEALS_INIT: Deal[] = [
     id: 'd6', title: 'Galaxy S24 Ultra — большой видеообзор', brandId: 'b3', authorId: 'a2', budget: 240000,
     type: 'Видео', stage: 2, date: '14.09.2024', pubDate: '12.10.2024',
     msgs: [
-      M('m1', 'in', 'Готов взять обзор, но нужна техника до 25.09', '18:22'),
-      M('m2', 'out', 'Доставим курьером 23.09, курьер согласует время', '18:51'),
+      M('m1', 'author', 'Готов взять обзор, но нужна техника до 25.09', '18:22'),
+      M('m2', 'user', 'Доставим курьером 23.09, курьер согласует время', '18:51'),
     ],
     desc: 'Ролик 12–15 минут: камера (сравнение с S23 Ultra), Galaxy AI в реальных задачах, автономность. Интеграция 60–90 секунд в начале.',
     terms: 'Фиксированная оплата 240 000 ₽, выплата 50/50', exclusive: true, edits: 2,
@@ -335,14 +336,14 @@ export const DEALS_INIT: Deal[] = [
   {
     id: 'd7', title: 'Stories-серия: тренировки в Nike Zoom 2', brandId: 'b2', authorId: 'a9', budget: 60000,
     type: 'Stories', stage: 2, date: '13.09.2024', pubDate: '07.10.2024',
-    msgs: [M('m1', 'sys', 'Автор запросил 42 размер для съёмки', '11:02')],
+    msgs: [M('m1', 'author', 'Автор запросил 42 размер для съёмки', '11:02')],
     desc: '6 Stories: утренний забег, ощущения от амортизации, замеры темпа через Nike Run Club.',
     terms: 'Фиксированная оплата 60 000 ₽ + пара кроссовок (бартер)', exclusive: false, edits: 1,
   },
   {
     id: 'd8', title: 'Reels: макияж Paris Fashion Week', brandId: 'b1', authorId: 'a10', budget: 180000,
     type: 'Reels', stage: 3, date: '11.09.2024', pubDate: '20.10.2024', file: 'ТЗ_PFW.pdf',
-    msgs: [M('m1', 'in', 'ТЗ посмотрела, есть вопрос по хэштегам — можно свои?', '14:17')],
+    msgs: [M('m1', 'author', 'ТЗ посмотрела, есть вопрос по хэштегам — можно свои?', '14:17')],
     desc: "Reels 30 секунд: 3 образа с показа на базе продуктов L'Oréal Paris. Титры с названиями средств, ERID в описании и на 1 кадре.",
     terms: 'Фиксированная оплата 180 000 ₽', exclusive: false, edits: 2,
   },
@@ -357,7 +358,7 @@ export const DEALS_INIT: Deal[] = [
     id: 'd10', title: 'Интеграция: Galaxy Tab в дороге', brandId: 'b3', authorId: 'a11', budget: 110000,
     type: 'Видео', stage: 4, date: '08.09.2024', pubDate: '05.10.2024', file: 'Договор_Samsung_08.09.pdf',
     erid: 'ERID-1694683200-A7B3C9D2E1',
-    msgs: [M('m1', 'sys', 'Договор подписан обеими сторонами', '16:30')],
+    msgs: [M('m1', 'author', 'Договор подписан обеими сторонами', '16:30')],
     desc: 'Интеграция 45 секунд в ролик об автопутешествии: планшет как навигатор и развлечение для пассажиров.',
     terms: 'Фиксированная оплата 110 000 ₽', exclusive: false, edits: 1,
   },
@@ -365,7 +366,7 @@ export const DEALS_INIT: Deal[] = [
     id: 'd11', title: 'Стрим + пост: Poco X6 для геймеров', brandId: 'b5', authorId: 'a12', budget: 75000,
     type: 'Пост', stage: 4, date: '07.09.2024', pubDate: '02.10.2024', file: 'Договор_Xiaomi_07.09.pdf',
     erid: 'ERID-1694596800-C5D1E9F3A4',
-    msgs: [M('m1', 'sys', 'Договор на подписи у автора', '10:15')],
+    msgs: [M('m1', 'author', 'Договор на подписи у автора', '10:15')],
     desc: 'Часовой стрим с геймплеем на Poco X6 + закреп с результатами FPS-тестов.',
     terms: 'Фикс 50 000 ₽ + 25 000 ₽ при 200K просмотров стрима', exclusive: false, edits: 1,
   },
@@ -373,7 +374,7 @@ export const DEALS_INIT: Deal[] = [
     id: 'd12', title: 'Пост: доставка Ozon Fresh за 15 минут', brandId: 'b6', authorId: 'a6', budget: 40000,
     type: 'Пост', stage: 5, date: '01.09.2024', pubDate: '12.09.2024', file: 'Акт_FOODIE.pdf',
     erid: 'ERID-1694509800-B8C4D0E3F2',
-    msgs: [M('m1', 'sys', 'Контент опубликован, метрики синхронизированы', '13:00')],
+    msgs: [M('m1', 'author', 'Контент опубликован, метрики синхронизированы', '13:00')],
     desc: 'Пост с таймлапсом заказа: корзина → курьер → стол накрыт. Промокод FOODIE15.',
     terms: 'Фиксированная оплата 40 000 ₽', exclusive: false, edits: 1,
   },
@@ -464,3 +465,17 @@ export const TEMPLATES: Template[] = [
 export const authorById = (id: string) => AUTHORS.find(a => a.id === id) ?? AUTHORS[0];
 export const brandById = (id: string) => BRANDS.find(b => b.id === id) ?? BRANDS[0];
 export const dealById = (deals: Deal[], id: string) => deals.find(d => d.id === id);
+
+export const resolveAuthor = (deal: Deal): Pick<Author, 'nick' | 'social' | 'hue' | 'followers' | 'er'> => {
+  if (deal.authorSummary) {
+    const s = deal.authorSummary;
+    return {
+      nick: s.username ? (s.username.startsWith('@') ? s.username : '@' + s.username) : '@' + s.title,
+      social: (s.platform === 'instagram' ? 'Instagram' : s.platform === 'telegram' ? 'Telegram' : s.platform === 'youtube' ? 'YouTube' : 'Instagram') as Social,
+      hue: Math.abs(s.id * 137) % 360,
+      followers: s.subscribers_count || 0,
+      er: s.static_avg_er || 0,
+    };
+  }
+  return authorById(deal.authorId);
+};

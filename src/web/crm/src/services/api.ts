@@ -1,4 +1,4 @@
-import type { Social } from '../data';
+import type { Deal, Social } from '../data';
 
 export interface CreatorRecord {
   id: string;
@@ -36,18 +36,83 @@ export interface CreatorsResponse {
   total: number;
 }
 
+export interface DealAuthorSummary {
+  id: number;
+  platform: string;
+  username: string | null;
+  title: string;
+  subscribers_count: number | null;
+  static_avg_er: number | null;
+  category_path: string | null;
+}
+
+export interface DealMessageItem {
+  id: number;
+  deal_id: number;
+  sender_type: 'user' | 'creator' | 'system' | string;
+  text: string;
+  is_read: boolean;
+  created_at: string;
+}
+
+export interface DealItem {
+  id: number;
+  user_id: number;
+  account_id: number;
+  title: string;
+  stage: number;
+  budget: number;
+  type: string;
+  brand_name: string | null;
+  pub_date: string | null;
+  terms: string | null;
+  created_at: string;
+  updated_at: string;
+  author: DealAuthorSummary | null;
+  last_message: DealMessageItem | null;
+  unread_count: number;
+}
+
+export interface DealCreatePayload {
+  account_id: string | number;
+  title: string;
+  budget?: number;
+  type?: string;
+  brand_name?: string | null;
+  pub_date?: string | null;
+  terms?: string | null;
+  initial_message?: string | null;
+}
+
+export interface DealUpdatePayload {
+  title?: string;
+  stage?: number;
+  budget?: number;
+  type?: string;
+  brand_name?: string | null;
+  pub_date?: string | null;
+  terms?: string | null;
+}
+
+export interface CommunicationChannelItem {
+  deal_id: number;
+  author_id: number;
+  author_name: string;
+  author_handle: string;
+  platform: string;
+  deal_title: string;
+  stage: number;
+  last_message: string;
+  last_message_time: string;
+  unread_count: number;
+}
+
 const TOKEN_KEY = 'creatorflow_token';
 const USER_KEY = 'creatorflow_user';
 
-const envUrl = import.meta.env.VITE_API_URL;
-const BASE_URL: string =
-  envUrl && String(envUrl).trim() !== ''
-    ? String(envUrl)
-    : typeof window !== 'undefined'
-      ? `${window.location.protocol}//${window.location.hostname}:8000/api/v1/crm`
-      : 'http://localhost:8000/api/v1/crm';
-
-const API_BASE = BASE_URL.replace(/\/+$/, '');
+const API_BASE = typeof window !== 'undefined'
+  ? `${window.location.protocol}//${window.location.hostname}:8000/api/v1/crm`
+  : 'http://localhost:8000/api/v1/crm';
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -61,6 +126,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem(TOKEN_KEY);
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  if (response.status === 401) {
+    api.logout();
+    window.dispatchEvent(new CustomEvent('creatorflow:auth_expired'));
+    throw new ApiError('Сессия истекла. Пожалуйста, войдите снова.', 401);
+  }
   if (!response.ok) {
     let detail = `Ошибка запроса (${response.status})`;
     try {
@@ -139,6 +209,53 @@ export const api = {
     });
   },
 
+  async getDeals(params?: { stage?: number; search?: string }): Promise<DealItem[]> {
+    const query = new URLSearchParams();
+    if (params?.stage !== undefined) query.set('stage', String(params.stage));
+    if (params?.search) query.set('search', params.search);
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request<DealItem[]>(`/deals${suffix}`);
+  },
+
+  async createDeal(payload: DealCreatePayload): Promise<DealItem> {
+    return request<DealItem>('/deals', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async getDeal(dealId: number): Promise<DealItem> {
+    return request<DealItem>(`/deals/${dealId}`);
+  },
+
+  async updateDeal(dealId: number, payload: DealUpdatePayload): Promise<DealItem> {
+    return request<DealItem>(`/deals/${dealId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async deleteDeal(dealId: number): Promise<{ status: string; deal_id: number }> {
+    return request<{ status: string; deal_id: number }>(`/deals/${dealId}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async getDealMessages(dealId: number): Promise<DealMessageItem[]> {
+    return request<DealMessageItem[]>(`/deals/${dealId}/messages`);
+  },
+
+  async sendDealMessage(dealId: number, text: string, senderType: string = 'user'): Promise<DealMessageItem> {
+    return request<DealMessageItem>(`/deals/${dealId}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ text, sender_type: senderType }),
+    });
+  },
+
+  async getCommunications(): Promise<CommunicationChannelItem[]> {
+    return request<CommunicationChannelItem[]>('/communications');
+  },
+
   logout(): void {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
@@ -156,6 +273,27 @@ export const api = {
     return localStorage.getItem(TOKEN_KEY) ?? '';
   },
 };
+
+export function mapDealItemToDeal(item: DealItem): Deal {
+  const authorTitle = item.author ? (item.author.username || item.author.title) : '';
+  return {
+    id: String(item.id),
+    title: item.title || authorTitle,
+    brandId: item.brand_name ? String(item.brand_name) : 'b1',
+    authorId: String(item.account_id),
+    authorSummary: item.author,
+    budget: item.budget,
+    stage: item.stage,
+    date: new Date(item.created_at).toLocaleDateString('ru-RU'),
+    pubDate: item.pub_date || new Date(item.created_at).toLocaleDateString('ru-RU'),
+    type: item.type as Deal['type'],
+    msgs: item.last_message ? [{ id: String(item.last_message.id), from: item.last_message.sender_type === 'creator' ? 'author' : 'user', text: item.last_message.text, time: new Date(item.last_message.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) }] : [],
+    desc: item.terms || '',
+    terms: item.terms || `Фиксированная оплата ${item.budget} ₽`,
+    exclusive: false,
+    edits: 2,
+  };
+}
 
 export function userName(user: Record<string, unknown> | null): string {
   if (!user) return '';

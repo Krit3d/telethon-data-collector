@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react';
 import { MessageCircle, FileText, Plus, X, ChevronRight, ChevronLeft, KanbanSquare, BookOpen } from 'lucide-react';
-import { STAGES, BRANDS, fmtMoney, authorById, brandById, type Deal } from '../data';
+import { STAGES, BRANDS, fmtMoney, resolveAuthor, brandById, type Deal } from '../data';
 import { Badge, Avatar, useToast, Btn, inputCls } from '../components/ui';
 import { SocialIcon } from '../components/icons';
+import { api } from '../services/api';
 
 const typeTone: Record<Deal['type'], string> = { Stories: 'violet', Reels: 'sky', Пост: 'indigo', Видео: 'red' };
 
@@ -31,8 +32,14 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
     if (!dragId) return;
     const deal = deals.find(d => d.id === dragId);
     if (deal && deal.stage !== stage) {
-      setDeals(prev => prev.map(d => d.id === dragId ? { ...d, stage } : d));
-      toast('ok', `Сделка перемещена в «${STAGES.find(s => s.id === stage)?.name}»`);
+      const prev = deals;
+      setDeals(prevDeals => prevDeals.map(d => d.id === dragId ? { ...d, stage } : d));
+      api.updateDeal(Number(dragId), { stage })
+        .then(() => toast('ok', `Сделка перемещена в «${STAGES.find(s => s.id === stage)?.name}»`))
+        .catch(() => {
+          setDeals(() => prev);
+          toast('err', 'Ошибка при обновлении стадии');
+        });
     }
     setDragId(null); setOverCol(null);
   };
@@ -82,7 +89,7 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
                   </div>
                   <div className="flex-1 min-h-0 overflow-y-auto scroll-thin px-2 pb-2 flex flex-col gap-2">
                     {cards.map(d => {
-                      const a = authorById(d.authorId);
+                      const a = resolveAuthor(d);
                       return (
                         <div key={d.id}
                           draggable
@@ -128,7 +135,7 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
               <h3 className="text-[13.5px] font-bold text-gray-900">Контекст сделки</h3>
               <button onClick={() => setCollapsed(true)} className="text-gray-300 hover:text-gray-500"><ChevronRight size={16} /></button>
             </div>
-            {(() => { const b = brandById(ctx.brandId); const a = authorById(ctx.authorId); return (
+            {(() => { const b = brandById(ctx.brandId); const a = resolveAuthor(ctx); return (
               <>
                 <div className="rounded-xl border border-gray-100 bg-slate-50/60 p-3">
                   <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wide mb-2">Бренд</div>
