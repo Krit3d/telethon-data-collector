@@ -41,7 +41,7 @@ export interface CreatorPostItem {
 }
 
 export interface CreatorProfileDetail {
-  id: number;
+  id: string;
   platform: string;
   username: string | null;
   title: string;
@@ -71,7 +71,7 @@ export interface CreatorsResponse {
 }
 
 export interface DealAuthorSummary {
-  id: number;
+  id: string;
   platform: string;
   username: string | null;
   title: string;
@@ -92,7 +92,7 @@ export interface DealMessageItem {
 export interface DealItem {
   id: number;
   user_id: number;
-  account_id: number;
+  account_id: string;
   title: string;
   stage: number;
   budget: number;
@@ -108,7 +108,7 @@ export interface DealItem {
 }
 
 export interface DealCreatePayload {
-  account_id: string | number;
+  account_id: string;
   title: string;
   budget?: number;
   type?: string;
@@ -129,8 +129,8 @@ export interface DealUpdatePayload {
 }
 
 export interface CommunicationChannelItem {
-  deal_id: number;
-  author_id: number;
+  deal_id: number | null;
+  author_id: string;
   author_name: string;
   author_handle: string;
   platform: string;
@@ -296,9 +296,8 @@ export const api = {
   },
 
   async initCommunication(creatorId: string): Promise<CommunicationChannelItem> {
-    return request<CommunicationChannelItem>('/communications/init', {
+    return request<CommunicationChannelItem>(`/communications/init?creator_id=${encodeURIComponent(creatorId)}`, {
       method: 'POST',
-      body: JSON.stringify({ creator_id: creatorId }),
     });
   },
 

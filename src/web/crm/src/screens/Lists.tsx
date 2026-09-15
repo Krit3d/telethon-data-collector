@@ -2,7 +2,7 @@ import { Archive, ArchiveRestore, Briefcase, Eye, MessageSquare, Paperclip, Plus
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { SocialIcon } from '../components/icons';
 import { Avatar, Badge, Btn, Card, inputCls, Modal, Tip, useToast } from '../components/ui';
-import { brandById, BRANDS, fmtMoney, resolveAuthor, STAGES, type Author, type Deal, type DealMsg, type Social } from '../data';
+import { ARCHIVED_STAGE, brandById, BRANDS, fmtMoney, getStage, resolveAuthor, STAGES, type Author, type Deal, type DealMsg, type Social } from '../data';
 import { api, normalizeSocial, type CommunicationChannelItem, type CreatorRecord, type DealMessageItem } from '../services/api';
 
 /* ================= СДЕЛКИ ================= */
@@ -30,6 +30,7 @@ export function DealsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal: (i
             </div>
             <select className={selCls} value={fStage} onChange={e => setFStage(e.target.value)}>
               <option value="all">Все этапы</option>
+              <option value="0">{ARCHIVED_STAGE.name}</option>
               {STAGES.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
             <select className={selCls} value={fBrand} onChange={e => setFBrand(e.target.value)}>
@@ -50,7 +51,7 @@ export function DealsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal: (i
               </thead>
               <tbody className="divide-y divide-gray-50">
                 {list.map(d => {
-                  const a = resolveAuthor(d), b = brandById(d.brandId), s = STAGES.find(x => x.id === d.stage)!;
+                  const a = resolveAuthor(d), b = brandById(d.brandId), s = getStage(d.stage);
                   return (
                     <tr key={d.id} onClick={() => onOpenDeal(d.id)} className="group cursor-pointer hover:bg-indigo-50/40 transition-colors">
                       <td className="px-4 py-3 max-w-[260px]"><span className="font-bold text-gray-800 truncate block group-hover:text-indigo-600">{d.title}</span></td>
@@ -75,10 +76,10 @@ export function DealsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal: (i
 }
 
 /* ================= КОММУНИКАЦИИ ================= */
-export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { deals: Deal[]; onOpenDeal?: (id: string) => void; initialAuthorId?: string | null; onNewDeal?: (id: string) => void }) {
+export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { deals: Deal[]; onOpenDeal?: (id: string) => void; initialAuthorId?: string | null; onNewDeal?: (authorId: string, meta?: { name?: string; handle?: string }) => void }) {
   const toast = useToast();
   const [channels, setChannels] = useState<CommunicationChannelItem[]>([]);
-  const [selectedDealId, setSelectedDealId] = useState<number | null>(null);
+  const [selectedAuthorId, setSelectedAuthorId] = useState<string | null>(null);
   const [msgs, setMsgs] = useState<DealMsg[]>([]);
   const [draft, setDraft] = useState('');
   const [q, setQ] = useState('');
@@ -93,19 +94,19 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
       .then(items => {
         if (cancelled) return;
         if (initialAuthorId) {
-          const target = items.find(c => c.author_id === Number(initialAuthorId));
+          const target = items.find(c => String(c.author_id) === String(initialAuthorId));
           if (target) {
             setChannels(items);
-            setSelectedDealId(target.deal_id);
+            setSelectedAuthorId(String(initialAuthorId));
           } else {
             api.getCreatorProfile(initialAuthorId)
               .then(profile => {
                 if (cancelled) return;
                 const temp: CommunicationChannelItem = {
-                  deal_id: -Number(initialAuthorId),
-                  author_id: Number(initialAuthorId),
+                  deal_id: null,
+                  author_id: initialAuthorId,
                   author_name: profile.title,
-                  author_handle: profile.username ? `@${profile.username.replace(/^@/, '')}` : `@${profile.title}`,
+                  author_handle: profile.username ? `@${stripAt(profile.username)}` : `@${profile.title}`,
                   platform: profile.platform,
                   deal_title: 'Новый контакт',
                   stage: 1,
@@ -115,17 +116,17 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
                   is_archived: false,
                 };
                 setChannels([temp, ...items]);
-                setSelectedDealId(temp.deal_id);
+                setSelectedAuthorId(String(initialAuthorId));
               })
               .catch(() => {
                 if (cancelled) return;
                 setChannels(items);
-                setSelectedDealId(items.length > 0 ? items[0].deal_id : null);
+                setSelectedAuthorId(items.length > 0 ? String(items[0].author_id) : null);
               });
           }
         } else {
           setChannels(items);
-          setSelectedDealId(prev => prev ?? (items.length > 0 ? items[0].deal_id : null));
+          setSelectedAuthorId(prev => prev ?? (items.length > 0 ? String(items[0].author_id) : null));
         }
       })
       .catch(() => {
@@ -146,9 +147,9 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
   const activeCount = useMemo(() => channels.filter(c => !c.is_archived).length, [channels]);
   const archivedCount = useMemo(() => channels.filter(c => c.is_archived).length, [channels]);
 
-  const ch = filtered.find(c => c.deal_id === selectedDealId) ?? filtered[0] ?? null;
+  const ch = filtered.find(c => String(c.author_id) === String(selectedAuthorId)) ?? filtered[0] ?? null;
   const a = ch ? channelAuthor(ch) : null;
-  const targetDeal = ch ? deals.find(d => d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) : undefined;
+  const targetDeal = ch ? deals.find(d => (d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) && d.stage >= 1 && d.stage <= 5) : undefined;
   const activeDeals = ch ? deals.filter(d => (d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) && d.stage >= 1 && d.stage <= 4) : [];
   const activeBudget = activeDeals.reduce((a, d) => a + d.budget, 0);
 
@@ -156,44 +157,36 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
 
   useEffect(() => {
     chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: 'smooth' });
-  }, [msgs.length, selectedDealId]);
+  }, [msgs.length, selectedAuthorId]);
 
   useEffect(() => {
     if (!ch) return;
-    const load = ch.deal_id > 0
-      ? api.getDealMessages(ch.deal_id)
-      : api.getCreatorMessages(String(ch.author_id));
-    load
+    api.getCreatorMessages(String(ch.author_id))
       .then(items => {
         setMsgs(items.map(toDealMsg));
-        setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, unread_count: 0 } : c));
+        setChannels(prev => prev.map(c => String(c.author_id) === String(ch.author_id) ? { ...c, unread_count: 0 } : c));
       })
       .catch(() => toast('err', 'Не удалось загрузить сообщения'));
-  }, [ch?.deal_id]);
+  }, [ch?.author_id]);
 
   const send = () => {
     if (!draft.trim() || !ch) return;
     const text = draft.trim();
     setDraft('');
-    const sendReq = ch.deal_id > 0
-      ? api.sendDealMessage(ch.deal_id, text)
-      : api.sendCreatorMessage(String(ch.author_id), text);
-    sendReq
+    api.sendCreatorMessage(String(ch.author_id), text)
       .then(m => {
         const dm = toDealMsg(m);
         setMsgs(prev => [...prev, dm]);
-        setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, last_message: dm.text, last_message_time: dm.time, deal_id: m.deal_id } : c));
-        if (ch.deal_id <= 0) setSelectedDealId(m.deal_id);
+        setChannels(prev => prev.map(c => String(c.author_id) === String(ch.author_id) ? { ...c, last_message: dm.text, last_message_time: m.created_at } : c));
       })
       .catch(() => toast('err', 'Не удалось отправить сообщение'));
   };
 
-  const handleStartChat = (creator: CreatorRecord) => {
-    const targetId = (creator.handle || creator.username || creator.name || creator.Name || creator.accountid || creator.id || '').toString().replace(/^@/, '');
+  const handleStartChat = (targetId: string) => {
     api.initCommunication(targetId)
       .then(channel => {
-        setChannels(prev => prev.some(c => c.deal_id === channel.deal_id) ? prev : [channel, ...prev]);
-        setSelectedDealId(channel.deal_id);
+        setChannels(prev => prev.some(c => String(c.author_id) === String(channel.author_id)) ? prev : [channel, ...prev]);
+        setSelectedAuthorId(String(channel.author_id));
         setNewChatOpen(false);
         setChatTab('active');
       })
@@ -202,10 +195,10 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
 
   const handleArchiveConfirm = () => {
     if (!ch) return;
-    const targetId = ch.author_handle ? ch.author_handle.replace(/^@/, '') : String(Math.abs(ch.author_id));
+    const targetId = String(ch.author_id);
     api.updateCreatorStatus(targetId, 'В архиве', activeDeals.length > 0 ? closeDeals : false)
       .then(() => {
-        setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, is_archived: true } : c));
+        setChannels(prev => prev.map(c => String(c.author_id) === String(ch.author_id) ? { ...c, is_archived: true } : c));
         setConfirmArchive(false);
         toast('info', 'Чат перемещён в архив');
       })
@@ -214,10 +207,10 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
 
   const handleRestoreChat = () => {
     if (!ch) return;
-    const targetId = ch.author_handle ? ch.author_handle.replace(/^@/, '') : String(Math.abs(ch.author_id));
+    const targetId = String(ch.author_id);
     api.updateCreatorStatus(targetId, 'Свободен')
       .then(() => {
-        setChannels(prev => prev.map(c => c.deal_id === ch.deal_id ? { ...c, is_archived: false } : c));
+        setChannels(prev => prev.map(c => String(c.author_id) === String(ch.author_id) ? { ...c, is_archived: false } : c));
         setChatTab('active');
         toast('ok', 'Чат восстановлен из архива');
       })
@@ -256,11 +249,11 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
           {filtered.map(c => {
             const ca = channelAuthor(c);
             return (
-              <button key={c.deal_id} onClick={() => setSelectedDealId(c.deal_id)}
-                className={'flex items-center gap-2.5 px-2.5 py-2.5 rounded-xl text-left transition-colors ' + (selectedDealId === c.deal_id ? 'bg-indigo-50' : 'hover:bg-slate-50')}>
+              <button key={String(c.author_id)} onClick={() => setSelectedAuthorId(String(c.author_id))}
+                className={'flex items-center gap-2.5 px-2.5 py-2.5 rounded-xl text-left transition-colors ' + (String(selectedAuthorId) === String(c.author_id) ? 'bg-indigo-50' : 'hover:bg-slate-50')}>
                 <Avatar nick={ca.nick} hue={ca.hue} size={36} />
                 <span className="min-w-0 flex-1">
-                  <span className={'flex items-center justify-between ' + (selectedDealId === c.deal_id ? 'text-indigo-700' : 'text-gray-800')}>
+                  <span className={'flex items-center justify-between ' + (String(selectedAuthorId) === String(c.author_id) ? 'text-indigo-700' : 'text-gray-800')}>
                     <span className="text-[13px] font-bold truncate">{ca.nick}</span>
                     <span className="text-[10px] font-bold text-gray-300 shrink-0">{formatMessageTime(c.last_message_time)}</span>
                   </span>
@@ -280,15 +273,15 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
             <div className="flex items-center gap-2"><span className="text-[14px] font-bold text-gray-900">{a?.nick ?? ''}</span>{a && <SocialIcon social={a.social} size={13} />}</div>
             <div className="text-[11px] font-semibold text-gray-400 truncate">Сделка: {ch?.deal_title}</div>
           </div>
-          {targetDeal && targetDeal.budget > 0 ? (
+          {targetDeal ? (
             <>
-              <Badge tone={targetDeal.stage === 5 ? 'green' : targetDeal.stage === 4 ? 'indigo' : targetDeal.stage === 2 ? 'orange' : targetDeal.stage === 3 ? 'amber' : 'gray'} dot>{STAGES.find(x => x.id === targetDeal.stage)?.name ?? 'Этап'}</Badge>
+              <Badge tone={targetDeal.stage === 5 ? 'green' : targetDeal.stage === 4 ? 'indigo' : targetDeal.stage === 2 ? 'orange' : targetDeal.stage === 3 ? 'amber' : 'gray'} dot>{getStage(targetDeal.stage).name}</Badge>
               <Btn variant="secondary" size="sm" className="ml-auto" onClick={() => onOpenDeal?.(String(targetDeal.id))}><Briefcase size={13} />К сделке</Btn>
             </>
           ) : (
             <>
               <Badge tone="violet">Аутрич / Переговоры</Badge>
-              <Btn size="sm" className="ml-auto" onClick={() => ch && onNewDeal?.(String(ch.author_id))}><Plus size={13} />Оформить сделку</Btn>
+              <Btn size="sm" className="ml-auto" onClick={() => ch && onNewDeal?.(String(ch.author_id), { name: ch.author_name, handle: ch.author_handle })}><Plus size={13} />Оформить сделку</Btn>
             </>
           )}
           {ch && !ch.is_archived ? (
@@ -298,15 +291,26 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
           )}
         </div>
         <div ref={chatRef} className="flex-1 min-h-0 overflow-y-auto scroll-thin p-5 flex flex-col gap-3">
-          {msgs.length === 0 && <div className="m-auto text-[12.5px] font-semibold text-gray-400">Начните диалог — автор увидит сообщение в {a?.social ?? ''}</div>}
-          {msgs.map(m => (
-            <div key={m.id} className={'flex ' + (m.from === 'user' ? 'justify-end' : 'justify-start')}>
-              <div className={'relative max-w-[60%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ' + (m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md')}>
-                {m.text}
-                <span className={'block text-[10px] font-semibold mt-1 text-right ' + (m.from === 'user' ? 'text-indigo-200' : 'text-gray-300')}>{m.time} {m.from === 'user' && '✓✓'}</span>
+          {!msgs.some(m => m.from === 'user' || m.from === 'author') && <div className="m-auto text-[12.5px] font-semibold text-gray-400">Начните диалог — автор увидит сообщение в {a?.social ?? ''}</div>}
+          {msgs.map(m => {
+            if (m.from === 'system') {
+              return (
+                <div key={m.id} className="flex justify-center my-1.5">
+                  <span className="text-[11px] font-medium text-gray-400 bg-gray-100/80 border border-gray-200/60 px-3 py-0.5 rounded-full">
+                    {m.text} · {m.time}
+                  </span>
+                </div>
+              );
+            }
+            return (
+              <div key={m.id} className={'flex ' + (m.from === 'user' ? 'justify-end' : 'justify-start')}>
+                <div className={'relative max-w-[60%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ' + (m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md')}>
+                  {m.text}
+                  <span className={'block text-[10px] font-semibold mt-1 text-right ' + (m.from === 'user' ? 'text-indigo-200' : 'text-gray-300')}>{m.time} {m.from === 'user' && '✓✓'}</span>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
         <div className="p-3.5 border-t border-gray-200 bg-white shrink-0 flex items-end gap-2">
           <button className="w-9 h-9 rounded-lg text-gray-400 hover:bg-gray-100 hover:text-indigo-600 flex items-center justify-center shrink-0" onClick={() => toast('info', 'Прикрепление файла…')}><Paperclip size={17} /></button>
@@ -352,7 +356,7 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
 function NewChatModal({ channels, onClose, onStart }: {
   channels: CommunicationChannelItem[];
   onClose: () => void;
-  onStart: (creator: CreatorRecord) => void;
+  onStart: (id: string) => void;
 }) {
   const [creators, setCreators] = useState<CreatorRecord[]>([]);
   const [q, setQ] = useState('');
@@ -388,7 +392,7 @@ function NewChatModal({ channels, onClose, onStart }: {
         {loading && <div className="text-center text-[13px] font-semibold text-gray-400 py-10">Загрузка авторов…</div>}
         {!loading && list.length === 0 && <div className="text-center text-[13px] font-semibold text-gray-400 py-10">Авторы не найдены</div>}
         {list.map(creator => {
-          const id = String(creator.accountid || creator.accountId || creator.id || '');
+          const id = String(creator.accountid || creator.accountId || creator.id || creator.username || creator.handle || '');
           const hasChat = channels.some(c => String(c.author_id) === id);
           const nick = creator.name || creator.Name || creator.handle || creator.username || 'Без имени';
           const social = normalizeSocial(creator.platform || creator.Platform || 'Instagram');
@@ -407,7 +411,7 @@ function NewChatModal({ channels, onClose, onStart }: {
               {hasChat ? (
                 <Badge tone="gray">Чат начат</Badge>
               ) : (
-                <Btn size="sm" onClick={() => onStart(creator)}><MessageSquare size={13} />Написать</Btn>
+                <Btn size="sm" onClick={() => onStart(id)}><MessageSquare size={13} />Написать</Btn>
               )}
             </div>
           );
@@ -427,6 +431,8 @@ const hashHue = (seed: string): number => {
   return h % 360;
 };
 
+const stripAt = (value: string): string => value.startsWith('@') ? value.slice(1) : value;
+
 const formatMessageTime = (isoString: string): string => {
   const date = new Date(isoString);
   if (isNaN(date.getTime())) return isoString;
@@ -438,15 +444,17 @@ const formatMessageTime = (isoString: string): string => {
   return date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' });
 };
 
-const channelAuthor = (c: CommunicationChannelItem): Pick<Author, 'nick' | 'social' | 'hue'> => ({
-  nick: c.author_handle || c.author_name,
-  hue: Math.abs(c.author_id * 137) % 360,
-  social: (c.platform === 'instagram' ? 'Instagram' : c.platform === 'telegram' ? 'Telegram' : c.platform === 'youtube' ? 'YouTube' : 'Instagram') as Social,
-});
+const channelAuthor = (c: CommunicationChannelItem): Pick<Author, 'nick' | 'social' | 'hue'> => {
+  return {
+    nick: c.author_handle || c.author_name,
+    hue: hashHue(String(c.author_id)),
+    social: (c.platform === 'instagram' ? 'Instagram' : c.platform === 'telegram' ? 'Telegram' : c.platform === 'youtube' ? 'YouTube' : 'Instagram') as Social,
+  };
+};
 
 const toDealMsg = (m: DealMessageItem): DealMsg => ({
   id: String(m.id),
-  from: m.sender_type === 'creator' ? 'author' : 'user',
+  from: m.sender_type === 'creator' ? 'author' : (m.sender_type === 'system' ? 'system' : 'user'),
   text: m.text,
   time: new Date(m.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
 });

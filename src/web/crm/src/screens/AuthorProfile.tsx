@@ -147,7 +147,7 @@ const cleanText = (text: string | null | undefined): string | null => {
 };
 
 export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOpenDeal, onOpenComms }: {
-  authorId: string; deals: Deal[]; onBack: () => void; onNewDeal: (authorId: string) => void; onOpenDeal: (id: string, tab?: string) => void; onOpenComms: () => void;
+  authorId: string; deals: Deal[]; onBack: () => void; onNewDeal: (authorId: string, meta?: { name?: string; handle?: string }) => void; onOpenDeal: (id: string, tab?: string) => void; onOpenComms: () => void;
 }) {
   const toast = useToast();
   const [tab, setTab] = useState('analytics');
@@ -158,6 +158,8 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
   const [noteOpen, setNoteOpen] = useState(false);
   const [noteText, setNoteText] = useState('');
   const [customDocs, setCustomDocs] = useState<AuthorDocItem[]>(() => loadAuthorDocs(authorId));
+  const [confirmArchiveOpen, setConfirmArchiveOpen] = useState(false);
+  const [closeDeals, setCloseDeals] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const myDeals = deals.filter(d => String(d.authorId) === String(authorId) || (profile && String(d.authorId) === String(profile.id)));
@@ -281,15 +283,27 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
     toast('info', 'Документ удален');
   };
 
-  const handleArchive = async () => {
+  const handleRestore = async () => {
     if (!profile) return;
-    const nextStatus = profile.status === 'В архиве' ? 'Свободен' : 'В архиве';
     try {
-      await api.updateCreatorStatus(String(profile.id), nextStatus);
-      setProfile({ ...profile, status: nextStatus });
-      toast('ok', nextStatus === 'В архиве' ? 'Автор архивирован' : 'Автор восстановлен');
+      await api.updateCreatorStatus(String(profile.id), 'Свободен');
+      setProfile({ ...profile, status: 'Свободен' });
+      toast('ok', 'Автор восстановлен');
     } catch {
-      toast('err', 'Не удалось обновить статус автора');
+      toast('err', 'Не удалось восстановить автора');
+    }
+  };
+
+  const handleArchiveConfirm = async () => {
+    if (!profile) return;
+    const activeDeals = myDeals.filter(d => d.stage >= 1 && d.stage <= 4);
+    try {
+      await api.updateCreatorStatus(String(profile.id), 'В архиве', activeDeals.length > 0 ? closeDeals : false);
+      setProfile({ ...profile, status: 'В архиве' });
+      setConfirmArchiveOpen(false);
+      toast('ok', 'Автор архивирован');
+    } catch {
+      toast('err', 'Не удалось архивировать автора');
     }
   };
 
@@ -328,13 +342,14 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
   }
 
   const nick = profile.username || profile.title;
-  const hue = Math.abs(profile.id * 137) % 360;
+  const hue = Math.abs(Number(profile.id) * 137) % 360;
   const social = normalizeSocial(profile.platform.toLowerCase());
   const erPosts = profile.posts.slice(0, 12).reverse();
   const roas = profile.cpm > 0 ? Math.max(1, Math.round((200 / profile.cpm) * 2.5 * 10) / 10) : 1;
   const onTime = myDeals.length ? Math.round((myDeals.filter(d => d.stage >= 4).length / myDeals.length) * 100) : 0;
   const rating = ratingFromEr(profile.static_avg_er);
-  const currentStatus = profile.status === 'В архиве' ? 'В архиве' : myDeals.length > 0 ? 'В сделке' : 'Свободен';
+  const hasActiveDeal = myDeals.some(d => d.stage >= 1 && d.stage <= 4);
+  const currentStatus = profile.status === 'В архиве' ? 'В архиве' : profile.status === 'На паузе' ? 'На паузе' : hasActiveDeal ? 'В сделке' : 'Свободен';
 
   return (
     <div className="h-full overflow-y-auto scroll-thin">
@@ -362,9 +377,9 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
             </div>
           </div>
           <div className="flex items-center gap-2 ml-auto">
-            <Btn onClick={() => onNewDeal(String(profile.id))}><Briefcase size={14} />Новая сделка</Btn>
+            <Btn onClick={() => onNewDeal(String(profile.id), { name: profile.title, handle: profile.username ? (profile.username.startsWith('@') ? profile.username : `@${profile.username}`) : undefined })}><Briefcase size={14} />Новая сделка</Btn>
             <Btn variant="secondary" onClick={() => myDeals.length > 0 ? onOpenDeal(myDeals[0].id, 'comms') : onOpenComms()}><MessageSquare size={14} />Написать</Btn>
-            <Btn variant="danger" onClick={() => void handleArchive()}>
+            <Btn variant="danger" onClick={() => profile.status === 'В архиве' ? void handleRestore() : (setCloseDeals(true), setConfirmArchiveOpen(true))}>
               {profile.status === 'В архиве' ? <ArchiveRestore size={14} /> : <Archive size={14} />}
               {profile.status === 'В архиве' ? 'Восстановить' : 'В архив'}
             </Btn>
@@ -583,6 +598,37 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
           </div>
         </Modal>
       )}
+
+      {confirmArchiveOpen && profile && (() => {
+        const activeDeals = myDeals.filter(d => d.stage >= 1 && d.stage <= 4);
+        const activeBudget = activeDeals.reduce((acc, d) => acc + d.budget, 0);
+        return (
+          <Modal onClose={() => setConfirmArchiveOpen(false)} w="max-w-sm">
+            <div className="px-5 py-4 border-b border-gray-200">
+              <h2 className="text-[16px] font-display font-semibold text-gray-900">Архивировать автора?</h2>
+            </div>
+            {activeDeals.length === 0 ? (
+              <div className="px-5 py-4 text-[13px] font-medium text-gray-600 leading-relaxed">
+                Автор @{nick} будет перемещен в архив. Вы сможете восстановить его в любой момент.
+              </div>
+            ) : (
+              <div className="px-5 py-4">
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-[12.5px] font-medium text-amber-800 leading-relaxed">
+                  У автора {activeDeals.length} {activeDeals.length % 10 === 1 && activeDeals.length % 100 !== 11 ? 'открытая сделка' : activeDeals.length % 10 >= 2 && activeDeals.length % 10 <= 4 && (activeDeals.length % 100 < 10 || activeDeals.length % 100 >= 20) ? 'открытые сделки' : 'открытых сделок'} на сумму {fmtMoney(activeBudget)}.
+                </div>
+                <label className="mt-3 flex items-center gap-2.5 cursor-pointer select-none">
+                  <input type="checkbox" checked={closeDeals} onChange={e => setCloseDeals(e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-200" />
+                  <span className="text-[13px] font-medium text-gray-700">Перевести активные сделки в архив (сорваны)</span>
+                </label>
+              </div>
+            )}
+            <div className="px-5 py-4 border-t border-gray-200 flex items-center justify-end gap-2">
+              <Btn variant="secondary" size="sm" onClick={() => setConfirmArchiveOpen(false)}>Отмена</Btn>
+              <Btn size="sm" onClick={() => void handleArchiveConfirm()}><Archive size={13} />В архив</Btn>
+            </div>
+          </Modal>
+        );
+      })()}
     </div>
   );
 }

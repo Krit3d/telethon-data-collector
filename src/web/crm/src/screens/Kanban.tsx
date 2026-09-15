@@ -22,11 +22,12 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
   const [collapsed, setCollapsed] = useState(false);
 
   const filtered = useMemo(() => deals.filter(d =>
+    d.stage >= 1 && d.stage <= 5 &&
     (fBrand === 'all' || d.brandId === fBrand) && (fType === 'all' || d.type === fType)
   ), [deals, fBrand, fType]);
 
   const total = filtered.reduce((a, d) => a + d.budget, 0);
-  const ctx = filtered.find(d => d.stage === 2) ?? filtered[0];
+  const ctx = filtered.find(d => d.stage === 2) ?? filtered[0] ?? null;
 
   const drop = (stage: number) => {
     if (!dragId) return;

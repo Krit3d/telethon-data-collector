@@ -50,7 +50,7 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
   const [dealId, setDealId] = useState<string | null>(null);
   const [dealTab, setDealTab] = useState<string | undefined>(undefined);
   const [wizardDeal, setWizardDeal] = useState<Deal | null>(null);
-  const [newDeal, setNewDeal] = useState<null | { authorId?: string }>(null);
+  const [newDeal, setNewDeal] = useState<null | { authorId?: string; authorName?: string; authorHandle?: string }>(null);
   const [notifOpen, setNotifOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [kbBrand, setKbBrand] = useState<string | undefined>(undefined);
@@ -173,9 +173,9 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
         <main className="flex-1 min-h-0 relative">
           {screen === 'kanban' && <Kanban deals={deals} setDeals={setDeals} onOpenDeal={openDeal} onNewDeal={() => setNewDeal({})} onOpenKB={openKB} />}
           {screen === 'deals' && <DealsList deals={deals} onOpenDeal={openDeal} />}
-          {screen === 'authors' && <Authors deals={deals} onOpenProfile={id => { setProfileId(id); setScreen('author'); }} onNewDeal={id => setNewDeal({ authorId: id })} onOpenComms={(authorId?: string) => handleAuthorChat(authorId || profileId)} />}
-          {screen === 'author' && <AuthorProfile authorId={profileId} deals={deals} onBack={() => setScreen('authors')} onNewDeal={id => setNewDeal({ authorId: id })} onOpenDeal={(id, tab) => openDeal(id, tab ?? 'comms')} onOpenComms={(authorId?: string) => handleAuthorChat(authorId || profileId)} />}
-          {screen === 'comms' && <CommsList deals={deals} initialAuthorId={commsAuthorId} onOpenDeal={openDeal} onNewDeal={id => setNewDeal({ authorId: id })} />}
+          {screen === 'authors' && <Authors deals={deals} onOpenProfile={id => { setProfileId(id); setScreen('author'); }} onNewDeal={(id, meta) => setNewDeal({ authorId: id, authorName: meta?.name, authorHandle: meta?.handle })} onOpenComms={(authorId?: string) => handleAuthorChat(authorId || profileId)} />}
+          {screen === 'author' && <AuthorProfile authorId={profileId} deals={deals} onBack={() => setScreen('authors')} onNewDeal={(id, meta) => setNewDeal({ authorId: id, authorName: meta?.name, authorHandle: meta?.handle })} onOpenDeal={(id, tab) => openDeal(id, tab ?? 'comms')} onOpenComms={(authorId?: string) => handleAuthorChat(authorId || profileId)} />}
+          {screen === 'comms' && <CommsList deals={deals} initialAuthorId={commsAuthorId} onOpenDeal={openDeal} onNewDeal={(id, meta) => setNewDeal({ authorId: id, authorName: meta?.name, authorHandle: meta?.handle })} />}
           {screen === 'erid' && <Erid deals={deals} onOpenDeal={openDeal} />}
           {screen === 'kb' && <KnowledgeBase initialBrandId={kbBrand} key={kbBrand ?? 'kb'} />}
           {screen === 'pubs' && <Publications onOpenDeal={openDeal} />}
@@ -196,7 +196,7 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
           }} />
       )}
       {wizardDeal && <ContractWizard deal={wizardDeal} onClose={() => setWizardDeal(null)} onDone={() => setWizardDeal(null)} />}
-      {newDeal && <NewDealModal initialAuthor={newDeal.authorId} onClose={() => setNewDeal(null)} onCreate={d => {
+      {newDeal && <NewDealModal initialAuthor={newDeal.authorId} initialAuthorMeta={{ name: newDeal.authorName, handle: newDeal.authorHandle }} onClose={() => setNewDeal(null)} onCreate={d => {
         setDeals(prev => [d, ...prev]);
         setNewDeal(null);
         setScreen('kanban');
@@ -234,12 +234,13 @@ const buildAuthorOptions = (records: CreatorRecord[]): { id: string; label: stri
   });
 };
 
-function NewDealModal({ initialAuthor, onClose, onCreate }: { initialAuthor?: string; onClose: () => void; onCreate: (d: Deal) => void }) {
+function NewDealModal({ initialAuthor, initialAuthorMeta, onClose, onCreate }: { initialAuthor?: string; initialAuthorMeta?: { name?: string; handle?: string }; onClose: () => void; onCreate: (d: Deal) => void }) {
   const toast = useToast();
   const [title, setTitle] = useState('');
   const [creators, setCreators] = useState<CreatorRecord[]>([]);
   const [extraAuthorOption, setExtraAuthorOption] = useState<{ id: string; label: string; handle: string } | null>(null);
-  const [authorId, setAuthorId] = useState(initialAuthor ?? '');
+  const initId = initialAuthor ? String(initialAuthor).trim() : '';
+  const [authorId, setAuthorId] = useState(initId);
   const [brandId, setBrandId] = useState(BRANDS[0].id);
   const [budget, setBudget] = useState('50000');
   const [type, setType] = useState<Deal['type']>('Stories');
@@ -253,7 +254,20 @@ function NewDealModal({ initialAuthor, onClose, onCreate }: { initialAuthor?: st
     api.getCreators()
       .then(records => {
         setCreators(records);
-        if (!initialAuthor) {
+        if (initialAuthor) {
+          const match = records.find(c => String(c.accountid ?? c.accountId ?? '') === String(initialAuthor) || String(c.id ?? '') === String(initialAuthor));
+          if (match) {
+            const rawHandle = match.handle ?? match.username;
+            const handle = rawHandle ? (rawHandle.startsWith('@') ? rawHandle : `@${rawHandle}`) : '';
+            const name = match.name ?? match.Name ?? '';
+            setExtraAuthorOption({
+              id: String(initialAuthor).trim(),
+              label: handle ? `${handle} (${name || 'Автор'})` : (name || 'Автор'),
+              handle,
+            });
+          }
+        }
+        if (!initId && !authorId) {
           const options = buildAuthorOptions(records);
           if (options.length > 0) {
             setAuthorId(options[0].id);
@@ -267,19 +281,27 @@ function NewDealModal({ initialAuthor, onClose, onCreate }: { initialAuthor?: st
     if (!initialAuthor) return;
     api.getCreatorProfile(String(initialAuthor))
       .then(profile => {
-        const resolvedId = String(profile.id);
         const handle = profile.username ? (profile.username.startsWith('@') ? profile.username : `@${profile.username}`) : `@${profile.title}`;
         const label = `${handle} (${profile.title || 'Автор'})`;
-        setExtraAuthorOption({ id: resolvedId, label, handle });
-        setAuthorId(resolvedId);
+        setExtraAuthorOption({ id: String(initialAuthor).trim(), label, handle });
       })
       .catch(() => {});
   }, [initialAuthor]);
 
+  const initialOption = initialAuthor
+    ? {
+        id: String(initialAuthor).trim(),
+        label: initialAuthorMeta?.handle ? `${initialAuthorMeta.handle} (${initialAuthorMeta.name || 'Автор'})` : (initialAuthorMeta?.name || 'Автор'),
+        handle: initialAuthorMeta?.handle || '',
+      }
+    : null;
   const baseOptions = buildAuthorOptions(creators);
-  const authorOptions = extraAuthorOption && !baseOptions.some(o => o.id === extraAuthorOption.id)
-    ? [extraAuthorOption, ...baseOptions]
-    : baseOptions;
+  const mergedOptions = [extraAuthorOption, initialOption]
+    .filter((o): o is { id: string; label: string; handle: string } => o !== null)
+    .reduce((acc, o) => (acc.some(x => x.id === o.id) ? acc : [o, ...acc]), baseOptions);
+  const authorOptions = authorId && !mergedOptions.some(o => o.id === authorId)
+    ? [{ id: authorId, label: initialOption?.label ?? 'Автор', handle: initialOption?.handle ?? '' }, ...mergedOptions]
+    : mergedOptions;
   const currentOption = authorOptions.find(o => o.id === authorId);
   const fallbackTitle = `${finalBrandName} · ${type} · ${currentOption?.handle || currentOption?.label || 'Автор'}`.slice(0, 250);
 

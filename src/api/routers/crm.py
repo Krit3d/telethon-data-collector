@@ -186,7 +186,7 @@ def _author_summary(account: Account | None) -> DealAuthorSummary | None:
     if account is None:
         return None
     return DealAuthorSummary(
-        id=account.id,
+        id=str(account.id),
         platform=account.platform,
         username=account.username,
         title=account.title,
@@ -200,7 +200,7 @@ def _message_item(message: CreatorMessage) -> CreatorMessageItem:
     return CreatorMessageItem(
         id=message.id,
         user_id=message.user_id,
-        account_id=message.account_id,
+        account_id=str(message.account_id),
         deal_id=message.deal_id,
         sender_type=message.sender_type,
         text=message.text,
@@ -218,7 +218,7 @@ def _deal_item(
     return DealItem(
         id=deal.id,
         user_id=deal.user_id,
-        account_id=deal.account_id,
+        account_id=str(deal.account_id),
         title=deal.title,
         stage=deal.stage,
         budget=deal.budget,
@@ -288,25 +288,29 @@ async def _resolve_account(
     crm_client: TwentyCrmClient,
     identifier: str,
 ) -> Account | None:
-    raw = identifier.strip().lstrip("@")
-    cleaned = raw.lstrip("-") if raw.startswith("-") else raw
-    if not cleaned:
+    raw_identifier = identifier.strip().lstrip("@")
+    if not raw_identifier:
         return None
     conditions = [
-        Account.platform_id == cleaned,
-        func.lower(Account.username) == cleaned.lower(),
-        func.lower(Account.title) == cleaned.lower(),
+        Account.platform_id == raw_identifier,
+        func.lower(Account.username) == raw_identifier.lower(),
+        func.lower(Account.username) == f"@{raw_identifier}".lower(),
+        func.lower(Account.title) == raw_identifier.lower(),
     ]
-    if cleaned.isdigit():
-        conditions.append(Account.id == int(cleaned))
+    try:
+        int_val = int(raw_identifier)
+    except (ValueError, TypeError):
+        int_val = None
+    if int_val is not None:
+        conditions.append(Account.id == int_val)
     result = await session.execute(select(Account).where(or_(*conditions)).limit(1))
     account = result.scalar_one_or_none()
     if account is not None:
         return account
     try:
-        creator_record = await crm_client.get_creator_by_id(cleaned)
+        creator_record = await crm_client.get_creator_by_id(raw_identifier)
         if creator_record is None:
-            creator_record = await crm_client.find_creator_by_account_id(cleaned)
+            creator_record = await crm_client.find_creator_by_account_id(raw_identifier)
         if creator_record is not None:
             account_id = creator_record.get("accountid") or creator_record.get("accountId")
             if account_id is not None:
@@ -320,7 +324,7 @@ async def _resolve_account(
                     if account is not None:
                         return account
     except Exception:
-        logger.warning("Twenty CRM fallback lookup failed for %s", cleaned, exc_info=True)
+        logger.warning("Twenty CRM fallback lookup failed for %s", raw_identifier, exc_info=True)
     return None
 
 
@@ -533,7 +537,7 @@ async def crm_update_creator_status(
         account = await _resolve_account(session, crm_client, creator_id)
         if account is None:
             raise HTTPException(status_code=404, detail="Автор не найден")
-        if payload.status in {"ARCHIVED", "В архиве"}:
+        if payload.status.strip().lower() in {"archived", "в архиве"}:
             account.status = "archived"
             if payload.archive_active_deals:
                 await session.execute(
@@ -616,12 +620,24 @@ async def get_creator_detail(
         content_result = await session.execute(content_stmt)
         posts = list(content_result.scalars().all())
 
-        deals_stmt = (
+        active_deals_stmt = (
+            select(func.count(Deal.id))
+            .where(
+                Deal.account_id == account.id,
+                Deal.user_id == current_user.id,
+                Deal.stage >= 1,
+                Deal.stage <= 4,
+            )
+        )
+        active_deals_result = await session.execute(active_deals_stmt)
+        active_deals_count = active_deals_result.scalar() or 0
+
+        total_deals_stmt = (
             select(func.count(Deal.id))
             .where(Deal.account_id == account.id, Deal.user_id == current_user.id)
         )
-        deals_result = await session.execute(deals_stmt)
-        deals_count = deals_result.scalar() or 0
+        total_deals_result = await session.execute(total_deals_stmt)
+        total_deals_count = total_deals_result.scalar() or 0
 
     followers = int(account.subscribers_count or 0)
     er = round(float(account.static_avg_er or 0.0), 2)
@@ -633,17 +649,17 @@ async def get_creator_detail(
         cpm = 0
 
     platform = _normalize_platform(account.platform)
-    raw_status = account.status or ""
-    if raw_status in {"ARCHIVED", "В архиве"}:
+    normalized_status = (account.status or "").strip().lower()
+    if normalized_status in {"archived", "в архиве"}:
         status = "В архиве"
-    elif raw_status in {"NA_PAUZE", "На паузе"}:
+    elif normalized_status in {"na_pauze", "на паузе"}:
         status = "На паузе"
-    elif deals_count > 0:
+    elif active_deals_count > 0:
         status = "В сделке"
     else:
         status = "Свободен"
     return CreatorProfileDetail(
-        id=account.id,
+        id=str(account.id),
         platform=platform,
         username=account.username,
         title=account.title,
@@ -658,7 +674,7 @@ async def get_creator_detail(
         profile_url=_profile_url(platform, account.username),
         cpm=cpm,
         avg_reach=avg_reach,
-        deals_count=deals_count,
+        deals_count=total_deals_count,
         posts=[_post_item(post, platform) for post in posts],
     )
 
@@ -715,7 +731,11 @@ async def send_creator_message(
             raise HTTPException(status_code=404, detail="Автор не найден")
         deal_stmt = (
             select(Deal)
-            .where(Deal.account_id == account.id, Deal.user_id == current_user.id)
+            .where(
+                Deal.account_id == account.id,
+                Deal.user_id == current_user.id,
+                Deal.stage.in_([1, 2, 3, 4]),
+            )
             .order_by(Deal.updated_at.desc())
             .limit(1)
         )
@@ -806,7 +826,7 @@ async def list_deals(
                 last_map[row.deal_id] = CreatorMessageItem(
                     id=row.id,
                     user_id=row.user_id,
-                    account_id=row.account_id,
+                    account_id=str(row.account_id),
                     deal_id=row.deal_id,
                     sender_type=row.sender_type,
                     text=row.text,
@@ -827,7 +847,7 @@ async def create_deal(
     crm_client: TwentyCrmClient = Depends(get_crm_client),
 ) -> DealItem:
     async with db.async_session() as session:
-        account = await _resolve_account(session, crm_client, str(payload.account_id))
+        account = await _resolve_account(session, crm_client, str(payload.account_id).strip())
         if account is None:
             raise HTTPException(status_code=404, detail="Автор не найден")
         deal = Deal(
@@ -1055,11 +1075,53 @@ async def init_communication(
         )
         deal_result = await session.execute(deal_stmt)
         deal = deal_result.scalar_one_or_none()
+        existing_stmt = (
+            select(CreatorMessage.id)
+            .where(
+                CreatorMessage.user_id == current_user.id,
+                CreatorMessage.account_id == account.id,
+            )
+            .limit(1)
+        )
+        existing_result = await session.execute(existing_stmt)
+        existing_message = existing_result.scalar_one_or_none()
+        if existing_message is None:
+            system_message = CreatorMessage(
+                user_id=current_user.id,
+                account_id=account.id,
+                deal_id=deal.id if deal else None,
+                sender_type="system",
+                text="Диалог начат",
+                is_read=True,
+            )
+            session.add(system_message)
+            await session.commit()
+            await session.refresh(system_message)
+            last_message = "Диалог начат"
+            last_message_time = system_message.created_at
+        else:
+            last_stmt = (
+                select(CreatorMessage)
+                .where(
+                    CreatorMessage.user_id == current_user.id,
+                    CreatorMessage.account_id == account.id,
+                )
+                .order_by(CreatorMessage.created_at.desc())
+                .limit(1)
+            )
+            last_result = await session.execute(last_stmt)
+            last_existing = last_result.scalar_one_or_none()
+            last_message = last_existing.text if last_existing else ""
+            last_message_time = (
+                last_existing.created_at
+                if last_existing
+                else (deal.updated_at if deal else account.created_at)
+            )
         raw_status = account.status or ""
         is_archived = raw_status in {"ARCHIVED", "В архиве"}
         return CommunicationChannelItem(
             deal_id=deal.id if deal else None,
-            author_id=account.id,
+            author_id=str(account.id),
             author_name=account.title or "",
             author_handle=(
                 f"@{account.username.lstrip('@')}"
@@ -1069,8 +1131,8 @@ async def init_communication(
             platform=account.platform or "",
             deal_title=deal.title if deal else None,
             stage=deal.stage if deal else None,
-            last_message="",
-            last_message_time=deal.updated_at if deal else account.created_at,
+            last_message=last_message,
+            last_message_time=last_message_time,
             unread_count=0,
             is_archived=is_archived,
         )
@@ -1107,7 +1169,7 @@ async def list_communications(
                 CreatorMessage.user_id == current_user.id,
                 CreatorMessage.account_id.in_(account_ids),
                 CreatorMessage.is_read.is_(False),
-                CreatorMessage.sender_type != "user",
+                CreatorMessage.sender_type == "creator",
             )
             .group_by(CreatorMessage.account_id)
         )
@@ -1147,11 +1209,11 @@ async def list_communications(
                 else (best_deal.updated_at if best_deal else (account.created_at if account else datetime.now(timezone.utc)))
             )
             raw_status = (account.status or "") if account is not None else ""
-            is_archived = raw_status in {"ARCHIVED", "В архиве"}
+            is_archived = raw_status.strip().lower() in {"archived", "в архиве"}
             channels.append(
                 CommunicationChannelItem(
                     deal_id=best_deal.id if best_deal else None,
-                    author_id=account_id,
+                    author_id=str(account_id),
                     author_name=account.title if account is not None else "",
                     author_handle=(
                         f"@{account.username.lstrip('@')}"

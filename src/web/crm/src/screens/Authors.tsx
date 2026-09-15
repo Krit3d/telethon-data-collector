@@ -2,7 +2,7 @@ import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpDown, Briefcase, Ch
 import { useEffect, useMemo, useState } from 'react';
 import { SocialIcon } from '../components/icons';
 import { Avatar, Badge, Btn, Card, inputCls, Modal, Toggle, useToast } from '../components/ui';
-import { type Author, type Deal, type Social } from '../data';
+import { fmtMoney, type Author, type Deal, type Social } from '../data';
 import { api, normalizeSocial, STATUS_OPTIONS, type CreatorRecord } from '../services/api';
 
 type SortKey = 'nick' | 'social' | 'followers' | 'niche' | 'reach' | 'er' | 'cpm' | 'status';
@@ -75,7 +75,7 @@ function getPendingImportIds(): string[] {
   return Array.from(new Set(ids));
 }
 
-export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }: { deals: Deal[]; onOpenProfile: (id: string) => void; onNewDeal: (authorId: string) => void; onOpenComms: () => void }) {
+export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }: { deals: Deal[]; onOpenProfile: (id: string) => void; onNewDeal: (authorId: string, meta?: { name?: string; handle?: string }) => void; onOpenComms: () => void }) {
   const toast = useToast();
   const [authors, setAuthors] = useState<Author[]>([]);
   const [loading, setLoading] = useState(true);
@@ -89,8 +89,10 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
   const [page, setPage] = useState(0);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
-  const [menu, setMenu] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ id: string; top: number; left: number } | null>(null);
   const [confirmDeleteAuthor, setConfirmDeleteAuthor] = useState<Author | null>(null);
+  const [authorToArchive, setAuthorToArchive] = useState<Author | null>(null);
+  const [closeDeals, setCloseDeals] = useState(true);
 
   const load = async () => {
     setLoading(true);
@@ -106,6 +108,17 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
   };
 
   useEffect(() => { void load(); }, []);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => {
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+    };
+  }, [menu]);
 
   const openSearch = () => {
     window.open(getSearchBaseUrl(), '_blank');
@@ -295,9 +308,8 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
-                  {pageItems.map((a, idx) => {
+                  {pageItems.map(a => {
                     const dealsCount = dealsCountFor(a);
-                    const openUp = pageItems.length > 2 && idx >= pageItems.length - 2;
                     return (
                     <tr key={a.id} className="group hover:bg-indigo-50/40 transition-colors">
                       <td className="px-4 py-2.5">
@@ -318,33 +330,22 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
                       <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
                         <Badge tone={statusTone[computedStatus(a, dealsCount)]}>{computedStatus(a, dealsCount)}</Badge>
                       </td>
-                      <td className="px-4 py-2.5 text-right relative" onClick={e => e.stopPropagation()}>
+                      <td className="px-4 py-2.5 text-right" onClick={e => e.stopPropagation()}>
                         <button className="w-7 h-7 rounded-lg text-gray-300 group-hover:text-gray-500 hover:bg-gray-100 inline-flex items-center justify-center transition-colors"
-                          onClick={() => setMenu(m => m === a.id ? null : a.id)}><MoreVertical size={15} /></button>
-                        {menu === a.id && (
-                          <div className={openUp
-                            ? "absolute right-4 bottom-8 z-30 w-48 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5 text-left origin-bottom-right"
-                            : "absolute right-4 top-9 z-30 w-48 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5 text-left origin-top-right"}>
-                            <MenuItem icon={<Briefcase size={14} />} label="Новая сделка" onClick={() => { setMenu(null); onNewDeal(a.id); }} />
-                            <MenuItem icon={<MessageSquare size={14} />} label="Написать" onClick={() => { setMenu(null); onOpenComms(); }} />
-                            <div className="h-px bg-gray-100 my-1" />
-                            {a.status === 'В архиве' ? (
-                              <MenuItem icon={<ArchiveRestore size={14} />} label="Восстановить" onClick={() => void changeStatus(a, 'Свободен')} />
-                            ) : (
-                              <MenuItem icon={<Archive size={14} />} label="В архив" onClick={() => void changeStatus(a, 'В архиве')} />
-                            )}
-                            <div className="h-px bg-gray-100 my-1" />
-                            <MenuItem icon={<Trash2 size={14} />} label="Удалить из шортлиста" danger blocked={dealsCount > 0}
-                              onClick={() => {
-                                setMenu(null);
-                                if (dealsCount > 0) {
-                                  toast('err', 'Нельзя удалить автора с историей сделок. Отправьте его в архив.');
-                                } else {
-                                  setConfirmDeleteAuthor(a);
-                                }
-                              }} />
-                          </div>
-                        )}
+                          onClick={e => {
+                            e.stopPropagation();
+                            if (menu?.id === a.id) {
+                              setMenu(null);
+                              return;
+                            }
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            const dropdownHeight = 185;
+                            const dropdownWidth = 192;
+                            const openUp = rect.bottom + dropdownHeight > window.innerHeight;
+                            const top = openUp ? Math.max(8, rect.top - dropdownHeight) : rect.bottom + 4;
+                            const left = Math.max(8, rect.right - dropdownWidth);
+                            setMenu({ id: a.id, top, left });
+                          }}><MoreVertical size={15} /></button>
                       </td>
                     </tr>
                     );
@@ -381,6 +382,77 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
           </div>
         </Modal>
       )}
+
+      {authorToArchive && (() => {
+        const activeDeals = deals.filter(d => (String(d.authorId) === String(authorToArchive.id) || (authorToArchive.twentyId && String(d.authorId) === String(authorToArchive.twentyId))) && d.stage >= 1 && d.stage <= 4);
+        const activeBudget = activeDeals.reduce((acc, d) => acc + d.budget, 0);
+        const handleConfirm = async () => {
+          try {
+            await api.updateCreatorStatus(authorToArchive.twentyId || authorToArchive.id, 'В архиве', activeDeals.length > 0 ? closeDeals : false);
+            setAuthors(prev => prev.map(x => x.id === authorToArchive.id ? { ...x, status: 'В архиве' } : x));
+            toast('ok', `Автор ${authorToArchive.nick} архивирован`);
+          } catch (err) {
+            toast('err', err instanceof Error && err.message ? err.message : 'Не удалось архивировать автора');
+          } finally {
+            setAuthorToArchive(null);
+          }
+        };
+        return (
+          <Modal onClose={() => setAuthorToArchive(null)} w="max-w-sm">
+            <div className="px-5 py-4 border-b border-gray-200">
+              <h2 className="text-[16px] font-display font-semibold text-gray-900">Архивировать автора?</h2>
+            </div>
+            {activeDeals.length === 0 ? (
+              <div className="px-5 py-4 text-[13px] font-medium text-gray-600 leading-relaxed">
+                Автор @{authorToArchive.nick} будет перемещен в архив. Вы сможете восстановить его в любой момент.
+              </div>
+            ) : (
+              <div className="px-5 py-4">
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-[12.5px] font-medium text-amber-800 leading-relaxed">
+                  У автора {activeDeals.length} {activeDeals.length % 10 === 1 && activeDeals.length % 100 !== 11 ? 'открытая сделка' : activeDeals.length % 10 >= 2 && activeDeals.length % 10 <= 4 && (activeDeals.length % 100 < 10 || activeDeals.length % 100 >= 20) ? 'открытые сделки' : 'открытых сделок'} на сумму {fmtMoney(activeBudget)}.
+                </div>
+                <label className="mt-3 flex items-center gap-2.5 cursor-pointer select-none">
+                  <input type="checkbox" checked={closeDeals} onChange={e => setCloseDeals(e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-200" />
+                  <span className="text-[13px] font-medium text-gray-700">Перевести активные сделки в архив (сорваны)</span>
+                </label>
+              </div>
+            )}
+            <div className="px-5 py-4 border-t border-gray-200 flex items-center justify-end gap-2">
+              <Btn variant="secondary" size="sm" onClick={() => setAuthorToArchive(null)}>Отмена</Btn>
+              <Btn size="sm" onClick={() => void handleConfirm()}><Archive size={13} />В архив</Btn>
+            </div>
+          </Modal>
+        );
+      })()}
+
+      {(() => {
+        const activeMenuAuthor = authors.find(x => x.id === menu?.id);
+        if (!menu || !activeMenuAuthor) return null;
+        return (
+          <div className="fixed z-50 w-48 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5 text-left"
+            style={{ top: `${menu.top}px`, left: `${menu.left}px` }}
+            onClick={e => e.stopPropagation()}>
+            <MenuItem icon={<Briefcase size={14} />} label="Новая сделка" onClick={() => { setMenu(null); onNewDeal(activeMenuAuthor.id, { name: activeMenuAuthor.nick }); }} />
+            <MenuItem icon={<MessageSquare size={14} />} label="Написать" onClick={() => { setMenu(null); onOpenComms(); }} />
+            <div className="h-px bg-gray-100 my-1" />
+            {activeMenuAuthor.status === 'В архиве' ? (
+              <MenuItem icon={<ArchiveRestore size={14} />} label="Восстановить" onClick={() => { setMenu(null); void changeStatus(activeMenuAuthor, 'Свободен'); }} />
+            ) : (
+              <MenuItem icon={<Archive size={14} />} label="В архив" onClick={() => { setMenu(null); setCloseDeals(true); setAuthorToArchive(activeMenuAuthor); }} />
+            )}
+            <div className="h-px bg-gray-100 my-1" />
+            <MenuItem icon={<Trash2 size={14} />} label="Удалить из шортлиста" danger blocked={dealsCountFor(activeMenuAuthor) > 0}
+              onClick={() => {
+                setMenu(null);
+                if (dealsCountFor(activeMenuAuthor) > 0) {
+                  toast('err', 'Нельзя удалить автора с историей сделок. Отправьте его в архив.');
+                } else {
+                  setConfirmDeleteAuthor(activeMenuAuthor);
+                }
+              }} />
+          </div>
+        );
+      })()}
     </div>
   );
 }

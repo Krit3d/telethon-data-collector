@@ -20,7 +20,7 @@ export interface Brand {
   allowed: string[]; forbidden: string[]; mentions: string[]; payTypes: PayType[];
 }
 
-export interface DealMsg { id: string; from: 'author' | 'user'; text: string; time: string }
+export interface DealMsg { id: string; from: 'author' | 'user' | 'system'; text: string; time: string }
 
 export interface Deal {
   id: string; title: string; brandId: string; authorId: string; budget: number;
@@ -28,7 +28,7 @@ export interface Deal {
   stage: number; date: string; pubDate: string;
   msgs: DealMsg[]; file?: string; erid?: string;
   desc: string; terms: string; exclusive: boolean; edits: number;
-  authorSummary?: { id: number; platform: string; username: string | null; title: string; subscribers_count: number | null; static_avg_er: number | null; category_path: string | null } | null;
+  authorSummary?: { id: string; platform: string; username: string | null; title: string; subscribers_count: number | null; static_avg_er: number | null; category_path: string | null } | null;
 }
 
 export interface EridRec {
@@ -61,6 +61,22 @@ export const STAGES = [
   { id: 4, name: 'Подписание договора', color: '#6366F1', soft: '#EEF2FF' },
   { id: 5, name: 'Контент создан', color: '#10B981', soft: '#ECFDF5' },
 ];
+
+export interface Stage {
+  id: number;
+  name: string;
+  color: string;
+  soft: string;
+}
+
+export const ARCHIVED_STAGE: Stage = { id: 0, name: 'В архиве', color: '#94A3B8', soft: '#F8FAFC' };
+
+export const getStage = (stage: number): Stage => {
+  const found = STAGES.find(x => x.id === stage);
+  if (found) return found;
+  if (stage === 0) return ARCHIVED_STAGE;
+  return { id: stage, name: 'Неизвестно', color: '#94A3B8', soft: '#F8FAFC' };
+};
 
 export const fmtMoney = (n: number) => `${Math.round(n).toLocaleString('ru-RU')} ₽`;
 export const fmtNum = (n: number) =>
@@ -473,7 +489,7 @@ export const resolveAuthor = (deal: Deal): Pick<Author, 'nick' | 'social' | 'hue
     return {
       nick: s.username ? (s.username.startsWith('@') ? s.username : '@' + s.username) : '@' + s.title,
       social: (s.platform === 'instagram' ? 'Instagram' : s.platform === 'telegram' ? 'Telegram' : s.platform === 'youtube' ? 'YouTube' : 'Instagram') as Social,
-      hue: Math.abs(s.id * 137) % 360,
+      hue: Math.abs(Number(s.id) * 137) % 360,
       followers: s.subscribers_count || 0,
       er: s.static_avg_er || 0,
     };

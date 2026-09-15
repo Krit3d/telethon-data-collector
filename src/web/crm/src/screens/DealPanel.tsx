@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { X, Share2, MoreHorizontal, Trash2, Paperclip, Send, Upload, Check, ShieldCheck, BookOpen, Bold, Italic, List, Image as ImageIcon, FilePlus2, MessageCircle } from 'lucide-react';
-import { STAGES, fmtMoney, resolveAuthor, brandById, type Deal, type DealMsg } from '../data';
+import { STAGES, ARCHIVED_STAGE, getStage, fmtMoney, resolveAuthor, brandById, type Deal, type DealMsg } from '../data';
 import { SidePanel, Badge, Avatar, Btn, Tabs, useToast, Tip, CopyBtn, Field, inputCls, Modal } from '../components/ui';
 import { SocialIcon, FakeQR } from '../components/icons';
 import { api, type DealMessageItem } from '../services/api';
@@ -25,7 +25,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
   const [deleting, setDeleting] = useState(false);
   const chatRef = useRef<HTMLDivElement>(null);
   const a = resolveAuthor(deal), b = brandById(deal.brandId);
-  const stage = STAGES.find(s => s.id === deal.stage)!;
+  const stage = getStage(deal.stage);
 
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: 'smooth' }); }, [deal.msgs.length, tab]);
 
@@ -82,10 +82,11 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
                 const oldStage = deal.stage;
                 onUpdate({ stage: newStage });
                 api.updateDeal(Number(deal.id), { stage: newStage })
-                  .then(() => toast('ok', `Статус: «${STAGES.find(s => s.id === newStage)?.name}»`))
+                  .then(() => toast('ok', `Статус: «${getStage(newStage).name}»`))
                   .catch(() => { onUpdate({ stage: oldStage }); toast('err', 'Не удалось обновить стадию'); });
               }}
               className="appearance-none pl-6.5 pr-7 h-8 rounded-lg border border-gray-200 bg-white text-[12.5px] font-bold text-gray-800 cursor-pointer hover:border-gray-300 transition-colors outline-none">
+              {deal.stage === 0 && <option value={0}>{ARCHIVED_STAGE.name}</option>}
               {STAGES.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
             <span className="absolute left-2.5 top-1/2 -translate-y-1/2 w-2 h-2 rounded-full pointer-events-none" style={{ background: stage.color }} />
@@ -162,6 +163,12 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
                   </div>
                 ))}
               </div>
+              {deal.stage === 0 && (
+                <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-[12.5px] font-semibold text-slate-600 flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-slate-400 shrink-0" />
+                  Сделка находится в архиве (сорвана)
+                </div>
+              )}
             </section>
 
             <section>
@@ -200,13 +207,21 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
             <div ref={chatRef} className="flex-1 min-h-0 overflow-y-auto scroll-thin p-5 flex flex-col gap-3 bg-slate-50/50">
               {deal.msgs.length === 0 && <div className="m-auto text-center text-[12.5px] font-semibold text-gray-400">Сообщений пока нет — напишите автору первым</div>}
               {deal.msgs.map(m => (
-                <div key={m.id} className={`flex ${m.from === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`relative max-w-[75%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ${
-                    m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md'}`}>
-                    {m.text}
-                    <span className={`block text-[10px] font-semibold mt-1 text-right ${m.from === 'user' ? 'text-indigo-200' : 'text-gray-300'}`}>{m.time} {m.from === 'user' && '✓✓'}</span>
+                m.from === 'system' ? (
+                  <div key={m.id} className="flex justify-center my-1.5">
+                    <span className="text-[11px] font-medium text-gray-400 bg-gray-100/80 border border-gray-200/60 px-3 py-0.5 rounded-full">
+                      {m.text} · {m.time}
+                    </span>
                   </div>
-                </div>
+                ) : (
+                  <div key={m.id} className={`flex ${m.from === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <div className={`relative max-w-[75%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ${
+                      m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md'}`}>
+                      {m.text}
+                      <span className={`block text-[10px] font-semibold mt-1 text-right ${m.from === 'user' ? 'text-indigo-200' : 'text-gray-300'}`}>{m.time} {m.from === 'user' && '✓✓'}</span>
+                    </div>
+                  </div>
+                )
               ))}
             </div>
             <div className="p-3.5 border-t border-gray-100 bg-white shrink-0">
@@ -384,7 +399,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
 
 const toDealMsg = (m: DealMessageItem): DealMsg => ({
   id: String(m.id),
-  from: m.sender_type === 'creator' ? 'author' : 'user',
+  from: m.sender_type === 'creator' ? 'author' : (m.sender_type === 'system' ? 'system' : 'user'),
   text: m.text,
   time: new Date(m.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
 });

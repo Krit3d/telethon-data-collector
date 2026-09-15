@@ -484,7 +484,7 @@ class CrmUpdateStatusRequest(BaseModel):
 
 
 class DealAuthorSummary(BaseModel):
-    id: int
+    id: str
     platform: str
     username: str | None = None
     title: str
@@ -496,7 +496,7 @@ class DealAuthorSummary(BaseModel):
 class CreatorMessageItem(BaseModel):
     id: int
     user_id: int
-    account_id: int
+    account_id: str
     deal_id: int | None = None
     sender_type: str
     text: str
@@ -507,7 +507,7 @@ class CreatorMessageItem(BaseModel):
 class DealItem(BaseModel):
     id: int
     user_id: int
-    account_id: int
+    account_id: str
     title: str
     stage: int
     budget: int
@@ -523,7 +523,7 @@ class DealItem(BaseModel):
 
 
 class DealCreateRequest(BaseModel):
-    account_id: int | str
+    account_id: str
     title: str
     budget: int = 0
     type: str = "Stories"
@@ -550,7 +550,7 @@ class CreatorSendMessageRequest(BaseModel):
 
 class CommunicationChannelItem(BaseModel):
     deal_id: int | None = None
-    author_id: int
+    author_id: str
     author_name: str
     author_handle: str
     platform: str
@@ -577,7 +577,7 @@ class CreatorPostItem(BaseModel):
 
 
 class CreatorProfileDetail(BaseModel):
-    id: int
+    id: str
     platform: str
     username: str | None = None
     title: str
