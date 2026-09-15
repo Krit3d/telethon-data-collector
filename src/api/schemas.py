@@ -493,15 +493,28 @@ class DealAuthorSummary(BaseModel):
     category_path: str | None = None
 
 
+class FileUploadResponse(BaseModel):
+    media_url: str
+    media_name: str
+    media_type: str
+    file_size: int
+
+
 class CreatorMessageItem(BaseModel):
     id: int
     user_id: int
     account_id: str
     deal_id: int | None = None
     sender_type: str
-    text: str
+    text: str | None = None
     is_read: bool
     created_at: datetime
+    channel_type: str | None = None
+    channel_target: str | None = None
+    external_message_id: str | None = None
+    media_url: str | None = None
+    media_name: str | None = None
+    media_type: str | None = None
 
 
 class DealItem(BaseModel):
@@ -544,8 +557,12 @@ class DealUpdateRequest(BaseModel):
 
 
 class CreatorSendMessageRequest(BaseModel):
-    text: str
+    text: str | None = None
     sender_type: str = "user"
+    preferred_channel: str | None = None
+    media_url: str | None = None
+    media_name: str | None = None
+    media_type: str | None = None
 
 
 class CommunicationChannelItem(BaseModel):
@@ -560,6 +577,7 @@ class CommunicationChannelItem(BaseModel):
     last_message_time: datetime
     unread_count: int
     is_archived: bool = False
+    channel_type: str | None = None
 
 
 class CreatorPostItem(BaseModel):

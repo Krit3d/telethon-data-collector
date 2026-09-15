@@ -14,7 +14,7 @@ from starlette.responses import Response
 
 from src.api.routers import search, health, crm
 from src.api.services.crm_client import TwentyCrmClient
-from src.config.config import load_settings
+from src.config.config import MEDIA_DIR, load_settings
 from src.db.database import Database
 from src.embeddings.qdrant_service import QdrantService
 from src.graph.client import Neo4jClient
@@ -144,3 +144,5 @@ if WEB_DIR.exists():
         NoCacheStaticFiles(directory=str(WEB_DIR / "js"), html=True),
         name="js",
     )
+
+app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")

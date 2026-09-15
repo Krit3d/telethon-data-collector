@@ -558,7 +558,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
 const toDealMsg = (m: DealMessageItem): DealMsg => ({
   id: String(m.id),
   from: m.sender_type === 'creator' ? 'author' : (m.sender_type === 'system' ? 'system' : 'user'),
-  text: m.text,
+  text: m.text || '',
   time: new Date(m.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
 });
 

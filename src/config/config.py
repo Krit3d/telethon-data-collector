@@ -11,6 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.logger import setup_logging
 
+MEDIA_DIR: Path = Path(__file__).resolve().parent.parent.parent / "media"
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 class Settings(BaseSettings):
 
@@ -336,6 +339,7 @@ class Settings(BaseSettings):
         default=8000,
         description="FastAPI server port",
     )
+    api_base_url: str = Field(default="http://127.0.0.1:8000", validation_alias="API_BASE_URL")
 
     # ---- Twenty CRM integration settings ----
     twenty_api_url: str = Field(

@@ -489,6 +489,7 @@ class CreatorMessage(Base):
             "created_at",
         ),
         Index("ix_creator_messages_deal_id", "deal_id"),
+        Index("ix_creator_messages_account_channel", "account_id", "channel_type"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -511,7 +512,13 @@ class CreatorMessage(Base):
         index=True,
     )
     sender_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    text: Mapped[str] = mapped_column(Text, nullable=False)
+    channel_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    channel_target: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    external_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    media_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    media_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     is_read: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

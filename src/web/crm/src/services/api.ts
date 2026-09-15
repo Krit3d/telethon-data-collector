@@ -80,13 +80,26 @@ export interface DealAuthorSummary {
   category_path: string | null;
 }
 
+export interface FileUploadResponse {
+  media_url: string;
+  media_name: string;
+  media_type: string;
+  file_size: number;
+}
+
 export interface DealMessageItem {
   id: number;
   deal_id: number;
   sender_type: 'user' | 'creator' | 'system' | string;
-  text: string;
+  text?: string | null;
   is_read: boolean;
   created_at: string;
+  channel_type?: string | null;
+  channel_target?: string | null;
+  external_message_id?: string | null;
+  media_url?: string | null;
+  media_name?: string | null;
+  media_type?: string | null;
 }
 
 export interface DealItem {
@@ -140,14 +153,24 @@ export interface CommunicationChannelItem {
   last_message_time: string;
   unread_count: number;
   is_archived: boolean;
+  channel_type?: 'telegram' | 'email' | 'whatsapp' | 'internal' | string | null;
 }
 
 const TOKEN_KEY = 'creatorflow_token';
 const USER_KEY = 'creatorflow_user';
 
-const API_BASE = typeof window !== 'undefined'
-  ? `${window.location.protocol}//${window.location.hostname}:8000/api/v1/crm`
-  : 'http://localhost:8000/api/v1/crm';
+const API_PROTOCOL = typeof window !== 'undefined' ? window.location.protocol : 'http:';
+const API_HOSTNAME = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+const DEFAULT_API_URL = `${API_PROTOCOL}//${API_HOSTNAME}:8000/api/v1`;
+const ROOT_API_URL = (import.meta.env.VITE_API_URL || DEFAULT_API_URL).replace(/\/+$/, '');
+const API_BASE = `${ROOT_API_URL.replace(/\/crm\/?$/, '')}/crm`;
+export const MEDIA_SERVER_BASE = ROOT_API_URL.replace(/\/api(\/v\d+)?.*$/, '');
+
+export function resolveMediaUrl(path?: string | null): string {
+  if (!path) return '';
+  if (path.startsWith('http://') || path.startsWith('https://')) return path;
+  return `${MEDIA_SERVER_BASE}/${path.replace(/^\/+/, '')}`;
+}
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -305,10 +328,41 @@ export const api = {
     return request<DealMessageItem[]>(`/creators/${encodeURIComponent(creatorId)}/messages`);
   },
 
-  async sendCreatorMessage(creatorId: string, text: string, senderType: string = 'user'): Promise<DealMessageItem> {
+  async uploadChatFile(file: File): Promise<FileUploadResponse> {
+    const form = new FormData();
+    form.append('file', file);
+    const headers: Record<string, string> = {};
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const response = await fetch(`${API_BASE}/upload`, { method: 'POST', headers, body: form });
+    if (response.status === 401) {
+      api.logout();
+      window.dispatchEvent(new CustomEvent('creatorflow:auth_expired'));
+      throw new ApiError('Сессия истекла. Пожалуйста, войдите снова.', 401);
+    }
+    if (!response.ok) {
+      let detail = `Ошибка запроса (${response.status})`;
+      try {
+        const body = (await response.json()) as { detail?: unknown };
+        if (typeof body.detail === 'string') detail = body.detail;
+      } catch {
+        /* ignore parse failures */
+      }
+      throw new ApiError(detail, response.status);
+    }
+    return (await response.json()) as FileUploadResponse;
+  },
+
+  async sendCreatorMessage(creatorId: string, text?: string | null, senderType: string = 'user', media?: { media_url: string; media_name: string; media_type: string }): Promise<DealMessageItem> {
     return request<DealMessageItem>(`/creators/${encodeURIComponent(creatorId)}/messages`, {
       method: 'POST',
-      body: JSON.stringify({ text, sender_type: senderType }),
+      body: JSON.stringify({
+        text: text?.trim() || null,
+        sender_type: senderType,
+        media_url: media?.media_url || null,
+        media_name: media?.media_name || null,
+        media_type: media?.media_type || null,
+      }),
     });
   },
 
@@ -343,7 +397,7 @@ export function mapDealItemToDeal(item: DealItem): Deal {
     date: new Date(item.created_at).toLocaleDateString('ru-RU'),
     pubDate: item.pub_date || new Date(item.created_at).toLocaleDateString('ru-RU'),
     type: item.type as Deal['type'],
-    msgs: item.last_message ? [{ id: String(item.last_message.id), from: item.last_message.sender_type === 'creator' ? 'author' : 'user', text: item.last_message.text, time: new Date(item.last_message.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) }] : [],
+    msgs: item.last_message ? [{ id: String(item.last_message.id), from: item.last_message.sender_type === 'creator' ? 'author' : 'user', text: item.last_message.text || '', time: new Date(item.last_message.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) }] : [],
     desc: item.terms || '',
     terms: item.terms || `Фиксированная оплата ${item.budget} ₽`,
     exclusive: false,

@@ -2,16 +2,20 @@ import asyncio
 import base64
 import json
 import logging
+import shutil
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import joinedload
 
 from src.api.dependencies import get_crm_client, get_db
+from src.config.config import MEDIA_DIR
 from src.api.schemas import (
     CommunicationChannelItem,
     CreatorMessageItem,
@@ -28,7 +32,9 @@ from src.api.schemas import (
     DealCreateRequest,
     DealItem,
     DealUpdateRequest,
+    FileUploadResponse,
 )
+from src.api.services.contact_resolver import ContactResolver
 from src.api.services.crm_client import TwentyCrmClient
 from src.db.database import Database
 from src.db.models import Account, Content, Deal, CreatorMessage, User
@@ -206,6 +212,79 @@ def _message_item(message: CreatorMessage) -> CreatorMessageItem:
         text=message.text,
         is_read=message.is_read,
         created_at=message.created_at,
+        channel_type=message.channel_type,
+        channel_target=message.channel_target,
+        external_message_id=message.external_message_id,
+        media_url=message.media_url,
+        media_name=message.media_name,
+        media_type=message.media_type,
+    )
+
+
+def _message_snippet(message: CreatorMessage | None) -> str:
+    if message is None:
+        return ""
+    if message.text and message.text.strip():
+        return message.text
+    if message.media_url:
+        if message.media_type == "image":
+            return "[Фото]"
+        if message.media_type == "video":
+            return "[Видео]"
+        return f"[Файл: {message.media_name or 'Документ'}]"
+    return ""
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+FORBIDDEN_EXTENSIONS = {".exe", ".bat", ".sh", ".py", ".php", ".js"}
+
+
+def _detect_media_type(extension: str) -> str:
+    if extension in IMAGE_EXTENSIONS:
+        return "image"
+    if extension in VIDEO_EXTENSIONS:
+        return "video"
+    return "document"
+
+
+@router.post("/upload", response_model=FileUploadResponse)
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+) -> FileUploadResponse:
+    internal_token = request.headers.get("x-internal-token")
+    if internal_token != request.app.state.settings.secret_key:
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Unauthorized upload access")
+        token = auth[len("Bearer "):].strip()
+        if not token:
+            raise HTTPException(status_code=401, detail="Unauthorized upload access")
+        payload = decode_access_token(token, request.app.state.settings.secret_key)
+        if payload is None:
+            raise HTTPException(status_code=401, detail="Unauthorized upload access")
+    original_filename = file.filename or "file"
+    extension = Path(original_filename).suffix.lower()
+    if extension in FORBIDDEN_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Запрещённый тип файла")
+    media_type = _detect_media_type(extension)
+    saved_filename = f"{uuid.uuid4().hex}{extension}"
+    destination = MEDIA_DIR / saved_filename
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    total_size = 0
+    with destination.open("wb") as buffer:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            buffer.write(chunk)
+            total_size += len(chunk)
+    return FileUploadResponse(
+        media_url=f"/media/{saved_filename}",
+        media_name=original_filename,
+        media_type=media_type,
+        file_size=total_size,
     )
 
 
@@ -723,8 +802,8 @@ async def send_creator_message(
     db: Database = Depends(get_db),
     crm_client: TwentyCrmClient = Depends(get_crm_client),
 ) -> CreatorMessageItem:
-    if not payload.text.strip():
-        raise HTTPException(status_code=400, detail="Текст сообщения не может быть пустым")
+    if not (payload.text and payload.text.strip()) and not payload.media_url:
+        raise HTTPException(status_code=400, detail="Сообщение не может быть пустым")
     async with db.async_session() as session:
         account = await _resolve_account(session, crm_client, creator_id)
         if account is None:
@@ -741,12 +820,21 @@ async def send_creator_message(
         )
         deal_result = await session.execute(deal_stmt)
         deal = deal_result.scalar_one_or_none()
+        resolution = ContactResolver.resolve(account)
+        target_channel = payload.preferred_channel or resolution.channel_type
+        target_handle = resolution.channel_target
         message = CreatorMessage(
             user_id=current_user.id,
             account_id=account.id,
             deal_id=deal.id if deal else None,
             sender_type=payload.sender_type,
-            text=payload.text.strip(),
+            text=payload.text.strip() if payload.text else None,
+            channel_type=target_channel,
+            channel_target=target_handle,
+            external_message_id=None,
+            media_url=payload.media_url,
+            media_name=payload.media_name,
+            media_type=payload.media_type,
         )
         session.add(message)
         await session.commit()
@@ -810,6 +898,9 @@ async def list_deals(
                     CreatorMessage.text,
                     CreatorMessage.is_read,
                     CreatorMessage.created_at,
+                    CreatorMessage.media_url,
+                    CreatorMessage.media_name,
+                    CreatorMessage.media_type,
                     func.row_number()
                     .over(
                         partition_by=CreatorMessage.deal_id,
@@ -832,6 +923,9 @@ async def list_deals(
                     text=row.text,
                     is_read=row.is_read,
                     created_at=row.created_at,
+                    media_url=row.media_url,
+                    media_name=row.media_name,
+                    media_type=row.media_type,
                 )
         return [
             _deal_item(deal, unread_map.get(deal.id, 0), last_map.get(deal.id))
@@ -1026,20 +1120,32 @@ async def send_deal_message(
     current_user: User = Depends(get_current_user),
     db: Database = Depends(get_db),
 ) -> CreatorMessageItem:
-    if not payload.text.strip():
-        raise HTTPException(status_code=400, detail="Текст сообщения не может быть пустым")
+    if not (payload.text and payload.text.strip()) and not payload.media_url:
+        raise HTTPException(status_code=400, detail="Сообщение не может быть пустым")
     async with db.async_session() as session:
         deal_stmt = select(Deal).where(Deal.id == deal_id, Deal.user_id == current_user.id)
         deal_result = await session.execute(deal_stmt)
         deal = deal_result.scalar_one_or_none()
         if deal is None:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
+        account_stmt = select(Account).where(Account.id == deal.account_id)
+        account_result = await session.execute(account_stmt)
+        account = account_result.scalar_one_or_none()
+        resolution = ContactResolver.resolve(account) if account is not None else ContactResolver.resolve({"platform": "", "username": None, "raw_metadata": None})
+        target_channel = payload.preferred_channel or resolution.channel_type
+        target_handle = resolution.channel_target
         message = CreatorMessage(
             user_id=deal.user_id,
             account_id=deal.account_id,
             deal_id=deal.id,
             sender_type=payload.sender_type,
-            text=payload.text.strip(),
+            text=payload.text.strip() if payload.text else None,
+            channel_type=target_channel,
+            channel_target=target_handle,
+            external_message_id=None,
+            media_url=payload.media_url,
+            media_name=payload.media_name,
+            media_type=payload.media_type,
         )
         session.add(message)
         deal.updated_at = datetime.now(timezone.utc)
@@ -1063,6 +1169,7 @@ async def init_communication(
         account = await _resolve_account(session, crm_client, identifier)
         if account is None:
             raise HTTPException(status_code=404, detail="Автор не найден")
+        resolution = ContactResolver.resolve(account)
         deal_stmt = (
             select(Deal)
             .where(
@@ -1085,6 +1192,7 @@ async def init_communication(
         )
         existing_result = await session.execute(existing_stmt)
         existing_message = existing_result.scalar_one_or_none()
+        last_existing: CreatorMessage | None = None
         if existing_message is None:
             system_message = CreatorMessage(
                 user_id=current_user.id,
@@ -1093,6 +1201,8 @@ async def init_communication(
                 sender_type="system",
                 text="Диалог начат",
                 is_read=True,
+                channel_type=resolution.channel_type,
+                channel_target=resolution.channel_target,
             )
             session.add(system_message)
             await session.commit()
@@ -1111,7 +1221,7 @@ async def init_communication(
             )
             last_result = await session.execute(last_stmt)
             last_existing = last_result.scalar_one_or_none()
-            last_message = last_existing.text if last_existing else ""
+            last_message = _message_snippet(last_existing)
             last_message_time = (
                 last_existing.created_at
                 if last_existing
@@ -1135,6 +1245,11 @@ async def init_communication(
             last_message_time=last_message_time,
             unread_count=0,
             is_archived=is_archived,
+            channel_type=(
+                last_existing.channel_type
+                if (last_existing and last_existing.channel_type)
+                else resolution.channel_type
+            ),
         )
 
 
@@ -1210,6 +1325,12 @@ async def list_communications(
             )
             raw_status = (account.status or "") if account is not None else ""
             is_archived = raw_status.strip().lower() in {"archived", "в архиве"}
+            if last_message is not None and last_message.channel_type:
+                channel_type = last_message.channel_type
+            elif account is not None:
+                channel_type = ContactResolver.resolve(account).channel_type
+            else:
+                channel_type = "internal"
             channels.append(
                 CommunicationChannelItem(
                     deal_id=best_deal.id if best_deal else None,
@@ -1223,10 +1344,11 @@ async def list_communications(
                     platform=account.platform if account is not None else "",
                     deal_title=best_deal.title if best_deal else None,
                     stage=best_deal.stage if best_deal else None,
-                    last_message=last_message.text if last_message else "",
+                    last_message=_message_snippet(last_message),
                     last_message_time=last_time,
                     unread_count=unread_map.get(account_id, 0),
                     is_archived=is_archived,
+                    channel_type=channel_type,
                 )
             )
     channels.sort(key=lambda channel: channel.last_message_time, reverse=True)

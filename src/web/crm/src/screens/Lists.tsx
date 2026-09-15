@@ -1,9 +1,9 @@
-import { Archive, ArchiveRestore, Briefcase, Eye, MessageSquare, Paperclip, Plus, Search, Send, X } from 'lucide-react';
+import { Archive, ArchiveRestore, Briefcase, Download, Eye, FileText, ImageOff, Loader2, MessageSquare, Paperclip, Plus, Search, Send, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { SocialIcon } from '../components/icons';
 import { Avatar, Badge, Btn, Card, inputCls, Modal, Tip, useToast } from '../components/ui';
 import { ARCHIVED_STAGE, brandById, BRANDS, fmtMoney, getStage, resolveAuthor, STAGES, type Author, type Deal, type DealMsg, type Social } from '../data';
-import { api, normalizeSocial, type CommunicationChannelItem, type CreatorRecord, type DealMessageItem } from '../services/api';
+import { api, normalizeSocial, resolveMediaUrl, type CommunicationChannelItem, type CreatorRecord, type DealMessageItem, type FileUploadResponse } from '../services/api';
 
 const STAGE_TONES: Record<number, string> = {
   6: 'green',
@@ -14,6 +14,61 @@ const STAGE_TONES: Record<number, string> = {
   1: 'gray',
   0: 'gray',
 };
+
+function getChannelBadge(channelType?: string | null): { label: string; tone: 'sky' | 'amber' | 'green' | 'gray' } {
+  switch (channelType?.toLowerCase()) {
+    case 'telegram':
+      return { label: 'Канал: Telegram', tone: 'sky' };
+    case 'email':
+      return { label: 'Канал: E-mail', tone: 'amber' };
+    case 'whatsapp':
+      return { label: 'Канал: WhatsApp', tone: 'green' };
+    default:
+      return { label: 'Внутренний чат', tone: 'gray' };
+  }
+}
+
+export type CommsMessage = DealMsg & {
+  media_url?: string | null;
+  media_name?: string | null;
+  media_type?: string | null;
+};
+
+function ChatImage({ src, alt }: { src: string; alt?: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return (
+      <div className="flex items-center gap-2 p-2 rounded-xl bg-black/10 text-[11.5px] font-medium text-current/80 mb-1.5">
+        <ImageOff size={14} className="shrink-0 opacity-70" />
+        <span className="truncate">Изображение недоступно</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt={alt || "Вложение"}
+      onError={() => setFailed(true)}
+      className="max-w-full max-h-64 rounded-xl object-cover mb-1.5 cursor-pointer"
+      onClick={() => window.open(src, "_blank")}
+    />
+  );
+}
+
+function VideoPlayer({ src }: { src: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return (
+      <div className="flex items-center gap-2 p-2 rounded-xl bg-black/10 text-[11.5px] font-medium text-current/80 mb-1.5">
+        <ImageOff size={14} className="shrink-0 opacity-70" />
+        <span className="truncate">Видеофайл недоступен</span>
+      </div>
+    );
+  }
+  return (
+    <video controls src={src} onError={() => setFailed(true)} className="max-w-full max-h-64 rounded-xl mb-1.5" />
+  );
+}
 
 /* ================= СДЕЛКИ ================= */
 export function DealsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal: (id: string) => void }) {
@@ -90,13 +145,16 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
   const toast = useToast();
   const [channels, setChannels] = useState<CommunicationChannelItem[]>([]);
   const [selectedAuthorId, setSelectedAuthorId] = useState<string | null>(null);
-  const [msgs, setMsgs] = useState<DealMsg[]>([]);
+  const [msgs, setMsgs] = useState<CommsMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [q, setQ] = useState('');
   const [chatTab, setChatTab] = useState<'active' | 'archived'>('active');
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [confirmArchive, setConfirmArchive] = useState(false);
   const [closeDeals, setCloseDeals] = useState(true);
+  const [attachedFile, setAttachedFile] = useState<FileUploadResponse | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -124,6 +182,7 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
                   last_message_time: new Date().toISOString(),
                   unread_count: 0,
                   is_archived: false,
+                  channel_type: 'internal',
                 };
                 setChannels([temp, ...items]);
                 setSelectedAuthorId(String(initialAuthorId));
@@ -171,25 +230,75 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
 
   useEffect(() => {
     if (!ch) return;
-    api.getCreatorMessages(String(ch.author_id))
-      .then(items => {
-        setMsgs(items.map(toDealMsg));
-        setChannels(prev => prev.map(c => String(c.author_id) === String(ch.author_id) ? { ...c, unread_count: 0 } : c));
-      })
-      .catch(() => toast('err', 'Не удалось загрузить сообщения'));
+    const authorId = String(ch.author_id);
+    let isMounted = true;
+
+    const fetchMessages = () => {
+      api.getCreatorMessages(authorId)
+        .then(items => {
+          if (!isMounted) return;
+          const mapped = items.map(toDealMsg);
+          setMsgs(prev => {
+            if (prev.length === mapped.length && prev[prev.length - 1]?.id === mapped[mapped.length - 1]?.id) {
+              return prev;
+            }
+            return mapped;
+          });
+          if (items.length > 0) {
+            const last = items[items.length - 1];
+            setChannels(prev => prev.map(c => {
+              if (String(c.author_id) !== authorId) return c;
+              return {
+                ...c,
+                last_message: last.text || '',
+                last_message_time: last.created_at,
+                unread_count: 0,
+              };
+            }));
+          }
+        })
+        .catch(() => {});
+    };
+
+    fetchMessages();
+    const timer = setInterval(fetchMessages, 4000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(timer);
+    };
   }, [ch?.author_id]);
 
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsUploading(true);
+    api.uploadChatFile(file)
+      .then(result => {
+        setAttachedFile(result);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+        toast('ok', `Файл "${file.name}" прикреплен`);
+      })
+      .catch(() => toast('err', 'Ошибка загрузки файла'))
+      .finally(() => setIsUploading(false));
+  };
+
   const send = () => {
-    if (!draft.trim() || !ch) return;
+    if ((!draft.trim() && !attachedFile) || !ch || isUploading) return;
     const text = draft.trim();
+    const file = attachedFile;
     setDraft('');
-    api.sendCreatorMessage(String(ch.author_id), text)
+    setAttachedFile(null);
+    api.sendCreatorMessage(String(ch.author_id), text || null, 'user', file ? { media_url: file.media_url, media_name: file.media_name, media_type: file.media_type } : undefined)
       .then(m => {
         const dm = toDealMsg(m);
         setMsgs(prev => [...prev, dm]);
         setChannels(prev => prev.map(c => String(c.author_id) === String(ch.author_id) ? { ...c, last_message: dm.text, last_message_time: m.created_at } : c));
       })
-      .catch(() => toast('err', 'Не удалось отправить сообщение'));
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : 'Не удалось отправить сообщение';
+        toast('err', msg);
+      });
   };
 
   const handleStartChat = (targetId: string) => {
@@ -267,7 +376,10 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
                     <span className="text-[13px] font-bold truncate">{ca.nick}</span>
                     <span className="text-[10px] font-bold text-gray-300 shrink-0">{formatMessageTime(c.last_message_time)}</span>
                   </span>
-                  <span className="block text-[11.5px] font-medium text-gray-400 truncate mt-0.5">{c.last_message}</span>
+                  <span className="flex items-center gap-1.5 mt-0.5">
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-gray-500 shrink-0">{getChannelBadge(c.channel_type).label}</span>
+                    <span className="text-[11.5px] font-medium text-gray-400 truncate">{c.last_message}</span>
+                  </span>
                 </span>
                 {c.unread_count > 0 && <span className="w-5 h-5 rounded-full bg-indigo-500 text-white text-[10px] font-extrabold flex items-center justify-center shrink-0">{c.unread_count}</span>}
               </button>
@@ -282,6 +394,11 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
           <div className="min-w-0">
             <div className="flex items-center gap-2"><span className="text-[14px] font-bold text-gray-900">{a?.nick ?? ''}</span>{a && <SocialIcon social={a.social} size={13} />}</div>
             <div className="text-[11px] font-semibold text-gray-400 truncate">Сделка: {ch?.deal_title}</div>
+            {ch && (
+              <Badge tone={getChannelBadge(ch.channel_type).tone}>
+                {getChannelBadge(ch.channel_type).label}
+              </Badge>
+            )}
           </div>
           {targetDeal ? (
             <>
@@ -315,7 +432,20 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
             return (
               <div key={m.id} className={'flex ' + (m.from === 'user' ? 'justify-end' : 'justify-start')}>
                 <div className={'relative max-w-[60%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ' + (m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md')}>
-                  {m.text}
+                  {m.media_url && m.media_type === 'image' && (
+                    <ChatImage src={resolveMediaUrl(m.media_url)} alt={m.media_name || undefined} />
+                  )}
+                  {m.media_url && m.media_type === 'video' && (
+                    <VideoPlayer src={resolveMediaUrl(m.media_url)} />
+                  )}
+                  {m.media_url && m.media_type !== 'image' && m.media_type !== 'video' && (
+                    <a href={resolveMediaUrl(m.media_url)} target="_blank" download={m.media_name || 'document'} className="flex items-center gap-2 p-2.5 rounded-xl bg-black/5 hover:bg-black/10 transition-colors mb-1.5">
+                      <FileText size={16} className="shrink-0" />
+                      <span className="text-[12.5px] font-semibold truncate">{m.media_name || 'Документ'}</span>
+                      <Download size={14} className="shrink-0" />
+                    </a>
+                  )}
+                  {m.text && <span className="block">{m.text}</span>}
                   <span className={'block text-[10px] font-semibold mt-1 text-right ' + (m.from === 'user' ? 'text-indigo-200' : 'text-gray-300')}>{m.time} {m.from === 'user' && '✓✓'}</span>
                 </div>
               </div>
@@ -323,13 +453,30 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
           })}
         </div>
         <div className="p-3.5 border-t border-gray-200 bg-white shrink-0 flex items-end gap-2">
-          <button className="w-9 h-9 rounded-lg text-gray-400 hover:bg-gray-100 hover:text-indigo-600 flex items-center justify-center shrink-0" onClick={() => toast('info', 'Прикрепление файла…')}><Paperclip size={17} /></button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            className="hidden"
+            accept="image/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.txt"
+            onChange={handleFileSelect}
+          />
+          {attachedFile && (
+            <div className="flex items-center gap-2 rounded-xl border border-indigo-200 bg-indigo-50 px-2.5 py-1.5 text-[12px] font-medium text-indigo-700 shrink-0">
+              <FileText size={14} className="shrink-0" />
+              <span className="max-w-[160px] truncate">{attachedFile.media_name}</span>
+              <span className="text-indigo-400 shrink-0">{formatFileSize(attachedFile.file_size)}</span>
+              <button onClick={() => setAttachedFile(null)} className="text-indigo-400 hover:text-indigo-700 shrink-0"><X size={13} /></button>
+            </div>
+          )}
+          <button disabled={isUploading} className={'w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ' + (isUploading ? 'text-indigo-500 cursor-default' : 'text-gray-400 hover:bg-gray-100 hover:text-indigo-600')} onClick={() => fileInputRef.current?.click()}>
+            {isUploading ? <Loader2 size={17} className="animate-spin" /> : <Paperclip size={17} />}
+          </button>
           <textarea rows={1} value={draft}
             onChange={e => setDraft(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
             placeholder={'Сообщение для ' + (a?.nick ?? '') + '…'}
             className="flex-1 resize-none rounded-xl border border-gray-200 px-3.5 py-2.5 text-[13px] outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100 transition-shadow" />
-          <Btn onClick={send} disabled={!draft.trim()} className="!rounded-xl !w-9 !h-9.5 !p-0 shrink-0"><Send size={15} /></Btn>
+          <Btn onClick={send} disabled={(!draft.trim() && !attachedFile) || isUploading} className="!rounded-xl !w-9 !h-9.5 !p-0 shrink-0"><Send size={15} /></Btn>
         </div>
       </div>
       {newChatOpen && <NewChatModal channels={channels} onClose={() => setNewChatOpen(false)} onStart={handleStartChat} />}
@@ -443,6 +590,12 @@ const hashHue = (seed: string): number => {
 
 const stripAt = (value: string): string => value.startsWith('@') ? value.slice(1) : value;
 
+const formatFileSize = (bytes: number): string => {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1).replace('.0', '').replace('.', ',')} МБ`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1).replace('.0', '').replace('.', ',')} КБ`;
+  return `${bytes} Б`;
+};
+
 const formatMessageTime = (isoString: string): string => {
   const date = new Date(isoString);
   if (isNaN(date.getTime())) return isoString;
@@ -462,9 +615,12 @@ const channelAuthor = (c: CommunicationChannelItem): Pick<Author, 'nick' | 'soci
   };
 };
 
-const toDealMsg = (m: DealMessageItem): DealMsg => ({
+const toDealMsg = (m: DealMessageItem): CommsMessage => ({
   id: String(m.id),
   from: m.sender_type === 'creator' ? 'author' : (m.sender_type === 'system' ? 'system' : 'user'),
-  text: m.text,
+  text: m.text || '',
   time: new Date(m.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+  media_url: m.media_url,
+  media_name: m.media_name,
+  media_type: m.media_type,
 });

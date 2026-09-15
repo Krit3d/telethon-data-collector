@@ -201,6 +201,34 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  outreach:
+    container_name: tg_parser_outreach
+    image: tg_parser_crawler_base:latest
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      PYTHONUNBUFFERED: "1"
+      SESSION_DIR: /app/sessions/outreach
+    volumes:
+      - .:/app
+      - ./sessions:/app/sessions
+      - ./proxies.txt:/app/proxies.txt
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.workers.telegram_outreach_worker
+    networks:
+      - scraper_network
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   scraper_network:
     driver: bridge
