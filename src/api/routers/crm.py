@@ -546,7 +546,7 @@ async def crm_update_creator_status(
                         Deal.user_id == current_user.id,
                         Deal.account_id == account.id,
                         Deal.stage >= 1,
-                        Deal.stage <= 4,
+                        Deal.stage <= 6,
                     )
                     .values(stage=0, updated_at=datetime.now(timezone.utc))
                 )
@@ -626,7 +626,7 @@ async def get_creator_detail(
                 Deal.account_id == account.id,
                 Deal.user_id == current_user.id,
                 Deal.stage >= 1,
-                Deal.stage <= 4,
+                Deal.stage <= 6,
             )
         )
         active_deals_result = await session.execute(active_deals_stmt)
@@ -734,7 +734,7 @@ async def send_creator_message(
             .where(
                 Deal.account_id == account.id,
                 Deal.user_id == current_user.id,
-                Deal.stage.in_([1, 2, 3, 4]),
+                Deal.stage.in_([1, 2, 3, 4, 5, 6]),
             )
             .order_by(Deal.updated_at.desc())
             .limit(1)
@@ -1068,7 +1068,7 @@ async def init_communication(
             .where(
                 Deal.account_id == account.id,
                 Deal.user_id == current_user.id,
-                Deal.stage.in_([1, 2, 3, 4]),
+                Deal.stage.in_([1, 2, 3, 4, 5, 6]),
             )
             .order_by(Deal.updated_at.desc())
             .limit(1)
@@ -1195,7 +1195,7 @@ async def list_communications(
         for account_id in account_ids:
             account = account_map.get(account_id)
             account_deals = [d for d in deals if d.account_id == account_id]
-            active_deals = [d for d in account_deals if d.stage in [1, 2, 3, 4]]
+            active_deals = [d for d in account_deals if d.stage in [1, 2, 3, 4, 5, 6]]
             if active_deals:
                 best_deal = max(active_deals, key=lambda d: d.updated_at or d.created_at)
             elif account_deals:

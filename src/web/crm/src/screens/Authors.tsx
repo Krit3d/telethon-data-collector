@@ -384,7 +384,7 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
       )}
 
       {authorToArchive && (() => {
-        const activeDeals = deals.filter(d => (String(d.authorId) === String(authorToArchive.id) || (authorToArchive.twentyId && String(d.authorId) === String(authorToArchive.twentyId))) && d.stage >= 1 && d.stage <= 4);
+        const activeDeals = deals.filter(d => (String(d.authorId) === String(authorToArchive.id) || (authorToArchive.twentyId && String(d.authorId) === String(authorToArchive.twentyId))) && d.stage >= 1 && d.stage <= 6);
         const activeBudget = activeDeals.reduce((acc, d) => acc + d.budget, 0);
         const handleConfirm = async () => {
           try {

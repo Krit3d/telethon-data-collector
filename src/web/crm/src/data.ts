@@ -59,7 +59,8 @@ export const STAGES = [
   { id: 2, name: 'Переговоры', color: '#F97316', soft: '#FFF7ED' },
   { id: 3, name: 'Согласование ТЗ', color: '#F59E0B', soft: '#FFFBEB' },
   { id: 4, name: 'Подписание договора', color: '#6366F1', soft: '#EEF2FF' },
-  { id: 5, name: 'Контент создан', color: '#10B981', soft: '#ECFDF5' },
+  { id: 5, name: 'Доставка', color: '#0EA5E9', soft: '#F0F9FF' },
+  { id: 6, name: 'Контент создан', color: '#10B981', soft: '#ECFDF5' },
 ];
 
 export interface Stage {
@@ -389,7 +390,7 @@ export const DEALS_INIT: Deal[] = [
   },
   {
     id: 'd12', title: 'Пост: доставка Ozon Fresh за 15 минут', brandId: 'b6', authorId: 'a6', budget: 40000,
-    type: 'Пост', stage: 5, date: '01.09.2024', pubDate: '12.09.2024', file: 'Акт_FOODIE.pdf',
+    type: 'Пост', stage: 6, date: '01.09.2024', pubDate: '12.09.2024', file: 'Акт_FOODIE.pdf',
     erid: 'ERID-1694509800-B8C4D0E3F2',
     msgs: [M('m1', 'author', 'Контент опубликован, метрики синхронизированы', '13:00')],
     desc: 'Пост с таймлапсом заказа: корзина → курьер → стол накрыт. Промокод FOODIE15.',

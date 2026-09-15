@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowLeft, Briefcase, MessageSquare, Archive, ArchiveRestore, ArrowDownRight, ArrowUpRight, StickyNote, FileText, TrendingUp, Target, X, Sparkles, Upload, Download, Trash2 } from 'lucide-react';
-import { fmtNum, fmtMoney, type Deal } from '../data';
+import { fmtNum, fmtMoney, ARCHIVED_STAGE, getStage, STAGES, type Deal } from '../data';
 import { Badge, Avatar, Card, Btn, useToast, Modal, inputCls } from '../components/ui';
 import { SocialIcon, PostThumb } from '../components/icons';
 import { LineChart, HBars } from '../components/charts';
@@ -296,7 +296,7 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
 
   const handleArchiveConfirm = async () => {
     if (!profile) return;
-    const activeDeals = myDeals.filter(d => d.stage >= 1 && d.stage <= 4);
+    const activeDeals = myDeals.filter(d => d.stage >= 1 && d.stage <= 6);
     try {
       await api.updateCreatorStatus(String(profile.id), 'В архиве', activeDeals.length > 0 ? closeDeals : false);
       setProfile({ ...profile, status: 'В архиве' });
@@ -348,7 +348,7 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
   const roas = profile.cpm > 0 ? Math.max(1, Math.round((200 / profile.cpm) * 2.5 * 10) / 10) : 1;
   const onTime = myDeals.length ? Math.round((myDeals.filter(d => d.stage >= 4).length / myDeals.length) * 100) : 0;
   const rating = ratingFromEr(profile.static_avg_er);
-  const hasActiveDeal = myDeals.some(d => d.stage >= 1 && d.stage <= 4);
+  const hasActiveDeal = myDeals.some(d => d.stage >= 1 && d.stage <= 6);
   const currentStatus = profile.status === 'В архиве' ? 'В архиве' : profile.status === 'На паузе' ? 'На паузе' : hasActiveDeal ? 'В сделке' : 'Свободен';
 
   return (
@@ -443,14 +443,14 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
             <div className="flex flex-col gap-2.5">
               {myDeals.map(d => (
                 <Card key={d.id} className="p-4 flex items-center gap-4 hover:border-indigo-200 transition-colors cursor-pointer" onClick={() => onOpenDeal(d.id, 'overview')}>
-                  <span className={`w-1 h-10 rounded-full shrink-0 ${d.stage === 5 ? 'bg-emerald-500' : d.stage === 4 ? 'bg-indigo-500' : d.stage === 2 ? 'bg-orange-400' : d.stage === 3 ? 'bg-amber-400' : 'bg-slate-300'}`} />
+                  <span className="w-1 h-10 rounded-full shrink-0" style={{ backgroundColor: getStage(d.stage).color }} />
                   <div className="min-w-0 flex-1">
                     <div className="text-[13.5px] font-bold text-gray-900 truncate">{d.title}</div>
                     <div className="text-[11.5px] font-semibold text-gray-400 mt-0.5">{d.type} · публикация {d.pubDate} · создан {d.date}</div>
                   </div>
                   <div className="text-right shrink-0">
                     <div className="text-[14px] font-extrabold text-gray-900 tabular-nums">{fmtMoney(d.budget)}</div>
-                    <div className="text-[11px] font-semibold text-gray-400">Этап {d.stage} из 5</div>
+                    <div className="text-[11px] font-semibold text-gray-400">{d.stage === 0 ? ARCHIVED_STAGE.name : `Этап ${d.stage} из ${STAGES.length}`}</div>
                   </div>
                 </Card>
               ))}
@@ -600,7 +600,7 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
       )}
 
       {confirmArchiveOpen && profile && (() => {
-        const activeDeals = myDeals.filter(d => d.stage >= 1 && d.stage <= 4);
+        const activeDeals = myDeals.filter(d => d.stage >= 1 && d.stage <= 6);
         const activeBudget = activeDeals.reduce((acc, d) => acc + d.budget, 0);
         return (
           <Modal onClose={() => setConfirmArchiveOpen(false)} w="max-w-sm">

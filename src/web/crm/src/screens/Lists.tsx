@@ -5,6 +5,16 @@ import { Avatar, Badge, Btn, Card, inputCls, Modal, Tip, useToast } from '../com
 import { ARCHIVED_STAGE, brandById, BRANDS, fmtMoney, getStage, resolveAuthor, STAGES, type Author, type Deal, type DealMsg, type Social } from '../data';
 import { api, normalizeSocial, type CommunicationChannelItem, type CreatorRecord, type DealMessageItem } from '../services/api';
 
+const STAGE_TONES: Record<number, string> = {
+  6: 'green',
+  5: 'sky',
+  4: 'indigo',
+  3: 'amber',
+  2: 'orange',
+  1: 'gray',
+  0: 'gray',
+};
+
 /* ================= СДЕЛКИ ================= */
 export function DealsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal: (id: string) => void }) {
   const [q, setQ] = useState('');
@@ -59,7 +69,7 @@ export function DealsList({ deals, onOpenDeal }: { deals: Deal[]; onOpenDeal: (i
                       <td className="px-4 py-3"><span className="flex items-center gap-2"><Avatar nick={a.nick} hue={a.hue} size={24} /><span className="font-bold text-gray-700">{a.nick}</span><SocialIcon social={a.social} size={12} /></span></td>
                       <td className="px-4 py-3"><Badge tone={d.type === 'Stories' ? 'violet' : d.type === 'Reels' ? 'sky' : d.type === 'Видео' ? 'red' : 'indigo'}>{d.type}</Badge></td>
                       <td className="px-4 py-3 font-extrabold text-gray-900 tabular-nums whitespace-nowrap">{fmtMoney(d.budget)}</td>
-                      <td className="px-4 py-3"><Badge tone={d.stage === 5 ? 'green' : d.stage === 4 ? 'indigo' : d.stage === 2 ? 'orange' : d.stage === 3 ? 'amber' : 'gray'} dot>{s.name}</Badge></td>
+                      <td className="px-4 py-3"><Badge tone={STAGE_TONES[d.stage] ?? 'gray'} dot>{s.name}</Badge></td>
                       <td className="px-4 py-3 font-semibold text-gray-500 tabular-nums whitespace-nowrap">{d.pubDate}</td>
                       <td className="px-4 py-3"><Eye size={15} className="text-gray-300 group-hover:text-indigo-500 transition-colors" /></td>
                     </tr>
@@ -149,8 +159,8 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
 
   const ch = filtered.find(c => String(c.author_id) === String(selectedAuthorId)) ?? filtered[0] ?? null;
   const a = ch ? channelAuthor(ch) : null;
-  const targetDeal = ch ? deals.find(d => (d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) && d.stage >= 1 && d.stage <= 5) : undefined;
-  const activeDeals = ch ? deals.filter(d => (d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) && d.stage >= 1 && d.stage <= 4) : [];
+  const targetDeal = ch ? deals.find(d => (d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) && d.stage >= 1 && d.stage <= 6) : undefined;
+  const activeDeals = ch ? deals.filter(d => (d.authorId === String(ch.author_id) || d.id === String(ch.deal_id)) && d.stage >= 1 && d.stage <= 6) : [];
   const activeBudget = activeDeals.reduce((a, d) => a + d.budget, 0);
 
   const chatRef = useRef<HTMLDivElement>(null);
@@ -275,7 +285,7 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
           </div>
           {targetDeal ? (
             <>
-              <Badge tone={targetDeal.stage === 5 ? 'green' : targetDeal.stage === 4 ? 'indigo' : targetDeal.stage === 2 ? 'orange' : targetDeal.stage === 3 ? 'amber' : 'gray'} dot>{getStage(targetDeal.stage).name}</Badge>
+              <Badge tone={STAGE_TONES[targetDeal.stage] ?? 'gray'} dot>{getStage(targetDeal.stage).name}</Badge>
               <Btn variant="secondary" size="sm" className="ml-auto" onClick={() => onOpenDeal?.(String(targetDeal.id))}><Briefcase size={13} />К сделке</Btn>
             </>
           ) : (

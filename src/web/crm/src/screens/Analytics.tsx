@@ -23,6 +23,7 @@ export default function Analytics({ deals }: { deals: Deal[] }) {
     { label: 'Переговоры', v: 31 },
     { label: 'Согласование ТЗ', v: 19 },
     { label: 'Подписание договора', v: 12 },
+    { label: 'Доставка', v: 10 },
     { label: 'Контент создан', v: 8 },
   ];
   const months = ['Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен'];
@@ -99,7 +100,7 @@ export default function Analytics({ deals }: { deals: Deal[] }) {
         <div className="p-6 anim-in" key={period}>
           <div className="grid grid-cols-4 gap-4 mb-5 stagger">
             <Stat label="Выручка за период" value={fmtMoney(4_860_000)} sub="+18% к прошлому периоду" tone="green" icon={<TrendingUp size={15} />} />
-            <Stat label="Активных сделок" value={deals.length} sub={`${deals.filter(d => d.stage === 5).length} завершено`} tone="indigo" icon={<FileCheck2 size={15} />} />
+            <Stat label="Активных сделок" value={deals.length} sub={`${deals.filter(d => d.stage === 6).length} завершено`} tone="indigo" icon={<FileCheck2 size={15} />} />
             <Stat label="Средний ROAS" value="2.4x" sub="цель ≥ 2.0x" tone="blue" icon={<TrendingUp size={15} />} />
             <Stat label="Публикаций" value="24" sub="6 ожидают синхронизации" tone="amber" icon={<CalendarCheck2 size={15} />} />
           </div>

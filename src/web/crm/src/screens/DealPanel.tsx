@@ -1,11 +1,21 @@
+import { Bold, BookOpen, Check, Download, FilePlus2, Italic, List, MessageCircle, MoreHorizontal, Paperclip, Send, Share2, ShieldCheck, Trash2, Upload, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { X, Share2, MoreHorizontal, Trash2, Paperclip, Send, Upload, Check, ShieldCheck, BookOpen, Bold, Italic, List, Image as ImageIcon, FilePlus2, MessageCircle } from 'lucide-react';
-import { STAGES, ARCHIVED_STAGE, getStage, fmtMoney, resolveAuthor, brandById, type Deal, type DealMsg } from '../data';
-import { SidePanel, Badge, Avatar, Btn, Tabs, useToast, Tip, CopyBtn, Field, inputCls, Modal } from '../components/ui';
-import { SocialIcon, FakeQR } from '../components/icons';
+import { FakeQR, SocialIcon } from '../components/icons';
+import { Avatar, Badge, Btn, CopyBtn, Modal, SidePanel, Tabs, Tip, useToast } from '../components/ui';
+import { ARCHIVED_STAGE, brandById, fmtMoney, getStage, resolveAuthor, STAGES, type Deal, type DealMsg } from '../data';
 import { api, type DealMessageItem } from '../services/api';
 
-export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, onOpenKB, onGenerateContract, onDelete }: {
+type DocType = 'pdf' | 'doc' | 'img' | 'other';
+interface DealDocument {
+  id: string;
+  name: string;
+  size: string;
+  date: string;
+  type: DocType;
+  url?: string;
+}
+
+export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, onOpenKB, onGenerateContract, onDelete, onOpenAuthor }: {
   deal: Deal;
   deals: Deal[];
   initialTab?: string;
@@ -14,33 +24,125 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
   onOpenKB: (brandId?: string) => void;
   onGenerateContract: (deal: Deal) => void;
   onDelete?: (dealId: string) => void;
+  onOpenAuthor?: (authorId: string) => void;
 }) {
   const toast = useToast();
   const [tab, setTab] = useState(initialTab ?? 'overview');
   const [msg, setMsg] = useState('');
-  const [uploading, setUploading] = useState<number | null>(null);
   const [checkOk, setCheckOk] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const tzKey = `creatorflow_tz_${deal.id}`;
+  const [termsText, setTermsText] = useState(() => {
+    try {
+      const saved = localStorage.getItem(tzKey);
+      if (saved) return saved;
+    } catch {
+      // ignore
+    }
+    return deal.desc || deal.terms || '';
+  });
   const chatRef = useRef<HTMLDivElement>(null);
+  const termsRef = useRef<HTMLDivElement>(null);
   const a = resolveAuthor(deal), b = brandById(deal.brandId);
   const stage = getStage(deal.stage);
+
+  const storageKey = `creatorflow_docs_${deal.id}`;
+  const [docs, setDocs] = useState<DealDocument[]>(() => {
+    try {
+      const saved = localStorage.getItem(storageKey);
+      return saved ? (JSON.parse(saved) as DealDocument[]) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [selectedDocId, setSelectedDocId] = useState<string>('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const selectedDoc = docs.find(d => d.id === selectedDocId) ?? docs[0];
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+    const type: DocType = ext === 'pdf' ? 'pdf' : (ext === 'doc' || ext === 'docx') ? 'doc' : (ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'webp' || ext === 'svg') ? 'img' : 'other';
+    const size = file.size >= 1024 * 1024 ? `${(file.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(file.size / 1024))} KB`;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const doc: DealDocument = {
+        id: `doc-${Date.now()}`,
+        name: file.name,
+        size,
+        date: `загружен ${new Date().toLocaleDateString('ru-RU')}`,
+        type,
+        url: typeof reader.result === 'string' ? reader.result : undefined,
+      };
+      setDocs(prev => {
+        const next = [doc, ...prev];
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(next.filter(d => d.url)));
+        } catch {
+          // quota exceeded
+        }
+        return next;
+      });
+      setSelectedDocId(doc.id);
+      toast('ok', `Файл ${file.name} успешно загружен`);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
+  };
+
+  const deleteDoc = (doc: DealDocument) => {
+    setDocs(prev => {
+      const next = prev.filter(d => d.id !== doc.id);
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+    if (selectedDocId === doc.id) setSelectedDocId('');
+    toast('ok', `Файл ${doc.name} удалён`);
+  };
+
+  const downloadDoc = (doc: DealDocument) => {
+    if (doc.url) {
+      const a = document.createElement('a');
+      a.href = doc.url;
+      a.download = doc.name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } else {
+      const blob = new Blob([`Документ: ${doc.name}\nРазмер: ${doc.size}\nДата: ${doc.date}\n\nОписание документа по сделке «${deal.title}».`], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = doc.name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+    toast('ok', `Скачивание ${doc.name}`);
+  };
 
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: 'smooth' }); }, [deal.msgs.length, tab]);
 
   useEffect(() => {
-    if (tab !== 'comms') return;
-    api.getDealMessages(Number(deal.id))
+    if (tab !== 'comms' || !deal.authorId) return;
+    api.getCreatorMessages(String(deal.authorId))
       .then(items => onUpdate({ msgs: items.map(toDealMsg) }))
-      .catch(() => toast('err', 'Не удалось загрузить сообщения'));
-  }, [tab, deal.id]);
+      .catch(() => toast('err', 'Не удалось загрузить сообщения автора'));
+  }, [tab, deal.authorId]);
 
   const send = () => {
     if (!msg.trim()) return;
     const text = msg.trim();
     setMsg('');
-    api.sendDealMessage(Number(deal.id), text)
+    api.sendCreatorMessage(String(deal.authorId), text, 'user')
       .then(m => onUpdate({ msgs: [...deal.msgs, toDealMsg(m)] }))
       .catch(() => toast('err', 'Не удалось отправить сообщение'));
   };
@@ -52,18 +154,47 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
       .catch(() => { setDeleting(false); setConfirmDeleteOpen(false); toast('err', 'Не удалось удалить сделку'); });
   };
 
-  const startUpload = () => {
-    setUploading(0);
-    const iv = setInterval(() => {
-      setUploading(p => {
-        if (p === null) return p;
-        if (p >= 100) { clearInterval(iv); setUploading(null); toast('ok', 'Файл загружен: Презентация_кампании.pdf'); return null; }
-        return p + 12;
-      });
-    }, 120);
+  const eridCode = deal.erid ?? 'ERID-1695115200-X2K9M4P7Q1';
+
+  const saveTerms = () => {
+    const newContent = termsRef.current?.innerHTML ?? termsText;
+    try {
+      localStorage.setItem(tzKey, newContent);
+    } catch {
+      // ignore
+    }
+    onUpdate({ desc: newContent });
+    setTermsText(newContent);
+    toast('ok', 'ТЗ сохранено');
   };
 
-  const eridCode = deal.erid ?? 'ERID-1695115200-X2K9M4P7Q1';
+  const remindAuthor = () => {
+    api.sendCreatorMessage(String(deal.authorId), `Здравствуйте! Напоминаем по сделке «${deal.title}». Подскажите, пожалуйста, статус подготовки материалов?`, 'user')
+      .then(m => {
+        onUpdate({ msgs: [...deal.msgs, toDealMsg(m)] });
+        setTab('comms');
+        toast('ok', 'Напоминание отправлено в чат');
+      })
+      .catch(() => toast('err', 'Не удалось отправить напоминание'));
+  };
+
+  const copyLink = () => {
+    const base = window.location.origin + window.location.pathname;
+    const currentHash = window.location.hash.split('?')[0] || '#/deals';
+    const url = `${base}${currentHash}?dealId=${deal.id}`;
+    try {
+      navigator.clipboard.writeText(url);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = url;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+    }
+    setMenuOpen(false);
+    toast('ok', 'Ссылка на сделку скопирована');
+  };
 
   return (
     <SidePanel onClose={onClose} w="w-[640px]">
@@ -102,7 +233,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
                 <>
                   <div className="fixed inset-0 z-20" onClick={() => setMenuOpen(false)} />
                   <div className="absolute right-0 top-full mt-1 z-30 bg-white rounded-xl border border-gray-200 shadow-lg min-w-[210px] py-1">
-                    <button onClick={() => { setMenuOpen(false); navigator.clipboard?.writeText(location.href + '#' + deal.id).catch(() => {}); toast('ok', 'Ссылка скопирована'); }} className="w-full flex items-center gap-2 px-3 py-2 text-[13px] font-medium text-gray-700 hover:bg-gray-50 transition-colors"><Share2 size={14} />Копировать ссылку</button>
+                    <button onClick={copyLink} className="w-full flex items-center gap-2 px-3 py-2 text-[13px] font-medium text-gray-700 hover:bg-gray-50 transition-colors"><Share2 size={14} />Копировать ссылку</button>
                     <button onClick={() => { setMenuOpen(false); setConfirmDeleteOpen(true); }} className="w-full flex items-center gap-2 px-3 py-2 text-[13px] font-medium text-red-600 hover:bg-red-50 transition-colors"><Trash2 size={14} />Удалить сделку</button>
                   </div>
                 </>
@@ -116,8 +247,8 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
         { id: 'overview', label: 'Обзор' },
         { id: 'comms', label: `Коммуникации · ${deal.msgs.length}`, icon: <MessageCircle size={13} /> },
         { id: 'docs', label: 'Документы' },
-        { id: 'erid', label: 'ERID' },
-        { id: 'kb', label: 'База знаний', icon: <BookOpen size={13} /> },
+        // { id: 'erid', label: 'ERID' },
+        // { id: 'kb', label: 'База знаний', icon: <BookOpen size={13} /> },
       ]} />
 
       <div className="flex-1 min-h-0 overflow-y-auto scroll-thin">
@@ -129,7 +260,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
               <div className="grid grid-cols-2 gap-x-6 gap-y-3">
                 <Info label="Название" v={deal.title} />
                 <Info label="Бренд" v={<span className="flex items-center gap-2"><span className="w-6 h-6 rounded-md flex items-center justify-center text-[10px] font-extrabold text-white" style={{ background: `hsl(${b.hue} 70% 50%)` }}>{b.letter}</span>{b.name}</span>} />
-                <Info label="Автор" v={<button onClick={() => toast('info', `Профиль ${a.nick}`)} className="flex items-center gap-2 hover:text-indigo-600 transition-colors"><Avatar nick={a.nick} hue={a.hue} size={22} /><SocialIcon social={a.social} size={12} />{a.nick}</button>} />
+                <Info label="Автор" v={<button onClick={() => onOpenAuthor?.(deal.authorId)} className="flex items-center gap-2 hover:text-indigo-600 transition-colors"><Avatar nick={a.nick} hue={a.hue} size={22} /><SocialIcon social={a.social} size={12} />{a.nick}</button>} />
                 <Info label="Бюджет" v={<b className="text-[15px] font-extrabold">{fmtMoney(deal.budget)}</b>} />
                 <Info label="Тип контента" v={deal.type} />
                 <Info label="Дата публикации" v={deal.pubDate} />
@@ -138,12 +269,19 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-[12px] font-semibold text-gray-500">Описание · ТЗ</span>
                   <div className="flex items-center gap-0.5">
-                    {[Bold, Italic, List, ImageIcon].map((I, i) => (
-                      <button key={i} className="w-7 h-7 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-700 flex items-center justify-center" onClick={() => toast('info', 'Форматирование применено')}><I size={13} /></button>
-                    ))}
+                    <button onMouseDown={e => e.preventDefault()} className="w-7 h-7 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-700 flex items-center justify-center" onClick={() => document.execCommand('bold')}><Bold size={13} /></button>
+                    <button onMouseDown={e => e.preventDefault()} className="w-7 h-7 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-700 flex items-center justify-center" onClick={() => document.execCommand('italic')}><Italic size={13} /></button>
+                    <button onMouseDown={e => e.preventDefault()} className="w-7 h-7 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-700 flex items-center justify-center" onClick={() => document.execCommand('insertUnorderedList')}><List size={13} /></button>
                   </div>
                 </div>
-                <div className="rounded-xl border border-gray-200 bg-slate-50/50 px-3.5 py-3 text-[13px] font-medium text-gray-700 leading-relaxed">{deal.desc}</div>
+                <div
+                  ref={termsRef}
+                  contentEditable
+                  suppressContentEditableWarning
+                  onBlur={saveTerms}
+                  className="rounded-xl border border-gray-200 bg-slate-50/50 px-3.5 py-3 text-[13px] font-medium text-gray-700 leading-relaxed [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-1.5 [&_li]:my-0.5 [&_b]:font-bold [&_strong]:font-bold [&_i]:italic [&_em]:italic outline-none focus:ring-2 focus:ring-indigo-100"
+                  dangerouslySetInnerHTML={{ __html: termsText }}
+                />
               </div>
             </section>
 
@@ -153,13 +291,12 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
                 {STAGES.map((s, i) => (
                   <div key={s.id} className="flex-1 flex flex-col items-center relative">
                     {i > 0 && <span className={`absolute right-1/2 top-[13px] w-full h-[3px] rounded ${i < deal.stage ? 'bg-indigo-400' : 'bg-gray-200'}`} style={{ zIndex: 0 }} />}
-                    <span className={`relative z-10 w-[26px] h-[26px] rounded-full flex items-center justify-center text-[11px] font-extrabold border-2 transition-all ${
-                      i + 1 < deal.stage ? 'bg-indigo-500 border-indigo-500 text-white'
+                    <span className={`relative z-10 w-[26px] h-[26px] rounded-full flex items-center justify-center text-[11px] font-extrabold border-2 transition-all ${i + 1 < deal.stage ? 'bg-indigo-500 border-indigo-500 text-white'
                         : i + 1 === deal.stage ? 'bg-white border-indigo-500 text-indigo-600 pulse-ring'
                           : 'bg-white border-gray-200 text-gray-300'}`}>
                       {i + 1 < deal.stage ? <Check size={13} /> : i + 1}
                     </span>
-                    <span className={`text-[10px] font-bold mt-1.5 text-center leading-tight ${i + 1 === deal.stage ? 'text-indigo-600' : 'text-gray-400'}`}>{s.name}</span>
+                    <span className={`text-[10px] font-bold mt-1.5 text-center leading-tight truncate max-w-[85px] ${i + 1 === deal.stage ? 'text-indigo-600' : 'text-gray-400'}`}>{s.name}</span>
                   </div>
                 ))}
               </div>
@@ -182,7 +319,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
 
             <div className="flex gap-2">
               <Btn className="flex-1" onClick={() => onGenerateContract(deal)}><FilePlus2 size={14} />Сгенерировать договор</Btn>
-              <Btn variant="secondary" onClick={() => toast('ok', `Напоминание создано: follow-up ${a.nick}`)}>Напомнить автору</Btn>
+              <Btn variant="secondary" onClick={remindAuthor}>Напомнить автору</Btn>
             </div>
           </div>
         )}
@@ -215,8 +352,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
                   </div>
                 ) : (
                   <div key={m.id} className={`flex ${m.from === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`relative max-w-[75%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ${
-                      m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md'}`}>
+                    <div className={`relative max-w-[75%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ${m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md'}`}>
                       {m.text}
                       <span className={`block text-[10px] font-semibold mt-1 text-right ${m.from === 'user' ? 'text-indigo-200' : 'text-gray-300'}`}>{m.time} {m.from === 'user' && '✓✓'}</span>
                     </div>
@@ -244,54 +380,76 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
         {tab === 'docs' && (
           <div className="p-5 flex flex-col gap-4 anim-in">
             <div className="flex gap-2">
-              <Btn variant="secondary" onClick={startUpload}><Upload size={14} />Загрузить файл</Btn>
+              <Btn variant="secondary" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Загрузить файл</Btn>
               <Btn onClick={() => onGenerateContract(deal)}><FilePlus2 size={14} />Сгенерировать договор из шаблона</Btn>
             </div>
-            {uploading !== null && (
-              <div className="rounded-xl border border-indigo-200 bg-indigo-50/50 p-3">
-                <div className="flex items-center justify-between text-[12px] font-bold text-indigo-700 mb-1.5">
-                  <span>Презентация_кампании.pdf</span><span className="tabular-nums">{Math.min(uploading, 100)}%</span>
-                </div>
-                <div className="h-1.5 rounded-full bg-indigo-100 overflow-hidden">
-                  <div className="h-full rounded-full bg-indigo-500 transition-all duration-100" style={{ width: `${Math.min(uploading, 100)}%` }} />
-                </div>
+            <input ref={fileInputRef} type="file" accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,.txt" className="hidden" onChange={handleFileChange} />
+            {docs.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-gray-300 bg-slate-50/50 p-6 text-center">
+                <div className="text-[13px] font-semibold text-gray-600">Нет прикрепленных файлов. Загрузите документ или сгенерируйте договор из шаблона.</div>
+              </div>
+            ) : (
+              <div className="rounded-xl border border-gray-200 divide-y divide-gray-100">
+                {docs.map(doc => (
+                  <div key={doc.id} onClick={() => setSelectedDocId(doc.id)} className={`flex items-center gap-3 px-4 py-3 group transition-colors cursor-pointer ${doc.id === selectedDocId ? 'border-l-2 border-indigo-200 bg-indigo-50/30' : 'hover:bg-slate-50'}`}>
+                    <span className={`w-9 h-9 rounded-lg flex items-center justify-center text-[9px] font-extrabold text-white shrink-0 ${doc.type === 'pdf' ? 'bg-red-500' : doc.type === 'doc' ? 'bg-blue-500' : doc.type === 'img' ? 'bg-emerald-500' : 'bg-gray-500'}`}>
+                      {doc.type === 'pdf' ? 'PDF' : doc.type === 'doc' ? 'DOC' : doc.type === 'img' ? 'IMG' : 'FILE'}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[13px] font-bold text-gray-800 truncate group-hover:text-indigo-600 transition-colors">{doc.name}</div>
+                      <div className="text-[11px] font-semibold text-gray-400">{doc.size} · {doc.date}</div>
+                    </div>
+                    <span onClick={e => e.stopPropagation()} className="flex items-center gap-1.5">
+                      <Btn variant="ghost" size="xs" onClick={() => downloadDoc(doc)}><Download size={13} />Скачать</Btn>
+                      <button onClick={() => deleteDoc(doc)} className="w-7 h-7 rounded-md text-gray-400 hover:bg-red-50 hover:text-red-600 flex items-center justify-center transition-colors" title="Удалить файл"><Trash2 size={14} /></button>
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
-            <div className="rounded-xl border border-gray-200 divide-y divide-gray-100">
-              {[
-                { n: 'Договор_2024-09-15.pdf', s: '245 KB', d: 'загружен 14.09.2024', t: 'pdf' },
-                { n: 'ТЗ_крем_для_лица.docx', s: '128 KB', d: 'загружен 14.09.2024', t: 'doc' },
-                { n: 'Скриншот_профиля.png', s: '1.2 MB', d: 'загружен 13.09.2024', t: 'img' },
-              ].map(f => (
-                <div key={f.n} className="flex items-center gap-3 px-4 py-3 group hover:bg-slate-50 transition-colors">
-                  <span className={`w-9 h-9 rounded-lg flex items-center justify-center text-[9px] font-extrabold text-white shrink-0 ${f.t === 'pdf' ? 'bg-red-500' : f.t === 'doc' ? 'bg-blue-500' : 'bg-emerald-500'}`}>
-                    {f.t === 'pdf' ? 'PDF' : f.t === 'doc' ? 'DOC' : 'IMG'}
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13px] font-bold text-gray-800 truncate group-hover:text-indigo-600 transition-colors">{f.n}</div>
-                    <div className="text-[11px] font-semibold text-gray-400">{f.s} · {f.d}</div>
+            {selectedDoc && (
+              <div>
+                <div className="text-[12px] font-bold text-gray-400 uppercase tracking-wide mb-2">Превью · {selectedDoc.name}</div>
+                {selectedDoc.type === 'img' && selectedDoc.url ? (
+                  <img src={selectedDoc.url} alt={selectedDoc.name} className="max-h-[360px] w-full object-contain rounded-lg border border-gray-100" />
+                ) : selectedDoc.type === 'pdf' && selectedDoc.url ? (
+                  <iframe src={selectedDoc.url} title={selectedDoc.name} className="w-full h-[360px] rounded-lg border border-gray-100" />
+                ) : selectedDoc.type === 'pdf' ? (
+                  <div className="doc-page rounded-lg border border-gray-100 p-6">
+                    <div className="text-center mb-4">
+                      <div className="text-[13px] font-extrabold text-gray-900">ДОГОВОР ОКАЗАНИЯ УСЛУГ № 2024-0915</div>
+                      <div className="text-[11px] font-semibold text-gray-400 mt-1">г. Москва · 15.09.2024</div>
+                    </div>
+                    <div className="space-y-2">
+                      {[100, 96, 88, 100, 92, 60, 0, 98, 100, 74].map((w, i) => w > 0 && (
+                        <div key={i} className="h-2 rounded bg-gray-100" style={{ width: `${w}%` }} />
+                      ))}
+                    </div>
+                    <div className="mt-4 flex items-center justify-between text-[10px] font-bold text-gray-300">
+                      <span>Страница 1 из 4</span><span>Маркировка: 38-ФЗ, ст. 18.1</span>
+                    </div>
                   </div>
-                  <Btn variant="ghost" size="xs" onClick={() => toast('info', `Скачивание ${f.n}`)}>Скачать</Btn>
-                </div>
-              ))}
-            </div>
-            <div>
-              <div className="text-[12px] font-bold text-gray-400 uppercase tracking-wide mb-2">Превью · Договор_2024-09-15.pdf</div>
-              <div className="doc-page rounded-lg border border-gray-100 p-6">
-                <div className="text-center mb-4">
-                  <div className="text-[13px] font-extrabold text-gray-900">ДОГОВОР ОКАЗАНИЯ УСЛУГ № 2024-0915</div>
-                  <div className="text-[11px] font-semibold text-gray-400 mt-1">г. Москва · 15.09.2024</div>
-                </div>
-                <div className="space-y-2">
-                  {[100, 96, 88, 100, 92, 60, 0, 98, 100, 74].map((w, i) => w > 0 && (
-                    <div key={i} className="h-2 rounded bg-gray-100" style={{ width: `${w}%` }} />
-                  ))}
-                </div>
-                <div className="mt-4 flex items-center justify-between text-[10px] font-bold text-gray-300">
-                  <span>Страница 1 из 4</span><span>Маркировка: 38-ФЗ, ст. 18.1</span>
-                </div>
+                ) : (
+                  <div className="rounded-xl border border-gray-200 p-5">
+                    <div className="flex items-center gap-3">
+                      <span className={`w-11 h-11 rounded-xl flex items-center justify-center text-[10px] font-extrabold text-white shrink-0 ${selectedDoc.type === 'doc' ? 'bg-blue-500' : 'bg-gray-500'}`}>
+                        {selectedDoc.type === 'doc' ? 'DOC' : 'FILE'}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[14px] font-bold text-gray-900 truncate">{selectedDoc.name}</div>
+                        <div className="text-[11px] font-semibold text-gray-400">{selectedDoc.size} · {selectedDoc.date}</div>
+                      </div>
+                      <Badge tone={selectedDoc.type === 'doc' ? 'blue' : 'gray'}>{selectedDoc.type === 'doc' ? 'DOCX' : 'Файл'}</Badge>
+                    </div>
+                    <div className="mt-4 space-y-2">
+                      {[100, 96, 88, 100, 92, 60, 0, 98, 100, 74].map((w, i) => w > 0 && (
+                        <div key={i} className="h-2 rounded bg-gray-100" style={{ width: `${w}%` }} />
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
+            )}
           </div>
         )}
 

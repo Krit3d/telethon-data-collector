@@ -19,10 +19,10 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
   const [fType, setFType] = useState('all');
   const [dragId, setDragId] = useState<string | null>(null);
   const [overCol, setOverCol] = useState<number | null>(null);
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => typeof window !== 'undefined' && window.innerWidth < 1440);
 
   const filtered = useMemo(() => deals.filter(d =>
-    d.stage >= 1 && d.stage <= 5 &&
+    d.stage >= 1 && d.stage <= 6 &&
     (fBrand === 'all' || d.brandId === fBrand) && (fType === 'all' || d.type === fType)
   ), [deals, fBrand, fType]);
 
@@ -74,7 +74,7 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
 
       <div className="flex-1 min-h-0 flex gap-3 px-4 pb-4">
         <div className="flex-1 min-w-0 overflow-x-auto scroll-thin">
-          <div className="flex gap-3 h-full min-w-max">
+          <div className="flex gap-3 h-full min-w-full">
             {STAGES.map(stage => {
               const cards = filtered.filter(d => d.stage === stage.id);
               return (
@@ -82,7 +82,7 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
                   onDragOver={e => { e.preventDefault(); setOverCol(stage.id); }}
                   onDragLeave={() => setOverCol(c => (c === stage.id ? null : c))}
                   onDrop={() => drop(stage.id)}
-                  className={`w-[272px] shrink-0 rounded-xl border border-gray-200/70 bg-slate-50/80 flex flex-col transition-colors ${overCol === stage.id ? 'drop-target' : ''}`}>
+                  className={`flex-1 min-w-[220px] max-w-[340px] shrink-0 rounded-xl border border-gray-200/70 bg-slate-50/80 flex flex-col transition-colors ${overCol === stage.id ? 'drop-target' : ''}`}>
                   <div className="px-3 pt-3 pb-2 flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full" style={{ background: stage.color }} />
                     <span className="text-[12.5px] font-bold text-gray-700">{stage.name}</span>
@@ -101,16 +101,16 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
                           <span className="absolute left-0 top-3 bottom-3 w-[3px] rounded-full" style={{ background: stage.color }} />
                           <div className="flex items-center gap-2">
                             <Avatar nick={a.nick} hue={a.hue} size={26} />
-                            <span className="text-[12px] font-bold text-gray-800 truncate">{a.nick}</span>
+                            <span className="text-[12px] font-bold text-gray-800 truncate max-w-[110px]">{a.nick}</span>
                             <SocialIcon social={a.social} size={13} className="shrink-0" />
                             <Badge tone={typeTone[d.type]} className="ml-auto shrink-0">{d.type}</Badge>
                           </div>
                           <div className="text-[13px] font-semibold text-gray-900 leading-snug mt-2 line-clamp-2">{d.title}</div>
                           <div className="text-[14px] font-extrabold text-gray-900 mt-1.5 tabular-nums">{fmtMoney(d.budget)}</div>
                           <div className="flex items-center gap-3 mt-2.5 pt-2 border-t border-gray-100 text-[11px] font-semibold text-gray-400">
-                            <span className="inline-flex items-center gap-1"><MessageCircle size={12} />{d.msgs.length}</span>
-                            {d.file && <span className="inline-flex items-center gap-1 truncate"><FileText size={12} />{d.file.length > 14 ? d.file.slice(0, 13) + '…' : d.file}</span>}
-                            <span className="ml-auto shrink-0">{d.date}</span>
+                            <span className="inline-flex items-center gap-1 shrink-0"><MessageCircle size={12} />{d.msgs.length}</span>
+                            {d.file && <span className="inline-flex items-center gap-1 truncate max-w-[80px] shrink-0"><FileText size={12} />{d.file.length > 14 ? d.file.slice(0, 13) + '…' : d.file}</span>}
+                            <span className="ml-auto shrink-0 text-[10.5px]">{d.date}</span>
                           </div>
                           {d.erid && <Badge tone="green" className="absolute -top-2 right-2 shadow-sm">ERID ✓</Badge>}
                         </div>
@@ -131,10 +131,11 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
 
         {/* Правая панель «Контекст сделки» */}
         {!collapsed && ctx && (
-          <aside className="w-[300px] shrink-0 rounded-xl border border-gray-200/80 bg-white p-4 flex flex-col gap-3 self-start anim-in">
+          <aside className="w-[270px] 2xl:w-[290px] shrink-0 rounded-xl border border-gray-200/80 bg-white p-4 flex flex-col gap-3 self-start anim-in">
             <div className="flex items-center justify-between">
               <h3 className="text-[13.5px] font-bold text-gray-900">Контекст сделки</h3>
-              <button onClick={() => setCollapsed(true)} className="text-gray-300 hover:text-gray-500"><ChevronRight size={16} /></button>
+              <button onClick={() => setCollapsed(true)} title="Свернуть"
+                className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-300 hover:text-gray-600 hover:bg-gray-100 transition-colors"><ChevronRight size={16} /></button>
             </div>
             {(() => { const b = brandById(ctx.brandId); const a = resolveAuthor(ctx); return (
               <>
@@ -175,8 +176,8 @@ export default function Kanban({ deals, setDeals, onOpenDeal, onNewDeal, onOpenK
           </aside>
         )}
         {collapsed && (
-          <button onClick={() => setCollapsed(false)}
-            className="self-start bg-white border border-gray-200 rounded-xl shadow-sm px-1 py-4 text-gray-400 hover:text-indigo-600 hover:border-indigo-200 transition-colors">
+          <button onClick={() => setCollapsed(false)} title="Развернуть"
+            className="self-start shrink-0 w-7 h-9 flex items-center justify-center bg-white border border-gray-200 rounded-xl shadow-sm text-gray-400 hover:text-indigo-600 hover:border-indigo-200 transition-colors">
             <ChevronLeft size={16} />
           </button>
         )}

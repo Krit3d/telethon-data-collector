@@ -17,13 +17,24 @@ import { DealsList, CommsList } from './screens/Lists';
 
 type Screen = 'kanban' | 'deals' | 'authors' | 'author' | 'comms' | 'erid' | 'kb' | 'analytics' | 'pubs';
 
-const SCREENS: Screen[] = ['kanban', 'deals', 'authors', 'comms', 'erid', 'kb', 'pubs', 'analytics'];
+const SCREENS: Screen[] = ['kanban', 'deals', 'authors', 'author', 'comms', 'erid', 'kb', 'pubs', 'analytics'];
 
 const screenFromHash = (): Screen => {
   let seg = window.location.hash;
   if (seg.startsWith('#')) seg = seg.slice(1);
   if (seg.startsWith('/')) seg = seg.slice(1);
-  return SCREENS.includes(seg as Screen) ? (seg as Screen) : 'authors';
+  const path = seg.split('?')[0];
+  return SCREENS.includes(path as Screen) ? (path as Screen) : 'authors';
+};
+
+const dealIdFromHash = (): string | null => {
+  const hash = window.location.hash;
+  const q = hash.indexOf('?');
+  if (q !== -1) {
+    const fromHash = new URLSearchParams(hash.slice(q + 1)).get('dealId');
+    if (fromHash) return fromHash;
+  }
+  return new URLSearchParams(window.location.search).get('dealId');
 };
 
 const MENU: { id: Screen; label: string; icon: React.ReactNode }[] = [
@@ -85,7 +96,17 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
       .catch(() => toast('err', 'Не удалось загрузить сделки'));
   }, []);
 
-  const openDeal = (id: string, tab?: string) => { setDealTab(tab); setDealId(id); };
+  useEffect(() => {
+    const id = dealIdFromHash();
+    if (id && deals.some(d => d.id === id)) setDealId(id);
+  }, [deals]);
+
+  const openDeal = (id: string, tab?: string) => {
+    setDealTab(tab);
+    setDealId(id);
+    const path = window.location.hash.split('?')[0] || '#/deals';
+    window.location.hash = `${path}?dealId=${id}`;
+  };
   const handleAuthorChat = (authorId: string) => {
     setCommsAuthorId(authorId);
     setScreen('comms');
@@ -185,9 +206,19 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
 
       {/* ===== Оверлеи ===== */}
       {deal && (
-        <DealPanel deal={deal} deals={deals} initialTab={dealTab} key={deal.id + (dealTab ?? '')} onClose={() => setDealId(null)}
+        <DealPanel deal={deal} deals={deals} initialTab={dealTab} key={deal.id + (dealTab ?? '')} onClose={() => {
+          setDealId(null);
+          const path = window.location.hash.split('?')[0];
+          window.location.hash = path;
+        }}
           onUpdate={patch => setDeals(prev => prev.map(d => d.id === deal.id ? { ...d, ...patch } : d))}
           onOpenKB={openKB}
+          onOpenAuthor={(authorId: string) => {
+            setProfileId(authorId);
+            setScreen('author');
+            setDealId(null);
+            window.location.hash = '#/author';
+          }}
           onGenerateContract={d => { setDealId(null); setWizardDeal(d); }}
           onDelete={deletedId => {
             setDeals(prev => prev.filter(d => d.id !== deletedId));
