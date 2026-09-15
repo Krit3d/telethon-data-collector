@@ -74,6 +74,7 @@ services:
       - "8000:8000"
     volumes:
       - fastembed_cache:/app/model_cache
+      # - ./media:/app/media
     depends_on:
       - qdrant
       - neo4j

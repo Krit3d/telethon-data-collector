@@ -359,6 +359,22 @@ class Settings(BaseSettings):
         description="Secret key used to sign and verify JWT access tokens",
     )
 
+    # ---- Email settings ----
+    smtp_host: str | None = Field(default=None)
+    smtp_port: int = Field(default=465)
+    smtp_user: str | None = Field(default=None)
+    smtp_password: str | None = Field(default=None)
+    smtp_use_tls: bool = Field(default=False)
+    smtp_use_ssl: bool = Field(default=True)
+    imap_host: str | None = Field(default=None)
+    imap_port: int = Field(default=993)
+    imap_user: str | None = Field(default=None)
+    imap_password: str | None = Field(default=None)
+    email_poll_interval_s: int = Field(default=10)
+    email_outreach_enabled: bool = Field(default=True)
+    media_bridge_url: str | None = Field(default=None, description="Internal URL of the German media bridge, e.g. http://100.x.y.z:8090")
+    media_bridge_secret: str | None = Field(default=None, description="Secret token for media bridge authentication")
+
     # ---- Channel sourcing ----
     channels_file: Path = Field(
         default=Path("channels.txt"),

@@ -4,9 +4,10 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from starlette.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -145,4 +146,26 @@ if WEB_DIR.exists():
         name="js",
     )
 
-app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
+@app.get("/media/{filename}")
+async def get_media(filename: str) -> Response:
+    settings = load_settings()
+    if settings.media_bridge_url:
+        headers = {}
+        if settings.media_bridge_secret:
+            headers["X-Bridge-Secret"] = settings.media_bridge_secret
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(
+                f"{settings.media_bridge_url.rstrip('/')}/media/{filename}",
+                headers=headers,
+            )
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="File not found")
+        resp.raise_for_status()
+        return StreamingResponse(
+            resp.aiter_bytes(),
+            media_type=resp.headers.get("content-type"),
+        )
+    path = MEDIA_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path)

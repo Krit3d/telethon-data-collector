@@ -201,8 +201,8 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  outreach:
-    container_name: tg_parser_outreach
+  telegram_outreach:
+    container_name: tg_parser_telegram_outreach
     image: tg_parser_crawler_base:latest
     restart: always
     env_file:
@@ -217,10 +217,62 @@ services:
       - .:/app
       - ./sessions:/app/sessions
       - ./proxies.txt:/app/proxies.txt
+      - ./media:/app/media
     depends_on:
       db:
         condition: service_healthy
     command: python -m src.workers.telegram_outreach_worker
+    networks:
+      - scraper_network
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  email_outreach:
+    container_name: tg_parser_email_outreach
+    image: tg_parser_crawler_base:latest
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/app
+      - ./media:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.workers.email_outreach_worker
+    networks:
+      - scraper_network
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  media_bridge:
+    container_name: tg_parser_media_bridge
+    image: tg_parser_crawler_base:latest
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
+      MEDIA_BRIDGE_SECRET: ${MEDIA_BRIDGE_SECRET:-}
+    ports:
+      - "8090:8090"
+    volumes:
+      - .:/app
+      - ./media:/app/media
+    command: python -m uvicorn src.utils.media_bridge:app --host 0.0.0.0 --port 8090
     networks:
       - scraper_network
     logging:

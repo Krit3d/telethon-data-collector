@@ -4,6 +4,8 @@ import json
 import logging
 import shutil
 import uuid
+
+import httpx
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,11 @@ from src.api.schemas import (
 )
 from src.api.services.contact_resolver import ContactResolver
 from src.api.services.crm_client import TwentyCrmClient
+from src.parser.creators.core.contacts import (
+    is_valid_email,
+    is_valid_telegram_handle,
+    normalize_telegram_handle,
+)
 from src.db.database import Database
 from src.db.models import Account, Content, Deal, CreatorMessage, User
 from src.utils.security import create_access_token, decode_access_token, hash_password, verify_password
@@ -248,26 +255,79 @@ def _detect_media_type(extension: str) -> str:
     return "document"
 
 
+def _resolve_target_for_channel(account: Account, channel_type: str) -> str | None:
+    raw_metadata = account.raw_metadata if isinstance(account.raw_metadata, dict) else {}
+    contacts = raw_metadata.get("contacts", {})
+    if not isinstance(contacts, dict):
+        contacts = {}
+    if channel_type == "email":
+        items = contacts.get("emails")
+        if isinstance(items, list):
+            for cand in items:
+                if isinstance(cand, str) and is_valid_email(cand):
+                    return cand.strip().lower()
+        return None
+    if channel_type == "telegram":
+        items = contacts.get("telegrams")
+        if isinstance(items, list):
+            for cand in items:
+                if isinstance(cand, str) and is_valid_telegram_handle(cand):
+                    return f"@{normalize_telegram_handle(cand)}"
+        if account.platform == "TELEGRAM" and account.username:
+            return account.username
+        return None
+    if channel_type == "whatsapp":
+        items = contacts.get("phones")
+        if isinstance(items, list):
+            for cand in items:
+                if isinstance(cand, str):
+                    return cand.strip()
+        return None
+    return None
+
+
 @router.post("/upload", response_model=FileUploadResponse)
 async def upload_file(
     request: Request,
     file: UploadFile = File(...),
 ) -> FileUploadResponse:
+    original_filename = file.filename or "file"
+    extension = Path(original_filename).suffix.lower()
+    if extension in FORBIDDEN_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Запрещённый тип файла")
+    settings = request.app.state.settings
     internal_token = request.headers.get("x-internal-token")
-    if internal_token != request.app.state.settings.secret_key:
+    is_internal = bool(settings.secret_key and internal_token == settings.secret_key)
+    if not is_internal:
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Unauthorized upload access")
         token = auth[len("Bearer "):].strip()
         if not token:
             raise HTTPException(status_code=401, detail="Unauthorized upload access")
-        payload = decode_access_token(token, request.app.state.settings.secret_key)
+        payload = decode_access_token(token, settings.secret_key)
         if payload is None:
             raise HTTPException(status_code=401, detail="Unauthorized upload access")
-    original_filename = file.filename or "file"
-    extension = Path(original_filename).suffix.lower()
-    if extension in FORBIDDEN_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Запрещённый тип файла")
+    if settings.media_bridge_url:
+        headers = {}
+        if settings.media_bridge_secret:
+            headers["X-Bridge-Secret"] = settings.media_bridge_secret
+        content = await file.read()
+        files = {"file": (original_filename, content, file.content_type)}
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(
+                f"{settings.media_bridge_url.rstrip('/')}/upload",
+                headers=headers,
+                files=files,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        return FileUploadResponse(
+            media_url=data["url"],
+            media_name=data["name"],
+            media_type=data["type"],
+            file_size=len(content),
+        )
     media_type = _detect_media_type(extension)
     saved_filename = f"{uuid.uuid4().hex}{extension}"
     destination = MEDIA_DIR / saved_filename
@@ -821,8 +881,12 @@ async def send_creator_message(
         deal_result = await session.execute(deal_stmt)
         deal = deal_result.scalar_one_or_none()
         resolution = ContactResolver.resolve(account)
-        target_channel = payload.preferred_channel or resolution.channel_type
-        target_handle = resolution.channel_target
+        if payload.preferred_channel:
+            target_channel = payload.preferred_channel
+            target_handle = _resolve_target_for_channel(account, target_channel) or resolution.channel_target
+        else:
+            target_channel = resolution.channel_type
+            target_handle = resolution.channel_target
         message = CreatorMessage(
             user_id=current_user.id,
             account_id=account.id,
@@ -1131,9 +1195,15 @@ async def send_deal_message(
         account_stmt = select(Account).where(Account.id == deal.account_id)
         account_result = await session.execute(account_stmt)
         account = account_result.scalar_one_or_none()
-        resolution = ContactResolver.resolve(account) if account is not None else ContactResolver.resolve({"platform": "", "username": None, "raw_metadata": None})
-        target_channel = payload.preferred_channel or resolution.channel_type
-        target_handle = resolution.channel_target
+        if account is None:
+            raise HTTPException(status_code=404, detail="Автор не найден")
+        resolution = ContactResolver.resolve(account)
+        if payload.preferred_channel:
+            target_channel = payload.preferred_channel
+            target_handle = _resolve_target_for_channel(account, target_channel) or resolution.channel_target
+        else:
+            target_channel = resolution.channel_type
+            target_handle = resolution.channel_target
         message = CreatorMessage(
             user_id=deal.user_id,
             account_id=deal.account_id,
