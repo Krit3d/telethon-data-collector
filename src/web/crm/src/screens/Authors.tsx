@@ -75,7 +75,7 @@ function getPendingImportIds(): string[] {
   return Array.from(new Set(ids));
 }
 
-export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }: { deals: Deal[]; onOpenProfile: (id: string) => void; onNewDeal: (authorId: string, meta?: { name?: string; handle?: string }) => void; onOpenComms: () => void }) {
+export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }: { deals: Deal[]; onOpenProfile: (id: string) => void; onNewDeal: (authorId: string, meta?: { name?: string; handle?: string }) => void; onOpenComms: (authorId: string) => void }) {
   const toast = useToast();
   const [authors, setAuthors] = useState<Author[]>([]);
   const [loading, setLoading] = useState(true);
@@ -143,6 +143,8 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
 
   const dealsCountFor = (a: Author): number => deals.filter(d => String(d.authorId) === String(a.id) || (a.twentyId && String(d.authorId) === String(a.twentyId))).length;
 
+  const activeDealsCountFor = (a: Author): number => deals.filter(d => (String(d.authorId) === String(a.id) || (a.twentyId && String(d.authorId) === String(a.twentyId))) && d.stage >= 1 && d.stage <= 6).length;
+
   const changeStatus = async (a: Author, status: Author['status']) => {
     try {
       await api.updateCreatorStatus(a.twentyId || a.id, status);
@@ -186,7 +188,7 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
       (fSocial === 'all' || a.social === fSocial) &&
       (!fMin || a.followers >= Number(fMin) * 1000) &&
       (!fMax || a.followers <= Number(fMax) * 1000) &&
-      (!onlyFree || a.status === 'Свободен')
+      (!onlyFree || computedStatus(a, activeDealsCountFor(a)) === 'Свободен')
     );
     if (!sortKey) return filtered;
     const numeric = ['followers', 'reach', 'er', 'cpm'].includes(sortKey);
@@ -196,15 +198,15 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
         const vB = y[sortKey] as number;
         return sortOrder === 'asc' ? vA - vB : vB - vA;
       }
-      const sA = String(x[sortKey]);
-      const sB = String(y[sortKey]);
+      const sA = sortKey === 'status' ? computedStatus(x, activeDealsCountFor(x)) : String(x[sortKey]);
+      const sB = sortKey === 'status' ? computedStatus(y, activeDealsCountFor(y)) : String(y[sortKey]);
       return sortOrder === 'asc' ? sA.localeCompare(sB, 'ru') : sB.localeCompare(sA, 'ru');
     });
   }, [authors, q, fSocial, fMin, fMax, onlyFree, showArchived, sortKey, sortOrder]);
 
   const pages = Math.max(1, Math.ceil(list.length / PAGE));
   const pageItems = list.slice(page * PAGE, (page + 1) * PAGE);
-  const freeCount = authors.filter(a => a.status === 'Свободен').length;
+  const freeCount = authors.filter(a => computedStatus(a, activeDealsCountFor(a)) === 'Свободен').length;
 
   return (
     <div className="h-full overflow-y-auto scroll-thin" onClick={() => setMenu(null)}>
@@ -311,43 +313,43 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
                   {pageItems.map(a => {
                     const dealsCount = dealsCountFor(a);
                     return (
-                    <tr key={a.id} className="group hover:bg-indigo-50/40 transition-colors">
-                      <td className="px-4 py-2.5">
-                        <button onClick={e => { e.stopPropagation(); onOpenProfile(a.id); }} className="flex items-center gap-2.5 hover:text-indigo-600 transition-colors">
-                          <Avatar nick={a.nick} hue={a.hue} size={30} />
-                          <span className="text-left">
-                            <span className="block font-bold text-gray-800 group-hover:text-indigo-600">{a.nick}</span>
-                            <span className="block text-[10.5px] font-semibold text-gray-400">{dealsCount} сделок · ER {fmtER(a.er)}</span>
-                          </span>
-                        </button>
-                      </td>
-                      <td className="px-4 py-2.5"><span className="inline-flex items-center gap-1.5 font-semibold text-gray-600"><SocialIcon social={a.social} size={14} />{a.social}</span></td>
-                      <td className="px-4 py-2.5 font-bold text-gray-800 tabular-nums">{fmtBig(a.followers)}</td>
-                      <td className="px-4 py-2.5"><span title={a.niche}><Badge tone="violet">{formatNiche(a.niche)}</Badge></span></td>
-                      <td className="px-4 py-2.5 font-semibold text-gray-500 tabular-nums">{fmtBig(a.reach)}</td>
-                      <td className="px-4 py-2.5 font-bold text-emerald-600 tabular-nums">{fmtER(a.er)}</td>
-                      <td className="px-4 py-2.5 font-bold text-gray-800 tabular-nums">{a.cpm} ₽</td>
-                      <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
-                        <Badge tone={statusTone[computedStatus(a, dealsCount)]}>{computedStatus(a, dealsCount)}</Badge>
-                      </td>
-                      <td className="px-4 py-2.5 text-right" onClick={e => e.stopPropagation()}>
-                        <button className="w-7 h-7 rounded-lg text-gray-300 group-hover:text-gray-500 hover:bg-gray-100 inline-flex items-center justify-center transition-colors"
-                          onClick={e => {
-                            e.stopPropagation();
-                            if (menu?.id === a.id) {
-                              setMenu(null);
-                              return;
-                            }
-                            const rect = e.currentTarget.getBoundingClientRect();
-                            const dropdownHeight = 185;
-                            const dropdownWidth = 192;
-                            const openUp = rect.bottom + dropdownHeight > window.innerHeight;
-                            const top = openUp ? Math.max(8, rect.top - dropdownHeight) : rect.bottom + 4;
-                            const left = Math.max(8, rect.right - dropdownWidth);
-                            setMenu({ id: a.id, top, left });
-                          }}><MoreVertical size={15} /></button>
-                      </td>
-                    </tr>
+                      <tr key={a.id} className="group hover:bg-indigo-50/40 transition-colors">
+                        <td className="px-4 py-2.5">
+                          <button onClick={e => { e.stopPropagation(); onOpenProfile(a.id); }} className="flex items-center gap-2.5 hover:text-indigo-600 transition-colors">
+                            <Avatar nick={a.nick} hue={a.hue} size={30} />
+                            <span className="text-left">
+                              <span className="block font-bold text-gray-800 group-hover:text-indigo-600">{a.nick}</span>
+                              <span className="block text-[10.5px] font-semibold text-gray-400">{dealsCount} сделок · ER {fmtER(a.er)}</span>
+                            </span>
+                          </button>
+                        </td>
+                        <td className="px-4 py-2.5"><span className="inline-flex items-center gap-1.5 font-semibold text-gray-600"><SocialIcon social={a.social} size={14} />{a.social}</span></td>
+                        <td className="px-4 py-2.5 font-bold text-gray-800 tabular-nums">{fmtBig(a.followers)}</td>
+                        <td className="px-4 py-2.5"><span title={a.niche}><Badge tone="violet">{formatNiche(a.niche)}</Badge></span></td>
+                        <td className="px-4 py-2.5 font-semibold text-gray-500 tabular-nums">{fmtBig(a.reach)}</td>
+                        <td className="px-4 py-2.5 font-bold text-emerald-600 tabular-nums">{fmtER(a.er)}</td>
+                        <td className="px-4 py-2.5 font-bold text-gray-800 tabular-nums">{a.cpm} ₽</td>
+                        <td className="px-4 py-2.5" onClick={e => e.stopPropagation()}>
+                          <Badge tone={statusTone[computedStatus(a, activeDealsCountFor(a))]}>{computedStatus(a, activeDealsCountFor(a))}</Badge>
+                        </td>
+                        <td className="px-4 py-2.5 text-right" onClick={e => e.stopPropagation()}>
+                          <button className="w-7 h-7 rounded-lg text-gray-300 group-hover:text-gray-500 hover:bg-gray-100 inline-flex items-center justify-center transition-colors"
+                            onClick={e => {
+                              e.stopPropagation();
+                              if (menu?.id === a.id) {
+                                setMenu(null);
+                                return;
+                              }
+                              const rect = e.currentTarget.getBoundingClientRect();
+                              const dropdownHeight = 185;
+                              const dropdownWidth = 192;
+                              const openUp = rect.bottom + dropdownHeight > window.innerHeight;
+                              const top = openUp ? Math.max(8, rect.top - dropdownHeight) : rect.bottom + 4;
+                              const left = Math.max(8, rect.right - dropdownWidth);
+                              setMenu({ id: a.id, top, left });
+                            }}><MoreVertical size={15} /></button>
+                        </td>
+                      </tr>
                     );
                   })}
                   {pageItems.length === 0 && (
@@ -433,7 +435,7 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
             style={{ top: `${menu.top}px`, left: `${menu.left}px` }}
             onClick={e => e.stopPropagation()}>
             <MenuItem icon={<Briefcase size={14} />} label="Новая сделка" onClick={() => { setMenu(null); onNewDeal(activeMenuAuthor.id, { name: activeMenuAuthor.nick }); }} />
-            <MenuItem icon={<MessageSquare size={14} />} label="Написать" onClick={() => { setMenu(null); onOpenComms(); }} />
+            <MenuItem icon={<MessageSquare size={14} />} label="Написать" onClick={() => { setMenu(null); onOpenComms(String(activeMenuAuthor.id)); }} />
             <div className="h-px bg-gray-100 my-1" />
             {activeMenuAuthor.status === 'В архиве' ? (
               <MenuItem icon={<ArchiveRestore size={14} />} label="Восстановить" onClick={() => { setMenu(null); void changeStatus(activeMenuAuthor, 'Свободен'); }} />

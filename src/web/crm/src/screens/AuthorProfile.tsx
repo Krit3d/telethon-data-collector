@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, Briefcase, MessageSquare, Archive, ArchiveRestore, ArrowDownRight, ArrowUpRight, StickyNote, FileText, TrendingUp, Target, X, Sparkles, Upload, Download, Trash2 } from 'lucide-react';
+import { ArrowLeft, Briefcase, MessageSquare, Archive, ArchiveRestore, ArrowDownRight, ArrowUpRight, StickyNote, FileText, TrendingUp, Target, X, Upload, Download, Trash2 } from 'lucide-react';
 import { fmtNum, fmtMoney, ARCHIVED_STAGE, getStage, STAGES, type Deal } from '../data';
 import { Badge, Avatar, Card, Btn, useToast, Modal, inputCls } from '../components/ui';
 import { SocialIcon, PostThumb } from '../components/icons';
 import { LineChart, HBars } from '../components/charts';
-import { api, normalizeSocial, type CreatorPostItem, type CreatorProfileDetail } from '../services/api';
+import { api, normalizeSocial, type CreatorProfileDetail } from '../services/api';
 
 const loadNotes = (id: string): string[] => {
   try {
@@ -63,50 +63,6 @@ const docBadgeCls = (ext: AuthorDocItem['ext']): string => {
   return 'bg-gray-100 text-gray-500';
 };
 
-const fmtBudget = (v: number): string => v >= 1000000 ? `${(v / 1000000).toFixed(1).replace('.0', '')}M` : v >= 1000 ? `${Math.round(v / 1000)}K` : String(v);
-
-const getOptimalBudget = (cpm: number, avgReach: number): string => {
-  if (cpm <= 0) return 'Бюджет рассчитывается индивидуально';
-  const reach = avgReach > 0 ? avgReach : 100000;
-  const min = Math.round(cpm * reach / 1000 * 0.8);
-  const max = Math.round(cpm * reach / 1000 * 1.2);
-  return `Диапазон: ${fmtBudget(min)}–${fmtBudget(max)} ₽ (на основе CPM и среднего охвата)`;
-};
-
-const getBestFormat = (posts: CreatorPostItem[], platform: string): string => {
-  if (posts.length === 0) {
-    const s = normalizeSocial(platform.toLowerCase());
-    return s === 'YouTube' ? 'Видео' : s === 'TikTok' ? 'Короткие видео' : 'Reels';
-  }
-  const sums = new Map<string, { sum: number; count: number }>();
-  for (const p of posts) {
-    const cur = sums.get(p.post_type) ?? { sum: 0, count: 0 };
-    cur.sum += p.er;
-    cur.count += 1;
-    sums.set(p.post_type, cur);
-  }
-  let best = '';
-  let bestAvg = -1;
-  for (const [type, { sum, count }] of sums) {
-    const avg = sum / count;
-    if (avg > bestAvg) {
-      bestAvg = avg;
-      best = type;
-    }
-  }
-  return best;
-};
-
-const DAYS = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
-
-const getBestPublishTime = (posts: CreatorPostItem[]): string => {
-  if (posts.length === 0) return 'Вторник / Четверг 18:00–20:00 (МСК)';
-  let best = posts[0];
-  for (const p of posts) if (p.er > best.er) best = p;
-  const msk = new Date(new Date(best.published_at).getTime() + 3 * 3600 * 1000);
-  return `${DAYS[msk.getUTCDay()]} ${String(msk.getUTCHours()).padStart(2, '0')}:00 (МСК)`;
-};
-
 const ratingFromEr = (er: number): string => {
   if (er >= 5) return 'A';
   if (er >= 3.5) return 'B';
@@ -147,7 +103,7 @@ const cleanText = (text: string | null | undefined): string | null => {
 };
 
 export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOpenDeal, onOpenComms }: {
-  authorId: string; deals: Deal[]; onBack: () => void; onNewDeal: (authorId: string, meta?: { name?: string; handle?: string }) => void; onOpenDeal: (id: string, tab?: string) => void; onOpenComms: () => void;
+  authorId: string; deals: Deal[]; onBack: () => void; onNewDeal: (authorId: string, meta?: { name?: string; handle?: string }) => void; onOpenDeal: (id: string, tab?: string) => void; onOpenComms: (authorId: string) => void;
 }) {
   const toast = useToast();
   const [tab, setTab] = useState('analytics');
@@ -378,7 +334,7 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
           </div>
           <div className="flex items-center gap-2 ml-auto">
             <Btn onClick={() => onNewDeal(String(profile.id), { name: profile.title, handle: profile.username ? (profile.username.startsWith('@') ? profile.username : `@${profile.username}`) : undefined })}><Briefcase size={14} />Новая сделка</Btn>
-            <Btn variant="secondary" onClick={() => myDeals.length > 0 ? onOpenDeal(myDeals[0].id, 'comms') : onOpenComms()}><MessageSquare size={14} />Написать</Btn>
+            <Btn variant="secondary" onClick={() => onOpenComms(String(profile.id))}><MessageSquare size={14} />Написать</Btn>
             <Btn variant="danger" onClick={() => profile.status === 'В архиве' ? void handleRestore() : (setCloseDeals(true), setConfirmArchiveOpen(true))}>
               {profile.status === 'В архиве' ? <ArchiveRestore size={14} /> : <Archive size={14} />}
               {profile.status === 'В архиве' ? 'Восстановить' : 'В архив'}
@@ -557,14 +513,6 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
                 </div>
                 <div className="flex items-center gap-1 text-[11px] font-bold text-emerald-600 mt-1"><ArrowUpRight size={11} />{profile.static_avg_er >= 3.5 ? 'Выше среднего' : 'Ниже среднего'}</div>
               </div>
-            </div>
-          </Card>
-          <Card className="p-4">
-            <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wide mb-2.5 flex items-center gap-1.5"><Sparkles size={13} className="text-indigo-500" />AI-рекомендации</div>
-            <div className="flex flex-col gap-2">
-              <div className="rounded-lg bg-indigo-50/60 border border-indigo-100 px-3 py-2 text-[12px] font-semibold text-gray-700 leading-snug">Оптимальный бюджет: {getOptimalBudget(profile.cpm, profile.avg_reach)}</div>
-              <div className="rounded-lg bg-indigo-50/60 border border-indigo-100 px-3 py-2 text-[12px] font-semibold text-gray-700 leading-snug">Лучший формат: {getBestFormat(profile.posts, profile.platform)}</div>
-              <div className="rounded-lg bg-indigo-50/60 border border-indigo-100 px-3 py-2 text-[12px] font-semibold text-gray-700 leading-snug">Лучшее время: {getBestPublishTime(profile.posts)}</div>
             </div>
           </Card>
           <Card className="p-4">

@@ -1,4 +1,4 @@
-import { Bold, BookOpen, Check, Download, FilePlus2, Italic, List, MessageCircle, MoreHorizontal, Paperclip, Send, Share2, ShieldCheck, Trash2, Upload, X } from 'lucide-react';
+import { Bold, BookOpen, Check, Download, FilePlus2, Italic, List, MessageCircle, MoreHorizontal, Share2, ShieldCheck, Trash2, Upload, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { FakeQR, SocialIcon } from '../components/icons';
 import { Avatar, Badge, Btn, CopyBtn, Modal, SidePanel, Tabs, Tip, useToast } from '../components/ui';
@@ -15,7 +15,7 @@ interface DealDocument {
   url?: string;
 }
 
-export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, onOpenKB, onGenerateContract, onDelete, onOpenAuthor }: {
+export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, onOpenKB, onGenerateContract, onDelete, onOpenAuthor, onOpenComms }: {
   deal: Deal;
   deals: Deal[];
   initialTab?: string;
@@ -25,10 +25,10 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
   onGenerateContract: (deal: Deal) => void;
   onDelete?: (dealId: string) => void;
   onOpenAuthor?: (authorId: string) => void;
+  onOpenComms?: (authorId: string) => void;
 }) {
   const toast = useToast();
   const [tab, setTab] = useState(initialTab ?? 'overview');
-  const [msg, setMsg] = useState('');
   const [checkOk, setCheckOk] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
@@ -138,15 +138,6 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
       .catch(() => toast('err', 'Не удалось загрузить сообщения автора'));
   }, [tab, deal.authorId]);
 
-  const send = () => {
-    if (!msg.trim()) return;
-    const text = msg.trim();
-    setMsg('');
-    api.sendCreatorMessage(String(deal.authorId), text, 'user')
-      .then(m => onUpdate({ msgs: [...deal.msgs, toDealMsg(m)] }))
-      .catch(() => toast('err', 'Не удалось отправить сообщение'));
-  };
-
   const confirmDelete = () => {
     setDeleting(true);
     api.deleteDeal(Number(deal.id))
@@ -172,7 +163,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
     api.sendCreatorMessage(String(deal.authorId), `Здравствуйте! Напоминаем по сделке «${deal.title}». Подскажите, пожалуйста, статус подготовки материалов?`, 'user')
       .then(m => {
         onUpdate({ msgs: [...deal.msgs, toDealMsg(m)] });
-        setTab('comms');
+        onOpenComms?.(String(deal.authorId));
         toast('ok', 'Напоминание отправлено в чат');
       })
       .catch(() => toast('err', 'Не удалось отправить напоминание'));
@@ -226,7 +217,7 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
           <Badge tone="gray">{deal.date}</Badge>
           <Badge tone={deal.type === 'Stories' ? 'violet' : deal.type === 'Reels' ? 'sky' : deal.type === 'Видео' ? 'red' : 'indigo'}>{deal.type}</Badge>
           <div className="flex items-center gap-1 ml-auto shrink-0">
-            <Btn variant="outline" size="sm" onClick={() => setTab('comms')}><MessageCircle size={14} />Написать автору</Btn>
+            <Btn variant="outline" size="sm" onClick={() => onOpenComms?.(String(deal.authorId))}><MessageCircle size={14} />Написать автору</Btn>
             <div className="relative">
               <button className="w-8 h-8 rounded-lg text-gray-400 hover:bg-gray-100 flex items-center justify-center" onClick={() => setMenuOpen(!menuOpen)}><MoreHorizontal size={16} /></button>
               {menuOpen && (
@@ -326,51 +317,30 @@ export default function DealPanel({ deal, deals, initialTab, onClose, onUpdate, 
 
         {/* ===== КОММУНИКАЦИИ ===== */}
         {tab === 'comms' && (
-          <div className="flex flex-col h-full anim-in">
-            <div className="px-5 py-3 border-b border-indigo-100 bg-indigo-50/50 flex items-center gap-3 shrink-0">
-              <div className="relative shrink-0">
-                <Avatar nick={a.nick} hue={a.hue} size={36} />
-                <span className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full bg-emerald-500 border-2 border-white" />
-              </div>
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[13px] font-bold text-gray-900">{a.nick}</span>
-                  <SocialIcon social={a.social} size={13} />
+          <div className="p-5 anim-in">
+            <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-100 flex items-center gap-3">
+                <span className="w-9 h-9 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0"><MessageCircle size={16} /></span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[13px] font-bold text-gray-900">Диалог с автором</div>
+                  <div className="text-[11px] font-semibold text-gray-400">Связь с {a.nick} · {deal.msgs.length} сообщ.</div>
                 </div>
-                <div className="text-[11px] font-semibold text-gray-400">Связь с автором по сделке · обычно отвечает в течение часа</div>
+                <Badge tone="indigo" className="shrink-0">Канал: Внутренний чат</Badge>
               </div>
-              <Badge tone="indigo" className="ml-auto shrink-0">{deal.msgs.length} сообщ.</Badge>
-            </div>
-            <div ref={chatRef} className="flex-1 min-h-0 overflow-y-auto scroll-thin p-5 flex flex-col gap-3 bg-slate-50/50">
-              {deal.msgs.length === 0 && <div className="m-auto text-center text-[12.5px] font-semibold text-gray-400">Сообщений пока нет — напишите автору первым</div>}
-              {deal.msgs.map(m => (
-                m.from === 'system' ? (
-                  <div key={m.id} className="flex justify-center my-1.5">
-                    <span className="text-[11px] font-medium text-gray-400 bg-gray-100/80 border border-gray-200/60 px-3 py-0.5 rounded-full">
-                      {m.text} · {m.time}
-                    </span>
-                  </div>
-                ) : (
-                  <div key={m.id} className={`flex ${m.from === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`relative max-w-[75%] rounded-2xl px-3.5 py-2.5 text-[13px] font-medium leading-snug shadow-sm ${m.from === 'user' ? 'tail-r bg-indigo-500 text-white rounded-br-md' : 'tail-l bg-white border border-gray-200 text-gray-800 rounded-bl-md'}`}>
-                      {m.text}
-                      <span className={`block text-[10px] font-semibold mt-1 text-right ${m.from === 'user' ? 'text-indigo-200' : 'text-gray-300'}`}>{m.time} {m.from === 'user' && '✓✓'}</span>
+              <div className="px-4 py-3 flex flex-col gap-2.5">
+                {deal.msgs.slice(-3).map(m => (
+                  <div key={m.id} className="flex items-start gap-2">
+                    <span className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${m.from === 'user' ? 'bg-indigo-500' : 'bg-gray-300'}`} />
+                    <div className="min-w-0">
+                      <div className="text-[12.5px] font-medium text-gray-700 leading-snug line-clamp-2">{m.text}</div>
+                      <div className="text-[10.5px] font-semibold text-gray-300 mt-0.5">{m.time} · {m.from === 'user' ? 'Вы' : a.nick}</div>
                     </div>
                   </div>
-                )
-              ))}
-            </div>
-            <div className="p-3.5 border-t border-gray-100 bg-white shrink-0">
-              <div className="flex items-end gap-2">
-                <button className="w-9 h-9 rounded-lg text-gray-400 hover:bg-gray-100 hover:text-indigo-600 flex items-center justify-center shrink-0 transition-colors"
-                  onClick={() => toast('info', 'Прикрепление файла…')}><Paperclip size={17} /></button>
-                <textarea
-                  rows={1} value={msg}
-                  onChange={e => setMsg(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
-                  placeholder="Сообщение автору…"
-                  className="flex-1 resize-none rounded-xl border border-gray-200 px-3.5 py-2.5 text-[13px] outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100 transition-shadow" />
-                <Btn onClick={send} disabled={!msg.trim()} className="!rounded-xl !w-9 !h-9.5 !p-0 shrink-0"><Send size={15} /></Btn>
+                ))}
+                {deal.msgs.length === 0 && <div className="text-[12.5px] font-semibold text-gray-400">Сообщений пока нет — напишите автору первым</div>}
+              </div>
+              <div className="px-4 py-3 border-t border-gray-100 bg-slate-50/50">
+                <Btn className="w-full" onClick={() => onOpenComms?.(String(deal.authorId))}><MessageCircle size={14} />Перейти в диалог с автором</Btn>
               </div>
             </div>
           </div>

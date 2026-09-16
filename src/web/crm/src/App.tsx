@@ -194,8 +194,8 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
         <main className="flex-1 min-h-0 relative">
           {screen === 'kanban' && <Kanban deals={deals} setDeals={setDeals} onOpenDeal={openDeal} onNewDeal={() => setNewDeal({})} onOpenKB={openKB} />}
           {screen === 'deals' && <DealsList deals={deals} onOpenDeal={openDeal} />}
-          {screen === 'authors' && <Authors deals={deals} onOpenProfile={id => { setProfileId(id); setScreen('author'); }} onNewDeal={(id, meta) => setNewDeal({ authorId: id, authorName: meta?.name, authorHandle: meta?.handle })} onOpenComms={(authorId?: string) => handleAuthorChat(authorId || profileId)} />}
-          {screen === 'author' && <AuthorProfile authorId={profileId} deals={deals} onBack={() => setScreen('authors')} onNewDeal={(id, meta) => setNewDeal({ authorId: id, authorName: meta?.name, authorHandle: meta?.handle })} onOpenDeal={(id, tab) => openDeal(id, tab ?? 'comms')} onOpenComms={(authorId?: string) => handleAuthorChat(authorId || profileId)} />}
+          {screen === 'authors' && <Authors deals={deals} onOpenProfile={id => { setProfileId(id); setScreen('author'); }} onNewDeal={(id, meta) => setNewDeal({ authorId: id, authorName: meta?.name, authorHandle: meta?.handle })} onOpenComms={(authorId: string) => handleAuthorChat(String(authorId))} />}
+          {screen === 'author' && <AuthorProfile authorId={profileId} deals={deals} onBack={() => setScreen('authors')} onNewDeal={(id, meta) => setNewDeal({ authorId: id, authorName: meta?.name, authorHandle: meta?.handle })} onOpenDeal={(id, tab) => openDeal(id, tab ?? 'comms')} onOpenComms={(id?: string) => handleAuthorChat(id ? String(id) : String(profileId))} />}
           {screen === 'comms' && <CommsList deals={deals} initialAuthorId={commsAuthorId} onOpenDeal={openDeal} onNewDeal={(id, meta) => setNewDeal({ authorId: id, authorName: meta?.name, authorHandle: meta?.handle })} />}
           {screen === 'erid' && <Erid deals={deals} onOpenDeal={openDeal} />}
           {screen === 'kb' && <KnowledgeBase initialBrandId={kbBrand} key={kbBrand ?? 'kb'} />}
@@ -218,6 +218,10 @@ function Shell({ user, onLogout }: { user: Record<string, unknown> | null; onLog
             setScreen('author');
             setDealId(null);
             window.location.hash = '#/author';
+          }}
+          onOpenComms={(authorId: string) => {
+            setDealId(null);
+            handleAuthorChat(String(authorId));
           }}
           onGenerateContract={d => { setDealId(null); setWizardDeal(d); }}
           onDelete={deletedId => {

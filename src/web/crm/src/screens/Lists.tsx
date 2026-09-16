@@ -166,31 +166,44 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
           if (target) {
             setChannels(items);
             setSelectedAuthorId(String(initialAuthorId));
+            setChatTab(target.is_archived ? 'archived' : 'active');
           } else {
-            api.getCreatorProfile(initialAuthorId)
-              .then(profile => {
+            api.initCommunication(initialAuthorId)
+              .then(channel => {
                 if (cancelled) return;
-                const temp: CommunicationChannelItem = {
-                  deal_id: null,
-                  author_id: initialAuthorId,
-                  author_name: profile.title,
-                  author_handle: profile.username ? `@${stripAt(profile.username)}` : `@${profile.title}`,
-                  platform: profile.platform,
-                  deal_title: 'Новый контакт',
-                  stage: 1,
-                  last_message: 'Диалог не начат',
-                  last_message_time: new Date().toISOString(),
-                  unread_count: 0,
-                  is_archived: false,
-                  channel_type: 'internal',
-                };
-                setChannels([temp, ...items]);
-                setSelectedAuthorId(String(initialAuthorId));
+                setChannels([channel, ...items]);
+                setSelectedAuthorId(String(channel.author_id));
+                setChatTab(channel.is_archived ? 'archived' : 'active');
               })
               .catch(() => {
                 if (cancelled) return;
-                setChannels(items);
-                setSelectedAuthorId(items.length > 0 ? String(items[0].author_id) : null);
+                api.getCreatorProfile(initialAuthorId)
+                  .then(profile => {
+                    if (cancelled) return;
+                    const isArchived = profile.status === 'В архиве' || profile.status === 'ARCHIVED';
+                    const temp: CommunicationChannelItem = {
+                      deal_id: null,
+                      author_id: initialAuthorId,
+                      author_name: profile.title,
+                      author_handle: profile.username ? `@${stripAt(profile.username)}` : `@${profile.title}`,
+                      platform: profile.platform,
+                      deal_title: 'Новый контакт',
+                      stage: 1,
+                      last_message: 'Диалог не начат',
+                      last_message_time: new Date().toISOString(),
+                      unread_count: 0,
+                      is_archived: isArchived,
+                      channel_type: 'internal',
+                    };
+                    setChannels([temp, ...items]);
+                    setSelectedAuthorId(String(initialAuthorId));
+                    setChatTab(isArchived ? 'archived' : 'active');
+                  })
+                  .catch(() => {
+                    if (cancelled) return;
+                    setChannels(items);
+                    setSelectedAuthorId(items.length > 0 ? String(items[0].author_id) : null);
+                  });
               });
           }
         } else {

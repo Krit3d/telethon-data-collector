@@ -1297,8 +1297,7 @@ async def init_communication(
                 if last_existing
                 else (deal.updated_at if deal else account.created_at)
             )
-        raw_status = account.status or ""
-        is_archived = raw_status in {"ARCHIVED", "В архиве"}
+        is_archived = (account.status or "").strip().lower() in {"archived", "в архиве"}
         return CommunicationChannelItem(
             deal_id=deal.id if deal else None,
             author_id=str(account.id),

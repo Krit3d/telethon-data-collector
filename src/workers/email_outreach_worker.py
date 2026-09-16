@@ -26,6 +26,25 @@ class EmailOutreachWorker:
         self.settings = settings
         self._shutdown_event = asyncio.Event()
         self._db = Database(settings.db_url)
+        self._mailbox: MailBox | None = None
+
+    def _get_or_reconnect_mailbox(
+        self, imap_host: str, imap_user: str, imap_password: str
+    ) -> MailBox:
+        if self._mailbox is not None:
+            try:
+                self._mailbox.client.noop()
+                return self._mailbox
+            except Exception:
+                try:
+                    self._mailbox.logout()
+                except Exception:
+                    pass
+                self._mailbox = None
+        mailbox = MailBox(imap_host, port=self.settings.imap_port)
+        mailbox.login(imap_user, imap_password)
+        self._mailbox = mailbox
+        return mailbox
 
     def handle_shutdown(self, *args: object) -> None:
         logger.info("Shutdown signal received, stopping email outreach worker...")
@@ -100,7 +119,7 @@ class EmailOutreachWorker:
         if media_url:
             media_path = MEDIA_DIR / Path(media_url).name
             if media_path.exists():
-                payload = media_path.read_bytes()
+                payload = await asyncio.to_thread(media_path.read_bytes)
                 maintype, subtype = mimetypes.guess_type(media_url)
                 if maintype is None:
                     maintype = "application"
@@ -121,6 +140,7 @@ class EmailOutreachWorker:
             password=self.settings.smtp_password,
             use_tls=self.settings.smtp_use_ssl,
             start_tls=self.settings.smtp_use_tls,
+            timeout=180.0,
         )
 
         logger.info(
@@ -307,7 +327,7 @@ class EmailOutreachWorker:
             filename = attachment.filename or f"attachment_{uuid.uuid4().hex}"
             unique_name = f"{uuid.uuid4().hex}_{filename}"
             media_path = MEDIA_DIR / unique_name
-            media_path.write_bytes(payload)
+            await asyncio.to_thread(media_path.write_bytes, payload)
             media_type = self._detect_media_type(
                 attachment.content_type, filename
             )
@@ -399,14 +419,20 @@ class EmailOutreachWorker:
         imap_password: str = self.settings.imap_password
 
         def _fetch() -> list:
-            with MailBox(imap_host, port=self.settings.imap_port) as mailbox:
-                mailbox.login(imap_user, imap_password)
-                return list(
-                    mailbox.fetch(AND(seen=False), mark_seen=True)
-                )
+            mb = self._get_or_reconnect_mailbox(imap_host, imap_user, imap_password)
+            return list(mb.fetch(AND(seen=False), mark_seen=True))
 
         logger.debug("Checking for unread inbound emails via IMAP")
-        messages = await asyncio.to_thread(_fetch)
+        try:
+            messages = await asyncio.to_thread(_fetch)
+        except Exception:
+            if self._mailbox is not None:
+                try:
+                    self._mailbox.logout()
+                except Exception:
+                    pass
+                self._mailbox = None
+            raise
         if messages:
             logger.info("Found %s new inbound emails via IMAP", len(messages))
         for msg in messages:
@@ -471,6 +497,11 @@ class EmailOutreachWorker:
             logger.info("Worker tasks cancelled, shutting down...")
         finally:
             self._shutdown_event.set()
+            if self._mailbox is not None:
+                try:
+                    await asyncio.to_thread(self._mailbox.logout)
+                except Exception:
+                    pass
             await self._db.close()
             logger.info("Email outreach worker stopped")
 
