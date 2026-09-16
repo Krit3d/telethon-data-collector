@@ -6,12 +6,13 @@ import os
 import signal
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Awaitable, cast
 
 import httpx
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -26,7 +27,7 @@ from telethon.network.connection.tcpintermediate import ConnectionTcpIntermediat
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.tl.types import DocumentAttributeFilename
 
-from src.config.config import Settings, load_settings
+from src.config.config import MEDIA_DIR, Settings, load_settings
 from src.db.database import Database
 from src.db.models import Account, CreatorMessage, User
 from src.utils.proxy import build_telethon_proxy
@@ -125,17 +126,30 @@ class TelegramOutreachWorker:
         me_username = getattr(me, "username", None)
         logger.info("Telegram client connected and authorized as @%s (id=%s)", me_username, me_id)
 
+        async with self.db.async_session() as session:
+            await session.execute(
+                update(CreatorMessage)
+                .where(
+                    CreatorMessage.channel_type == "telegram",
+                    CreatorMessage.external_message_id == "SENDING",
+                )
+                .values(external_message_id=None)
+            )
+            await session.commit()
+
         client.add_event_handler(self._handle_incoming_message, events.NewMessage(incoming=True))
 
         return True
 
     async def _resolve_outbox_file(self, media_url: str) -> tuple[str | None, bool]:
+        filename = Path(media_url).name
+        local_path = MEDIA_DIR / filename
+        if local_path.exists():
+            return str(local_path), False
         if Path(media_url).exists():
             return media_url, False
         if media_url.startswith("http://") or media_url.startswith("https://"):
             return await self._download_to_temp(media_url)
-        if media_url.startswith("/media/"):
-            return await self._download_to_temp(f"{self.api_base_url}{media_url}")
         return None, False
 
     async def _download_to_temp(self, url: str) -> tuple[str | None, bool]:
@@ -175,25 +189,20 @@ class TelegramOutreachWorker:
             return media_type, original_filename or "document.bin"
         return None, None
 
-    async def _upload_inbound_media(self, file_path: str, filename: str) -> str | None:
+    async def _save_inbound_media(self, event: events.NewMessage.Event, filename: str | None) -> str | None:
         try:
-            mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            headers = {"X-Internal-Token": getattr(self.settings, "secret_key", "")}
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                with open(file_path, "rb") as f:
-                    response = await client.post(
-                        f"{self.api_base_url}/api/v1/crm/upload",
-                        files={"file": (filename, f, mime_type)},
-                        headers=headers,
-                    )
-                if response.status_code == 200:
-                    payload = response.json()
-                    logger.info("Inbound media uploaded successfully to API: %s", payload.get("media_url"))
-                    return payload.get("media_url")
-                logger.error("API inbound upload failed with status %d: %s", response.status_code, response.text)
-                return None
+            clean_name = filename or "document.bin"
+            unique_name = f"{uuid.uuid4().hex}_{clean_name}"
+            target_path = MEDIA_DIR / unique_name
+            downloaded = await event.message.download_media(file=str(target_path))
+            if downloaded:
+                saved_media_url = f"/media/{unique_name}"
+                logger.info("Inbound media saved successfully: %s (original: %s)", saved_media_url, clean_name)
+                return saved_media_url
+            logger.error("Telegram download_media returned None for message %s", event.message.id)
+            return None
         except Exception as e:
-            logger.error("Failed to upload inbound media to API (%s): %s", self.api_base_url, e)
+            logger.error("Failed to download inbound Telegram media: %s", e, exc_info=True)
             return None
 
     async def _handle_incoming_message(self, event: events.NewMessage.Event) -> None:
@@ -211,11 +220,7 @@ class TelegramOutreachWorker:
 
         if has_media:
             detected_media_type, detected_filename = self._detect_media_type(event.message)
-            downloaded_path = await event.message.download_media()
-            if downloaded_path:
-                saved_media_url = await self._upload_inbound_media(downloaded_path, detected_filename or "document.bin")
-                if saved_media_url is not None:
-                    Path(downloaded_path).unlink(missing_ok=True)
+            saved_media_url = await self._save_inbound_media(event, detected_filename)
 
         sender = await event.get_sender()
         sender_id = event.sender_id
@@ -255,7 +260,19 @@ class TelegramOutreachWorker:
                 matched_account_id, matched_user_id, matched_deal_id = row_prev
             else:
                 if username_clean:
-                    stmt_acc = select(Account.id).where(func.lower(Account.username) == username_clean).limit(1)
+                    stmt_acc = (
+                        select(Account.id)
+                        .where(
+                            or_(
+                                func.lower(Account.username) == username_clean,
+                                Account.raw_metadata["contacts"]["telegram_handles"].contains([username_clean]),
+                                Account.raw_metadata["contacts"]["telegram_personal"].contains([username_clean]),
+                                Account.raw_metadata["contacts"]["advertising_telegrams"].contains([username_clean]),
+                                Account.raw_metadata["contacts"]["telegrams"].contains([username_clean]),
+                            )
+                        )
+                        .limit(1)
+                    )
                     res_acc = await session.execute(stmt_acc)
                     matched_account_id = res_acc.scalar_one_or_none()
 
@@ -351,7 +368,11 @@ class TelegramOutreachWorker:
                 continue
 
             try:
-                entity = cast(EntityLike, await self.client.get_entity(target))
+                if target.isdigit() or (target.startswith("-") and target[1:].isdigit()):
+                    entity_key: EntityLike = int(target)
+                else:
+                    entity_key = target
+                entity = cast(EntityLike, await self.client.get_entity(entity_key))
                 if media_url:
                     file_path, is_temp = await self._resolve_outbox_file(media_url)
                     if file_path is None:
@@ -381,14 +402,25 @@ class TelegramOutreachWorker:
                             ext = Path(media_name).suffix.lower()
                             if ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
                                 is_video = True
-                        sent = await self.client.send_file(
-                            entity,
-                            file=file_path,
-                            caption=text or "",
-                            attributes=file_attributes,
-                            progress_callback=_upload_progress,
-                            supports_streaming=is_video,
-                        )
+                        if text and len(text) > 1024:
+                            sent = await self.client.send_file(
+                                entity,
+                                file=file_path,
+                                caption="",
+                                attributes=file_attributes,
+                                progress_callback=_upload_progress,
+                                supports_streaming=is_video,
+                            )
+                            await self.client.send_message(entity, text)
+                        else:
+                            sent = await self.client.send_file(
+                                entity,
+                                file=file_path,
+                                caption=text or "",
+                                attributes=file_attributes,
+                                progress_callback=_upload_progress,
+                                supports_streaming=is_video,
+                            )
                     finally:
                         if is_temp:
                             Path(file_path).unlink(missing_ok=True)

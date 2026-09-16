@@ -8,8 +8,8 @@ from pathlib import Path
 
 import aiosmtplib
 from imap_tools import AND, MailBox
-from sqlalchemy import or_, select
-from sqlalchemy.orm import joinedload
+from sqlalchemy import or_, select, update
+from sqlalchemy.orm import selectinload
 
 from src.config.config import MEDIA_DIR, Settings, load_settings
 from src.db.database import Database
@@ -44,12 +44,12 @@ class EmailOutreachWorker:
         return [e for e in emails if isinstance(e, str) and e.strip()]
 
     async def _find_previous(
-        self, session, message: CreatorMessage
+        self, session, user_id: int, account_id: int
     ) -> CreatorMessage | None:
         stmt = (
             select(CreatorMessage)
-            .where(CreatorMessage.user_id == message.user_id)
-            .where(CreatorMessage.account_id == message.account_id)
+            .where(CreatorMessage.user_id == user_id)
+            .where(CreatorMessage.account_id == account_id)
             .where(CreatorMessage.external_message_id.isnot(None))
             .order_by(CreatorMessage.created_at.desc())
             .limit(1)
@@ -57,29 +57,26 @@ class EmailOutreachWorker:
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def _send_message(self, session, message: CreatorMessage) -> None:
-        account = message.account
-        channel_target = message.channel_target
+    async def _send_message(self, task: dict) -> tuple[str, str]:
+        account = task["account"]
+        channel_target = task["channel_target"]
         if not channel_target:
             emails = self._extract_emails(account)
             if not emails:
-                message.external_message_id = "FAILED_NO_EMAIL"
-                await session.commit()
-                return
+                raise RuntimeError("No email available for account")
             channel_target = emails[0].strip().lower()
-            message.channel_target = channel_target
 
         msg = EmailMessage()
         msg["From"] = self.settings.smtp_user
         msg["To"] = channel_target
-        if message.deal_id:
+        if task["deal_id"]:
             msg["Subject"] = "Сотрудничество с брендом"
         else:
             msg["Subject"] = "Предложение о сотрудничестве"
 
         logger.info(
             "Sending email: msg_id=%s, to=%s, subject=%s",
-            message.id,
+            task["id"],
             channel_target,
             msg["Subject"],
         )
@@ -89,18 +86,22 @@ class EmailOutreachWorker:
         message_id = f"<{uuid.uuid4()}@{domain}>"
         msg["Message-ID"] = message_id
 
-        previous = await self._find_previous(session, message)
-        if previous is not None and previous.external_message_id:
-            msg["In-Reply-To"] = previous.external_message_id
-            msg["References"] = previous.external_message_id
+        async with self._db.async_session() as session:
+            previous = await self._find_previous(
+                session, task["user_id"], task["account_id"]
+            )
+            if previous is not None and previous.external_message_id:
+                msg["In-Reply-To"] = previous.external_message_id
+                msg["References"] = previous.external_message_id
 
-        msg.set_content(message.text or "")
+        msg.set_content(task["text"] or "")
 
-        if message.media_url:
-            media_path = MEDIA_DIR / Path(message.media_url).name
+        media_url = task["media_url"]
+        if media_url:
+            media_path = MEDIA_DIR / Path(media_url).name
             if media_path.exists():
                 payload = media_path.read_bytes()
-                maintype, subtype = mimetypes.guess_type(message.media_url)
+                maintype, subtype = mimetypes.guess_type(media_url)
                 if maintype is None:
                     maintype = "application"
                 if subtype is None:
@@ -109,7 +110,7 @@ class EmailOutreachWorker:
                     payload,
                     maintype=maintype,
                     subtype=subtype,
-                    filename=message.media_name or media_path.name,
+                    filename=task["media_name"] or media_path.name,
                 )
 
         await aiosmtplib.send(
@@ -122,41 +123,78 @@ class EmailOutreachWorker:
             start_tls=self.settings.smtp_use_tls,
         )
 
-        message.external_message_id = message_id
-        await session.commit()
         logger.info(
             "Email sent successfully: msg_id=%s, to=%s, external_message_id=%s",
-            message.id,
+            task["id"],
             channel_target,
             message_id,
         )
+        return message_id, channel_target
 
     async def _process_outbox(self) -> bool:
         async with self._db.async_session() as session:
             stmt = (
                 select(CreatorMessage)
-                .options(joinedload(CreatorMessage.account))
+                .options(selectinload(CreatorMessage.account))
                 .where(CreatorMessage.channel_type == "email")
                 .where(CreatorMessage.external_message_id.is_(None))
                 .where(CreatorMessage.sender_type == "user")
                 .order_by(CreatorMessage.created_at.asc())
                 .limit(10)
+                .with_for_update(of=CreatorMessage, skip_locked=True)
             )
             result = await session.execute(stmt)
             messages = list(result.scalars().all())
+            if not messages:
+                return False
 
+            tasks: list[dict] = []
             for message in messages:
-                try:
-                    await self._send_message(session, message)
-                except Exception as e:
-                    logger.error(
-                        "Failed to send email message id=%s: %s",
-                        message.id,
-                        e,
-                        exc_info=True,
-                    )
+                tasks.append(
+                    {
+                        "id": message.id,
+                        "channel_target": message.channel_target,
+                        "text": message.text,
+                        "media_url": message.media_url,
+                        "media_name": message.media_name,
+                        "deal_id": message.deal_id,
+                        "account": message.account,
+                        "user_id": message.user_id,
+                        "account_id": message.account_id,
+                    }
+                )
+                message.external_message_id = "SENDING"
+            await session.commit()
 
-            return len(messages) > 0
+        for task in tasks:
+            try:
+                message_id, final_email = await self._send_message(task)
+                async with self._db.async_session() as session:
+                    await session.execute(
+                        update(CreatorMessage)
+                        .where(CreatorMessage.id == task["id"])
+                        .values(
+                            external_message_id=message_id,
+                            channel_target=final_email,
+                        )
+                    )
+                    await session.commit()
+            except Exception as e:
+                async with self._db.async_session() as session:
+                    await session.execute(
+                        update(CreatorMessage)
+                        .where(CreatorMessage.id == task["id"])
+                        .values(external_message_id=f"FAILED:{str(e)[:50]}")
+                    )
+                    await session.commit()
+                logger.error(
+                    "Failed to send email message id=%s: %s",
+                    task["id"],
+                    e,
+                    exc_info=True,
+                )
+
+        return True
 
     async def _outbox_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -403,6 +441,17 @@ class EmailOutreachWorker:
     async def start(self) -> None:
         logger.info("Email outreach worker starting")
         await self._db.init_db()
+
+        async with self._db.async_session() as session:
+            await session.execute(
+                update(CreatorMessage)
+                .where(
+                    CreatorMessage.channel_type == "email",
+                    CreatorMessage.external_message_id == "SENDING",
+                )
+                .values(external_message_id=None)
+            )
+            await session.commit()
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
