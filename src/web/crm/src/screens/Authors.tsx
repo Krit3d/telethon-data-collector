@@ -8,7 +8,7 @@ import { api, normalizeSocial, STATUS_OPTIONS, type CreatorRecord } from '../ser
 type SortKey = 'nick' | 'social' | 'followers' | 'niche' | 'reach' | 'er' | 'cpm' | 'status';
 type SortOrder = 'asc' | 'desc';
 
-type ActiveStatus = Exclude<Author['status'], 'На паузе'>;
+type ActiveStatus = Author['status'];
 const statusTone: Record<ActiveStatus, string> = { 'Свободен': 'green', 'В сделке': 'blue', 'В архиве': 'gray' };
 const SOCIALS: Social[] = ['Instagram', 'VK', 'Telegram', 'TikTok', 'YouTube', 'Дзен'];
 const PAGE = 15;
@@ -121,7 +121,26 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
   }, [menu]);
 
   const openSearch = () => {
-    window.open(getSearchBaseUrl(), '_blank');
+    const baseUrl = getSearchBaseUrl();
+    const token = window.localStorage.getItem('creatorflow_token');
+    if (!token) {
+      window.open(baseUrl, '_blank');
+      return;
+    }
+    const params = new URLSearchParams();
+    params.set('session_token', token);
+    let user: { id?: unknown; email?: unknown } | null = null;
+    try {
+      const raw = window.localStorage.getItem('creatorflow_user');
+      user = raw ? JSON.parse(raw) as { id?: unknown; email?: unknown } : null;
+    } catch {
+      user = null;
+    }
+    if (user) {
+      if (user.id != null) params.set('user_id', String(user.id));
+      if (user.email != null) params.set('user_email', String(user.email));
+    }
+    window.open(`${baseUrl}?${params.toString()}`, '_blank');
   };
 
   useEffect(() => {

@@ -249,12 +249,10 @@ export const api = {
     });
   },
 
-  async exportShortlist(accountIds: string[], userEmail?: string): Promise<{ added_count: number; redirect_url: string }> {
-    const currentUser = getStoredUser();
-    const email = userEmail || (typeof currentUser?.email === 'string' ? currentUser.email : '');
+  async exportShortlist(accountIds: string[]): Promise<{ added_count: number; redirect_url: string }> {
     return request<{ added_count: number; redirect_url: string }>('/shortlist', {
       method: 'POST',
-      body: JSON.stringify({ account_ids: accountIds, user_email: email }),
+      body: JSON.stringify({ account_ids: accountIds }),
     });
   },
 
@@ -369,6 +367,7 @@ export const api = {
   logout(): void {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
+    window.dispatchEvent(new CustomEvent('creatorflow:logout'));
   },
 
   isAuthenticated(): boolean {
@@ -417,7 +416,7 @@ export function userHandle(user: Record<string, unknown> | null): string {
   return email ? '@' + email.split('@')[0] : '';
 }
 
-export const STATUS_OPTIONS: string[] = ['Свободен', 'В сделке', 'На паузе', 'В архиве'];
+export const STATUS_OPTIONS: string[] = ['Свободен', 'В сделке', 'В архиве'];
 
 export function normalizeSocial(raw: string | null | undefined): Social {
   const value = (raw ?? '').trim();

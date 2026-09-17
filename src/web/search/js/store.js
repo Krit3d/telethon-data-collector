@@ -1,6 +1,3 @@
-const SHORTLIST_KEY = "collabrama_shortlist";
-const THREADS_KEY = "collabrama_crm_threads";
-
 function readStorage(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
@@ -48,6 +45,8 @@ function normalizeCountryCode(value) {
 export class AppStore {
   constructor() {
     this.activeTab = "search";
+    window.addEventListener("storage", () => this.syncUserSession());
+    window.addEventListener("creatorflow:logout", () => this.syncUserSession(true));
     this.searchQuery = "";
     this.brandDescription = "";
     this.targetAudienceDescription = "";
@@ -77,9 +76,51 @@ export class AppStore {
     this.inferredFilters = null;
     this.searchResults = [];
     this.queryMetadata = null;
-    this.shortlist = readStorage(SHORTLIST_KEY, []);
-    this.threads = readStorage(THREADS_KEY, []);
+    this.shortlist = readStorage(this.getShortlistKey(), []);
+    this.threads = readStorage(this.getThreadsKey(), []);
     this.activeThreadId = null;
+  }
+
+  getThreadsKey() {
+    try {
+      const raw = localStorage.getItem("creatorflow_user");
+      if (raw) {
+        const user = JSON.parse(raw);
+        if (user && (user.id || user.email)) {
+          return "collabrama_crm_threads_" + (user.id || user.email);
+        }
+      }
+    } catch {
+      return "collabrama_crm_threads_anonymous";
+    }
+    return "collabrama_crm_threads_anonymous";
+  }
+
+  getShortlistKey() {
+    try {
+      const raw = localStorage.getItem("creatorflow_user");
+      if (raw) {
+        const user = JSON.parse(raw);
+        if (user && (user.id || user.email)) {
+          return "collabrama_shortlist_" + (user.id || user.email);
+        }
+      }
+    } catch {
+      return "collabrama_shortlist_anonymous";
+    }
+    return "collabrama_shortlist_anonymous";
+  }
+
+  syncUserSession(clear) {
+    if (clear) {
+      this.shortlist = [];
+      this.threads = [];
+      this.activeThreadId = null;
+    } else {
+      this.shortlist = readStorage(this.getShortlistKey(), []);
+      this.threads = readStorage(this.getThreadsKey(), []);
+    }
+    window.dispatchEvent(new CustomEvent("collabrama:store_updated"));
   }
 
   get selectedLanguage() {
@@ -265,17 +306,17 @@ export class AppStore {
   }
 
   toggleShortlist(author) {
-    const index = this.shortlist.findIndex((a) => a.account_id === author.account_id);
+    const index = this.shortlist.findIndex((a) => String(a.account_id ?? a.id ?? "") === String(author.account_id ?? author.id ?? ""));
     if (index >= 0) {
       this.shortlist.splice(index, 1);
     } else {
       this.shortlist.push(author);
     }
-    writeStorage(SHORTLIST_KEY, this.shortlist);
+    writeStorage(this.getShortlistKey(), this.shortlist);
   }
 
   isInShortlist(accountId) {
-    return this.shortlist.some((a) => a.account_id === accountId);
+    return this.shortlist.some((a) => String(a.account_id ?? a.id ?? "") === String(accountId));
   }
 
   openChatWithAuthor(author) {
@@ -292,7 +333,7 @@ export class AppStore {
         createdAt: Date.now(),
       };
       this.threads.push(thread);
-      writeStorage(THREADS_KEY, this.threads);
+      writeStorage(this.getThreadsKey(), this.threads);
     }
     this.activeThreadId = thread.id;
     this.activeTab = "crm";
@@ -309,6 +350,6 @@ export class AppStore {
       from: "us",
       time: Date.now(),
     });
-    writeStorage(THREADS_KEY, this.threads);
+    writeStorage(this.getThreadsKey(), this.threads);
   }
 }

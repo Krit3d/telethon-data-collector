@@ -405,30 +405,41 @@ export function CommsList({ deals, onOpenDeal, initialAuthorId, onNewDeal }: { d
         <div className="px-5 py-3.5 bg-white border-b border-gray-200 flex items-center gap-3 shrink-0">
           <Avatar nick={a?.nick ?? ''} hue={a?.hue ?? 0} size={36} />
           <div className="min-w-0">
-            <div className="flex items-center gap-2"><span className="text-[14px] font-bold text-gray-900">{a?.nick ?? ''}</span>{a && <SocialIcon social={a.social} size={13} />}</div>
-            <div className="text-[11px] font-semibold text-gray-400 truncate">Сделка: {ch?.deal_title}</div>
-            {ch && (
-              <Badge tone={getChannelBadge(ch.channel_type).tone}>
-                {getChannelBadge(ch.channel_type).label}
-              </Badge>
+            <div className="flex items-center gap-2"><span className="text-[14px] font-bold text-gray-900 truncate">{a?.nick ?? ''}</span>{a && <SocialIcon social={a.social} size={13} />}</div>
+            {Boolean(ch?.deal_title) && <div className="text-[11px] font-semibold text-gray-400 truncate">Сделка: {ch?.deal_title}</div>}
+            <div className="flex items-center gap-1.5 mt-0.5">
+              {ch && <Badge tone={getChannelBadge(ch.channel_type).tone}>{getChannelBadge(ch.channel_type).label}</Badge>}
+              {targetDeal ? (
+                <Badge tone={STAGE_TONES[targetDeal.stage] ?? 'gray'} dot>{getStage(targetDeal.stage).name}</Badge>
+              ) : ch?.is_archived ? (
+                <Badge tone="gray">В архиве</Badge>
+              ) : (
+                <Badge tone="violet">Аутрич / Переговоры</Badge>
+              )}
+            </div>
+          </div>
+          <div className="ml-auto flex items-center gap-2 shrink-0">
+            {targetDeal ? (
+              <>
+                <Btn variant="secondary" size="sm" onClick={() => onOpenDeal?.(String(targetDeal.id))}><Briefcase size={13} />К сделке</Btn>
+                {!ch?.is_archived ? (
+                  <Tip label="В архив"><Btn variant="ghost" size="sm" onClick={() => { setCloseDeals(true); setConfirmArchive(true); }}><Archive size={14} /></Btn></Tip>
+                ) : (
+                  <Btn variant="secondary" size="sm" onClick={handleRestoreChat}><ArchiveRestore size={13} />Восстановить из архива</Btn>
+                )}
+              </>
+            ) : ch?.is_archived ? (
+              <>
+                <Tip label="Восстановите автора из архива, чтобы оформить сделку"><Btn size="sm" disabled className="opacity-40 cursor-not-allowed pointer-events-none"><Plus size={13} />Оформить сделку</Btn></Tip>
+                <Btn variant="secondary" size="sm" onClick={handleRestoreChat}><ArchiveRestore size={13} />Восстановить из архива</Btn>
+              </>
+            ) : (
+              <>
+                <Btn size="sm" onClick={() => ch && onNewDeal?.(String(ch.author_id), { name: ch.author_name, handle: ch.author_handle })}><Plus size={13} />Оформить сделку</Btn>
+                <Tip label="В архив"><Btn variant="ghost" size="sm" onClick={() => { setCloseDeals(true); setConfirmArchive(true); }}><Archive size={14} /></Btn></Tip>
+              </>
             )}
           </div>
-          {targetDeal ? (
-            <>
-              <Badge tone={STAGE_TONES[targetDeal.stage] ?? 'gray'} dot>{getStage(targetDeal.stage).name}</Badge>
-              <Btn variant="secondary" size="sm" className="ml-auto" onClick={() => onOpenDeal?.(String(targetDeal.id))}><Briefcase size={13} />К сделке</Btn>
-            </>
-          ) : (
-            <>
-              <Badge tone="violet">Аутрич / Переговоры</Badge>
-              <Btn size="sm" className="ml-auto" onClick={() => ch && onNewDeal?.(String(ch.author_id), { name: ch.author_name, handle: ch.author_handle })}><Plus size={13} />Оформить сделку</Btn>
-            </>
-          )}
-          {ch && !ch.is_archived ? (
-            <Tip label="В архив"><Btn variant="ghost" size="sm" onClick={() => { setCloseDeals(true); setConfirmArchive(true); }}><Archive size={14} /></Btn></Tip>
-          ) : (
-            <Btn variant="secondary" size="sm" onClick={handleRestoreChat}><ArchiveRestore size={13} />Восстановить из архива</Btn>
-          )}
         </div>
         <div ref={chatRef} className="flex-1 min-h-0 overflow-y-auto scroll-thin p-5 flex flex-col gap-3">
           {!msgs.some(m => m.from === 'user' || m.from === 'author') && <div className="m-auto text-[12.5px] font-semibold text-gray-400">Начните диалог — автор увидит сообщение в {a?.social ?? ''}</div>}

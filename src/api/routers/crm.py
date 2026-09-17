@@ -1,6 +1,4 @@
 import asyncio
-import base64
-import json
 import logging
 import shutil
 import uuid
@@ -14,6 +12,7 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import joinedload
 
 from src.api.dependencies import get_crm_client, get_db
@@ -44,7 +43,7 @@ from src.parser.creators.core.contacts import (
     normalize_telegram_handle,
 )
 from src.db.database import Database
-from src.db.models import Account, Content, Deal, CreatorMessage, User
+from src.db.models import Account, Content, Deal, CreatorMessage, User, UserShortlist
 from src.utils.security import create_access_token, decode_access_token, hash_password, verify_password
 
 logger = logging.getLogger(__name__)
@@ -54,18 +53,15 @@ router = APIRouter(prefix="/crm", tags=["crm"])
 STATUS_UI_TO_CRM: dict[str, str] = {
     "Свободен": "SVOBODEN",
     "В сделке": "V_SDELKE",
-    "На паузе": "NA_PAUZE",
     "В архиве": "ARCHIVED",
     "SVOBODEN": "SVOBODEN",
     "V_SDELKE": "V_SDELKE",
-    "NA_PAUZE": "NA_PAUZE",
     "ARCHIVED": "ARCHIVED",
 }
 
 STATUS_CRM_TO_UI: dict[str, str] = {
     "SVOBODEN": "Свободен",
     "V_SDELKE": "В сделке",
-    "NA_PAUZE": "На паузе",
     "ARCHIVED": "В архиве",
 }
 
@@ -124,46 +120,6 @@ def _deduplicate_accounts(accounts: list[Account]) -> list[Account]:
         elif current_platform != "INSTAGRAM" and candidate_platform != "INSTAGRAM" and candidate_followers > current_followers:
             best[key] = account
     return list(best.values())
-
-
-def _decode_jwt_email(token: str) -> str | None:
-    parts = token.split(".")
-    if len(parts) < 2:
-        return None
-    payload = parts[1]
-    padding = "=" * (-len(payload) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(payload + padding)
-        data = json.loads(decoded)
-    except (ValueError, TypeError):
-        return None
-    email = data.get("email")
-    if isinstance(email, str) and email:
-        return email
-    sub = data.get("sub")
-    if isinstance(sub, str) and "@" in sub:
-        return sub
-    return None
-
-
-def get_current_user_email(request: Request) -> str | None:
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        token = auth[len("Bearer "):].strip()
-        if token:
-            if "@" in token:
-                return token
-            if "." in token:
-                email = _decode_jwt_email(token)
-                if email:
-                    return email
-    query_email = request.query_params.get("user_email")
-    if query_email:
-        return query_email
-    header_email = request.headers.get("X-User-Email")
-    if header_email:
-        return header_email
-    return None
 
 
 async def get_current_user(
@@ -426,6 +382,7 @@ async def _resolve_account(
     session: Any,
     crm_client: TwentyCrmClient,
     identifier: str,
+    user_email: str | None = None,
 ) -> Account | None:
     raw_identifier = identifier.strip().lstrip("@")
     if not raw_identifier:
@@ -447,9 +404,9 @@ async def _resolve_account(
     if account is not None:
         return account
     try:
-        creator_record = await crm_client.get_creator_by_id(raw_identifier)
+        creator_record = await crm_client.get_creator_by_id(raw_identifier, user_email)
         if creator_record is None:
-            creator_record = await crm_client.find_creator_by_account_id(raw_identifier)
+            creator_record = await crm_client.find_creator_by_account_id(raw_identifier, user_email)
         if creator_record is not None:
             account_id = creator_record.get("accountid") or creator_record.get("accountId")
             if account_id is not None:
@@ -473,15 +430,9 @@ async def export_to_shortlist(
     request: Request,
     db: Database = Depends(get_db),
     crm_client: TwentyCrmClient = Depends(get_crm_client),
-    current_user_email: str | None = Depends(get_current_user_email),
+    current_user: User = Depends(get_current_user),
 ) -> CrmShortlistResponse:
-    target_email = payload.user_email or current_user_email or request.headers.get("X-User-Email") or ""
-    if not target_email:
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            bearer = auth[len("Bearer "):].strip()
-            if bearer and "@" in bearer:
-                target_email = bearer
+    target_email = current_user.email
     raw_ids: list[str] = []
     for aid in payload.account_ids:
         if not aid:
@@ -533,9 +484,28 @@ async def export_to_shortlist(
         result = await session.execute(stmt)
         accounts = list(result.scalars().all())
 
-    accounts = _deduplicate_accounts(accounts)
+        accounts = _deduplicate_accounts(accounts)
 
-    logger.info("CRM export: found %d Account records in Postgres for raw_ids=%s", len(accounts), raw_ids)
+        logger.info("CRM export: found %d Account records in Postgres for raw_ids=%s", len(accounts), raw_ids)
+
+        if accounts:
+            now = datetime.now(timezone.utc)
+            rows = [
+                {
+                    "user_id": current_user.id,
+                    "account_id": account.id,
+                    "status": "Свободен",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                for account in accounts
+            ]
+            await session.execute(
+                pg_insert(UserShortlist)
+                .values(rows)
+                .on_conflict_do_nothing(index_elements=["user_id", "account_id"])
+            )
+            await session.commit()
 
     if not accounts:
         logger.warning("No accounts found in DB for ids: %s", raw_ids)
@@ -546,10 +516,9 @@ async def export_to_shortlist(
     for account, res in zip(accounts, results):
         if isinstance(res, Exception):
             logger.error("Error upserting %s: %s", account.id, repr(res))
-    success_count = sum(1 for r in results if not isinstance(r, Exception))
 
     return CrmShortlistResponse(
-        added_count=success_count,
+        added_count=len(accounts),
         redirect_url=f"{request.app.state.settings.crm_frontend_url}/#/authors?import_ids={','.join(raw_ids)}",
     )
 
@@ -655,12 +624,93 @@ async def crm_register(
 @router.get("/creators")
 async def crm_creators(
     limit: int = 100,
-    crm_client: TwentyCrmClient = Depends(get_crm_client),
-    current_user_email: str | None = Depends(get_current_user_email),
+    offset: int = 0,
+    status: str | None = None,
+    db: Database = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    records = await crm_client.get_creators(limit=limit, user_email=current_user_email)
-    translated = [dict(record, status=STATUS_CRM_TO_UI.get(record["status"], record["status"])) for record in records]
-    return {"data": translated, "total": len(translated)}
+    async with db.async_session() as session:
+        stmt = (
+            select(UserShortlist, Account)
+            .join(Account, UserShortlist.account_id == Account.id)
+            .where(UserShortlist.user_id == current_user.id)
+        )
+        if status:
+            stmt = stmt.where(UserShortlist.status == STATUS_CRM_TO_UI.get(status, status))
+        stmt = stmt.order_by(UserShortlist.created_at.desc()).limit(limit).offset(offset)
+        result = await session.execute(stmt)
+        rows = result.all()
+        if not rows:
+            return {"data": [], "total": 0}
+
+        account_ids = [row[1].id for row in rows]
+
+        active_stmt = (
+            select(Deal.account_id, func.count(Deal.id))
+            .where(
+                Deal.user_id == current_user.id,
+                Deal.account_id.in_(account_ids),
+                Deal.stage.between(1, 6),
+            )
+            .group_by(Deal.account_id)
+        )
+        active_result = await session.execute(active_stmt)
+        active_map = {account_id: count for account_id, count in active_result.all()}
+
+        total_stmt = (
+            select(Deal.account_id, func.count(Deal.id))
+            .where(Deal.user_id == current_user.id, Deal.account_id.in_(account_ids))
+            .group_by(Deal.account_id)
+        )
+        total_result = await session.execute(total_stmt)
+        total_map = {account_id: count for account_id, count in total_result.all()}
+
+        total_count_stmt = select(func.count(UserShortlist.user_id)).where(UserShortlist.user_id == current_user.id)
+        if status:
+            total_count_stmt = total_count_stmt.where(UserShortlist.status == STATUS_CRM_TO_UI.get(status, status))
+        total_count_result = await session.execute(total_count_stmt)
+        total_count = total_count_result.scalar() or 0
+
+        creators = []
+        for shortlist, account in rows:
+            followers = int(account.subscribers_count or 0)
+            er = round(float(account.static_avg_er or 0.0), 2)
+            if er > 0:
+                avg_reach = int(followers * (er / 100))
+                calc_cpm = int((followers * (er / 100) / 1000) * 200)
+            else:
+                avg_reach = int(followers * 0.1)
+                calc_cpm = 0
+            cpm = shortlist.custom_cpm if shortlist.custom_cpm is not None else calc_cpm
+            active_count = active_map.get(account.id, 0)
+            if shortlist.status == "В архиве":
+                creator_status = "В архиве"
+            elif active_count > 0:
+                creator_status = "В сделке"
+            else:
+                creator_status = shortlist.status
+            deals_count = total_map.get(account.id, 0)
+            creators.append(
+                {
+                    "id": str(account.id),
+                    "accountid": str(account.id),
+                    "accountId": str(account.id),
+                    "name": account.title or account.username or "",
+                    "platform": _normalize_platform(account.platform),
+                    "handle": f"@{account.username.lstrip('@')}" if account.username else "",
+                    "followers": followers,
+                    "er": er,
+                    "avgreach": avg_reach,
+                    "cpm": cpm,
+                    "niche": account.category_path or "Общее",
+                    "status": creator_status,
+                    "dealscount": deals_count,
+                    "dealsCount": deals_count,
+                    "notes": shortlist.notes,
+                    "useremail": current_user.email,
+                }
+            )
+        return {"data": creators, "total": total_count}
 
 
 @router.patch("/creators/{creator_id}")
@@ -671,41 +721,51 @@ async def crm_update_creator_status(
     db: Database = Depends(get_db),
     crm_client: TwentyCrmClient = Depends(get_crm_client),
 ) -> dict[str, Any]:
-    mapped_status = STATUS_UI_TO_CRM.get(payload.status, payload.status)
+    mapped_status = STATUS_CRM_TO_UI.get(payload.status, payload.status)
     async with db.async_session() as session:
-        account = await _resolve_account(session, crm_client, creator_id)
+        account = await _resolve_account(session, crm_client, creator_id, current_user.email)
         if account is None:
             raise HTTPException(status_code=404, detail="Автор не найден")
-        if payload.status.strip().lower() in {"archived", "в архиве"}:
-            account.status = "archived"
-            if payload.archive_active_deals:
-                await session.execute(
-                    update(Deal)
-                    .where(
-                        Deal.user_id == current_user.id,
-                        Deal.account_id == account.id,
-                        Deal.stage >= 1,
-                        Deal.stage <= 6,
-                    )
-                    .values(stage=0, updated_at=datetime.now(timezone.utc))
+        now = datetime.now(timezone.utc)
+        await session.execute(
+            pg_insert(UserShortlist)
+            .values(
+                user_id=current_user.id,
+                account_id=account.id,
+                status=mapped_status,
+                created_at=now,
+                updated_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=["user_id", "account_id"],
+                set_={
+                    "status": mapped_status,
+                    "updated_at": now,
+                },
+            )
+        )
+        if payload.status.strip().lower() in {"archived", "в архиве"} and payload.archive_active_deals:
+            await session.execute(
+                update(Deal)
+                .where(
+                    Deal.user_id == current_user.id,
+                    Deal.account_id == account.id,
+                    Deal.stage >= 1,
+                    Deal.stage <= 6,
                 )
-        else:
-            account.status = "verified"
+                .values(stage=0, updated_at=datetime.now(timezone.utc))
+            )
         await session.commit()
-        creator_payload = _build_creator_payload(account, current_user.email)
-        creator_payload["status"] = mapped_status
     try:
-        creator_record = await crm_client.get_creator_by_id(creator_id)
-        if creator_record is not None:
-            await crm_client.update_creator_status(creator_id, mapped_status)
-        else:
-            await crm_client.upsert_creator(creator_payload)
+        await crm_client.update_creator_status(
+            creator_id, STATUS_UI_TO_CRM.get(payload.status, payload.status), current_user.email
+        )
     except Exception:
         logger.warning("Failed to update creator status in Twenty CRM", exc_info=True)
     return {
         "status": "ok",
         "creator_id": creator_id,
-        "new_status": STATUS_CRM_TO_UI.get(mapped_status, mapped_status),
+        "new_status": mapped_status,
     }
 
 
@@ -717,8 +777,14 @@ async def crm_delete_creator(
     crm_client: TwentyCrmClient = Depends(get_crm_client),
 ) -> dict[str, str]:
     async with db.async_session() as session:
-        account = await _resolve_account(session, crm_client, creator_id)
+        account = await _resolve_account(session, crm_client, creator_id, current_user.email)
         if account is not None:
+            await session.execute(
+                delete(UserShortlist).where(
+                    UserShortlist.user_id == current_user.id,
+                    UserShortlist.account_id == account.id,
+                )
+            )
             await session.execute(
                 delete(CreatorMessage).where(
                     CreatorMessage.account_id == account.id,
@@ -732,9 +798,10 @@ async def crm_delete_creator(
                 )
             )
             await session.commit()
-    deleted = await crm_client.delete_creator(creator_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Автор не найден")
+    try:
+        await crm_client.delete_creator(creator_id, current_user.email)
+    except Exception:
+        logger.warning("Failed to delete creator in Twenty CRM", exc_info=True)
     return {"status": "deleted", "creator_id": creator_id}
 
 
@@ -778,25 +845,42 @@ async def get_creator_detail(
         total_deals_result = await session.execute(total_deals_stmt)
         total_deals_count = total_deals_result.scalar() or 0
 
+        shortlist_stmt = (
+            select(UserShortlist)
+            .where(
+                UserShortlist.user_id == current_user.id,
+                UserShortlist.account_id == account.id,
+            )
+        )
+        shortlist_result = await session.execute(shortlist_stmt)
+        shortlist = shortlist_result.scalar_one_or_none()
+
     followers = int(account.subscribers_count or 0)
     er = round(float(account.static_avg_er or 0.0), 2)
     if er > 0:
         avg_reach = int(followers * (er / 100))
-        cpm = int((followers * (er / 100) / 1000) * 200)
+        calc_cpm = int((followers * (er / 100) / 1000) * 200)
     else:
         avg_reach = int(followers * 0.1)
-        cpm = 0
+        calc_cpm = 0
+    cpm = shortlist.custom_cpm if (shortlist is not None and shortlist.custom_cpm is not None) else calc_cpm
 
     platform = _normalize_platform(account.platform)
-    normalized_status = (account.status or "").strip().lower()
-    if normalized_status in {"archived", "в архиве"}:
-        status = "В архиве"
-    elif normalized_status in {"na_pauze", "на паузе"}:
-        status = "На паузе"
-    elif active_deals_count > 0:
-        status = "В сделке"
+    if shortlist is not None:
+        if shortlist.status == "В архиве":
+            status = "В архиве"
+        elif active_deals_count > 0:
+            status = "В сделке"
+        else:
+            status = shortlist.status
     else:
-        status = "Свободен"
+        normalized_status = (account.status or "").strip().lower()
+        if normalized_status in {"archived", "в архиве"}:
+            status = "В архиве"
+        elif active_deals_count > 0:
+            status = "В сделке"
+        else:
+            status = "Свободен"
     return CreatorProfileDetail(
         id=str(account.id),
         platform=platform,
@@ -1297,7 +1381,29 @@ async def init_communication(
                 if last_existing
                 else (deal.updated_at if deal else account.created_at)
             )
-        is_archived = (account.status or "").strip().lower() in {"archived", "в архиве"}
+        now = datetime.now(timezone.utc)
+        await session.execute(
+            pg_insert(UserShortlist)
+            .values(
+                user_id=current_user.id,
+                account_id=account.id,
+                status="Свободен",
+                created_at=now,
+                updated_at=now,
+            )
+            .on_conflict_do_nothing(index_elements=["user_id", "account_id"])
+        )
+        shortlist_stmt = (
+            select(UserShortlist)
+            .where(
+                UserShortlist.user_id == current_user.id,
+                UserShortlist.account_id == account.id,
+            )
+        )
+        shortlist_result = await session.execute(shortlist_stmt)
+        shortlist_entry = shortlist_result.scalar_one_or_none()
+        is_archived = bool(shortlist_entry and shortlist_entry.status == "В архиве")
+        await session.commit()
         return CommunicationChannelItem(
             deal_id=deal.id if deal else None,
             author_id=str(account.id),
@@ -1375,6 +1481,17 @@ async def list_communications(
             if message.account_id not in last_map:
                 last_map[message.account_id] = message
 
+        shortlist_stmt = (
+            select(UserShortlist)
+            .where(
+                UserShortlist.user_id == current_user.id,
+                UserShortlist.account_id.in_(account_ids),
+            )
+        )
+        shortlist_result = await session.execute(shortlist_stmt)
+        shortlist_rows = list(shortlist_result.scalars().all())
+        shortlist_map = {row.account_id: row for row in shortlist_rows}
+
         channels: list[CommunicationChannelItem] = []
         for account_id in account_ids:
             account = account_map.get(account_id)
@@ -1392,8 +1509,8 @@ async def list_communications(
                 if last_message
                 else (best_deal.updated_at if best_deal else (account.created_at if account else datetime.now(timezone.utc)))
             )
-            raw_status = (account.status or "") if account is not None else ""
-            is_archived = raw_status.strip().lower() in {"archived", "в архиве"}
+            shortlist_item = shortlist_map.get(account_id)
+            is_archived = bool(shortlist_item and shortlist_item.status == "В архиве")
             if last_message is not None and last_message.channel_type:
                 channel_type = last_message.channel_type
             elif account is not None:

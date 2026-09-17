@@ -5,7 +5,7 @@ export type Social = 'Instagram' | 'VK' | 'Telegram' | 'TikTok' | 'YouTube' | '�
 export interface Author {
   id: string; nick: string; social: Social; followers: number; niche: string;
   reach: number; cpm: number; er: number; roas: number;
-  status: 'Свободен' | 'В сделке' | 'На паузе' | 'В архиве'; hue: number; deals: number;
+  status: 'Свободен' | 'В сделке' | 'В архиве'; hue: number; deals: number;
   twentyId?: string;
 }
 
@@ -92,9 +92,9 @@ const BASE_AUTHORS: Author[] = [
   { id: 'a3', nick: '@gadget_review', social: 'YouTube', followers: 1240000, niche: 'Технологии', reach: 615000, cpm: 265, er: 4.1, roas: 3.6, status: 'Свободен', hue: 200, deals: 22 },
   { id: 'a4', nick: '@travel_diary', social: 'Instagram', followers: 412000, niche: 'Путешествия', reach: 189000, cpm: 195, er: 3.8, roas: 2.4, status: 'Свободен', hue: 175, deals: 9 },
   { id: 'a5', nick: '@mama_blog', social: 'VK', followers: 156000, niche: 'Семья', reach: 74000, cpm: 120, er: 5.1, roas: 1.8, status: 'Свободен', hue: 45, deals: 7 },
-  { id: 'a6', nick: '@foodie_moscow', social: 'Telegram', followers: 98000, niche: 'Еда', reach: 52000, cpm: 150, er: 6.2, roas: 2.0, status: 'На паузе', hue: 15, deals: 11 },
+  { id: 'a6', nick: '@foodie_moscow', social: 'Telegram', followers: 98000, niche: 'Еда', reach: 52000, cpm: 150, er: 6.2, roas: 2.0, status: 'Свободен', hue: 15, deals: 11 },
   { id: 'a7', nick: '@vegan_food', social: 'Telegram', followers: 64000, niche: 'Еда', reach: 31000, cpm: 130, er: 5.6, roas: 1.6, status: 'Свободен', hue: 95, deals: 5 },
-  { id: 'a8', nick: '@crypto_talk', social: 'Telegram', followers: 210000, niche: 'Финансы', reach: 98000, cpm: 310, er: 2.9, roas: 1.2, status: 'На паузе', hue: 260, deals: 8 },
+  { id: 'a8', nick: '@crypto_talk', social: 'Telegram', followers: 210000, niche: 'Финансы', reach: 98000, cpm: 310, er: 2.9, roas: 1.2, status: 'Свободен', hue: 260, deals: 8 },
   { id: 'a9', nick: '@fitness_pro', social: 'Instagram', followers: 530000, niche: 'Фитнес', reach: 240000, cpm: 175, er: 3.5, roas: 2.2, status: 'В сделке', hue: 130, deals: 14 },
   { id: 'a10', nick: '@fashion_week', social: 'Instagram', followers: 720000, niche: 'Мода', reach: 310000, cpm: 220, er: 3.0, roas: 2.6, status: 'Свободен', hue: 290, deals: 16 },
   { id: 'a11', nick: '@auto_drive', social: 'YouTube', followers: 356000, niche: 'Авто', reach: 150000, cpm: 205, er: 3.3, roas: 1.9, status: 'В сделке', hue: 225, deals: 10 },
@@ -105,7 +105,7 @@ const GEN_NICHES = ['Красота', 'Технологии', 'Еда', 'Пут�
 const GEN_SOCIALS: Social[] = ['Instagram', 'VK', 'Telegram', 'TikTok', 'YouTube', 'Дзен'];
 const PREF = ['pro', 'the', 'daily', 'real', 'top', 'max', 'neo', 'go', 'my', 'just'];
 const ROOT = ['style', 'life', 'food', 'tech', 'beauty', 'travel', 'fit', 'media', 'blog', 'gram', 'space', 'lab'];
-const GEN_STATUS: Author['status'][] = ['Свободен', 'Свободен', 'В сделке', 'На паузе'];
+const GEN_STATUS: Author['status'][] = ['Свободен', 'Свободен', 'В сделке', 'В архиве'];
 
 function mulberry(seed: number) {
   return () => {

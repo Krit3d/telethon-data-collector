@@ -165,6 +165,9 @@ class Account(Base):
     messages: Mapped[list["CreatorMessage"]] = relationship(
         back_populates="account", cascade="all, delete-orphan"
     )
+    shortlists: Mapped[list["UserShortlist"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<Account(id={self.id}, platform={self.platform}, platform_id={self.platform_id})>"
@@ -410,6 +413,9 @@ class User(Base):
     messages: Mapped[list["CreatorMessage"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    shortlists: Mapped[list["UserShortlist"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email})>"
@@ -537,5 +543,58 @@ class CreatorMessage(Base):
     deal: Mapped["Deal | None"] = relationship(back_populates="messages")
 
 
-# Backward compatibility alias for legacy Channel class references
-Channel = Account
+class UserShortlist(Base):
+    __tablename__ = "user_shortlists"
+
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="Foreign key referencing the user",
+    )
+    account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+        comment="Foreign key referencing the account",
+    )
+    status: Mapped[str] = mapped_column(
+        String(30),
+        default="Свободен",
+        server_default="Свободен",
+        nullable=False,
+        comment="Custom manager status (e.g., 'Свободен')",
+    )
+    notes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Manager custom notes for this shortlist entry",
+    )
+    custom_cpm: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Custom CPM override set by the manager",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        comment="Timestamp when the record was first inserted",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        comment="Timestamp of the last record update",
+    )
+
+    __table_args__ = (
+        Index("ix_user_shortlists_user_created", "user_id", created_at.desc()),
+        Index("ix_user_shortlists_user_status", "user_id", "status"),
+        {"comment": "User shortlist mapping table with manager notes and custom status"},
+    )
+
+    user: Mapped["User"] = relationship(back_populates="shortlists")
+    account: Mapped["Account"] = relationship(lazy="joined")

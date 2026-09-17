@@ -175,9 +175,12 @@ class TwentyCrmClient:
         logger.info("Twenty CRM: found 0 creators")
         return []
 
-    async def get_creator_by_id(self, creator_id: str) -> dict[str, Any] | None:
+    async def get_creator_by_id(self, creator_id: str, user_email: str | None = None) -> dict[str, Any] | None:
         try:
-            response = await self._client.get(f"/rest/creators/{creator_id.strip()}")
+            params: dict[str, Any] = {}
+            if user_email:
+                params["filter[useremail][eq]"] = user_email
+            response = await self._client.get(f"/rest/creators/{creator_id.strip()}", params=params)
         except httpx.HTTPError:
             return None
         if response.status_code != 200:
@@ -191,13 +194,13 @@ class TwentyCrmClient:
             return record
         return None
 
-    async def update_creator_status(self, creator_id: str, status: str) -> dict[str, Any]:
+    async def update_creator_status(self, creator_id: str, status: str, user_email: str | None = None) -> dict[str, Any]:
         response = await self._client.patch(
             f"/rest/creators/{creator_id}",
             json={"status": status},
         )
         if response.status_code == 404:
-            existing = await self.find_creator_by_account_id(creator_id)
+            existing = await self.find_creator_by_account_id(creator_id, user_email)
             if existing is not None:
                 existing_id = existing.get("id")
                 if existing_id:
@@ -208,8 +211,10 @@ class TwentyCrmClient:
         response.raise_for_status()
         return response.json()
 
-    async def find_creator_by_account_id(self, account_id: str) -> dict[str, Any] | None:
+    async def find_creator_by_account_id(self, account_id: str, user_email: str | None = None) -> dict[str, Any] | None:
         params: dict[str, Any] = {"filter[accountid][eq]": str(account_id).strip()}
+        if user_email:
+            params["filter[useremail][eq]"] = user_email
         response = await self._client.get(
             "/rest/creators",
             params=params,
@@ -232,7 +237,7 @@ class TwentyCrmClient:
                 return c
         return None
 
-    async def delete_creator(self, identifier: str) -> bool:
+    async def delete_creator(self, identifier: str, user_email: str | None = None) -> bool:
         target = str(identifier).strip()
         if not target:
             return False
@@ -240,7 +245,7 @@ class TwentyCrmClient:
         if response.status_code in {200, 204}:
             return True
         if response.status_code == 404:
-            existing = await self.find_creator_by_account_id(target)
+            existing = await self.find_creator_by_account_id(target, user_email)
             if existing is not None:
                 existing_id = existing.get("id")
                 if existing_id:

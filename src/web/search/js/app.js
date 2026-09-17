@@ -9,8 +9,48 @@ import {
 } from "./render.js";
 import { AppStore, DEFAULT_COUNTRIES } from "./store.js";
 
+function getCrmLoginUrl() {
+  return `${window.location.protocol}//${window.location.hostname || "localhost"}:3001/#/login`;
+}
+
+function handleAuthGuard() {
+  const params = new URLSearchParams(window.location.search);
+  const sessionToken = params.get("session_token");
+  if (sessionToken) {
+    const userId = params.get("user_id") || "";
+    const userEmail = params.get("user_email") || "";
+    localStorage.setItem("creatorflow_token", sessionToken);
+    localStorage.setItem("creatorflow_user", JSON.stringify({ id: String(userId), email: userEmail }));
+    params.delete("session_token");
+    params.delete("user_id");
+    params.delete("user_email");
+    const queryStr = params.toString();
+    const cleanUrl = `${window.location.pathname}${queryStr ? `?${queryStr}` : ""}${window.location.hash}`;
+    window.history.replaceState(null, "", cleanUrl);
+    store.syncUserSession();
+    return true;
+  }
+  if (localStorage.getItem("creatorflow_token")) {
+    return true;
+  }
+  window.location.href = `${getCrmLoginUrl()}?redirect=${encodeURIComponent(window.location.href)}`;
+  return false;
+}
+
 const store = new AppStore();
 const api = new SearchApiClient();
+
+window.addEventListener("collabrama:store_updated", () => render());
+window.addEventListener("creatorflow:logout", () => {
+  store.syncUserSession(true);
+  render();
+});
+window.addEventListener("storage", (e) => {
+  if (e.key === "creatorflow_user" || e.key === "creatorflow_token") {
+    store.syncUserSession();
+    render();
+  }
+});
 
 let availableLanguages = [];
 let languageAliases = {};
@@ -19,6 +59,8 @@ const app = document.querySelector(".app");
 if (!app) {
   throw new Error("App root not found");
 }
+
+const authAllowed = handleAuthGuard();
 
 let progressTimer = null;
 let progressStep = 0;
@@ -963,7 +1005,8 @@ app.addEventListener("click", (e) => {
       .map((id) => String(id).trim().replace(/^@/, ""));
     exportToCrm(Array.from(new Set(ids)));
   } else if (action === "remove-shortlist") {
-    const author = store.shortlist.find((a) => a.account_id === Number(target.dataset.authorId));
+    const targetId = String(target.dataset.authorId || "");
+    const author = store.shortlist.find((a) => String(a.account_id ?? a.id ?? "") === targetId);
     if (author) {
       store.toggleShortlist(author);
       render();
@@ -1037,5 +1080,7 @@ async function loadDictionaries() {
   }
 }
 
-loadDictionaries();
-render();
+if (authAllowed) {
+  loadDictionaries();
+  render();
+}

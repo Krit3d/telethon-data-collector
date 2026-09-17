@@ -486,17 +486,19 @@ export default function App() {
   const handleLogin = (loggedIn: Record<string, unknown>) => {
     setUser(loggedIn);
     setAuthed(true);
+    window.location.hash = '#/authors';
   };
 
   const handleLogout = () => {
     api.logout();
     setUser(null);
     setAuthed(false);
+    window.location.hash = '#/authors';
   };
 
   return (
     <ToastProvider>
-      {authed ? <Shell user={user} onLogout={handleLogout} /> : <LoginModal onLogin={handleLogin} />}
+      {authed ? <Shell key={String(user?.id ?? user?.email ?? 'guest')} user={user} onLogout={handleLogout} /> : <LoginModal onLogin={handleLogin} />}
     </ToastProvider>
   );
 }

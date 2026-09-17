@@ -3,6 +3,19 @@ import { Zap, Mail, Lock, Eye, EyeOff, LogIn, UserPlus, AlertTriangle } from 'lu
 import { api } from '../services/api';
 import { Btn, Field, inputCls, Tabs } from './ui';
 
+function getRedirectTarget(): string | null {
+  const searchParams = new URLSearchParams(window.location.search);
+  const fromSearch = searchParams.get('redirect');
+  if (fromSearch) return fromSearch;
+  const hash = window.location.hash;
+  if (hash.includes('?')) {
+    const hashParams = new URLSearchParams(hash.substring(hash.indexOf('?')));
+    const fromHash = hashParams.get('redirect');
+    if (fromHash) return fromHash;
+  }
+  return null;
+}
+
 export default function LoginModal({ onLogin }: { onLogin: (user: Record<string, unknown>) => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
@@ -29,6 +42,15 @@ export default function LoginModal({ onLogin }: { onLogin: (user: Record<string,
       const data = mode === 'register'
         ? await api.register(trimmed, password, name.trim() || undefined)
         : await api.login(trimmed, password);
+      const redirectTarget = getRedirectTarget();
+      if (redirectTarget) {
+        const target = new URL(redirectTarget, window.location.origin);
+        target.searchParams.set('session_token', data.token);
+        if (data.user?.id != null) target.searchParams.set('user_id', String(data.user.id));
+        if (data.user?.email != null) target.searchParams.set('user_email', String(data.user.email));
+        window.location.href = target.toString();
+        return;
+      }
       onLogin(data.user);
     } catch (err) {
       setError(err instanceof Error && err.message ? err.message : 'Не удалось выполнить операцию. Проверьте подключение к серверу');
