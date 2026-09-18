@@ -54,7 +54,6 @@ rsync -avz --delete \
     --exclude='node_modules/' \
     --exclude='dist/' \
     --exclude='.vite/' \
-    --exclude='src/parser/' \
     --exclude='src/web/crm/' \
     --exclude='docker/scraper/' \
     --exclude='docker/crm/' \

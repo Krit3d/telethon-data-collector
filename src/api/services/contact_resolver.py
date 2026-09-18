@@ -50,10 +50,17 @@ class ContactResolver:
         return normalized
 
     @staticmethod
+    def _clean_username(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        cleaned = value.strip()
+        if cleaned.startswith("@"):
+            cleaned = cleaned[1:]
+        return cleaned.strip()
+
+    @staticmethod
     def resolve(raw_metadata: dict[str, Any] | None, username: str | None = None) -> ContactResolutionResult:
         contacts = ContactResolver._contacts(raw_metadata)
-        if not contacts:
-            return ContactResolutionResult()
         blacklist = ContactResolver._blacklist(contacts)
 
         for cand in contacts.get("advertising_telegrams", []):
@@ -85,13 +92,15 @@ class ContactResolver:
             if handle is not None:
                 return ContactResolutionResult("telegram", f"@{handle}", True, "general")
 
+        raw_username = username if username is not None else (raw_metadata.get("username") if isinstance(raw_metadata, dict) else None)
+        clean_username = ContactResolver._clean_username(raw_username)
+        if clean_username:
+            return ContactResolutionResult("instagram", f"@{clean_username}", True, "direct")
         return ContactResolutionResult()
 
     @staticmethod
     def get_all_channels(raw_metadata: dict[str, Any] | None) -> list[ContactResolutionResult]:
         contacts = ContactResolver._contacts(raw_metadata)
-        if not contacts:
-            return []
         blacklist = ContactResolver._blacklist(contacts)
         results: list[ContactResolutionResult] = []
 
@@ -123,6 +132,11 @@ class ContactResolver:
             handle = ContactResolver._telegram_candidate(cand, blacklist)
             if handle is not None:
                 results.append(ContactResolutionResult("telegram", f"@{handle}", True, "general"))
+
+        raw_username = raw_metadata.get("username") if isinstance(raw_metadata, dict) else None
+        clean_username = ContactResolver._clean_username(raw_username)
+        if clean_username:
+            results.append(ContactResolutionResult("instagram", f"@{clean_username}", True, "direct"))
 
         seen: set[tuple[str, str]] = set()
         deduplicated: list[ContactResolutionResult] = []
