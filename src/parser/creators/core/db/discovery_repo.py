@@ -8,7 +8,7 @@ from sqlalchemy.exc import DatabaseError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account
-from src.parser.creators.core.contacts import URL_PATTERN
+from src.parser.creators.core.contacts import extract_external_links
 from src.parser.creators.core.db.helpers import (
     generate_deterministic_id,
     extract_platform_info,
@@ -78,7 +78,7 @@ async def queue_discovered_accounts(
     urls_to_scan: list[str] = []
 
     if biography:
-        bio_urls = URL_PATTERN.findall(biography)
+        bio_urls = extract_external_links(biography)
         urls_to_scan.extend(bio_urls)
 
     if website:

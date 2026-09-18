@@ -8,7 +8,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account, Content
-from src.parser.creators.core.contacts import URL_PATTERN
+from src.parser.creators.core.contacts import extract_external_links
 from src.parser.creators.core.db.discovery_repo import queue_single_account
 from src.parser.creators.core.db.helpers import (
     clean_content_raw_metadata,
@@ -198,7 +198,7 @@ async def process_content_external_links(
 
         combined_text = " ".join(text_parts)
 
-        urls = URL_PATTERN.findall(combined_text)
+        urls = extract_external_links(combined_text)
 
         for url in urls:
             platform, platform_id = extract_platform_info(url)

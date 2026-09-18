@@ -1,85 +1,135 @@
+from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel
-
-from src.db.models import Account
 from src.parser.creators.core.contacts import (
     is_valid_email,
     is_valid_telegram_handle,
+    normalize_phone,
     normalize_telegram_handle,
 )
 
 
-class ContactResolutionResult(BaseModel):
-    channel_type: str
+@dataclass(slots=True, frozen=True)
+class ContactResolutionResult:
+    channel_type: str | None = None
     channel_target: str | None = None
     is_available: bool = False
+    role: str | None = None
 
 
 class ContactResolver:
     @staticmethod
-    def resolve(account: Account | dict[str, Any]) -> ContactResolutionResult:
-        if isinstance(account, Account):
-            raw_metadata = account.raw_metadata
-            platform = account.platform
-            username = account.username
-        else:
-            raw_metadata = account.get("raw_metadata")
-            platform = account.get("platform")
-            username = account.get("username")
+    def _contacts(raw_metadata: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(raw_metadata, dict):
+            return {}
+        contacts = raw_metadata.get("contacts")
+        return contacts if isinstance(contacts, dict) else {}
 
-        contacts = raw_metadata.get("contacts") if isinstance(raw_metadata, dict) else {}
-        contacts = contacts if isinstance(contacts, dict) else {}
+    @staticmethod
+    def _blacklist(contacts: dict[str, Any]) -> set[str]:
+        channels = contacts.get("telegram_channels", [])
+        if not isinstance(channels, list):
+            return set()
+        return {str(item) for item in channels}
 
-        for key in ("telegram_personal", "advertising_telegrams", "telegram_handles"):
-            items = contacts.get(key, [])
-            if not isinstance(items, list):
+    @staticmethod
+    def _is_dm_handle(handle: str) -> bool:
+        return not handle.startswith("+") and "joinchat" not in handle
+
+    @staticmethod
+    def _telegram_candidate(handle: Any, blacklist: set[str]) -> str | None:
+        if not isinstance(handle, str):
+            return None
+        if handle in blacklist:
+            return None
+        if not ContactResolver._is_dm_handle(handle):
+            return None
+        normalized = normalize_telegram_handle(handle)
+        if not is_valid_telegram_handle(normalized):
+            return None
+        return normalized
+
+    @staticmethod
+    def resolve(raw_metadata: dict[str, Any] | None, username: str | None = None) -> ContactResolutionResult:
+        contacts = ContactResolver._contacts(raw_metadata)
+        if not contacts:
+            return ContactResolutionResult()
+        blacklist = ContactResolver._blacklist(contacts)
+
+        for cand in contacts.get("advertising_telegrams", []):
+            handle = ContactResolver._telegram_candidate(cand, blacklist)
+            if handle is not None:
+                return ContactResolutionResult("telegram", f"@{handle}", True, "commercial")
+
+        for cand in contacts.get("telegram_personal", []):
+            handle = ContactResolver._telegram_candidate(cand, blacklist)
+            if handle is not None:
+                return ContactResolutionResult("telegram", f"@{handle}", True, "personal")
+
+        for cand in contacts.get("advertising_emails", []):
+            if isinstance(cand, str) and is_valid_email(cand):
+                return ContactResolutionResult("email", cand.strip().lower(), True, "commercial")
+
+        for cand in contacts.get("emails", []):
+            if isinstance(cand, str) and is_valid_email(cand):
+                return ContactResolutionResult("email", cand.strip().lower(), True, "general")
+
+        for cand in contacts.get("phones", []):
+            if isinstance(cand, str):
+                phone = normalize_phone(cand)
+                if phone is not None:
+                    return ContactResolutionResult("whatsapp", phone, True, "personal")
+
+        for cand in contacts.get("telegram_handles", []):
+            handle = ContactResolver._telegram_candidate(cand, blacklist)
+            if handle is not None:
+                return ContactResolutionResult("telegram", f"@{handle}", True, "general")
+
+        return ContactResolutionResult()
+
+    @staticmethod
+    def get_all_channels(raw_metadata: dict[str, Any] | None) -> list[ContactResolutionResult]:
+        contacts = ContactResolver._contacts(raw_metadata)
+        if not contacts:
+            return []
+        blacklist = ContactResolver._blacklist(contacts)
+        results: list[ContactResolutionResult] = []
+
+        for cand in contacts.get("advertising_telegrams", []):
+            handle = ContactResolver._telegram_candidate(cand, blacklist)
+            if handle is not None:
+                results.append(ContactResolutionResult("telegram", f"@{handle}", True, "commercial"))
+
+        for cand in contacts.get("telegram_personal", []):
+            handle = ContactResolver._telegram_candidate(cand, blacklist)
+            if handle is not None:
+                results.append(ContactResolutionResult("telegram", f"@{handle}", True, "personal"))
+
+        for cand in contacts.get("advertising_emails", []):
+            if isinstance(cand, str) and is_valid_email(cand):
+                results.append(ContactResolutionResult("email", cand.strip().lower(), True, "commercial"))
+
+        for cand in contacts.get("emails", []):
+            if isinstance(cand, str) and is_valid_email(cand):
+                results.append(ContactResolutionResult("email", cand.strip().lower(), True, "general"))
+
+        for cand in contacts.get("phones", []):
+            if isinstance(cand, str):
+                phone = normalize_phone(cand)
+                if phone is not None:
+                    results.append(ContactResolutionResult("whatsapp", phone, True, "personal"))
+
+        for cand in contacts.get("telegram_handles", []):
+            handle = ContactResolver._telegram_candidate(cand, blacklist)
+            if handle is not None:
+                results.append(ContactResolutionResult("telegram", f"@{handle}", True, "general"))
+
+        seen: set[tuple[str, str]] = set()
+        deduplicated: list[ContactResolutionResult] = []
+        for item in results:
+            key = (item.channel_type or "", item.channel_target or "")
+            if key in seen:
                 continue
-            for cand in items:
-                if not isinstance(cand, str):
-                    continue
-                if "+" in cand or "joinchat" in cand:
-                    continue
-                if is_valid_telegram_handle(cand):
-                    return ContactResolutionResult(
-                        channel_type="telegram",
-                        channel_target=f"@{normalize_telegram_handle(cand)}",
-                        is_available=True,
-                    )
-
-        if (
-            isinstance(platform, str)
-            and platform.upper() == "TELEGRAM"
-            and isinstance(username, str)
-            and username
-        ):
-            if is_valid_telegram_handle(username):
-                return ContactResolutionResult(
-                    channel_type="telegram",
-                    channel_target=f"@{normalize_telegram_handle(username)}",
-                    is_available=True,
-                )
-
-        for key in ("advertising_emails", "emails"):
-            items = contacts.get(key, [])
-            if not isinstance(items, list):
-                continue
-            for cand in items:
-                if not isinstance(cand, str):
-                    continue
-                if is_valid_email(cand):
-                    return ContactResolutionResult(
-                        channel_type="email",
-                        channel_target=cand.strip().lower(),
-                        is_available=True,
-                    )
-
-        phones = contacts.get("phones", [])
-        if isinstance(phones, list) and phones and isinstance(phones[0], str) and len(phones[0]) >= 10:
-            return ContactResolutionResult(
-                channel_type="whatsapp",
-                channel_target=phones[0].strip(),
-                is_available=True,
-            )
-
-        return ContactResolutionResult(channel_type="internal", channel_target=None, is_available=False)
+            seen.add(key)
+            deduplicated.append(item)
+        return deduplicated
