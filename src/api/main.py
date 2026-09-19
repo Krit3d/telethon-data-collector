@@ -147,8 +147,8 @@ if WEB_DIR.exists():
     )
 
 @app.get("/media/{filename}")
-async def get_media(filename: str) -> Response:
-    settings = load_settings()
+async def get_media(filename: str, request: Request) -> Response:
+    settings = request.app.state.settings
     if settings.media_bridge_url:
         headers = {}
         if settings.media_bridge_secret:
@@ -161,9 +161,14 @@ async def get_media(filename: str) -> Response:
         if resp.status_code == 404:
             raise HTTPException(status_code=404, detail="File not found")
         resp.raise_for_status()
+        headers = {}
+        cd = resp.headers.get("content-disposition")
+        if cd:
+            headers["Content-Disposition"] = cd
         return StreamingResponse(
             resp.aiter_bytes(),
-            media_type=resp.headers.get("content-type"),
+            media_type=resp.headers.get("content-type", "application/octet-stream"),
+            headers=headers,
         )
     path = MEDIA_DIR / filename
     if not path.exists():

@@ -89,7 +89,8 @@ export interface FileUploadResponse {
 
 export interface DealMessageItem {
   id: number;
-  deal_id: number;
+  deal_id?: number | null;
+  account_id?: string;
   sender_type: 'user' | 'creator' | 'system' | string;
   text?: string | null;
   is_read: boolean;
@@ -147,8 +148,8 @@ export interface CommunicationChannelItem {
   author_name: string;
   author_handle: string;
   platform: string;
-  deal_title: string;
-  stage: number;
+  deal_title: string | null;
+  stage: number | null;
   last_message: string;
   last_message_time: string;
   unread_count: number;

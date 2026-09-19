@@ -375,12 +375,12 @@ class Settings(BaseSettings):
     media_bridge_url: str | None = Field(default=None, description="Internal URL of the German media bridge, e.g. http://100.x.y.z:8090")
     media_bridge_secret: str | None = Field(default=None, description="Secret token for media bridge authentication")
 
-    # ---- DMnode integration settings ----
-    dmnode_api_key: str | None = Field(default=None, description="API key for DMnode Instagram outreach")
-    dmnode_base_url: str = Field(default="https://dmnode.com", description="Base URL for DMnode API")
-    dmnode_webhook_secret: str | None = Field(default=None, description="Secret token for verifying incoming DMnode webhook signatures")
-    dmnode_webhook_url: str | None = Field(default=None, description="Public webhook URL for receiving DMnode events")
-    dmnode_poll_interval_s: int = Field(default=15, description="Poll interval in seconds for DMnode outreach worker")
+    # ---- Slide Cold integration settings ----
+    slidecold_api_key: str | None = Field(default=None, description="Slidecold API key (Bearer token)")
+    slidecold_account_id: str | None = Field(default=None, description="Slidecold connected account ID")
+    slidecold_base_url: str = Field(default="https://slidecold.com", description="Slidecold API base URL")
+    slidecold_webhook_secret: str | None = Field(default=None, description="Secret token for verifying X-SlideCold-Signature")
+    slidecold_poll_interval_s: int = Field(default=15, description="Poll interval in seconds for Slidecold worker fallback")
 
     # ---- Channel sourcing ----
     channels_file: Path = Field(

@@ -256,6 +256,37 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  slidecold_outreach:
+    container_name: tg_parser_slidecold_outreach
+    image: tg_parser_crawler_base:latest
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql+asyncpg://postgres:postgres@db:5432/tg_parser}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-TEXT}
+      PYTHONUNBUFFERED: "1"
+      SLIDECOLD_API_KEY: ${SLIDECOLD_API_KEY}
+      SLIDECOLD_ACCOUNT_ID: ${SLIDECOLD_ACCOUNT_ID:-}
+      SLIDECOLD_BASE_URL: ${SLIDECOLD_BASE_URL:-https://slidecold.com}
+      SLIDECOLD_WEBHOOK_SECRET: ${SLIDECOLD_WEBHOOK_SECRET:-}
+      SLIDECOLD_POLL_INTERVAL_S: ${SLIDECOLD_POLL_INTERVAL_S:-15}
+    volumes:
+      - .:/app
+      - ./media:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m src.workers.slidecold_outreach_worker
+    networks:
+      - scraper_network
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   media_bridge:
     container_name: tg_parser_media_bridge
     image: tg_parser_crawler_base:latest

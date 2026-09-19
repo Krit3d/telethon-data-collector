@@ -3,27 +3,29 @@ import logging
 import signal
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import selectinload
 
-from src.api.services.dmnode_client import DMnodeClient
+from src.api.services.slidecold_client import SlideColdClient
 from src.config.config import Settings, load_settings
 from src.db.database import Database
-from src.db.models import Account, CreatorMessage, User
+from src.db.models import Account, CreatorMessage, Deal, User
 
 logger = logging.getLogger(__name__)
 
+ACTIVE_STAGES = [1, 2, 3, 4, 5, 6]
 
-class DMnodeOutreachWorker:
 
-    def __init__(self, settings: Settings, db: Database, dmnode: DMnodeClient) -> None:
+class SlideColdOutreachWorker:
+
+    def __init__(self, settings: Settings, db: Database, slidecold: SlideColdClient) -> None:
         self.settings = settings
         self._db = db
-        self._dmnode = dmnode
+        self._slidecold = slidecold
         self._shutdown_event = asyncio.Event()
 
     def handle_shutdown(self, *args: object) -> None:
-        logger.info("Shutdown signal received, stopping DMnode outreach worker...")
+        logger.info("Shutdown signal received, stopping SlideCold outreach worker...")
         self._shutdown_event.set()
 
     async def _process_outbox(self) -> bool:
@@ -59,18 +61,18 @@ class DMnodeOutreachWorker:
 
         for task in tasks:
             try:
-                campaign_id = await self._send_message(task)
+                message_id = await self._send_message(task)
                 async with self._db.async_session() as session:
                     await session.execute(
                         update(CreatorMessage)
                         .where(CreatorMessage.id == task["id"])
-                        .values(external_message_id=f"dmnode:{campaign_id}")
+                        .values(external_message_id=f"slidecold:{message_id}")
                     )
                     await session.commit()
                 logger.info(
-                    "DM sent: msg_id=%s, campaign_id=%s",
+                    "SlideCold message sent: msg_id=%s, message_id=%s",
                     task["id"],
-                    campaign_id,
+                    message_id,
                 )
             except Exception as e:
                 async with self._db.async_session() as session:
@@ -81,7 +83,7 @@ class DMnodeOutreachWorker:
                     )
                     await session.commit()
                 logger.error(
-                    "Failed to send DM message id=%s: %s",
+                    "Failed to send SlideCold message id=%s: %s",
                     task["id"],
                     e,
                     exc_info=True,
@@ -90,32 +92,25 @@ class DMnodeOutreachWorker:
         return True
 
     async def _send_message(self, task: dict[str, Any]) -> str:
-        target_handle = (task.get("channel_target") or "").lstrip("@").strip()
-        if not target_handle:
-            target_handle = (task.get("username") or "").lstrip("@").strip()
-        if not target_handle:
-            raise ValueError(f"No valid Instagram handle for task {task.get('id')}")
+        recipient = (task.get("channel_target") or "").lstrip("@").strip()
+        if not recipient:
+            recipient = (task.get("username") or "").lstrip("@").strip()
+        if not recipient:
+            raise ValueError(f"No valid Instagram recipient for task {task.get('id')}")
 
-        full_message_text = task["text"] or ""
-        if task["media_url"]:
-            public_url = f"{self.settings.api_base_url.rstrip('/')}{task['media_url']}"
-            full_message_text = (
-                f"{full_message_text}\n{public_url}" if full_message_text else public_url
-            )
+        text = task.get("text") or ""
+        media_url = task.get("media_url")
+        public_media_url = f"{self.settings.api_base_url.rstrip('/')}{media_url}" if media_url else None
+        if public_media_url:
+            text = f"{text}\n{public_media_url}" if text else public_media_url
 
-        payload: dict[str, Any] = {
-            "targets": [{"handle": target_handle}],
-            "message": full_message_text,
-            "campaign": f"outreach_msg_{task['id']}",
-            "settings": {"dedupeScope": "client"},
-        }
-        if self.settings.dmnode_webhook_url:
-            payload["webhookUrl"] = self.settings.dmnode_webhook_url
-
-        approval_token = await self._dmnode.run_safety_check(payload)
-        campaign_id = await self._dmnode.create_campaign(payload, approval_token)
-        await self._dmnode.start_campaign(campaign_id)
-        return campaign_id
+        message_id = await self._slidecold.send_message(
+            recipient=recipient,
+            text=text,
+            media_url=public_media_url,
+            account_id=self.settings.slidecold_account_id,
+        )
+        return str(message_id)
 
     async def _outbox_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -136,10 +131,9 @@ class DMnodeOutreachWorker:
 
     def _reply_handle(self, reply: dict[str, Any]) -> str:
         raw = (
-            reply.get("handle")
-            or reply.get("author")
+            reply.get("sender")
+            or reply.get("handle")
             or reply.get("username")
-            or reply.get("sender")
             or reply.get("from")
         )
         return str(raw or "").lstrip("@").strip().lower()
@@ -149,42 +143,41 @@ class DMnodeOutreachWorker:
 
     def _reply_external_id(self, reply: dict[str, Any]) -> str | None:
         return (
-            reply.get("external_message_id")
-            or reply.get("externalId")
+            reply.get("id")
             or reply.get("message_id")
-            or reply.get("id")
-            or reply.get("conversationId")
+            or reply.get("external_id")
+            or reply.get("external_message_id")
         )
-
-    def _reply_is_read(self, reply: dict[str, Any]) -> bool:
-        return bool(reply.get("read") or reply.get("isRead") or reply.get("is_read"))
 
     async def _process_reply(self, reply: dict[str, Any]) -> None:
         handle = self._reply_handle(reply)
         external_message_id = self._reply_external_id(reply)
         if not handle or not external_message_id:
             return
-        if self._reply_is_read(reply):
-            return
 
         async with self._db.async_session() as session:
-            existing = await session.execute(
-                select(CreatorMessage.id).where(
-                    CreatorMessage.external_message_id == external_message_id
-                )
+            duplicate_stmt = (
+                select(CreatorMessage.id)
+                .where(CreatorMessage.external_message_id == str(external_message_id))
+                .limit(1)
             )
-            if existing.scalar_one_or_none() is not None:
+            if (await session.execute(duplicate_stmt)).scalar_one_or_none() is not None:
                 return
 
             account_result = await session.execute(
                 select(Account)
-                .where(func.lower(Account.username) == handle)
+                .where(
+                    or_(
+                        func.lower(Account.username) == handle,
+                        func.lower(Account.username) == f"@{handle}",
+                    )
+                )
                 .limit(1)
             )
             account = account_result.scalar_one_or_none()
             if account is None:
                 logger.warning(
-                    "Inbound DM from %s ignored: creator account not found",
+                    "SlideCold reply from %s ignored: creator account not found",
                     handle,
                 )
                 return
@@ -202,28 +195,40 @@ class DMnodeOutreachWorker:
             if user_id is None:
                 return
 
+            deal_stmt = (
+                select(Deal.id)
+                .where(
+                    Deal.account_id == account.id,
+                    Deal.user_id == user_id,
+                    Deal.stage.in_(ACTIVE_STAGES),
+                )
+                .order_by(Deal.updated_at.desc())
+                .limit(1)
+            )
+            deal_id = (await session.execute(deal_stmt)).scalar_one_or_none()
+
             new_message = CreatorMessage(
                 user_id=user_id,
                 account_id=account.id,
-                deal_id=None,
+                deal_id=deal_id,
                 sender_type="creator",
                 channel_type="instagram",
                 channel_target=f"@{handle}",
-                external_message_id=external_message_id,
+                external_message_id=str(external_message_id),
                 text=self._reply_text(reply),
                 is_read=False,
             )
             session.add(new_message)
             await session.commit()
             logger.info(
-                "Inbound DM processed: account_id=%s, user_id=%s, from=%s",
+                "SlideCold inbound reply processed: account_id=%s, user_id=%s, from=%s",
                 account.id,
                 user_id,
                 handle,
             )
 
     async def _poll_inbound(self) -> None:
-        replies = await self._dmnode.get_replies()
+        replies = await self._slidecold.get_replies(account_id=self.settings.slidecold_account_id)
         if not isinstance(replies, list):
             return
         for reply in replies:
@@ -232,7 +237,7 @@ class DMnodeOutreachWorker:
             try:
                 await self._process_reply(reply)
             except Exception as e:
-                logger.error("Failed to process inbound DM reply: %s", e, exc_info=True)
+                logger.error("Failed to process SlideCold inbound reply: %s", e, exc_info=True)
 
     async def _inbound_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -247,13 +252,13 @@ class DMnodeOutreachWorker:
             try:
                 await asyncio.wait_for(
                     self._shutdown_event.wait(),
-                    timeout=self.settings.dmnode_poll_interval_s,
+                    timeout=self.settings.slidecold_poll_interval_s,
                 )
             except asyncio.TimeoutError:
                 pass
 
     async def start(self) -> None:
-        logger.info("DMnode outreach worker starting")
+        logger.info("SlideCold outreach worker starting")
         await self._db.init_db()
 
         async with self._db.async_session() as session:
@@ -285,21 +290,22 @@ class DMnodeOutreachWorker:
             logger.info("Worker tasks cancelled, shutting down...")
         finally:
             self._shutdown_event.set()
-            await self._dmnode.aclose()
+            await self._slidecold.aclose()
             await self._db.close()
-            logger.info("DMnode outreach worker stopped")
+            logger.info("SlideCold outreach worker stopped")
 
 
 async def main() -> None:
     settings = load_settings()
-    if not settings.dmnode_api_key:
-        raise RuntimeError("DMnode API key is not configured")
+    if not settings.slidecold_api_key:
+        raise RuntimeError("SlideCold API key is not configured")
     db = Database(settings.db_url)
-    dmnode = DMnodeClient(
-        api_key=settings.dmnode_api_key,
-        base_url=settings.dmnode_base_url,
+    slidecold = SlideColdClient(
+        api_key=settings.slidecold_api_key,
+        account_id=settings.slidecold_account_id,
+        base_url=settings.slidecold_base_url,
     )
-    worker = DMnodeOutreachWorker(settings=settings, db=db, dmnode=dmnode)
+    worker = SlideColdOutreachWorker(settings=settings, db=db, slidecold=slidecold)
     await worker.start()
 
 
