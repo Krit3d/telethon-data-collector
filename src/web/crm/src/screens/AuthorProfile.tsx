@@ -297,6 +297,8 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
     );
   }
 
+  const displayName = profile.title || profile.username || 'Без имени';
+  const handle = profile.username ? (profile.username.startsWith('@') ? profile.username : `@${profile.username}`) : '';
   const nick = profile.username || profile.title;
   const hue = Math.abs(Number(profile.id) * 137) % 360;
   const social = normalizeSocial(profile.platform.toLowerCase());
@@ -315,15 +317,17 @@ export default function AuthorProfile({ authorId, deals, onBack, onNewDeal, onOp
         </button>
 
         <Card className="p-5 flex items-center gap-5 flex-wrap">
-          <Avatar nick={nick} hue={hue} size={80} />
+          <Avatar nick={displayName} hue={hue} size={80} />
           <div className="min-w-0">
             <div className="flex items-center gap-2.5">
-              <h1 className="text-[24px] font-display font-semibold text-gray-900">{nick}</h1>
+              <h1 className="text-[24px] font-display font-semibold text-gray-900">{displayName}</h1>
+              {(profile.source === 'manual' || profile.account_status === 'manual') && <Badge tone="violet">Вручную</Badge>}
               <a href={profile.profile_url} target="_blank" rel="noreferrer"
                 className="inline-flex items-center gap-1.5 text-[12.5px] font-bold text-gray-500 hover:text-indigo-600 transition-colors">
                 <SocialIcon social={social} size={15} />{social}
               </a>
             </div>
+            {handle && handle !== displayName && <div className="text-gray-400 font-semibold text-[13px] mt-0.5">{handle}</div>}
             <div className="flex items-center gap-4 mt-2 text-[13px] font-semibold text-gray-500 flex-wrap">
               <span>Статус: <Badge tone={currentStatus === 'В архиве' ? 'gray' : currentStatus === 'В сделке' ? 'indigo' : 'green'}>{currentStatus}</Badge></span>
               <span>Подписчики: <b className="text-gray-900">{fmtNum(profile.subscribers_count)}</b></span>

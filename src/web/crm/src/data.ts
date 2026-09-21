@@ -7,6 +7,9 @@ export interface Author {
   reach: number; cpm: number; er: number; roas: number;
   status: 'Свободен' | 'В сделке' | 'В архиве'; hue: number; deals: number;
   twentyId?: string;
+  title?: string;
+  source?: 'search' | 'manual' | string;
+  accountStatus?: string;
 }
 
 export interface Product { name: string; desc: string; tags: string[]; hue: number }

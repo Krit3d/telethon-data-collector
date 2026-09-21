@@ -1,4 +1,4 @@
-import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpDown, Briefcase, ChevronLeft, ChevronRight, MessageSquare, MoreVertical, RefreshCw, Search, Sparkles, Trash2, Users, X } from 'lucide-react';
+import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpDown, Briefcase, ChevronLeft, ChevronRight, Loader2, MessageSquare, MoreVertical, RefreshCw, Search, Sparkles, Trash2, UserPlus, Users, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { SocialIcon } from '../components/icons';
 import { Avatar, Badge, Btn, Card, inputCls, Modal, Toggle, useToast } from '../components/ui';
@@ -50,7 +50,10 @@ function toAuthor(rec: CreatorRecord): Author {
   return {
     id: accountId,
     twentyId: rec.id,
-    nick: rec.name || rec.Name || rec.handle || rec.username || 'Без имени',
+    source: rec.source || 'search',
+    title: rec.title || rec.name || rec.Name || rec.handle || rec.username || 'Без имени',
+    accountStatus: rec.account_status || rec.accountStatus || 'verified',
+    nick: (rec.handle || rec.username || rec.name || 'Без имени').replace(/^@/, ''),
     social,
     followers,
     niche: rec.niche || rec.category_path || 'Общее',
@@ -93,6 +96,9 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
   const [confirmDeleteAuthor, setConfirmDeleteAuthor] = useState<Author | null>(null);
   const [authorToArchive, setAuthorToArchive] = useState<Author | null>(null);
   const [closeDeals, setCloseDeals] = useState(true);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [formSubmitting, setFormSubmitting] = useState(false);
+  const [form, setForm] = useState({ platform: 'Instagram', username: '', title: '', telegramCommercial: '', telegramPersonal: '', email: '', phone: '' });
 
   const load = async () => {
     setLoading(true);
@@ -178,7 +184,7 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
     setMenu(null);
     setConfirmDeleteAuthor(null);
     if (dealsCountFor(a) > 0) {
-      toast('err', 'Нельзя удалить автора со сделками или перепиской. Отправьте его в архив.');
+      toast('err', 'Нельзя удалить автора со сделками. Отправьте его в архив.');
       return;
     }
     try {
@@ -187,6 +193,33 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
       toast('ok', `${a.nick} удалён из шортлиста`);
     } catch (err) {
       toast('err', err instanceof Error && err.message ? err.message : 'Не удалось удалить автора');
+    }
+  };
+
+  const handleAddManual = async () => {
+    if (!form.username.trim()) {
+      toast('err', 'Укажите username автора');
+      return;
+    }
+    setFormSubmitting(true);
+    try {
+      await api.addCreatorManual({
+        platform: form.platform,
+        username: form.username.trim().replace(/^@/, ''),
+        title: form.title.trim() || undefined,
+        telegram_commercial: form.telegramCommercial.trim() || undefined,
+        telegram_personal: form.telegramPersonal.trim() || undefined,
+        email: form.email.trim() || undefined,
+        phone: form.phone.trim() || undefined,
+      });
+      setShowAddModal(false);
+      setForm({ platform: 'Instagram', username: '', title: '', telegramCommercial: '', telegramPersonal: '', email: '', phone: '' });
+      toast('ok', 'Автор успешно добавлен в шортлист');
+      void load();
+    } catch (err) {
+      toast('err', err instanceof Error && err.message ? err.message : 'Не удалось добавить автора');
+    } finally {
+      setFormSubmitting(false);
     }
   };
 
@@ -237,6 +270,7 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
           </div>
           <div className="flex items-center gap-2">
             <Btn variant="secondary" onClick={() => void load()}><RefreshCw size={14} />Обновить</Btn>
+            <Btn variant="secondary" onClick={() => setShowAddModal(true)}><UserPlus size={14} />Добавить автора</Btn>
             <Btn onClick={openSearch}><Sparkles size={14} />AI-подбор авторов</Btn>
           </div>
         </div>
@@ -337,8 +371,8 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
                           <button onClick={e => { e.stopPropagation(); onOpenProfile(a.id); }} className="flex items-center gap-2.5 hover:text-indigo-600 transition-colors">
                             <Avatar nick={a.nick} hue={a.hue} size={30} />
                             <span className="text-left">
-                              <span className="block font-bold text-gray-800 group-hover:text-indigo-600">{a.nick}</span>
-                              <span className="block text-[10.5px] font-semibold text-gray-400">{dealsCount} сделок · ER {fmtER(a.er)}</span>
+                              <span className="block font-bold text-gray-800 group-hover:text-indigo-600">{a.title || a.nick}{a.source === 'manual' && <Badge tone="violet" className="ml-1.5">Вручную</Badge>}</span>
+                              <span className="block text-[10.5px] font-semibold text-gray-400">@{a.nick} · {dealsCount} сделок · ER {fmtER(a.er)}</span>
                             </span>
                           </button>
                         </td>
@@ -391,11 +425,69 @@ export default function Authors({ deals, onOpenProfile, onNewDeal, onOpenComms }
         )}
       </div>
 
+      {showAddModal && (
+        <Modal onClose={() => setShowAddModal(false)} w="max-w-lg">
+          <div className="px-5 py-4 border-b border-gray-200">
+            <h2 className="text-[16px] font-display font-semibold text-gray-900">Добавление автора вручную</h2>
+          </div>
+          <div className="px-5 py-4 space-y-4">
+            <div className="flex items-center gap-3">
+              <label className="block flex-1">
+                <div className="text-[12px] font-semibold text-gray-500 mb-1.5">Платформа</div>
+                <select className={selCls} value={form.platform} onChange={e => setForm({ ...form, platform: e.target.value })}>
+                  <option>Instagram</option>
+                  <option>Telegram</option>
+                </select>
+              </label>
+              <label className="block flex-1">
+                <div className="text-[12px] font-semibold text-gray-500 mb-1.5">Username</div>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-[13.5px]">@</span>
+                  <input className={inputCls + ' !pl-7'} placeholder="username" value={form.username} onChange={e => setForm({ ...form, username: e.target.value })} />
+                </div>
+              </label>
+            </div>
+            <label className="block">
+              <div className="text-[12px] font-semibold text-gray-500 mb-1.5">Название / отображаемое имя</div>
+              <input className={inputCls} placeholder="Например: Иван Петров" value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} />
+            </label>
+            <div className="text-[12.5px] font-bold text-gray-600">Контакты для связи</div>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block">
+                <div className="text-[12px] font-semibold text-gray-500 mb-1.5">TG коммерческий</div>
+                <input className={inputCls} placeholder="@advertising_tg" value={form.telegramCommercial} onChange={e => setForm({ ...form, telegramCommercial: e.target.value })} />
+              </label>
+              <label className="block">
+                <div className="text-[12px] font-semibold text-gray-500 mb-1.5">TG личный</div>
+                <input className={inputCls} placeholder="@personal_tg" value={form.telegramPersonal} onChange={e => setForm({ ...form, telegramPersonal: e.target.value })} />
+              </label>
+              <label className="block">
+                <div className="text-[12px] font-semibold text-gray-500 mb-1.5">Email</div>
+                <input className={inputCls} placeholder="name@example.com" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} />
+              </label>
+              <label className="block">
+                <div className="text-[12px] font-semibold text-gray-500 mb-1.5">Телефон / WhatsApp</div>
+                <input className={inputCls} placeholder="+7 900 000-00-00" value={form.phone} onChange={e => setForm({ ...form, phone: e.target.value })} />
+              </label>
+            </div>
+            <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-3.5 py-2.5 text-[12.5px] font-medium text-indigo-700 leading-relaxed">
+              Платформа связывается с автором по приоритету: TG коммерческий → TG личный → Email → WhatsApp → Direct
+            </div>
+          </div>
+          <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-end gap-2">
+            <Btn variant="secondary" onClick={() => setShowAddModal(false)}>Отмена</Btn>
+            <Btn variant="primary" disabled={formSubmitting} onClick={() => void handleAddManual()}>
+              {formSubmitting ? <Loader2 size={14} className="animate-spin" /> : <UserPlus size={14} />}Добавить в базу
+            </Btn>
+          </div>
+        </Modal>
+      )}
+
       {confirmDeleteAuthor && (
         <Modal onClose={() => setConfirmDeleteAuthor(null)} w="max-w-md">
           <div className="px-5 py-4">
             <h3 className="text-[16px] font-bold text-gray-900">Удалить автора из шортлиста?</h3>
-            <p className="text-[13px] font-medium text-gray-500 mt-2">Автор @{confirmDeleteAuthor.nick} будет удален из рабочей базы. Это действие нельзя отменить.</p>
+            <p className="text-[13px] font-medium text-gray-500 mt-2">Автор @{confirmDeleteAuthor.nick} будет удален из вашего шортлиста.</p>
           </div>
           <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-gray-100">
             <Btn variant="secondary" onClick={() => setConfirmDeleteAuthor(null)}>Отмена</Btn>

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone
 from urllib.parse import unquote
@@ -12,6 +13,7 @@ from src.api.schemas import (
     CreatorMessageItem,
     CreatorProfileDetail,
     CreatorSendMessageRequest,
+    CrmManualCreatorRequest,
     CrmShortlistRequest,
     CrmShortlistResponse,
     CrmUpdateStatusRequest,
@@ -32,6 +34,13 @@ from src.api.services.crm_helpers import (
 )
 from src.db.database import Database
 from src.db.models import Account, Content, Deal, CreatorMessage, User, UserShortlist
+from src.parser.creators.core.contacts import (
+    is_valid_email,
+    is_valid_telegram_handle,
+    normalize_phone,
+    normalize_telegram_handle,
+)
+from src.parser.creators.sc_client import ScrapeCreatorsClient
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +118,7 @@ async def export_to_shortlist(
                     "user_id": current_user.id,
                     "account_id": account.id,
                     "status": "Свободен",
+                    "source": "search",
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -135,6 +145,194 @@ async def export_to_shortlist(
         added_count=len(accounts),
         redirect_url=f"{request.app.state.settings.crm_frontend_url}/#/authors?import_ids={','.join(raw_ids)}",
     )
+
+
+def _deterministic_creator_id(key: str) -> int:
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big") & 0x7FFFFFFFFFFFFFFF
+
+
+def _build_contacts_metadata(payload: CrmManualCreatorRequest) -> dict[str, list[str]]:
+    contacts: dict[str, list[str]] = {}
+    if payload.telegram_commercial:
+        handle = normalize_telegram_handle(payload.telegram_commercial)
+        if is_valid_telegram_handle(handle):
+            contacts["advertising_telegrams"] = [handle]
+    if payload.telegram_personal:
+        handle = normalize_telegram_handle(payload.telegram_personal)
+        if is_valid_telegram_handle(handle):
+            contacts["telegram_personal"] = [handle]
+    if payload.email:
+        email = payload.email.strip().lower()
+        if is_valid_email(email):
+            contacts["emails"] = [email]
+    if payload.phone:
+        phone = normalize_phone(payload.phone)
+        if phone:
+            contacts["phones"] = [phone]
+    return contacts
+
+
+@router.post("/creators/manual")
+async def add_creator_manual(
+    payload: CrmManualCreatorRequest,
+    request: Request,
+    db: Database = Depends(get_db),
+    crm_client: TwentyCrmClient = Depends(get_crm_client),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, object]:
+    platform = payload.platform.upper().strip()
+    clean_username = payload.username.lstrip("@").strip().lower()
+    if not clean_username:
+        raise HTTPException(status_code=400, detail="Username не может быть пустым")
+
+    platform_id: str
+    account_id: int
+    title: str = clean_username
+    scraped_title: str | None = None
+    subscribers_count: int | None = payload.subscribers_count
+
+    if platform == "INSTAGRAM":
+        try:
+            async with ScrapeCreatorsClient(request.app.state.settings) as client:
+                response = await client.get(
+                    endpoint="/v1/instagram/profile",
+                    params={"handle": clean_username},
+                )
+            data = response.get("data") or response
+            user = data.get("user") or data if isinstance(data, dict) else {}
+            raw_pid = user.get("id") or user.get("pk") or user.get("media_id")
+            if raw_pid is not None:
+                try:
+                    account_id = int(raw_pid)
+                except (ValueError, TypeError):
+                    account_id = _deterministic_creator_id(f"instagram:{clean_username}")
+                platform_id = str(account_id)
+            else:
+                account_id = _deterministic_creator_id(f"instagram:{clean_username}")
+                platform_id = str(account_id)
+            scraped_title = user.get("full_name") or user.get("title") or user.get("name")
+            scraped_subs = user.get("edge_followed_by")
+            if isinstance(scraped_subs, dict):
+                scraped_subs = scraped_subs.get("count")
+            if scraped_subs is None:
+                scraped_subs = user.get("followers") or user.get("followers_count") or user.get("follower_count")
+            if scraped_subs is not None:
+                try:
+                    subscribers_count = int(scraped_subs)
+                except (ValueError, TypeError):
+                    pass
+        except Exception:
+            logger.warning(
+                "Scrape Creators profile fetch failed for %s, falling back to deterministic id",
+                clean_username,
+                exc_info=True,
+            )
+            account_id = _deterministic_creator_id(f"instagram:{clean_username}")
+            platform_id = str(account_id)
+    elif platform == "TELEGRAM":
+        account_id = _deterministic_creator_id(f"telegram:{clean_username}")
+        platform_id = str(account_id)
+    else:
+        raise HTTPException(status_code=400, detail="Поддерживаются только INSTAGRAM и TELEGRAM")
+
+    if payload.title:
+        title = payload.title
+    elif scraped_title:
+        title = str(scraped_title)
+    else:
+        title = clean_username
+
+    contacts = _build_contacts_metadata(payload)
+    raw_metadata: dict[str, object] = {"contacts": contacts}
+
+    now = datetime.now(timezone.utc)
+    async with db.async_session() as session:
+        existing_stmt = select(Account).where(
+            or_(
+                and_(Account.platform == platform, Account.platform_id == platform_id),
+                and_(Account.platform == platform, func.lower(Account.username) == clean_username),
+            )
+        )
+        existing_result = await session.execute(existing_stmt)
+        account = existing_result.scalars().first()
+
+        if account is None:
+            account = Account(
+                id=account_id,
+                platform=platform,
+                platform_id=platform_id,
+                username=clean_username,
+                title=title,
+                subscribers_count=subscribers_count,
+                status="manual",
+                raw_metadata=raw_metadata,
+            )
+            session.add(account)
+            await session.flush()
+        else:
+            existing_meta = account.raw_metadata if isinstance(account.raw_metadata, dict) else {}
+            existing_contacts = existing_meta.get("contacts")
+            if not isinstance(existing_contacts, dict):
+                existing_contacts = {}
+            merged_contacts: dict[str, list[str]] = {}
+            for key in ("advertising_telegrams", "telegram_personal", "emails", "phones"):
+                merged = list(existing_contacts.get(key, []))
+                for item in contacts.get(key, []):
+                    if item not in merged:
+                        merged.append(item)
+                if merged:
+                    merged_contacts[key] = merged
+            existing_meta["contacts"] = merged_contacts
+            account.raw_metadata = existing_meta
+            if account.status != "verified":
+                account.status = "manual"
+            if title:
+                account.title = title
+            if subscribers_count is not None:
+                account.subscribers_count = subscribers_count
+
+        await session.execute(
+            pg_insert(UserShortlist)
+            .values(
+                user_id=current_user.id,
+                account_id=account.id,
+                status="Свободен",
+                source="manual",
+                created_at=now,
+                updated_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=["user_id", "account_id"],
+                set_={
+                    "source": "manual",
+                    "updated_at": now,
+                },
+            )
+        )
+        await session.commit()
+        await session.refresh(account)
+
+    try:
+        await crm_client.upsert_creator(build_creator_payload(account, current_user.email))
+    except Exception:
+        logger.warning("Failed to upsert manually added creator in Twenty CRM", exc_info=True)
+
+    return {
+        "id": str(account.id),
+        "accountid": str(account.id),
+        "accountId": str(account.id),
+        "handle": f"@{account.username.lstrip('@')}" if account.username else "",
+        "username": account.username,
+        "name": account.title or account.username or "",
+        "platform": normalize_platform(account.platform),
+        "followers": int(account.subscribers_count or 0),
+        "subscribers_count": int(account.subscribers_count or 0),
+        "status": "Свободен",
+        "source": "manual",
+        "account_status": account.status,
+        "title": account.title or account.username or "",
+    }
 
 
 @router.get("/creators")
@@ -212,6 +410,9 @@ async def crm_creators(
                     "accountid": str(account.id),
                     "accountId": str(account.id),
                     "name": account.title or account.username or "",
+                    "source": shortlist.source,
+                    "account_status": account.status,
+                    "title": account.title or account.username or "",
                     "platform": normalize_platform(account.platform),
                     "handle": f"@{account.username.lstrip('@')}" if account.username else "",
                     "followers": followers,
@@ -299,18 +500,6 @@ async def crm_delete_creator(
                 delete(UserShortlist).where(
                     UserShortlist.user_id == current_user.id,
                     UserShortlist.account_id == account.id,
-                )
-            )
-            await session.execute(
-                delete(CreatorMessage).where(
-                    CreatorMessage.account_id == account.id,
-                    CreatorMessage.user_id == current_user.id,
-                )
-            )
-            await session.execute(
-                delete(Deal).where(
-                    Deal.account_id == account.id,
-                    Deal.user_id == current_user.id,
                 )
             )
             await session.commit()
@@ -402,6 +591,7 @@ async def get_creator_detail(
         platform=platform,
         username=account.username,
         title=account.title,
+        account_status=account.status,
         description=account.description,
         subscribers_count=followers,
         static_avg_er=er,

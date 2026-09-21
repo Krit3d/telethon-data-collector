@@ -483,6 +483,39 @@ class CrmUpdateStatusRequest(BaseModel):
     archive_active_deals: bool = Field(default=False, description="Archive active deals when archiving the creator")
 
 
+class CrmManualCreatorRequest(BaseModel):
+    platform: str = Field(description="Платформа автора: INSTAGRAM или TELEGRAM")
+    username: str = Field(description="Username автора без @")
+    title: str | None = Field(default=None, description="Отображаемое имя автора")
+    subscribers_count: int | None = Field(default=None, description="Число подписчиков (опционально)")
+    telegram_commercial: str | None = Field(default=None, description="Коммерческий Telegram контакт")
+    telegram_personal: str | None = Field(default=None, description="Личный Telegram контакт")
+    email: str | None = Field(default=None, description="Email для связи")
+    phone: str | None = Field(default=None, description="Номер телефона или WhatsApp")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        for key in ("username", "telegram_commercial", "telegram_personal"):
+            value = data.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if value.startswith("@"):
+                    value = value[1:]
+                data[key] = value if value else None
+        for key in ("title", "email", "phone"):
+            value = data.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                data[key] = value if value else None
+        platform = data.get("platform")
+        if isinstance(platform, str):
+            data["platform"] = platform.strip().upper()
+        return data
+
+
 class DealAuthorSummary(BaseModel):
     id: str
     platform: str
@@ -599,6 +632,7 @@ class CreatorProfileDetail(BaseModel):
     platform: str
     username: str | None = None
     title: str
+    account_status: str = "verified"
     description: str | None = None
     subscribers_count: int = 0
     static_avg_er: float = 0.0

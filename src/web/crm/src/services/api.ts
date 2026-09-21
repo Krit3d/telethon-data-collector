@@ -24,6 +24,21 @@ export interface CreatorRecord {
   hue?: number | null;
   dealscount?: number | null;
   dealsCount?: number | null;
+  title?: string | null;
+  source?: 'search' | 'manual' | string | null;
+  account_status?: string | null;
+  accountStatus?: string | null;
+}
+
+export interface ManualCreatorPayload {
+  platform: 'Instagram' | 'Telegram' | string;
+  username: string;
+  title?: string;
+  subscribers_count?: number;
+  telegram_commercial?: string;
+  telegram_personal?: string;
+  email?: string;
+  phone?: string;
 }
 
 export interface CreatorPostItem {
@@ -58,6 +73,8 @@ export interface CreatorProfileDetail {
   avg_reach: number;
   deals_count: number;
   posts: CreatorPostItem[];
+  source?: 'search' | 'manual' | string | null;
+  account_status?: string | null;
 }
 
 export interface LoginResponse {
@@ -241,6 +258,13 @@ export const api = {
 
   async getCreatorProfile(creatorId: string): Promise<CreatorProfileDetail> {
     return request<CreatorProfileDetail>(`/creators/${encodeURIComponent(creatorId)}`);
+  },
+
+  async addCreatorManual(payload: ManualCreatorPayload): Promise<CreatorRecord> {
+    return request<CreatorRecord>('/creators/manual', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
   },
 
   async exportToCrmShortlist(accountIds: string[], userEmail: string): Promise<{ added_count: number; redirect_url: string }> {
