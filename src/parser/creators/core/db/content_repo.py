@@ -110,7 +110,7 @@ async def bulk_upsert_content(
             "updated_at": now,
             "created_at": now,
             "is_embedded": values.get("is_embedded", False),
-            "is_graph_extracted": values.get("is_graph_extracted", False),
+            "graph_status": values.get("graph_status", 0),
             "has_media": values.get("has_media", False),
         }
         insert_values.append(prepared)
@@ -132,9 +132,9 @@ async def bulk_upsert_content(
                 (Content.transcription.is_(None) & stmt.excluded.transcription.isnot(None), False),
                 else_=Content.is_embedded,
             ),
-            is_graph_extracted=case(
-                (Content.transcription.is_(None) & stmt.excluded.transcription.isnot(None), False),
-                else_=Content.is_graph_extracted,
+            graph_status=case(
+                (Content.transcription.is_(None) & stmt.excluded.transcription.isnot(None), 0),
+                else_=Content.graph_status,
             ),
             updated_at=stmt.excluded.updated_at,
         ),
@@ -165,16 +165,11 @@ async def process_content_external_links(
     stmt = select(Account).where(Account.id.in_(account_ids))
     result = await session.execute(stmt)
     parent_handle_map: dict[int, str] = {}
-    parent_category_map: dict[int, str | None] = {}
 
     for account in result.scalars():
         account_id = account.id
         handle = account.username or account.platform_id or str(account_id)
         parent_handle_map[account_id] = handle
-        category = None
-        if account.raw_metadata and isinstance(account.raw_metadata, dict):
-            category = account.raw_metadata.get("category")
-        parent_category_map[account_id] = category
 
     for content_dict in content_values:
         account_id = content_dict.get("account_id")
@@ -182,7 +177,6 @@ async def process_content_external_links(
             continue
 
         parent_handle = parent_handle_map.get(account_id, str(account_id))
-        parent_category = parent_category_map.get(account_id)
 
         text_parts = []
         content = content_dict.get("content")
@@ -209,5 +203,5 @@ async def process_content_external_links(
                 continue
 
             await queue_single_account(
-                session, platform, platform_id, parent_handle, status, parent_category
+                session, platform, platform_id, parent_handle, status
             )

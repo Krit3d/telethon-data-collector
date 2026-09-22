@@ -724,7 +724,7 @@ class YouTubeParser(BasePlatformParser):
                             "has_media": True,
                             "raw_metadata": raw_metadata,
                             "is_embedded": False,
-                            "is_graph_extracted": False,
+                            "graph_status": 0,
                             "updated_at": datetime.now(timezone.utc),
                         }
                     )
@@ -784,7 +784,7 @@ class YouTubeParser(BasePlatformParser):
                             "has_media": True,
                             "raw_metadata": raw_metadata,
                             "is_embedded": False,
-                            "is_graph_extracted": False,
+                            "graph_status": 0,
                             "updated_at": datetime.now(timezone.utc),
                         }
                     )

@@ -41,12 +41,6 @@ HEAVY_PROFILE_KEYS: list[str] = [
 ]
 
 
-class GeoData(BaseModel):
-    city: str | None = None
-    country: str | None = None
-    coordinates: list[float] | None = None
-
-
 class MetricsEntry(BaseModel):
     subscribers_count: int | None = None
     posts_count: int | None = None
@@ -66,14 +60,10 @@ class Contacts(BaseModel):
 class AccountMetadata(BaseModel):
     profile_url: str | None = None
     biography: str | None = None
-    category: str | None = None
-    language: str | None = None
-    location: str | None = None
     contacts: Contacts = Field(default_factory=Contacts)
     external_platforms: dict[str, str | None] = Field(default_factory=dict)
     link_in_bio: str | None = None
     website: str | None = None
-    geo_data: GeoData | None = None
     metrics_history: list[MetricsEntry] = Field(default_factory=list)
     external_links: list[str] = Field(default_factory=list)
     raw_profile_payload: dict[str, Any] | None = None
@@ -111,13 +101,6 @@ class AccountMetadata(BaseModel):
         return cls(**kwargs)
 
 
-class PostGeoData(BaseModel):
-    location_id: str | None = None
-    name: str | None = None
-    lat: float | None = None
-    lng: float | None = None
-
-
 class PlatformMetrics(BaseModel):
     likes: int | None = None
     comments_count: int | None = None
@@ -133,12 +116,9 @@ class AuthorProfileSnapshot(BaseModel):
 
 class ContentMetadata(BaseModel):
     video_url: str | None = None
-    category: str | None = None
-    language: str | None = None
     post_type: str
     post_url: str | None = None
     platform_metrics: PlatformMetrics | None = None
-    geo_data: PostGeoData | None = None
     author_profile_snapshot: AuthorProfileSnapshot | None = None
     raw_item_payload: dict[str, Any] | None = None
     extracted_at: str
@@ -194,15 +174,8 @@ class ContentMetadata(BaseModel):
             if isinstance(music_info, dict) and not data.get("music_author"):
                 data["music_author"] = music_info.get("artist_name")
 
-        location = raw_payload.get("location")
-        if isinstance(location, dict) and not data.get("geo_data"):
-            location_id = location.get("pk") or location.get("id")
-            data["geo_data"] = {
-                "location_id": str(location_id) if location_id is not None else None,
-                "name": location.get("name"),
-                "lat": location.get("lat") or location.get("latitude"),
-                "lng": location.get("lng") or location.get("longitude"),
-            }
+        if "pk" in raw_payload:
+            raw_payload.pop("id", None)
 
         if "platform_metrics" not in data:
             likes = (
@@ -253,11 +226,12 @@ class ContentMetadata(BaseModel):
         heavy_fields = [
             "video_dash_manifest",
             "image_versions2",
-            "user",
             "owner",
             "clips_metadata",
             "scrubber_spritesheet_info_candidates",
             "organic_tracking_token",
+            "strong_id__",
+            "location",
         ]
 
         for field in heavy_fields:

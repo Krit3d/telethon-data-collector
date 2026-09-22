@@ -85,9 +85,57 @@ OK_DOMAINS: frozenset[str] = frozenset({
     "odnoklassniki.ru",
 })
 
+BANNED_ACCOUNT_KEYS: frozenset[str] = frozenset({
+    "category",
+    "language",
+    "geo_data",
+    "location",
+})
+
+BANNED_CONTENT_TOP_KEYS: frozenset[str] = frozenset({
+    "category",
+    "language",
+    "geo_data",
+    "location",
+    "geo_lat",
+    "geo_long",
+    "numeric_metrics",
+    "has_links",
+    "has_hashtags",
+    "has_mentions",
+    "author",
+})
+
+BANNED_PAYLOAD_KEYS: frozenset[str] = frozenset({
+    "owner",
+    "category",
+    "geo_data",
+    "clips_metadata",
+    "video_dash_manifest",
+    "scrubber_spritesheet_info_candidates",
+    "strong_id__",
+    "location",
+    "image_versions2",
+    "organic_tracking_token",
+    "sharing_friction_info",
+    "mashup_info",
+    "commerciality_status",
+    "is_paid_partnership",
+    "comment_threading_enabled",
+    "hide_view_count",
+    "can_viewer_reshare",
+    "like_and_view_counts_disabled",
+    "can_see_insights_as_brand",
+    "is_dash_eligible",
+    "has_delayed_metadata_feedback",
+    "can_reply",
+    "can_viewer_save",
+    "is_organic_product_tagging_eligible",
+})
+
 
 def generate_deterministic_id(platform: str, platform_id: str) -> int:
-    key = f"{platform.upper()}:{platform_id.lower()}".encode("utf-8")
+    key = f"{platform.upper()}:{platform_id.strip().lower()}".encode("utf-8")
     hash_bytes = hashlib.sha256(key).digest()
     return int.from_bytes(hash_bytes[:8], byteorder="big") & 0x7FFFFFFFFFFFFFFF
 
@@ -286,6 +334,19 @@ def clean_content_raw_metadata(raw_metadata: dict[str, Any] | ContentMetadata | 
         )
         return None
 
+    for key in BANNED_CONTENT_TOP_KEYS:
+        result.pop(key, None)
+
+    payload = result.get("raw_item_payload")
+    if isinstance(payload, dict):
+        for key in BANNED_PAYLOAD_KEYS:
+            payload.pop(key, None)
+        if "pk" in payload:
+            payload.pop("id", None)
+        caption = payload.get("caption")
+        if isinstance(caption, dict) and "user" in caption:
+            payload["caption"] = {"text": caption.get("text", "")}
+
     result["schema_version"] = 1
     return result
 
@@ -312,6 +373,9 @@ def clean_account_raw_metadata(
             type(raw_metadata).__name__,
         )
         return None
+
+    for key in BANNED_ACCOUNT_KEYS:
+        result.pop(key, None)
 
     result["schema_version"] = 1
     return result

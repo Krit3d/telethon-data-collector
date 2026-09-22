@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, update, delete, or_
+from sqlalchemy import select, update, delete, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account, Content, Comment
@@ -13,6 +13,7 @@ from src.parser.creators.core.db.helpers import (
 )
 from src.parser.creators.core.db.discovery_repo import queue_discovered_accounts
 from src.parser.creators.core.schemas import MetricsEntry
+from src.parser.creators.core.text import normalize_title, normalize_description
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ async def upsert_and_deduplicate_account(
     if platform not in SUPPORTED_PLATFORMS:
         raise ValueError(f"Unsupported platform: {platform}. Must be one of {SUPPORTED_PLATFORMS}")
 
+    title = normalize_title(title)
+    description = normalize_description(description)
+
     platform_id = platform_id.strip()
     if " " in platform_id or "\n" in platform_id or len(platform_id) > 100:
         logger.warning(
@@ -42,14 +46,17 @@ async def upsert_and_deduplicate_account(
         )
         platform_id = ""
 
+    clean_platform_id = platform_id.strip().lower()
+    clean_username = username.strip().lower() if username else None
+
     conditions = []
-    if platform_id:
+    if clean_platform_id:
         conditions.append(
-            (Account.platform == platform) & (Account.platform_id == platform_id)
+            (Account.platform == platform) & (func.lower(Account.platform_id) == clean_platform_id)
         )
-    if username:
+    if clean_username:
         conditions.append(
-            (Account.platform == platform) & (Account.username == username)
+            (Account.platform == platform) & (func.lower(Account.username) == clean_username)
         )
 
     if not conditions:
@@ -58,7 +65,7 @@ async def upsert_and_deduplicate_account(
             id=generated_id,
             platform=platform,
             platform_id=platform_id or "",
-            username=username,
+            username=clean_username,
             title=title,
             description=description,
             subscribers_count=subscribers_count,
@@ -81,7 +88,7 @@ async def upsert_and_deduplicate_account(
             id=generated_id,
             platform=platform,
             platform_id=platform_id or "",
-            username=username,
+            username=clean_username,
             title=title,
             description=description,
             subscribers_count=subscribers_count,
@@ -107,7 +114,7 @@ async def upsert_and_deduplicate_account(
             )
             return account.id
         account.platform_id = platform_id or account.platform_id
-        account.username = username or account.username
+        account.username = clean_username or account.username
         account.title = title
         account.description = description if description is not None else account.description
         account.subscribers_count = (
@@ -141,7 +148,7 @@ async def upsert_and_deduplicate_account(
 
     if primary_account.status != "verified":
         primary_account.platform_id = platform_id or primary_account.platform_id
-        primary_account.username = username or primary_account.username
+        primary_account.username = clean_username or primary_account.username
         primary_account.title = title
         primary_account.description = description if description is not None else primary_account.description
         primary_account.subscribers_count = (
@@ -177,14 +184,6 @@ async def upsert_and_deduplicate_account(
 
     await session.flush()
     return primary_id
-
-
-def _extract_raw_field(raw: dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        value = raw.get(key)
-        if value is not None:
-            return value
-    return None
 
 
 def _normalize_email(value: str | None) -> str | None:
@@ -238,49 +237,6 @@ def _enrich_contacts_from_payload(
             contacts.setdefault("phones", []).append(normalized)
 
     return contacts
-
-
-def _extract_geo_from_payload(
-    payload: dict[str, Any],
-) -> tuple[str | None, str | None, dict[str, Any] | None]:
-    city: str | None = None
-    country: str | None = None
-    coords: list[float] | None = None
-
-    city_raw = _extract_raw_field(payload, "city_name", "city")
-    if isinstance(city_raw, str) and city_raw.strip():
-        city = city_raw.strip()
-
-    address_fields = ("address", "location", "place")
-    if city is None:
-        for af in address_fields:
-            addr = payload.get(af)
-            if isinstance(addr, dict):
-                inner_city = addr.get("city_name") or addr.get("city") or addr.get("name")
-                if isinstance(inner_city, str) and inner_city.strip():
-                    city = inner_city.strip()
-                    break
-
-    country_raw = _extract_raw_field(payload, "country_code", "country", "country_name")
-    if isinstance(country_raw, str) and country_raw.strip():
-        country = country_raw.strip()
-
-    lat_raw = _extract_raw_field(payload, "latitude", "lat")
-    lng_raw = _extract_raw_field(payload, "longitude", "lng", "lon")
-    if isinstance(lat_raw, (int, float)) and isinstance(lng_raw, (int, float)):
-        coords = [float(lat_raw), float(lng_raw)]
-
-    geo_data: dict[str, Any] | None = None
-    if city or country or coords:
-        geo_data = {}
-        if city:
-            geo_data["city"] = city
-        if country:
-            geo_data["country"] = country
-        if coords:
-            geo_data["coordinates"] = coords
-
-    return city, country, geo_data
 
 
 def _extract_external_url_from_payload(
@@ -348,11 +304,7 @@ async def update_account_profile_metadata(
     platform: str,
     biography: str | None,
     external_url: str | None = None,
-    location: str | None = None,
-    language: str | None = None,
-    geo_data: dict[str, Any] | None = None,
     extra_meta: dict[str, Any] | None = None,
-    category: str | None = None,
     raw_profile_payload: dict[str, Any] | None = None,
     subscribers_count: int | None = None,
     posts_count: int | None = None,
@@ -388,33 +340,7 @@ async def update_account_profile_metadata(
     if payload:
         contacts = _enrich_contacts_from_payload(contacts, payload)
 
-    found_city: str | None = None
-    found_country: str | None = None
-    extracted_geo: dict[str, Any] | None = None
-
-    if payload:
-        found_city, found_country, extracted_geo = _extract_geo_from_payload(payload)
-
-    if extracted_geo is not None:
-        if geo_data is None:
-            geo_data = extracted_geo
-        else:
-            for key in ("city", "country", "coordinates"):
-                if key not in geo_data or geo_data[key] is None:
-                    geo_data[key] = extracted_geo.get(key)
-
-    if location is None and payload:
-        parts = [p for p in (found_city, found_country) if p]
-        if parts:
-            location = ", ".join(parts)
-
     username = account.username or account.platform_id
-
-    resolved_category = category
-    if resolved_category is None:
-        resolved_category = raw_metadata_dict.get("category")
-    if resolved_category is None:
-        resolved_category = "unknown"
 
     compiled_metadata = compile_author_metadata(
         platform=platform,
@@ -422,10 +348,6 @@ async def update_account_profile_metadata(
         biography=biography,
         contacts_dict=contacts,
         extra_links=contacts.get("external_links", []),
-        location=location,
-        language=language,
-        geo_data=geo_data,
-        category=resolved_category,
         raw_profile_payload=raw_profile_payload,
     )
 
@@ -459,7 +381,8 @@ async def update_account_profile_metadata(
                     key,
                 )
 
-    account.description = biography if biography is not None else account.description
+    normalized_biography = normalize_description(biography)
+    account.description = normalized_biography if normalized_biography is not None else account.description
     account.raw_metadata = compiled_metadata.model_dump(mode="json", exclude_none=False)
 
     if subscribers_count is not None:
@@ -471,7 +394,7 @@ async def update_account_profile_metadata(
     if contacts:
         parent_handle = account.username or account.platform_id or str(account_id)
         await queue_discovered_accounts(
-            session, compiled_metadata, parent_handle, status="pending", category=resolved_category
+            session, compiled_metadata, parent_handle, status="pending"
         )
 
     return compiled_metadata.model_dump(mode="json", exclude_none=False)

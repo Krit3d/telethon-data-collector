@@ -354,7 +354,7 @@ class ThreadsParser(BasePlatformParser):
                     "shares_count": post.get("repost_count") or post.get("reposts"),
                     "has_media": bool(post.get("media") or post.get("media_url")),
                     "is_embedded": False,
-                    "is_graph_extracted": False,
+                    "graph_status": 0,
                     "raw_metadata": raw_metadata,
                     "updated_at": datetime.now(timezone.utc),
                 }

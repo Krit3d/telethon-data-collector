@@ -18,7 +18,6 @@ from src.parser.creators.platforms.instagram.helpers import (
     extract_instagram_published_at,
     extract_instagram_metrics,
 )
-from src.parser.creators.core.queries import SearchQueriesManager
 from src.parser.creators.core.schemas import (
     InstagramContentMetadata,
     PlatformMetrics,
@@ -30,7 +29,7 @@ from src.parser.creators.platforms.base import BasePlatformParser
 from .client import fetch_instagram_profile, fetch_video_transcript
 from .contacts_processor import process_and_queue_discovered_contacts
 from .fetcher import fetch_recent_instagram_posts
-from .helpers import extract_instagram_geo_data, extract_instagram_video_url, prune_instagram_payload
+from .helpers import extract_instagram_video_url, prune_instagram_payload
 from .search_cursor import InstagramSearchPaginator
 from .validators import (
     check_cyrillic_stage1,
@@ -52,34 +51,6 @@ class InstagramParser(BasePlatformParser):
         settings,
     ) -> None:
         super().__init__(session_maker, client, settings)
-        self.queries_manager = SearchQueriesManager(settings.search_queries_path)
-
-    async def _fetch_account_category(self, account_id: int) -> str | None:
-        async with self.session_maker() as session:
-            stmt = select(Account.raw_metadata).where(Account.id == account_id)
-            result = await session.execute(stmt)
-            raw_metadata = result.scalar_one_or_none()
-            if raw_metadata and isinstance(raw_metadata, dict):
-                category = raw_metadata.get("category")
-                if category and isinstance(category, str):
-                    return category
-        return None
-
-    async def _persist_fallback_category(self, account_id: int, category: str) -> None:
-        async with self.session_maker() as session:
-            stmt = select(Account.raw_metadata).where(Account.id == account_id)
-            result = await session.execute(stmt)
-            raw_meta = result.scalar_one_or_none()
-            if not isinstance(raw_meta, dict):
-                raw_meta = {}
-            raw_meta["category"] = category
-            upd = (
-                update(Account)
-                .where(Account.id == account_id)
-                .values(raw_metadata=raw_meta, updated_at=datetime.now(timezone.utc))
-            )
-            await session.execute(upd)
-            await session.commit()
 
     async def _fetch_raw_profile_payload(self, account_id: int) -> dict[str, Any] | None:
         async with self.session_maker() as session:
@@ -212,34 +183,15 @@ class InstagramParser(BasePlatformParser):
                     status="processing",
                 )
 
-                existing_category = await self._fetch_account_category(account_id)
-
-                if not existing_category or existing_category == "unknown":
-                    fallback = self.queries_manager.classify_text(f"{full_name} {biography or ''}")
-                    if fallback:
-                        logger.info(
-                            "Fallback category '%s' resolved for handle %s via keyword matching",
-                            fallback,
-                            handle,
-                        )
-                        existing_category = fallback
-                        await self._persist_fallback_category(account_id, fallback)
-
-                location_str, geo_data_dict = extract_instagram_geo_data(profile, biography, full_name)
-
                 await update_account_profile_metadata(
                     session=session,
                     account_id=account_id,
                     platform="INSTAGRAM",
                     biography=biography or "",
                     external_url=profile.get("external_url"),
-                    category=existing_category,
                     subscribers_count=subscribers,
                     raw_profile_payload=profile,
                     posts_count=profile.get("media_count") or profile.get("posts_count"),
-                    language="ru",
-                    location=location_str,
-                    geo_data=geo_data_dict,
                 )
 
                 await session.commit()
@@ -278,34 +230,15 @@ class InstagramParser(BasePlatformParser):
                 status="processing",
             )
 
-            existing_category = await self._fetch_account_category(account_id)
-
-            if not existing_category or existing_category == "unknown":
-                fallback = self.queries_manager.classify_text(f"{full_name} {biography or ''}")
-                if fallback:
-                    logger.info(
-                        "Fallback category '%s' resolved for handle %s via keyword matching",
-                        fallback,
-                        handle,
-                    )
-                    existing_category = fallback
-                    await self._persist_fallback_category(account_id, fallback)
-
-            location_str, geo_data_dict = extract_instagram_geo_data(profile, biography, full_name)
-
             await update_account_profile_metadata(
                 session=session,
                 account_id=account_id,
                 platform="INSTAGRAM",
                 biography=biography or "",
                 external_url=profile.get("external_url"),
-                category=existing_category,
                 subscribers_count=subscribers,
                 raw_profile_payload=profile,
                 posts_count=profile.get("media_count") or profile.get("posts_count"),
-                language="ru",
-                location=location_str,
-                geo_data=geo_data_dict,
             )
 
             await session.commit()
@@ -418,7 +351,6 @@ class InstagramParser(BasePlatformParser):
                             )
 
                             meta: dict[str, Any] = {
-                                "category": category,
                                 "discovery_query": query,
                                 "search_metadata": profile,
                             }
@@ -475,8 +407,6 @@ class InstagramParser(BasePlatformParser):
             account_id,
             platform_id,
         )
-
-        account_category = await self._fetch_account_category(account_id) or "unknown"
 
         profile = await self._fetch_raw_profile_payload(account_id)
         if profile is None:
@@ -548,31 +478,6 @@ class InstagramParser(BasePlatformParser):
                 hashtags = re.findall(r"#(\w+)", description)
 
             aggregated_text += " " + description + " " + " ".join(hashtags)
-
-        if not account_category or account_category == "unknown":
-            rich_text = f"{author_profile_snapshot.title or ''} {profile_biography or ''} {aggregated_text}"
-            fallback = self.queries_manager.classify_text(rich_text)
-            if fallback:
-                account_category = fallback
-                await self._persist_fallback_category(account_id, fallback)
-
-        if not account_category or account_category == "unknown":
-            discovery_query_text = None
-            async with self.session_maker() as session:
-                stmt = select(Account.raw_metadata).where(Account.id == account_id)
-                result = await session.execute(stmt)
-                raw_meta = result.scalar_one_or_none()
-                if isinstance(raw_meta, dict):
-                    discovery_query_text = raw_meta.get("discovery_query")
-            if discovery_query_text and isinstance(discovery_query_text, str):
-                fallback = self.queries_manager.classify_text(discovery_query_text)
-                if fallback:
-                    account_category = fallback
-                    await self._persist_fallback_category(account_id, fallback)
-
-        if not account_category or account_category == "unknown":
-            account_category = "lifestyle"
-            await self._persist_fallback_category(account_id, "lifestyle")
 
         has_cyrillic = (
             check_cyrillic_stage1(profile_biography, author_profile_snapshot.title)
@@ -767,7 +672,6 @@ class InstagramParser(BasePlatformParser):
         await process_and_queue_discovered_contacts(
             session_maker=self.session_maker,
             parent_username=profile.get("username", ""),
-            account_category=account_category,
             profile_biography=profile_biography,
             profile_external_url=profile_external_url,
             items_data=items_data,
@@ -793,16 +697,10 @@ class InstagramParser(BasePlatformParser):
                 plays=views,
             )
 
-            post_category = self.queries_manager.classify_text(item_data.get("combined_text", ""))
-            if not post_category or post_category == "unknown":
-                post_category = account_category
-
             tx_status = "completed" if item_id in already_transcribed else item_data.get("transcription_status", "pending")
 
             content_metadata = InstagramContentMetadata.create_with_timestamp(
                 video_url=video_url,
-                category=post_category,
-                language="ru",
                 post_type=post_type,
                 platform_metrics=platform_metrics,
                 author_profile_snapshot=author_profile_snapshot,
@@ -828,7 +726,7 @@ class InstagramParser(BasePlatformParser):
                     "shares_count": None,
                     "has_media": True,
                     "is_embedded": False,
-                    "is_graph_extracted": False,
+                    "graph_status": 0,
                     "raw_metadata": raw_meta_dict,
                     "updated_at": datetime.now(timezone.utc),
                 }
@@ -841,22 +739,14 @@ class InstagramParser(BasePlatformParser):
                     content_values=final_content_values,
                 )
 
-                location_str, geo_data_dict = extract_instagram_geo_data(
-                    profile, profile_biography, author_profile_snapshot.title or "",
-                )
-
                 await update_account_profile_metadata(
                     session=session,
                     account_id=account_id,
                     platform="INSTAGRAM",
                     biography=profile_biography or "",
                     external_url=profile_external_url,
-                    category=account_category,
                     raw_profile_payload=profile,
                     posts_count=profile.get("media_count") or profile.get("posts_count"),
-                    language="ru",
-                    location=location_str,
-                    geo_data=geo_data_dict,
                 )
 
                 await session.commit()
@@ -865,3 +755,4 @@ class InstagramParser(BasePlatformParser):
                     len(final_content_values),
                     account_id,
                 )
+

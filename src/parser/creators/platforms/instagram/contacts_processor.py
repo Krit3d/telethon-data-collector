@@ -28,7 +28,6 @@ def _extract_username_str(element: str | dict[str, Any]) -> str | None:
 async def process_and_queue_discovered_contacts(
     session_maker: Any,
     parent_username: str,
-    account_category: str,
     profile_biography: str | None,
     profile_external_url: str | None,
     items_data: list[dict[str, Any]],
@@ -151,7 +150,6 @@ async def process_and_queue_discovered_contacts(
                         username=parent_username,
                         biography=profile_biography,
                         contacts_dict=aggregated_contacts,
-                        category=account_category,
                         context_text=context_text,
                     )
                     await queue_discovered_accounts(
@@ -159,7 +157,6 @@ async def process_and_queue_discovered_contacts(
                         metadata=compiled_meta,
                         parent_handle=parent_username,
                         status="pending",
-                        category=account_category,
                     )
                 if aggregated_mentions:
                     await queue_discovered_mentions(
@@ -168,7 +165,6 @@ async def process_and_queue_discovered_contacts(
                         mentions=list(aggregated_mentions),
                         parent_handle=parent_username,
                         status="pending",
-                        category=account_category,
                     )
                 await session.commit()
         except Exception as e:

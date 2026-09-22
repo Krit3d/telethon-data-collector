@@ -16,13 +16,18 @@ from src.parser.creators.core.db import (
     upsert_virtual_bio_post,
 )
 
+from src.parser.creators.core.contacts import (
+    compile_author_metadata_dict,
+    extract_mentions,
+    parse_profile_contacts,
+)
+
 from src.parser.creators.platforms.instagram.helpers import (
     extract_instagram_subscribers,
     extract_instagram_content_text,
     extract_instagram_published_at,
     extract_instagram_video_url,
     extract_instagram_metrics,
-    build_instagram_author_metadata,
 )
 
 __all__ = [
@@ -38,10 +43,12 @@ __all__ = [
     "queue_discovered_mentions",
     "queue_single_account",
     "upsert_virtual_bio_post",
+    "compile_author_metadata_dict",
+    "extract_mentions",
+    "parse_profile_contacts",
     "extract_instagram_subscribers",
     "extract_instagram_content_text",
     "extract_instagram_published_at",
     "extract_instagram_video_url",
     "extract_instagram_metrics",
-    "build_instagram_author_metadata",
 ]

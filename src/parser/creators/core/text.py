@@ -127,6 +127,32 @@ def is_slop_or_theme_page(username: str | None, biography: str | None) -> bool:
     return any(stop_word in search_text for stop_word in SLOP_STOP_WORDS)
 
 
+def normalize_title(text: str | None) -> str:
+    if not text:
+        return ""
+    cleaned = text.replace("\u200b", "")
+    return " ".join(cleaned.split())
+
+
+def normalize_description(text: str | None) -> str | None:
+    if text is None:
+        return None
+    cleaned = text.replace("\u200b", "")
+    lines = [" ".join(line.split()) for line in cleaned.splitlines()]
+    collapsed: list[str] = []
+    for line in lines:
+        if not line and collapsed and not collapsed[-1]:
+            continue
+        collapsed.append(line)
+    while collapsed and not collapsed[0]:
+        collapsed.pop(0)
+    while collapsed and not collapsed[-1]:
+        collapsed.pop()
+    if not collapsed:
+        return None
+    return "\n".join(collapsed)
+
+
 # ---------------------------------------------------------------------------
 # Timezone-aware datetime parser
 # ---------------------------------------------------------------------------

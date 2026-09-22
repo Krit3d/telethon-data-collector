@@ -36,7 +36,6 @@ from src.parser.creators.core.utils import (
     upsert_and_deduplicate_account,
     update_account_profile_metadata,
     bulk_upsert_content,
-    upsert_virtual_bio_post,
     parse_profile_contacts,
     parse_published_at,
     compile_author_metadata_dict,
@@ -312,20 +311,6 @@ class TikTokParser(BasePlatformParser):
             profile_biography: str | None = profile.get("signature") or profile.get("bio")
             contacts_dict: dict[str, Any] = parse_profile_contacts(profile_biography, None)
 
-            # Extract geo data (region/city/country) from profile
-            geo_data: dict[str, Any] | None = None
-            region = profile.get("region")
-            city = profile.get("city")
-            country = profile.get("country")
-            if region or city or country:
-                geo_data = {}
-                if region:
-                    geo_data["region"] = str(region)
-                if city:
-                    geo_data["city"] = str(city)
-                if country:
-                    geo_data["country"] = str(country)
-
             # Extract official website link
             extra_links: list[str] = []
             website = profile.get("websiteUrl") or profile.get("website")
@@ -338,9 +323,6 @@ class TikTokParser(BasePlatformParser):
                 biography=profile_biography,
                 contacts_dict=contacts_dict,
                 extra_links=extra_links if extra_links else None,
-                language=profile.get("language"),
-                location=profile.get("location"),
-                geo_data=geo_data,
             )
         else:
             logger.warning(

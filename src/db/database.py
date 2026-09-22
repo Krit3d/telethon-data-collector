@@ -22,6 +22,10 @@ from src.db.models import Base, Account, Content
 
 logger = logging.getLogger(__name__)
 
+PROTECTED_ACCOUNT_STATUSES: frozenset[str] = frozenset(
+    {"verified", "parsed", "ready_for_parsing"}
+)
+
 
 def with_retry_on_deadlock(
     max_retries: int = 3,
@@ -315,30 +319,74 @@ class Database:
 
     @with_retry_on_deadlock()
     async def upsert_account(self, account_data: dict[str, Any]) -> Account:
-        stmt = insert(Account).values(**account_data)
-        update_columns = {
-            "username": stmt.excluded.username,
-            "title": stmt.excluded.title,
-            "description": stmt.excluded.description,
-            "subscribers_count": stmt.excluded.subscribers_count,
-            "access_hash": stmt.excluded.access_hash,
-            "is_author_blog": stmt.excluded.is_author_blog,
-            "updated_at": stmt.excluded.updated_at,
-            "status": case(
-                (
-                    Account.status.in_(["parsed", "ready_for_parsing"]),
-                    Account.status,
-                ),
-                else_=stmt.excluded.status,
-            ),
-        }
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["id"],
-            set_=update_columns,
-        ).returning(Account)
+        platform = account_data.get("platform")
+        raw_username = account_data.get("username")
+        clean_username = (
+            raw_username.strip().lower()
+            if isinstance(raw_username, str) and raw_username.strip()
+            else None
+        )
+        incoming_id = account_data.get("id")
 
         async with self.async_session() as session:
             async with session.begin():
+                if platform and clean_username:
+                    lookup_stmt = select(Account).where(
+                        Account.platform == platform,
+                        func.lower(Account.username) == clean_username,
+                    )
+                    lookup_result = await session.execute(lookup_stmt)
+                    existing = lookup_result.scalars().first()
+
+                    if existing is not None and existing.id != incoming_id:
+                        update_values = {
+                            key: value
+                            for key, value in account_data.items()
+                            if key not in ("id", "status")
+                        }
+                        if incoming_id is not None:
+                            update_values["platform_id"] = str(incoming_id)
+                        update_values["updated_at"] = datetime.now(timezone.utc)
+                        if "status" in account_data:
+                            update_values["status"] = case(
+                                (
+                                    Account.status.in_(PROTECTED_ACCOUNT_STATUSES),
+                                    Account.status,
+                                ),
+                                else_=account_data["status"],
+                            )
+                        await session.execute(
+                            update(Account)
+                            .where(Account.id == existing.id)
+                            .values(**update_values)
+                        )
+                        await session.flush()
+                        await session.refresh(existing)
+                        logger.debug("Merged account by username: %s", existing)
+                        return existing
+
+                stmt = insert(Account).values(**account_data)
+                update_columns = {
+                    "username": stmt.excluded.username,
+                    "title": stmt.excluded.title,
+                    "description": stmt.excluded.description,
+                    "subscribers_count": stmt.excluded.subscribers_count,
+                    "access_hash": stmt.excluded.access_hash,
+                    "is_author_blog": stmt.excluded.is_author_blog,
+                    "updated_at": stmt.excluded.updated_at,
+                    "status": case(
+                        (
+                            Account.status.in_(PROTECTED_ACCOUNT_STATUSES),
+                            Account.status,
+                        ),
+                        else_=stmt.excluded.status,
+                    ),
+                }
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["id"],
+                    set_=update_columns,
+                ).returning(Account)
+
                 result = await session.execute(stmt)
                 account = result.scalar_one()
 

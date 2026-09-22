@@ -3,9 +3,8 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-from ..schemas import AccountMetadata, Contacts, GeoData
+from ..schemas import AccountMetadata, Contacts
 from .constants import (
-    GENERIC_CATEGORIES,
     LINK_IN_BIO_DOMAINS,
     PLATFORM_PROFILE_LINKS,
     SOCIAL_MEDIA_DOMAINS,
@@ -27,14 +26,6 @@ def _as_str_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if item and isinstance(item, str)]
-
-
-def _normalize_category_slug(category_name: str) -> str:
-    slug = category_name.lower()
-    slug = re.sub(r"[^a-z0-9\s/\-&]", "", slug)
-    slug = re.sub(r"[\s/\-&]+", "_", slug)
-    slug = slug.strip("_")
-    return slug
 
 
 def extract_mentions(text: str | None) -> list[str]:
@@ -108,10 +99,6 @@ def compile_author_metadata(
     biography: str | None,
     contacts_dict: dict[str, Any],
     extra_links: list[str] | None = None,
-    location: str | None = None,
-    language: str | None = None,
-    geo_data: dict[str, Any] | None = None,
-    category: str | None = None,
     raw_profile_payload: dict[str, Any] | None = None,
     context_text: str | None = None,
     posts_content: list[str] | None = None,
@@ -202,35 +189,13 @@ def compile_author_metadata(
             if pl_key not in external_platforms or external_platforms[pl_key] is None:
                 external_platforms[pl_key] = pl_val
 
-    geo_data_model: GeoData | None = None
-    if geo_data and isinstance(geo_data, dict):
-        geo_data_model = GeoData(
-            city=geo_data.get("city"),
-            country=geo_data.get("country"),
-            coordinates=geo_data.get("coordinates"),
-        )
-
-    final_category = category
-    if isinstance(raw_profile_payload, dict):
-        category_name = raw_profile_payload.get("category_name")
-        if not isinstance(category_name, str) or not category_name.strip():
-            category_name = raw_profile_payload.get("category")
-        if isinstance(category_name, str) and category_name.strip():
-            normalized_name = category_name.strip().lower()
-            if normalized_name not in GENERIC_CATEGORIES:
-                final_category = _normalize_category_slug(category_name)
-
     return AccountMetadata(
         profile_url=profile_url or None,
         biography=biography or None,
-        category=final_category,
-        language=language,
-        location=location,
         contacts=contacts,
         external_platforms=external_platforms,
         link_in_bio=link_in_bio,
         website=website,
-        geo_data=geo_data_model,
         external_links=remaining_external_links,
         metrics_history=[],
         raw_profile_payload=raw_profile_payload,
@@ -244,10 +209,6 @@ def compile_author_metadata_dict(
     biography: str | None,
     contacts_dict: dict[str, Any],
     extra_links: list[str] | None = None,
-    location: str | None = None,
-    language: str | None = None,
-    geo_data: dict[str, Any] | None = None,
-    category: str | None = None,
     raw_profile_payload: dict[str, Any] | None = None,
     context_text: str | None = None,
     posts_content: list[str] | None = None,
@@ -259,10 +220,6 @@ def compile_author_metadata_dict(
         biography=biography,
         contacts_dict=contacts_dict,
         extra_links=extra_links,
-        location=location,
-        language=language,
-        geo_data=geo_data,
-        category=category,
         raw_profile_payload=raw_profile_payload,
         context_text=context_text,
         posts_content=posts_content,

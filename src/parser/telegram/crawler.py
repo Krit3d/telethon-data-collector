@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyError,
@@ -254,17 +254,29 @@ class Worker(BaseTelegramWorker):
         if not active_client:
             raise RuntimeError("Telegram client is not initialized")
 
-        # Check if account already exists in DB
-        # Filter by TELEGRAM platform to prevent status leakage
+        clean_username = (rec_channel.username or "").strip().lower()
         async with self.db.async_session() as session:
-            stmt = select(AccountModel).where(
-                AccountModel.id == rec_channel.id,
-                AccountModel.platform == "TELEGRAM",
-            )
+            conditions = [
+                and_(
+                    AccountModel.platform == "TELEGRAM",
+                    AccountModel.id == rec_channel.id,
+                )
+            ]
+            if clean_username:
+                conditions.append(
+                    and_(
+                        AccountModel.platform == "TELEGRAM",
+                        func.lower(AccountModel.username) == clean_username,
+                    )
+                )
+            stmt = select(AccountModel).where(or_(*conditions))
             result = await session.execute(stmt)
-            existing = result.scalar_one_or_none()
+            existing = result.scalars().first()
 
             if existing is not None:
+                if existing.id != rec_channel.id:
+                    existing.platform_id = str(rec_channel.id)
+                    await session.commit()
                 logger.debug(
                     "Worker %d: Account %s already in DB, skipping",
                     self.worker_id,

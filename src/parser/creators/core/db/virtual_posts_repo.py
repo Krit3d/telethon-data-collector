@@ -49,7 +49,7 @@ async def upsert_virtual_bio_post(
         shares_count=None,
         has_media=False,
         is_embedded=False,
-        is_graph_extracted=False,
+        graph_status=0,
         raw_metadata=processed_metadata,
         updated_at=now,
     )

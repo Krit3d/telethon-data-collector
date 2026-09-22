@@ -153,6 +153,7 @@ async def _extract_account_metadata(
 
     account_data: dict[str, Any] = {
         "id": int(entity.id),
+        "platform": "TELEGRAM",
         "username": normalize_username(getattr(entity, "username", None)),
         "title": getattr(entity, "title", "") or "",
         "description": description,

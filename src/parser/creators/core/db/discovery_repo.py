@@ -2,7 +2,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DatabaseError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,7 +24,6 @@ async def queue_discovered_accounts(
     metadata: AccountMetadata | dict[str, Any],
     parent_handle: str,
     status: str = "pending",
-    category: str | None = None,
 ) -> None:
     if isinstance(metadata, dict):
         metadata = convert_dict_to_account_metadata(metadata)
@@ -45,7 +44,7 @@ async def queue_discovered_accounts(
         if key not in queued_accounts:
             queued_accounts.add(key)
             await queue_single_account(
-                session, platform, platform_id, parent_handle, status, category
+                session, platform, platform_id, parent_handle, status
             )
 
     for handle in telegram_channels:
@@ -114,14 +113,13 @@ async def queue_discovered_mentions(
     mentions: list[str],
     parent_handle: str,
     status: str = "pending",
-    category: str | None = None,
 ) -> None:
     for username in mentions:
         if not username or len(username) < 3:
             continue
         if username.startswith("+"):
             continue
-        await queue_single_account(session, platform, username, parent_handle, status, category)
+        await queue_single_account(session, platform, username, parent_handle, status)
 
 
 async def queue_single_account(
@@ -130,45 +128,52 @@ async def queue_single_account(
     platform_id: str,
     parent_handle: str,
     status: str = "pending",
-    category: str | None = None,
 ) -> None:
+    stripped_id = platform_id.strip()
+    if not stripped_id:
+        return
+
+    clean_id = stripped_id.lower()
+
     stmt = select(Account).where(
         Account.platform == platform,
-        Account.platform_id == platform_id,
+        or_(
+            func.lower(Account.platform_id) == clean_id,
+            func.lower(Account.username) == clean_id,
+        ),
     )
     result = await session.execute(stmt)
     existing = result.scalar_one_or_none()
 
-    if not existing:
-        generated_id = generate_deterministic_id(platform, platform_id)
-        raw_metadata = {"category": category} if category else None
+    if existing:
+        return
 
-        insert_stmt = insert(Account).values(
-            id=generated_id,
-            platform=platform,
-            platform_id=platform_id,
-            username=platform_id,
-            title=platform_id,
-            status=status,
-            raw_metadata=raw_metadata,
+    generated_id = generate_deterministic_id(platform, clean_id)
+
+    insert_stmt = insert(Account).values(
+        id=generated_id,
+        platform=platform,
+        platform_id=clean_id,
+        username=clean_id,
+        title=clean_id,
+        status=status,
+    )
+    insert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=["id"])
+
+    try:
+        async with session.begin_nested():
+            await session.execute(insert_stmt)
+            await session.flush()
+        logger.info(
+            "[SPIDER] Queued discovered %s account: %s from bio of parent account %s.",
+            platform,
+            clean_id,
+            parent_handle,
         )
-        insert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=["id"])
-
-        try:
-            async with session.begin_nested():
-                await session.execute(insert_stmt)
-                await session.flush()
-            logger.info(
-                "[SPIDER] Queued discovered %s account: %s from bio of parent account %s (category: %s).",
-                platform,
-                platform_id,
-                parent_handle,
-                category or "none",
-            )
-        except DatabaseError as e:
-            logger.warning(
-                "Database error while queuing %s account %s: %s",
-                platform,
-                platform_id,
-                e,
-            )
+    except DatabaseError as e:
+        logger.warning(
+            "Database error while queuing %s account %s: %s",
+            platform,
+            clean_id,
+            e,
+        )

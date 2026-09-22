@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import logging
 from datetime import datetime, timezone
 from urllib.parse import unquote
@@ -40,6 +39,7 @@ from src.parser.creators.core.contacts import (
     normalize_phone,
     normalize_telegram_handle,
 )
+from src.parser.creators.core.db.helpers import generate_deterministic_id
 from src.parser.creators.sc_client import ScrapeCreatorsClient
 
 logger = logging.getLogger(__name__)
@@ -147,11 +147,6 @@ async def export_to_shortlist(
     )
 
 
-def _deterministic_creator_id(key: str) -> int:
-    digest = hashlib.sha256(key.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], byteorder="big") & 0x7FFFFFFFFFFFFFFF
-
-
 def _build_contacts_metadata(payload: CrmManualCreatorRequest) -> dict[str, list[str]]:
     contacts: dict[str, list[str]] = {}
     if payload.telegram_commercial:
@@ -186,8 +181,11 @@ async def add_creator_manual(
     if not clean_username:
         raise HTTPException(status_code=400, detail="Username не может быть пустым")
 
-    platform_id: str
-    account_id: int
+    if platform not in ("INSTAGRAM", "TELEGRAM"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только INSTAGRAM и TELEGRAM")
+
+    account_id = generate_deterministic_id(platform, clean_username)
+    platform_id: str = str(account_id)
     title: str = clean_username
     scraped_title: str | None = None
     subscribers_count: int | None = payload.subscribers_count
@@ -203,14 +201,7 @@ async def add_creator_manual(
             user = data.get("user") or data if isinstance(data, dict) else {}
             raw_pid = user.get("id") or user.get("pk") or user.get("media_id")
             if raw_pid is not None:
-                try:
-                    account_id = int(raw_pid)
-                except (ValueError, TypeError):
-                    account_id = _deterministic_creator_id(f"instagram:{clean_username}")
-                platform_id = str(account_id)
-            else:
-                account_id = _deterministic_creator_id(f"instagram:{clean_username}")
-                platform_id = str(account_id)
+                platform_id = str(raw_pid).strip()
             scraped_title = user.get("full_name") or user.get("title") or user.get("name")
             scraped_subs = user.get("edge_followed_by")
             if isinstance(scraped_subs, dict):
@@ -224,17 +215,10 @@ async def add_creator_manual(
                     pass
         except Exception:
             logger.warning(
-                "Scrape Creators profile fetch failed for %s, falling back to deterministic id",
+                "Scrape Creators profile fetch failed for %s, using deterministic id",
                 clean_username,
                 exc_info=True,
             )
-            account_id = _deterministic_creator_id(f"instagram:{clean_username}")
-            platform_id = str(account_id)
-    elif platform == "TELEGRAM":
-        account_id = _deterministic_creator_id(f"telegram:{clean_username}")
-        platform_id = str(account_id)
-    else:
-        raise HTTPException(status_code=400, detail="Поддерживаются только INSTAGRAM и TELEGRAM")
 
     if payload.title:
         title = payload.title
@@ -250,7 +234,7 @@ async def add_creator_manual(
     async with db.async_session() as session:
         existing_stmt = select(Account).where(
             or_(
-                and_(Account.platform == platform, Account.platform_id == platform_id),
+                and_(Account.platform == platform, func.lower(Account.platform_id) == platform_id.lower()),
                 and_(Account.platform == platform, func.lower(Account.username) == clean_username),
             )
         )
