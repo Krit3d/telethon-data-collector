@@ -21,6 +21,9 @@ _KEYS_TO_KEEP = {
     "video_url",
     "coauthor_producers",
     "edge_media_to_tagged_user",
+    "usertags",
+    "tagged_users",
+    "carousel_media",
     "clips_metadata",
     "accessibility_caption",
     "hashtags",
@@ -145,6 +148,19 @@ def prune_instagram_payload(item: dict[str, Any]) -> dict[str, Any]:
     for key in _KEYS_TO_KEEP:
         if key in item:
             pruned[key] = item[key]
+
+    carousel_media = item.get("carousel_media")
+    if isinstance(carousel_media, list):
+        pruned_slides: list[dict[str, Any]] = []
+        for slide in carousel_media:
+            if not isinstance(slide, dict):
+                continue
+            pruned_slide: dict[str, Any] = {}
+            for slide_key in ("pk", "media_type", "usertags"):
+                if slide_key in slide:
+                    pruned_slide[slide_key] = slide[slide_key]
+            pruned_slides.append(pruned_slide)
+        pruned["carousel_media"] = pruned_slides
 
     caption = item.get("caption")
     if caption is not None:

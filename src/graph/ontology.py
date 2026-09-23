@@ -54,7 +54,6 @@ class PostType(StrEnum):
     reel = "reel"
     short = "short"
     tiktok = "tiktok"
-    video = "video"
 
 
 class ToneType(StrEnum):

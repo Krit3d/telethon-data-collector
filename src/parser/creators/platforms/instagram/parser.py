@@ -4,7 +4,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import cast, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 
 from src.db.models import Account, Content
 from src.parser.creators.core.db.accounts_repo import (
@@ -23,6 +24,7 @@ from src.parser.creators.core.schemas import (
     PlatformMetrics,
     AuthorProfileSnapshot,
 )
+from src.parser.creators.core.media_detector import detect_content_media
 from src.parser.creators.core.text import is_slop_or_theme_page
 from src.parser.creators.platforms.base import BasePlatformParser
 
@@ -530,30 +532,23 @@ class InstagramParser(BasePlatformParser):
 
             content_text: str | None = extract_instagram_content_text(item)
 
-            is_video = (
-                item.get("media_type") == 2
-                or item.get("is_video") is True
-                or (
-                    isinstance(item.get("video_versions"), list)
-                    and bool(item.get("video_versions"))
-                )
+            raw_duration = item.get("video_duration") or item.get("duration")
+            if raw_duration is not None:
+                try:
+                    duration: float | None = float(raw_duration)
+                except (ValueError, TypeError):
+                    duration = None
+            else:
+                duration = None
+
+            post_type, has_media = detect_content_media(
+                platform="INSTAGRAM", payload=item, duration=duration
             )
 
-            if is_video:
+            if has_media is True:
                 video_url = extract_instagram_video_url(item)
-                raw_duration = item.get("video_duration") or item.get("duration")
-                if raw_duration is not None:
-                    try:
-                        duration: float | None = float(raw_duration)
-                    except (ValueError, TypeError):
-                        duration = None
-                else:
-                    duration = None
-                post_type = "reel" if duration is None or duration <= 120.0 else "post"
             else:
                 video_url = None
-                duration = None
-                post_type = "post"
 
             views = item.get("video_view_count") or item.get("play_count")
 
@@ -571,12 +566,12 @@ class InstagramParser(BasePlatformParser):
             duration_eligible = duration is None or (3.0 <= duration <= 120.0)
 
             needs_transcript = (
-                is_video
+                has_media
                 and duration_eligible
                 and not is_stale
             )
 
-            if is_video:
+            if has_media:
                 transcription_status = "pending"
                 if not needs_transcript:
                     if is_stale:
@@ -598,6 +593,7 @@ class InstagramParser(BasePlatformParser):
                 "views": views,
                 "video_url": video_url,
                 "post_type": post_type,
+                "has_media": has_media,
                 "post_url": post_url,
                 "transcript": None,
                 "hashtags": hashtags,
@@ -647,6 +643,17 @@ class InstagramParser(BasePlatformParser):
                                     .where(Content.platform_content_id == item_id)
                                     .values(
                                         transcription=cleaned,
+                                        has_media=True,
+                                        raw_metadata=Content.raw_metadata.concat(
+                                            cast(
+                                                {
+                                                    "post_type": "reel",
+                                                    "is_reel": True,
+                                                    "transcription_status": "completed",
+                                                },
+                                                JSONB,
+                                            )
+                                        ),
                                         updated_at=datetime.now(timezone.utc),
                                     )
                                 )
@@ -724,7 +731,7 @@ class InstagramParser(BasePlatformParser):
                     "reactions_count": likes,
                     "comments_count": comments,
                     "shares_count": None,
-                    "has_media": True,
+                    "has_media": item_data["has_media"],
                     "is_embedded": False,
                     "graph_status": 0,
                     "raw_metadata": raw_meta_dict,

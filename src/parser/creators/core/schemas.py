@@ -17,6 +17,30 @@ def _safe_int(value: Any) -> int | None:
     return None
 
 
+def _collect_usernames(usertags: Any, target: set[str]) -> None:
+    if isinstance(usertags, dict):
+        items = usertags.get("in")
+    elif isinstance(usertags, list):
+        items = usertags
+    else:
+        return
+
+    if not isinstance(items, list):
+        return
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        user = item.get("user")
+        if not isinstance(user, dict):
+            continue
+        username = user.get("username")
+        if isinstance(username, str):
+            normalized = username.strip().lower()
+            if normalized:
+                target.add(normalized)
+
+
 HEAVY_PROFILE_KEYS: list[str] = [
     "chaining_results",
     "facebook_pages",
@@ -153,18 +177,38 @@ class ContentMetadata(BaseModel):
                 if isinstance(u, dict) and u.get("username")
             ]
 
-        tagged_edges = raw_payload.get("edge_media_to_tagged_user")
-        if isinstance(tagged_edges, dict) and not data.get("tagged_users"):
-            edges = tagged_edges.get("edges")
-            if isinstance(edges, list):
-                data["tagged_users"] = [
-                    e.get("node", {}).get("user", {}).get("username", "")
-                    for e in edges
-                    if isinstance(e, dict)
-                    and isinstance(e.get("node"), dict)
-                    and isinstance(e["node"].get("user"), dict)
-                    and e["node"]["user"].get("username")
-                ]
+        if not data.get("tagged_users"):
+            tagged_usernames: set[str] = set()
+
+            _collect_usernames(raw_payload.get("usertags"), tagged_usernames)
+
+            carousel_media = raw_payload.get("carousel_media")
+            if isinstance(carousel_media, list):
+                for slide in carousel_media:
+                    if isinstance(slide, dict):
+                        _collect_usernames(slide.get("usertags"), tagged_usernames)
+
+            tagged_edges = raw_payload.get("edge_media_to_tagged_user")
+            if isinstance(tagged_edges, dict):
+                edges = tagged_edges.get("edges")
+                if isinstance(edges, list):
+                    for edge in edges:
+                        if not isinstance(edge, dict):
+                            continue
+                        node = edge.get("node")
+                        if not isinstance(node, dict):
+                            continue
+                        user = node.get("user")
+                        if not isinstance(user, dict):
+                            continue
+                        username = user.get("username")
+                        if isinstance(username, str):
+                            normalized = username.strip().lower()
+                            if normalized:
+                                tagged_usernames.add(normalized)
+
+            if tagged_usernames:
+                data["tagged_users"] = sorted(tagged_usernames)
 
         clips_meta = raw_payload.get("clips_metadata")
         if isinstance(clips_meta, dict) and not data.get("music_title"):
@@ -228,6 +272,7 @@ class ContentMetadata(BaseModel):
             "image_versions2",
             "owner",
             "clips_metadata",
+            "carousel_media",
             "scrubber_spritesheet_info_candidates",
             "organic_tracking_token",
             "strong_id__",

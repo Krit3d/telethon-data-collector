@@ -128,6 +128,7 @@ async def bulk_upsert_content(
             reactions_count=stmt.excluded.reactions_count,
             comments_count=stmt.excluded.comments_count,
             raw_metadata=stmt.excluded.raw_metadata,
+            has_media=Content.has_media | stmt.excluded.has_media | stmt.excluded.transcription.isnot(None),
             is_embedded=case(
                 (Content.transcription.is_(None) & stmt.excluded.transcription.isnot(None), False),
                 else_=Content.is_embedded,
