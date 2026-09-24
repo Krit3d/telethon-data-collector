@@ -1,61 +1,83 @@
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
+from src.parser.creators.core.media_detector import detect_content_media
+
+from .helpers import extract_instagram_published_at
+
 logger = logging.getLogger(__name__)
-
-
-def _published_at_utc(item: dict[str, Any]) -> datetime:
-    raw_ts = (
-        item.get("taken_at")
-        or item.get("published_at")
-        or item.get("timestamp")
-        or 0
-    )
-    try:
-        ts = int(raw_ts)
-    except (ValueError, TypeError):
-        ts = 0
-    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
 async def fetch_recent_instagram_posts(
     client: Any,
     handle: str,
-    max_items: int,
+    target_posts: int = 4,
+    target_reels: int = 8,
+    max_pages: int = 4,
+    max_total_items: int = 20,
 ) -> list[dict[str, Any]]:
-    logger.info(
-        "Fetching recent Instagram posts for handle: %s (max_items=%d)",
-        handle,
-        max_items,
-    )
+    collected_items: dict[str, dict[str, Any]] = {}
+    posts_count = 0
+    reels_count = 0
+    cursor: str | None = None
+    pages_fetched = 0
 
-    try:
+    for page in range(max_pages):
+        params: dict[str, Any] = {"handle": handle}
+        if cursor:
+            params["next_max_id"] = cursor
+
         response = await client.get(
             endpoint="/v2/instagram/user/posts",
-            params={"handle": handle},
+            params=params,
         )
-    except Exception as e:
-        logger.error(
-            "Failed to fetch posts for %s: %s",
-            handle,
-            e,
-        )
-        raise
 
-    items: list[dict[str, Any]] = response.get("items", [])
+        pages_fetched = page + 1
 
-    if not items:
-        logger.info("No items returned for handle: %s", handle)
+        items = response.get("items", []) if isinstance(response, dict) else []
+        if not items:
+            break
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            item_id = str(item.get("id") or item.get("pk") or item.get("code") or "")
+            if not item_id or item_id in collected_items:
+                continue
+
+            collected_items[item_id] = item
+
+            post_type, _ = detect_content_media(platform="INSTAGRAM", payload=item)
+            if post_type == "reel":
+                reels_count += 1
+            else:
+                posts_count += 1
+
+        if posts_count >= target_posts and reels_count >= target_reels:
+            break
+
+        more_available = response.get("more_available") if isinstance(response, dict) else False
+        cursor = response.get("next_max_id") if isinstance(response, dict) else None
+
+        if not more_available or not cursor:
+            break
+
+    if not collected_items:
+        logger.info("No Instagram posts collected for handle: %s", handle)
         return []
 
-    items.sort(key=_published_at_utc, reverse=True)
-    items = items[:max_items]
+    items_list = list(collected_items.values())
+    items_list.sort(key=extract_instagram_published_at, reverse=True)
+    result = items_list[:max_total_items]
 
     logger.info(
-        "Collected %d recent posts for handle: %s",
-        len(items),
+        "Collected %d Instagram items for handle: %s (posts=%d, reels=%d, pages=%d)",
+        len(result),
         handle,
+        posts_count,
+        reels_count,
+        pages_fetched,
     )
 
-    return items
+    return result

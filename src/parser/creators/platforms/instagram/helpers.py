@@ -123,7 +123,7 @@ def extract_instagram_video_url(node_dict: dict[str, Any]) -> str | None:
 
 def extract_instagram_metrics(
     node_dict: dict[str, Any],
-) -> tuple[int | None, int | None]:
+) -> tuple[int | None, int | None, int | None]:
     likes_count: int | None = None
     raw_likes = node_dict.get("like_count") or node_dict.get("likes")
     if raw_likes is not None:
@@ -140,7 +140,20 @@ def extract_instagram_metrics(
         except (ValueError, TypeError):
             pass
 
-    return (likes_count, comments_count)
+    views_count: int | None = None
+    raw_views = (
+        node_dict.get("play_count")
+        or node_dict.get("ig_play_count")
+        or node_dict.get("video_view_count")
+        or node_dict.get("view_count")
+    )
+    if raw_views is not None:
+        try:
+            views_count = int(raw_views)
+        except (ValueError, TypeError):
+            pass
+
+    return (likes_count, comments_count, views_count)
 
 
 def prune_instagram_payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -170,3 +183,32 @@ def prune_instagram_payload(item: dict[str, Any]) -> dict[str, Any]:
             pruned["caption"] = caption
 
     return pruned
+
+
+def extract_instagram_bio_links(profile_dict: dict[str, Any]) -> list[str]:
+    user = profile_dict.get("user")
+    user_data = user if isinstance(user, dict) else profile_dict
+    bio_links = user_data.get("bio_links") or profile_dict.get("bio_links")
+
+    links: list[str] = []
+    seen: set[str] = set()
+
+    if isinstance(bio_links, list):
+        for item in bio_links:
+            link_url = item.get("url") if isinstance(item, dict) else None
+            if isinstance(link_url, str) and link_url and "l.instagram.com" not in link_url:
+                if link_url not in seen:
+                    seen.add(link_url)
+                    links.append(link_url)
+
+    if not links:
+        fallback = user_data.get("external_url") or profile_dict.get("external_url")
+        if isinstance(fallback, str) and fallback:
+            return [fallback]
+
+    return links
+
+
+def extract_instagram_primary_external_url(profile_dict: dict[str, Any]) -> str | None:
+    links = extract_instagram_bio_links(profile_dict)
+    return links[0] if links else None

@@ -53,6 +53,13 @@ def _detect_instagram(
     transcription: str | None,
     duration: float | None,
 ) -> tuple[str, bool]:
+    is_carousel = (
+        payload.get("media_type") == 8
+        or bool(payload.get("carousel_media"))
+        or payload.get("product_type") == "carousel_container"
+    )
+    if is_carousel:
+        return "post", _instagram_has_media(payload, transcription)
     has_media = _instagram_has_media(payload, transcription)
     if not has_media:
         return "post", False

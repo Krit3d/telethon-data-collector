@@ -256,6 +256,10 @@ class Settings(BaseSettings):
         default=15,
         description="Maximum age of a post in days to be eligible for video transcription",
     )
+    enable_contact_extraction: bool = Field(
+        default=False,
+        description="Enable contact extraction pipeline during parsing",
+    )
 
     # ---- Embedding worker settings ----
     embedding_priority_mode: bool = Field(

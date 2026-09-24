@@ -1,13 +1,28 @@
 import logging
 from typing import Any
 
-from src.parser.creators.core.contacts import parse_profile_contacts, extract_mentions, compile_author_metadata
+from src.parser.creators.core.contacts import (
+    compile_author_metadata,
+    extract_mentions,
+    parse_profile_contacts,
+)
 from src.parser.creators.core.db.discovery_repo import (
     queue_discovered_accounts,
     queue_discovered_mentions,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _empty_contacts(profile_biography: str | None) -> dict[str, Any]:
+    return {
+        "emails": [],
+        "advertising_emails": [],
+        "telegram_handles": [],
+        "external_links": [],
+        "external_platforms": {},
+        "raw_bio": profile_biography or "",
+    }
 
 
 def _extract_username_str(element: str | dict[str, Any]) -> str | None:
@@ -31,7 +46,11 @@ async def process_and_queue_discovered_contacts(
     profile_biography: str | None,
     profile_external_url: str | None,
     items_data: list[dict[str, Any]],
+    enable_contact_extraction: bool = False,
 ) -> dict[str, Any]:
+    if not enable_contact_extraction:
+        return _empty_contacts(profile_biography)
+
     parent_lower = parent_username.lower()
     aggregated_emails: list[str] = []
     aggregated_advertising_emails: list[str] = []

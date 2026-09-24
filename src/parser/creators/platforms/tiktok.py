@@ -18,7 +18,6 @@ Features:
     - Cross-platform spidering queue for discovered accounts
     - Duration filtering (<= 120 seconds) for short-form content
     - Auto-generated caption (subtitle) extraction from TikTok CDN links (0 API credits)
-    - Credit-optimized transcription: skip transcription for beauty/makeup/cosmetics content
 """
 
 import logging
@@ -29,7 +28,6 @@ from sqlalchemy import select
 
 from src.config.config import Settings
 from src.db.models import Account
-from src.parser.creators.core.queries import SearchQueriesManager
 from src.parser.creators.core.utils import (
     is_russian_text,
     is_slop_or_theme_page,
@@ -91,7 +89,6 @@ class TikTokParser(BasePlatformParser):
         super().__init__(session_maker, client, settings)
         self._cached_profile: dict[str, Any] | None = None
         self._cached_handle: str | None = None
-        self._queries_manager = SearchQueriesManager(settings.search_queries_path)
 
     async def parse_profile(self, handle: str) -> int | None:
         """Fetch TikTok profile, apply Gatekeeper filters, upsert account.
@@ -264,12 +261,6 @@ class TikTokParser(BasePlatformParser):
         filters videos with duration <= 120 seconds, collects a maximum of 10
         video items, and bulk upserts into the content table.
 
-        Transcription is credit-optimized: if video description contains target
-        semantics (beauty/makeup/cosmetics keywords), transcription is skipped.
-        Otherwise, CDN subtitles are extracted (0 API credits). If CDN subtitles
-        are not available, transcription remains None (optional Scrape Creators
-        transcript endpoint not implemented to save credits).
-
         The database stores numerical platform_id, but the API requires the textual
         handle (username) which is resolved from the database. Video descriptions
         are extracted directly from the inline payload (desc/title) and mapped to
@@ -367,10 +358,6 @@ class TikTokParser(BasePlatformParser):
                 video.get("createTime") or video.get("createdAt"),
             )
 
-            # Check if transcription should be skipped (target semantics present)
-            keywords_pattern = self._queries_manager.get_compiled_keywords_pattern()
-            skip_transcription = bool(keywords_pattern.search(description))
-
             # Extract CDN subtitle URL (0 API credits)
             subtitle_url: str | None = None
             video_url: str | None = None
@@ -403,7 +390,6 @@ class TikTokParser(BasePlatformParser):
                 "raw_metadata": {
                     "author_profile_metadata": author_metadata,
                     "duration": duration,
-                    "skip_transcription": skip_transcription,
                 },
             }
             content_values.append(content_value)

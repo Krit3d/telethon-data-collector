@@ -12,7 +12,7 @@ from src.parser.creators.core.db.helpers import (
     SUPPORTED_PLATFORMS,
 )
 from src.parser.creators.core.db.discovery_repo import queue_discovered_accounts
-from src.parser.creators.core.schemas import MetricsEntry
+from src.parser.creators.core.schemas import AccountMetadata, MetricsEntry
 from src.parser.creators.core.text import normalize_title, normalize_description
 
 logger = logging.getLogger(__name__)
@@ -308,6 +308,7 @@ async def update_account_profile_metadata(
     raw_profile_payload: dict[str, Any] | None = None,
     subscribers_count: int | None = None,
     posts_count: int | None = None,
+    account_metadata: AccountMetadata | None = None,
 ) -> dict[str, Any]:
     stmt = select(Account).where(Account.id == account_id)
     result = await session.execute(stmt)
@@ -330,26 +331,30 @@ async def update_account_profile_metadata(
 
     payload: dict[str, Any] = raw_profile_payload if isinstance(raw_profile_payload, dict) else {}
 
-    if external_url is None and payload:
-        external_url = _extract_external_url_from_payload(payload)
+    if account_metadata is not None:
+        compiled_metadata = account_metadata
+        contacts: dict[str, Any] = {}
+    else:
+        if external_url is None and payload:
+            external_url = _extract_external_url_from_payload(payload)
 
-    contacts: dict[str, Any] = {}
-    if biography or external_url:
-        contacts = parse_profile_contacts(biography, external_url)
+        contacts = {}
+        if biography or external_url:
+            contacts = parse_profile_contacts(biography, external_url)
 
-    if payload:
-        contacts = _enrich_contacts_from_payload(contacts, payload)
+        if payload:
+            contacts = _enrich_contacts_from_payload(contacts, payload)
 
-    username = account.username or account.platform_id
+        username = account.username or account.platform_id
 
-    compiled_metadata = compile_author_metadata(
-        platform=platform,
-        username=username,
-        biography=biography,
-        contacts_dict=contacts,
-        extra_links=contacts.get("external_links", []),
-        raw_profile_payload=raw_profile_payload,
-    )
+        compiled_metadata = compile_author_metadata(
+            platform=platform,
+            username=username,
+            biography=biography,
+            contacts_dict=contacts,
+            extra_links=contacts.get("external_links", []),
+            raw_profile_payload=raw_profile_payload,
+        )
 
     compiled_metadata.metrics_history = _load_existing_metrics_history(raw_metadata_dict)
 

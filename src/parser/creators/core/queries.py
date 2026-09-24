@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -19,7 +18,6 @@ class CategoryQuery(BaseModel):
 
 class SearchQueriesSchema(BaseModel):
     queries: list[str] = Field(default_factory=list)
-    keywords: list[str] = Field(default_factory=list)
     categories: list[CategoryQuery] = Field(default_factory=list)
 
 
@@ -32,7 +30,6 @@ class SearchQueriesManager:
             self.json_path = Path(json_path)
 
         self._schema: SearchQueriesSchema | None = None
-        self._category_patterns: dict[str, re.Pattern[str]] | None = None
         self._load_and_validate()
 
     def _load_and_validate(self) -> None:
@@ -50,7 +47,6 @@ class SearchQueriesManager:
             logger.info(
                 f"Successfully loaded search queries from {self.json_path}. "
                 f"Found {len(self._schema.queries)} general queries, "
-                f"{len(self._schema.keywords)} keywords, "
                 f"{len(self._schema.categories)} categories."
             )
         except FileNotFoundError as e:
@@ -94,49 +90,3 @@ class SearchQueriesManager:
 
         logger.debug(f"Generated {len(balanced)} balanced queries across {len(category_queries)} categories.")
         return balanced
-
-    def get_compiled_keywords_pattern(self) -> re.Pattern[str]:
-        if self._schema is None or not self._schema.keywords:
-            return re.compile(r"(?!.*)")
-
-        escaped_keywords = [re.escape(keyword) for keyword in self._schema.keywords]
-        pattern = r"\b(" + "|".join(escaped_keywords) + r")\b"
-
-        return re.compile(pattern, re.IGNORECASE)
-
-    def get_category_patterns(self) -> dict[str, re.Pattern[str]]:
-        if self._category_patterns is not None:
-            return self._category_patterns
-
-        if self._schema is None or not self._schema.categories:
-            self._category_patterns = {}
-            return self._category_patterns
-
-        self._category_patterns = {}
-        for category in self._schema.categories:
-            if not category.queries:
-                continue
-            escaped = [re.escape(q) for q in category.queries]
-            joined = "|".join(escaped)
-            boundary_pattern = (
-                rf"(?<![a-zA-Zа-яА-ЯёЁ0-9])(?:{joined})(?![a-zA-Zа-яА-ЯёЁ0-9])"
-            )
-            self._category_patterns[category.name] = re.compile(
-                boundary_pattern, re.IGNORECASE
-            )
-
-        return self._category_patterns
-
-    def classify_text(self, text: str) -> str | None:
-        if not text:
-            return None
-
-        patterns = self.get_category_patterns()
-        if not patterns:
-            return None
-
-        for category_name, pattern in patterns.items():
-            if pattern.search(text):
-                return category_name
-
-        return None

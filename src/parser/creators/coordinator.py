@@ -31,6 +31,8 @@ MIN_SUBSCRIBERS_THRESHOLD = 5000
 
 DEFAULT_CREATORS_POLL_INTERVAL_S = 300
 
+MAX_CONSECUTIVE_DISCOVERY_MISSES = 5
+
 
 class CreatorsCoordinator:
 
@@ -102,7 +104,8 @@ class CreatorsCoordinator:
 
         balanced_queries = self._queries_manager.get_balanced_queries()
         max_attempts = len(balanced_queries)
-        attempts = 0
+        attempts: int = 0
+        consecutive_misses: int = 0
 
         parser = get_platform_parser(
             platform=active_platform,
@@ -134,6 +137,7 @@ class CreatorsCoordinator:
             )
 
             prev_pending_count = pending_count
+            attempts += 1
 
             try:
                 logger.info(
@@ -154,16 +158,21 @@ class CreatorsCoordinator:
 
             new_pending_count = await self.db.count_pending_creator_accounts(active_platform)
 
-            if new_pending_count <= prev_pending_count:
+            if new_pending_count > prev_pending_count:
+                consecutive_misses = 0
+            else:
+                consecutive_misses += 1
                 logger.info(
-                    f"Discovery loop broken early after {attempts + 1}/{max_attempts} "
-                    f"attempts: no new pending accounts added "
-                    f"(pending_count={new_pending_count}). "
-                    f"Saving API credits."
+                    f"Query '{query}' produced no new pending accounts. "
+                    f"Consecutive misses: {consecutive_misses}/{MAX_CONSECUTIVE_DISCOVERY_MISSES}"
                 )
-                break
-
-            attempts += 1
+                if consecutive_misses >= MAX_CONSECUTIVE_DISCOVERY_MISSES:
+                    logger.info(
+                        f"Discovery loop stopped after {consecutive_misses} consecutive misses "
+                        f"(attempts={attempts}/{max_attempts}, pending_count={new_pending_count}). "
+                        f"Saving API credits."
+                    )
+                    break
 
     def is_shutdown_requested(self) -> bool:
         if self._shutdown_event is None:

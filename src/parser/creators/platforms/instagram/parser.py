@@ -18,11 +18,14 @@ from src.parser.creators.platforms.instagram.helpers import (
     extract_instagram_content_text,
     extract_instagram_published_at,
     extract_instagram_metrics,
+    extract_instagram_primary_external_url,
 )
 from src.parser.creators.core.schemas import (
     InstagramContentMetadata,
     PlatformMetrics,
     AuthorProfileSnapshot,
+    AccountMetadata,
+    Contacts,
 )
 from src.parser.creators.core.media_detector import detect_content_media
 from src.parser.creators.core.text import is_slop_or_theme_page
@@ -32,7 +35,6 @@ from .client import fetch_instagram_profile, fetch_video_transcript
 from .contacts_processor import process_and_queue_discovered_contacts
 from .fetcher import fetch_recent_instagram_posts
 from .helpers import extract_instagram_video_url, prune_instagram_payload
-from .search_cursor import InstagramSearchPaginator
 from .validators import (
     check_cyrillic_stage1,
     check_cyrillic_stage2,
@@ -53,6 +55,22 @@ class InstagramParser(BasePlatformParser):
         settings,
     ) -> None:
         super().__init__(session_maker, client, settings)
+
+    def _default_account_metadata(
+        self,
+        profile: dict[str, Any],
+        biography: str | None,
+    ) -> AccountMetadata | None:
+        if self.settings.enable_contact_extraction:
+            return None
+        username = profile.get("username", "")
+        return AccountMetadata(
+            profile_url=f"https://instagram.com/{username}" if username else None,
+            biography=biography or None,
+            contacts=Contacts(),
+            raw_profile_payload=profile,
+            extracted_at=datetime.now(timezone.utc).isoformat(),
+        )
 
     async def _fetch_raw_profile_payload(self, account_id: int) -> dict[str, Any] | None:
         async with self.session_maker() as session:
@@ -94,6 +112,7 @@ class InstagramParser(BasePlatformParser):
         username = profile.get("username", "")
         biography = profile.get("biography")
         full_name = profile.get("full_name", "")
+        profile_external_url = extract_instagram_primary_external_url(profile)
 
         subscribers = extract_instagram_subscribers(profile)
 
@@ -190,10 +209,11 @@ class InstagramParser(BasePlatformParser):
                     account_id=account_id,
                     platform="INSTAGRAM",
                     biography=biography or "",
-                    external_url=profile.get("external_url"),
+                    external_url=profile_external_url,
                     subscribers_count=subscribers,
                     raw_profile_payload=profile,
                     posts_count=profile.get("media_count") or profile.get("posts_count"),
+                    account_metadata=self._default_account_metadata(profile, biography),
                 )
 
                 await session.commit()
@@ -237,10 +257,11 @@ class InstagramParser(BasePlatformParser):
                 account_id=account_id,
                 platform="INSTAGRAM",
                 biography=biography or "",
-                external_url=profile.get("external_url"),
+                external_url=profile_external_url,
                 subscribers_count=subscribers,
                 raw_profile_payload=profile,
                 posts_count=profile.get("media_count") or profile.get("posts_count"),
+                account_metadata=self._default_account_metadata(profile, biography),
             )
 
             await session.commit()
@@ -260,150 +281,141 @@ class InstagramParser(BasePlatformParser):
             category,
         )
 
-        paginator = InstagramSearchPaginator(query, max_depth=2)
-        total_discovered = 0
+        try:
+            response = await self.client.get(
+                endpoint="/v1/instagram/search/profiles",
+                params={"query": query},
+            )
 
-        while paginator.should_continue():
-            try:
-                params = paginator.get_params()
+            if isinstance(response, list):
+                profiles = [item for item in response if isinstance(item, dict)]
+            elif isinstance(response, dict):
+                profiles = []
+                for key in ("profiles", "data", "items"):
+                    value = response.get(key)
+                    if isinstance(value, list):
+                        profiles = [item for item in value if isinstance(item, dict)]
+                        break
+            else:
+                profiles = []
 
-                response = await self.client.get(
-                    endpoint="/v1/instagram/search/profiles",
-                    params=params,
+            if not profiles:
+                logger.info(
+                    "Instagram search for query='%s' returned 0 profiles",
+                    query,
                 )
+                return 0
 
-                if not response:
-                    paginator.handle_empty_response()
-                    break
+            raw_count = len(profiles)
+            valid_count = 0
+            new_count = 0
+            existing_count = 0
+            filtered_count = 0
 
-                profiles = paginator.extract_profiles(response)
-                if not profiles:
-                    paginator.handle_empty_response()
-                    break
+            async with self.session_maker() as session:
+                for profile in profiles:
+                    username = profile.get("username") or profile.get("handle")
+                    if not username or not isinstance(username, str):
+                        filtered_count += 1
+                        continue
 
-                discovered_count = 0
-                new_candidates_found = 0
+                    followers_raw = profile.get("follower_count")
+                    if followers_raw is None:
+                        followers_raw = profile.get("followers")
+                    if followers_raw is None:
+                        stats = profile.get("stats")
+                        if isinstance(stats, dict):
+                            followers_raw = stats.get("followers")
+                    if followers_raw is None:
+                        user = profile.get("user")
+                        if isinstance(user, dict):
+                            followers_raw = user.get("follower_count")
 
-                async with self.session_maker() as session:
-                    for profile in profiles:
-                        if not isinstance(profile, dict):
-                            continue
+                    try:
+                        followers = int(followers_raw) if followers_raw is not None else 0
+                    except (ValueError, TypeError):
+                        followers = 0
 
-                        username = profile.get("username") or profile.get("handle")
-                        if not username or not isinstance(username, str):
-                            logger.debug(
-                                "Skipping profile with missing username in search results: %s",
-                                profile.get("id", "unknown"),
-                            )
-                            continue
+                    if followers == 0 or not validate_follower_count(followers):
+                        filtered_count += 1
+                        continue
 
-                        followers = profile.get("follower_count") or profile.get("followers")
-                        if followers is None:
-                            followers = (
-                                profile.get("stats", {}).get("followers")
-                                or profile.get("user", {}).get("follower_count")
-                            )
+                    valid_count += 1
 
-                        try:
-                            followers = int(followers) if followers is not None else 0
-                        except (ValueError, TypeError):
-                            followers = 0
+                    profile_id = profile.get("id")
+                    full_name = profile.get("full_name", "")
+                    biography = profile.get("biography", "") or ""
 
-                        if followers == 0:
-                            logger.debug(
-                                "Skipping Instagram profile %s: follower count is 0",
-                                username,
-                            )
-                            continue
+                    exists_stmt = select(Account.id).where(
+                        Account.platform == "INSTAGRAM",
+                        or_(
+                            Account.platform_id == str(profile_id or username),
+                            Account.username == username,
+                        ),
+                    )
+                    exists_result = await session.execute(exists_stmt)
+                    already_exists = exists_result.scalar_one_or_none() is not None
 
-                        if not validate_follower_count(followers):
-                            logger.debug(
-                                "Skipping Instagram profile %s: follower count %d outside range [%d, %d]",
-                                username,
-                                followers,
-                                MIN_SUBSCRIBERS,
-                                MAX_SUBSCRIBERS,
-                            )
-                            continue
-
-                        profile_id = profile.get("id")
-                        full_name = profile.get("full_name", "")
-                        biography = profile.get("biography", "") or ""
-
-                        exists_stmt = select(Account.id).where(
-                            Account.platform == "INSTAGRAM",
-                            or_(
-                                Account.platform_id == str(profile_id or username),
-                                Account.username == username,
-                            ),
+                    try:
+                        account_id = await upsert_and_deduplicate_account(
+                            session=session,
+                            platform="INSTAGRAM",
+                            platform_id=str(profile_id or username),
+                            username=username,
+                            title=full_name or username,
+                            description=biography,
+                            subscribers_count=followers,
+                            status="pending",
                         )
-                        exists_result = await session.execute(exists_stmt)
-                        already_exists = exists_result.scalar_one_or_none() is not None
 
-                        try:
-                            account_id = await upsert_and_deduplicate_account(
-                                session=session,
-                                platform="INSTAGRAM",
-                                platform_id=str(profile_id or username),
-                                username=username,
-                                title=full_name or username,
-                                description=biography,
-                                subscribers_count=followers,
-                                status="pending",
-                            )
-
+                        if not already_exists:
                             meta: dict[str, Any] = {
                                 "discovery_query": query,
                                 "search_metadata": profile,
                             }
-
-                            if not already_exists:
-                                stmt = (
-                                    update(Account)
-                                    .where(Account.id == account_id)
-                                    .values(raw_metadata=meta, updated_at=datetime.now(timezone.utc))
-                                )
-                                await session.execute(stmt)
-
-                            discovered_count += 1
-                            if not already_exists:
-                                new_candidates_found += 1
-
-                            logger.debug(
-                                "Discovered and stored Instagram candidate: %s (account_id: %d)",
-                                username,
-                                account_id,
+                            stmt = (
+                                update(Account)
+                                .where(Account.id == account_id)
+                                .values(raw_metadata=meta, updated_at=datetime.now(timezone.utc))
                             )
+                            await session.execute(stmt)
+                            new_count += 1
+                        else:
+                            existing_count += 1
 
-                        except Exception as e:
-                            logger.error(
-                                "Failed to upsert Instagram profile %s: %s",
-                                username,
-                                e,
-                                exc_info=True,
-                            )
-                            continue
+                    except Exception as e:
+                        logger.error(
+                            "Failed to upsert Instagram profile %s: %s",
+                            username,
+                            e,
+                            exc_info=True,
+                        )
+                        continue
 
-                    await session.commit()
+                await session.commit()
 
-                paginator.register_candidates(response, new_candidates_found, discovered_count)
-                total_discovered = discovered_count
+            logger.info(
+                "Discovery stats for query='%s' (category='%s'): raw=%d | valid=%d | new=%d | existing=%d | filtered=%d",
+                query,
+                category,
+                raw_count,
+                valid_count,
+                new_count,
+                existing_count,
+                filtered_count,
+            )
+            return valid_count
 
-                if new_candidates_found > 0:
-                    return discovered_count
+        except Exception as e:
+            logger.error(
+                "Instagram candidate discovery failed for query: '%s': %s",
+                query,
+                e,
+                exc_info=True,
+            )
+            return 0
 
-                await paginator.sleep()
-
-            except Exception as e:
-                paginator.handle_error(e)
-                return 0
-
-        paginator.finalize_exhausted()
-        return total_discovered
-
-    async def parse_content(
-        self, account_id: int, platform_id: str, max_items: int = 12
-    ) -> None:
+    async def parse_content(self, account_id: int, platform_id: str, max_items: int = 20) -> None:
         logger.info(
             "Starting Instagram content parse for account_id: %d, platform_id: %s",
             account_id,
@@ -417,16 +429,23 @@ class InstagramParser(BasePlatformParser):
             raise RuntimeError(f"Could not retrieve profile metadata for {platform_id} during content parsing.")
 
         profile_biography = profile.get("biography")
-        profile_external_url = profile.get("external_url")
+        profile_external_url = extract_instagram_primary_external_url(profile)
 
         author_profile_snapshot = AuthorProfileSnapshot(
             username=profile.get("username", ""),
             title=profile.get("full_name") or profile.get("username", ""),
         )
 
+        target_handle = str(profile.get("username") or platform_id)
+
         try:
             recent_items = await fetch_recent_instagram_posts(
-                self.client, platform_id, max_items,
+                client=self.client,
+                handle=target_handle,
+                target_posts=4,
+                target_reels=8,
+                max_pages=4,
+                max_total_items=max_items,
             )
         except Exception as e:
             if getattr(e, "status", None) == 404 or "404" in str(e):
@@ -516,11 +535,17 @@ class InstagramParser(BasePlatformParser):
         now_utc = datetime.now(timezone.utc)
 
         for item in recent_items:
-            item_id = item.get("id") or item.get("media_id") or item.get("pk")
-            if not item_id:
+            raw_id = item.get("id") or (
+                f"{item['pk']}_{item.get('user', {}).get('pk', '')}"
+                if item.get("pk") and isinstance(item.get("user"), dict) and item.get("user", {}).get("pk")
+                else item.get("pk")
+            )
+            if not raw_id:
                 continue
+            item_id = str(raw_id)
 
-            description = extract_instagram_content_text(item) or ""
+            content_text = extract_instagram_content_text(item)
+            description = content_text or ""
 
             hashtags = item.get("hashtags") or []
             if not hashtags and description:
@@ -528,9 +553,7 @@ class InstagramParser(BasePlatformParser):
 
             combined_text = description + " " + " ".join(hashtags)
 
-            likes, comments = extract_instagram_metrics(item)
-
-            content_text: str | None = extract_instagram_content_text(item)
+            likes, comments, views = extract_instagram_metrics(item)
 
             raw_duration = item.get("video_duration") or item.get("duration")
             if raw_duration is not None:
@@ -550,10 +573,8 @@ class InstagramParser(BasePlatformParser):
             else:
                 video_url = None
 
-            views = item.get("video_view_count") or item.get("play_count")
-
             shortcode = item.get("code") or item.get("shortcode")
-            post_url = f"https://instagram.com/p/{shortcode}" if shortcode else None
+            post_url = f"https://instagram.com/p/{shortcode}" if shortcode else item.get("url")
 
             try:
                 published_dt = _to_utc_aware(extract_instagram_published_at(item))
@@ -682,6 +703,7 @@ class InstagramParser(BasePlatformParser):
             profile_biography=profile_biography,
             profile_external_url=profile_external_url,
             items_data=items_data,
+            enable_contact_extraction=self.settings.enable_contact_extraction,
         )
 
         final_content_values: list[dict[str, Any]] = []
@@ -754,6 +776,7 @@ class InstagramParser(BasePlatformParser):
                     external_url=profile_external_url,
                     raw_profile_payload=profile,
                     posts_count=profile.get("media_count") or profile.get("posts_count"),
+                    account_metadata=self._default_account_metadata(profile, profile_biography),
                 )
 
                 await session.commit()

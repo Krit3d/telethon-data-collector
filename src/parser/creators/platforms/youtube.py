@@ -30,7 +30,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.config.config import Settings
 from src.db.models import Account, Content
-from src.parser.creators.core.queries import SearchQueriesManager
 from src.parser.creators.core.utils import (
     upsert_and_deduplicate_account,
     update_account_profile_metadata,
@@ -97,7 +96,6 @@ class YouTubeParser(BasePlatformParser):
         super().__init__(session_maker, client, settings)
         self._cached_profile: dict[str, Any] | None = None
         self._cached_handle: str | None = None
-        self._queries_manager = SearchQueriesManager(settings.search_queries_path)
 
     def _format_handle(self, handle: str) -> str:
         """Format YouTube handle with proper prefix for API calls.
@@ -611,9 +609,6 @@ class YouTubeParser(BasePlatformParser):
             )
             author_metadata = self._build_author_profile_metadata(channel_data)
 
-            # Get compiled semantic keywords pattern from queries manager
-            keywords_pattern = self._queries_manager.get_compiled_keywords_pattern()
-
             # Process videos and fetch transcripts concurrently
             content_values: list[dict[str, Any]] = []
             transcript_tasks: list[tuple[
@@ -649,9 +644,6 @@ class YouTubeParser(BasePlatformParser):
                     content_text: str = f"{title} {description}".strip()
                 else:
                     content_text: str = title.strip()
-
-                # Check if content contains target keywords using compiled regex pattern
-                has_target_keyword: bool = bool(keywords_pattern.search(content_text))
 
                 # Build video URL for downstream audio embedding extraction
                 video_url: str = f"https://www.youtube.com/watch?v={video_id}"
@@ -704,39 +696,13 @@ class YouTubeParser(BasePlatformParser):
                     "platform_metrics": platform_metrics,
                 }
 
-                # If content has target keyword, skip transcript
-                if has_target_keyword:
-                    logger.debug(
-                        "Video %s contains target keyword, skipping transcript",
-                        video_id,
-                    )
-                    content_values.append(
-                        {
-                            "account_id": account_id,
-                            "platform_content_id": video_id,
-                            "content": content_text,
-                            "transcription": None,
-                            "published_at": published_at,
-                            "views": views,
-                            "reactions_count": reactions_count,
-                            "comments_count": comments_count,
-                            "shares_count": shares_count,
-                            "has_media": True,
-                            "raw_metadata": raw_metadata,
-                            "is_embedded": False,
-                            "graph_status": 0,
-                            "updated_at": datetime.now(timezone.utc),
-                        }
-                    )
-                else:
-                    # Queue transcript fetching task
-                    transcript_tasks.append(
-                        (video, video_id, content_text, published_at, views,
-                         reactions_count, comments_count, shares_count,
-                         raw_metadata)
-                    )
+                transcript_tasks.append(
+                    (video, video_id, content_text, published_at, views,
+                     reactions_count, comments_count, shares_count,
+                     raw_metadata)
+                )
 
-            # Fetch transcripts concurrently for videos without target keywords
+            # Fetch transcripts concurrently
             if transcript_tasks:
                 logger.info(
                     "Fetching transcripts for %d videos concurrently",
