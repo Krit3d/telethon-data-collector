@@ -1,5 +1,5 @@
 import logging
-import re
+import string
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,7 +32,7 @@ SYSTEM_ERROR_PATTERNS: tuple[str, ...] = (
     "transcription failed",
 )
 
-WHISPER_NOISE_RE = re.compile(r"^[\(\[][^\]\)]+[\)\]]$")
+PUNCTUATION: str = string.punctuation + "«»—–…“”‘’"
 
 
 def clean_and_validate_transcription(text: str | None) -> str | None:
@@ -43,8 +43,11 @@ def clean_and_validate_transcription(text: str | None) -> str | None:
     if not text:
         return None
 
-    if WHISPER_NOISE_RE.match(text):
-        return None
+    if "\n" not in text:
+        if (text.startswith("(") and text.endswith(")")) or (
+            text.startswith("[") and text.endswith("]")
+        ):
+            return None
 
     lower_text = text.lower()
     if lower_text in IGNORE_TAGS:
@@ -54,9 +57,9 @@ def clean_and_validate_transcription(text: str | None) -> str | None:
         if pattern in lower_text:
             return None
 
-    words = lower_text.split()
-    if len(words) > 8:
-        unique_ratio = len(set(words)) / len(words)
+    tokens = [cleaned for token in text.split() if (cleaned := token.strip(PUNCTUATION))]
+    if len(tokens) > 8:
+        unique_ratio = len({token.lower() for token in tokens}) / len(tokens)
         if unique_ratio < 0.30:
             return None
 
@@ -64,12 +67,6 @@ def clean_and_validate_transcription(text: str | None) -> str | None:
     if len(lines) > 4:
         duplicate_ratio = 1 - len(set(lines)) / len(lines)
         if duplicate_ratio > 0.35:
-            return None
-
-    all_words = re.findall(r'\b[a-zA-Zа-яА-ЯёЁ]{3,}\b', text)
-    if len(all_words) > 15:
-        unique_words = set(w.lower() for w in all_words)
-        if len(unique_words) / len(all_words) < 0.48:
             return None
 
     return text

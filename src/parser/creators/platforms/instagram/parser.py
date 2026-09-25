@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,7 +11,10 @@ from src.parser.creators.core.db.accounts_repo import (
     upsert_and_deduplicate_account,
     update_account_profile_metadata,
 )
-from src.parser.creators.core.db.content_repo import bulk_upsert_content
+from src.parser.creators.core.db.content_repo import (
+    bulk_upsert_content,
+    clean_and_validate_transcription,
+)
 from src.parser.creators.platforms.instagram.helpers import (
     extract_instagram_subscribers,
     extract_instagram_content_text,
@@ -44,6 +46,16 @@ from .validators import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_hashtags(description: str) -> list[str]:
+    hashtags: list[str] = []
+    for token in description.split():
+        if token.startswith("#") and len(token) > 1:
+            cleaned = token[1:].rstrip(".,!?;:)\"'`~").lower()
+            if cleaned:
+                hashtags.append(cleaned)
+    return hashtags
 
 
 class InstagramParser(BasePlatformParser):
@@ -85,6 +97,78 @@ class InstagramParser(BasePlatformParser):
             if "username" not in payload and "id" not in payload:
                 return None
             return payload
+
+    async def _update_transcription_status(self, item_id: str, status: str) -> None:
+        async with self.session_maker() as session:
+            stmt = (
+                update(Content)
+                .where(Content.platform_content_id == item_id)
+                .values(
+                    raw_metadata=Content.raw_metadata.concat(
+                        cast({"transcription_status": status}, JSONB)
+                    ),
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    async def _transcribe_and_update_content(self, item_id: str, post_url: str) -> None:
+        try:
+            result = await fetch_video_transcript(
+                self.client, self.client.global_semaphore, post_url,
+            )
+        except Exception as e:
+            logger.warning(
+                "Background transcript fetch failed for %s: %s. Leaving record for retry.",
+                item_id,
+                e,
+            )
+            return
+
+        cleaned = result.strip() if isinstance(result, str) else ""
+
+        if not cleaned:
+            logger.warning(
+                "Background transcript for %s returned empty result. Leaving record for retry.",
+                item_id,
+            )
+            return
+
+        validated_text = clean_and_validate_transcription(cleaned)
+
+        if validated_text:
+            async with self.session_maker() as session:
+                stmt = (
+                    update(Content)
+                    .where(Content.platform_content_id == item_id)
+                    .values(
+                        transcription=validated_text,
+                        has_media=True,
+                        is_embedded=False,
+                        graph_status=0,
+                        raw_metadata=Content.raw_metadata.concat(
+                            cast(
+                                {
+                                    "post_type": "reel",
+                                    "is_reel": True,
+                                    "transcription_status": "completed",
+                                },
+                                JSONB,
+                            )
+                        ),
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+            logger.info(
+                "Background transcript updated for item %s",
+                item_id,
+            )
+            return
+
+        await self._update_transcription_status(item_id, "rejected")
 
     async def parse_profile(self, handle: str) -> int | None:
         logger.info("Starting Instagram profile parse for handle: %s", handle)
@@ -496,7 +580,7 @@ class InstagramParser(BasePlatformParser):
 
             hashtags = item.get("hashtags") or []
             if not hashtags and description:
-                hashtags = re.findall(r"#(\w+)", description)
+                hashtags = _extract_hashtags(description)
 
             aggregated_text += " " + description + " " + " ".join(hashtags)
 
@@ -549,7 +633,7 @@ class InstagramParser(BasePlatformParser):
 
             hashtags = item.get("hashtags") or []
             if not hashtags and description:
-                hashtags = re.findall(r"#(\w+)", description)
+                hashtags = _extract_hashtags(description)
 
             combined_text = description + " " + " ".join(hashtags)
 
@@ -646,66 +730,6 @@ class InstagramParser(BasePlatformParser):
             if item_id not in already_transcribed
         ]
 
-        for t_item_id, t_post_url in items_needing_transcripts:
-
-            async def _background_transcribe_and_update(
-                item_id: str = t_item_id, post_url: str = t_post_url,
-            ) -> None:
-                try:
-                    result = await fetch_video_transcript(
-                        self.client, self.client.global_semaphore, post_url,
-                    )
-                    if isinstance(result, str):
-                        cleaned = result.strip()
-                        if not cleaned.lower().startswith("please provide") and cleaned:
-                            async with self.session_maker() as session:
-                                stmt = (
-                                    update(Content)
-                                    .where(Content.platform_content_id == item_id)
-                                    .values(
-                                        transcription=cleaned,
-                                        has_media=True,
-                                        raw_metadata=Content.raw_metadata.concat(
-                                            cast(
-                                                {
-                                                    "post_type": "reel",
-                                                    "is_reel": True,
-                                                    "transcription_status": "completed",
-                                                },
-                                                JSONB,
-                                            )
-                                        ),
-                                        updated_at=datetime.now(timezone.utc),
-                                    )
-                                )
-                                await session.execute(stmt)
-                                await session.commit()
-                            logger.info(
-                                "Background transcript updated for item %s",
-                                item_id,
-                            )
-                except Exception as e:
-                    logger.error(
-                        "Background transcript fetch/update failed for %s: %s",
-                        item_id,
-                        e,
-                    )
-
-            task: asyncio.Task[None] = asyncio.create_task(
-                _background_transcribe_and_update()
-            )
-            self.client.background_tasks.add(task)
-            task.add_done_callback(self.client.background_tasks.discard)
-
-        await process_and_queue_discovered_contacts(
-            session_maker=self.session_maker,
-            parent_username=profile.get("username", ""),
-            profile_biography=profile_biography,
-            profile_external_url=profile_external_url,
-            items_data=items_data,
-            enable_contact_extraction=self.settings.enable_contact_extraction,
-        )
-
         final_content_values: list[dict[str, Any]] = []
 
         for item_data in items_data:
@@ -785,4 +809,22 @@ class InstagramParser(BasePlatformParser):
                     len(final_content_values),
                     account_id,
                 )
+
+        await process_and_queue_discovered_contacts(
+            session_maker=self.session_maker,
+            parent_username=profile.get("username", ""),
+            profile_biography=profile_biography,
+            profile_external_url=profile_external_url,
+            items_data=items_data,
+            enable_contact_extraction=self.settings.enable_contact_extraction,
+        )
+
+        for t_item_id, t_post_url in items_needing_transcripts:
+            task: asyncio.Task[None] = asyncio.create_task(
+                self._transcribe_and_update_content(
+                    item_id=t_item_id, post_url=t_post_url,
+                )
+            )
+            self.client.background_tasks.add(task)
+            task.add_done_callback(self.client.background_tasks.discard)
 
