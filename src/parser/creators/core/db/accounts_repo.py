@@ -17,7 +17,7 @@ from src.parser.creators.core.text import normalize_title, normalize_description
 
 logger = logging.getLogger(__name__)
 
-FINALIZED_STATUSES: frozenset[str] = frozenset({"parsed", "rejected", "verified"})
+FINALIZED_STATUSES: frozenset[str] = frozenset({"parsed", "rejected", "verified", "business", "community"})
 NON_FINALIZED_STATUSES: frozenset[str] = frozenset({"pending", "processing"})
 
 

@@ -10,7 +10,8 @@ from sqlalchemy import select
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
-from src.db.models import Account
+from src.db.models import Account, Content
+from src.parser.creators.core.business_detector import BusinessSemanticDetector
 from src.parser.creators.core.queries import SearchQueriesManager
 from src.parser.creators.platforms import get_platform_parser
 from src.parser.creators.sc_client import ScrapeCreatorsClient
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
 STATUS_PARSED = "parsed"
+STATUS_BUSINESS = "business"
+STATUS_COMMUNITY = "community"
 STATUS_REJECTED = "rejected"
 STATUS_FAILED = "failed"
 
@@ -54,6 +57,8 @@ class CreatorsCoordinator:
         )
         self.poll_interval_s: int = settings.creators_poll_interval_s
 
+        self.business_detector = BusinessSemanticDetector(settings, margin=0.02)
+
         self._queries_manager = SearchQueriesManager(settings.search_queries_path)
         self._current_category_index: int = 0
         self._category_query_indices: dict[str, int] = {}
@@ -64,6 +69,9 @@ class CreatorsCoordinator:
             f"poll_interval_s={self.poll_interval_s}, "
             f"platform_filter={self.platform_filter}"
         )
+
+    async def close(self) -> None:
+        await self.business_detector.close()
 
     def _get_next_queries(self, count: int) -> list[tuple[str, str]]:
         balanced_queries = self._queries_manager.get_balanced_queries()
@@ -353,6 +361,10 @@ class CreatorsCoordinator:
                     result = await session.execute(stmt)
                     account_after_content = result.scalar_one_or_none()
 
+                    stmt_posts = select(Content.content).where(Content.account_id == db_account_id).order_by(Content.published_at.desc()).limit(3)
+                    posts_result = await session.execute(stmt_posts)
+                    post_texts = posts_result.scalars().all()
+
                 if account_after_content and account_after_content.status in (
                     STATUS_REJECTED,
                     STATUS_FAILED,
@@ -364,11 +376,50 @@ class CreatorsCoordinator:
                     return 0
 
                 if account_after_content and account_after_content.status == STATUS_PROCESSING:
-                    await self.db.update_creator_account_status(db_account_id, STATUS_PARSED)
-                    logger.debug(
-                        f"Successfully processed account {db_account_id} "
-                        f"({username} on {platform})"
-                    )
+                    posts_snippet = " ".join(p[:200].strip() for p in post_texts if p)
+                    text_parts: list[str] = []
+                    if account_after_content.title:
+                        text_parts.append(account_after_content.title.strip())
+                    if account_after_content.description:
+                        text_parts.append(account_after_content.description.strip())
+                    if posts_snippet:
+                        text_parts.append(posts_snippet)
+                    analysis_text = ". ".join(text_parts).strip()
+                    status_label, sim_biz, sim_comm, sim_creator = await self.business_detector.classify(analysis_text)
+                    if status_label == "business":
+                        final_status = STATUS_BUSINESS
+                    elif status_label == "community":
+                        final_status = STATUS_COMMUNITY
+                    else:
+                        final_status = STATUS_PARSED
+                    await self.db.update_creator_account_status(db_account_id, final_status)
+                    if final_status == STATUS_BUSINESS:
+                        logger.info(
+                            "Account %d (%s on %s) classified as BUSINESS (biz=%.3f, creator=%.3f). Marked as business.",
+                            db_account_id,
+                            username,
+                            platform,
+                            sim_biz,
+                            sim_creator,
+                        )
+                    elif final_status == STATUS_COMMUNITY:
+                        logger.info(
+                            "Account %d (%s on %s) classified as COMMUNITY (comm=%.3f, creator=%.3f). Marked as community.",
+                            db_account_id,
+                            username,
+                            platform,
+                            sim_comm,
+                            sim_creator,
+                        )
+                    else:
+                        logger.info(
+                            "Account %d (%s on %s) classified as CREATOR (creator=%.3f, biz=%.3f). Marked as parsed.",
+                            db_account_id,
+                            username,
+                            platform,
+                            sim_creator,
+                            sim_biz,
+                        )
 
                 return spider_count or 0
 
@@ -503,6 +554,9 @@ async def main() -> None:
     settings: Settings = load_settings()
     setup_logging(settings.log_level)
 
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     db = Database(settings.db_url, echo=False)
 
     shutdown_event: asyncio.Event = asyncio.Event()
@@ -536,10 +590,12 @@ async def main() -> None:
                 f"Error during candidate discovery phase: {e!r}",
                 exc_info=e,
             )
+            await coordinator.close()
             await db.close()
             sys.exit(1)
 
         logger.info("Closing database connections...")
+        await coordinator.close()
         await db.close()
         logger.info("Discovery phase completed. Exiting.")
         sys.exit(0)
@@ -599,6 +655,7 @@ async def main() -> None:
         logger.info("Shutting down gracefully...")
 
         logger.info("Closing database connections...")
+        await coordinator.close()
         await db.close()
 
         logger.info("Creators coordinator daemon stopped cleanly.")

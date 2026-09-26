@@ -33,6 +33,8 @@ CREATOR_STATUSES: Final[frozenset[str]] = frozenset({
     "rejected",
     "failed",
     "verified",
+    "business",
+    "community",
 })
 
 # All valid statuses across all platforms
@@ -52,6 +54,8 @@ class AccountStatus(str, Enum):
     REJECTED = "rejected"
     FAILED = "failed"
     VERIFIED = "verified"
+    BUSINESS = "business"
+    COMMUNITY = "community"
     READY_FOR_PARSING = "ready_for_parsing"
 
     def is_valid_for_platform(self, platform: str) -> bool:
@@ -85,13 +89,15 @@ class StatusTransitionError(ValueError):
 
 # Valid transition map: current_status -> set of allowed new statuses
 VALID_TRANSITIONS: dict[str, frozenset[str]] = {
-    "pending": frozenset({"processing", "rejected"}),
-    "processing": frozenset({"parsed", "rejected", "failed", "pending"}),
+    "pending": frozenset({"processing", "rejected", "business", "community"}),
+    "processing": frozenset({"parsed", "rejected", "failed", "pending", "business", "community"}),
     "parsed": frozenset({"processing", "verified"}),
     "rejected": frozenset({"pending", "processing"}),
     "failed": frozenset({"pending", "processing"}),
     "ready_for_parsing": frozenset({"processing", "rejected"}),
     "verified": frozenset(),
+    "business": frozenset(),
+    "community": frozenset(),
 }
 
 

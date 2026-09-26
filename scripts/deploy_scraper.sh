@@ -54,7 +54,6 @@ rsync -avz --delete \
     --exclude='.pytest_cache/' \
     --exclude='*.log' \
     --exclude='src/web/' \
-    --exclude='src/embeddings/' \
     --exclude='src/graph/' \
     --exclude='docker/api/' \
     --exclude='docker/crm/' \

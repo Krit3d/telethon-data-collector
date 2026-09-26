@@ -6,11 +6,15 @@ import hashlib
 import logging
 import random
 import struct
-from typing import Final
+from typing import Any, Final
 
 import httpx
 from openai import AsyncOpenAI, RateLimitError
-from qdrant_client.http import models
+
+try:
+    from qdrant_client.http import models
+except ImportError:
+    models = None
 
 from src.config.config import Settings
 
@@ -34,7 +38,7 @@ class EmbeddingGenerator:
         )
 
     @staticmethod
-    def _make_fallback_sparse(text: str) -> models.SparseVector:
+    def _make_fallback_sparse(text: str) -> Any:
         tokens = text.lower().split()
         index_map: dict[int, float] = {}
         for token in tokens:
@@ -43,17 +47,20 @@ class EmbeddingGenerator:
             weight = index_map.get(idx, 0.0) + 1.0
             index_map[idx] = weight
         sorted_items = sorted(index_map.items())
-        if not sorted_items:
-            return models.SparseVector(indices=[0], values=[0.0])
-        return models.SparseVector(
-            indices=[k for k, _ in sorted_items],
-            values=[v for _, v in sorted_items],
-        )
+        if models is not None:
+            return models.SparseVector(
+                indices=[k for k, _ in sorted_items],
+                values=[v for _, v in sorted_items],
+            )
+        return {
+            "indices": [k for k, _ in sorted_items] if sorted_items else [0],
+            "values": [v for _, v in sorted_items] if sorted_items else [0.0],
+        }
 
     async def generate_batch(
         self,
         texts: list[str],
-    ) -> tuple[list[list[float]], list[models.SparseVector]]:
+    ) -> tuple[list[list[float]], list[Any]]:
         if not texts:
             return [], []
 
@@ -92,7 +99,7 @@ class EmbeddingGenerator:
                 await asyncio.sleep(sleep_duration)
 
         dense_map: dict[int, list[float]] = {}
-        sparse_map: dict[int, models.SparseVector] = {}
+        sparse_map: dict[int, Any] = {}
 
         for local_idx, item in enumerate(payload.get("data", [])):
             global_idx = valid_indices[local_idx]
@@ -106,7 +113,7 @@ class EmbeddingGenerator:
                     dense_emb = [0.0] * EMBEDDING_DIM
             dense_map[global_idx] = dense_emb
 
-            sparse_vector: models.SparseVector | None = None
+            sparse_vector: Any = None
 
             for key in ("sparse", "sparse_embedding"):
                 raw_sparse = item.get(key)
@@ -120,20 +127,32 @@ class EmbeddingGenerator:
                             and indices
                             and values
                         ):
-                            sparse_vector = models.SparseVector(
-                                indices=[int(i) for i in indices],
-                                values=[float(v) for v in values],
-                            )
+                            if models is not None:
+                                sparse_vector = models.SparseVector(
+                                    indices=[int(i) for i in indices],
+                                    values=[float(v) for v in values],
+                                )
+                            else:
+                                sparse_vector = {
+                                    "indices": [int(i) for i in indices],
+                                    "values": [float(v) for v in values],
+                                }
                             break
                         else:
                             sorted_items = sorted(
                                 (int(k), float(v)) for k, v in raw_sparse.items()
                             )
                             if sorted_items:
-                                sparse_vector = models.SparseVector(
-                                    indices=[k for k, _ in sorted_items],
-                                    values=[v for _, v in sorted_items],
-                                )
+                                if models is not None:
+                                    sparse_vector = models.SparseVector(
+                                        indices=[k for k, _ in sorted_items],
+                                        values=[v for _, v in sorted_items],
+                                    )
+                                else:
+                                    sparse_vector = {
+                                        "indices": [k for k, _ in sorted_items],
+                                        "values": [v for _, v in sorted_items],
+                                    }
                                 break
 
             if sparse_vector is None:
@@ -142,7 +161,7 @@ class EmbeddingGenerator:
             sparse_map[global_idx] = sparse_vector
 
         result_dense: list[list[float]] = []
-        result_sparse: list[models.SparseVector] = []
+        result_sparse: list[Any] = []
         for i in range(len(texts)):
             result_dense.append(dense_map.get(i, [0.0] * EMBEDDING_DIM))
             result_sparse.append(
