@@ -108,7 +108,7 @@ async def upsert_and_deduplicate_account(
     if len(existing_accounts) == 1:
         account = existing_accounts[0]
         if account.status == "verified":
-            logger.info(
+            logger.debug(
                 "Skipping update for verified account: id=%d",
                 account.id,
             )
@@ -123,7 +123,7 @@ async def upsert_and_deduplicate_account(
         if account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
             account.status = status
         await session.flush()
-        logger.info(
+        logger.debug(
             "Updated existing account: platform=%s, platform_id=%s, id=%d",
             platform,
             platform_id,
@@ -319,7 +319,7 @@ async def update_account_profile_metadata(
         return {}
 
     if account.status == "verified":
-        logger.info(
+        logger.debug(
             "Skipping metadata update for verified account: id=%d",
             account_id,
         )
@@ -394,7 +394,7 @@ async def update_account_profile_metadata(
         account.subscribers_count = subscribers_count
     await session.flush()
 
-    logger.info("Updated profile metadata for account_id: %d", account_id)
+    logger.debug("Updated profile metadata for account_id: %d", account_id)
 
     if contacts:
         parent_handle = account.username or account.platform_id or str(account_id)

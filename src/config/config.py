@@ -232,6 +232,10 @@ class Settings(BaseSettings):
     )
 
     # ---- Creators coordinator settings ----
+    creators_max_posts_per_account: int = Field(
+        default=12,
+        description="Maximum number of posts (prioritizing reels) to fetch and store per creator account",
+    )
     creators_poll_interval_s: int = Field(
         default=300,
         description="Poll interval in seconds for the creators coordinator daemon loop",

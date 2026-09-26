@@ -129,8 +129,9 @@ class InstagramParser(BasePlatformParser):
         cleaned = result.strip() if isinstance(result, str) else ""
 
         if not cleaned:
-            logger.warning(
-                "Background transcript for %s returned empty result. Leaving record for retry.",
+            await self._update_transcription_status(item_id, "skipped_no_speech")
+            logger.info(
+                "Background transcript for %s marked as skipped_no_speech (no speech or empty result).",
                 item_id,
             )
             return
@@ -162,7 +163,7 @@ class InstagramParser(BasePlatformParser):
                 )
                 await session.execute(stmt)
                 await session.commit()
-            logger.info(
+            logger.debug(
                 "Background transcript updated for item %s",
                 item_id,
             )
@@ -171,11 +172,9 @@ class InstagramParser(BasePlatformParser):
         await self._update_transcription_status(item_id, "rejected")
 
     async def parse_profile(self, handle: str) -> int | None:
-        logger.info("Starting Instagram profile parse for handle: %s", handle)
-
         profile = await fetch_instagram_profile(self.client, handle)
         if not profile:
-            logger.warning(
+            logger.info(
                 "Instagram handle %s: profile fetch returned None (deleted or not found). Marking as rejected.",
                 handle,
             )
@@ -229,7 +228,7 @@ class InstagramParser(BasePlatformParser):
             )
 
         if not validate_follower_count(subscribers):
-            logger.warning(
+            logger.info(
                 "Instagram handle %s REJECTED: subscriber count %d is outside range [%d, %d].",
                 handle,
                 subscribers,
@@ -251,7 +250,7 @@ class InstagramParser(BasePlatformParser):
                 return account_id
 
         if is_slop_or_theme_page(username, biography or ""):
-            logger.warning(
+            logger.info(
                 "Instagram handle %s REJECTED: Matched slop/theme stop-words.",
                 handle,
             )
@@ -313,12 +312,12 @@ class InstagramParser(BasePlatformParser):
         has_cyrillic = check_cyrillic_stage1(biography, full_name)
 
         if has_cyrillic:
-            logger.info(
+            logger.debug(
                 "Instagram handle %s: Stage1 PASSED (Cyrillic detected). Passing to Stage2.",
                 handle,
             )
         else:
-            logger.info(
+            logger.debug(
                 "Instagram handle %s: Stage1 did not detect Cyrillic in biography/full_name. "
                 "Transitioning to processing to validate via Stage2 content check.",
                 handle,
@@ -499,8 +498,8 @@ class InstagramParser(BasePlatformParser):
             )
             return 0
 
-    async def parse_content(self, account_id: int, platform_id: str, max_items: int = 20) -> None:
-        logger.info(
+    async def parse_content(self, account_id: int, platform_id: str, max_items: int = 12) -> int:
+        logger.debug(
             "Starting Instagram content parse for account_id: %d, platform_id: %s",
             account_id,
             platform_id,
@@ -526,9 +525,6 @@ class InstagramParser(BasePlatformParser):
             recent_items = await fetch_recent_instagram_posts(
                 client=self.client,
                 handle=target_handle,
-                target_posts=4,
-                target_reels=8,
-                max_pages=4,
                 max_total_items=max_items,
             )
         except Exception as e:
@@ -545,7 +541,7 @@ class InstagramParser(BasePlatformParser):
                     )
                     await session.execute(stmt)
                     await session.commit()
-                return
+                return 0
             raise
 
         def _to_utc_aware(dt: datetime) -> datetime:
@@ -566,9 +562,11 @@ class InstagramParser(BasePlatformParser):
                 )
                 await session.execute(stmt)
                 await session.commit()
-            return
+            return 0
 
-        logger.info(
+        recent_items = recent_items[:max_items]
+
+        logger.debug(
             "Fetched %d recent posts for account_id: %d",
             len(recent_items),
             account_id,
@@ -590,9 +588,8 @@ class InstagramParser(BasePlatformParser):
         )
 
         if not has_cyrillic:
-            logger.warning(
-                "Account %s (account_id: %d) REJECTED: No Cyrillic characters found in %d fetched posts. "
-                "Rejecting without writing content to database.",
+            logger.info(
+                "Account %s (account_id: %d) REJECTED: No Cyrillic characters found in %d fetched posts.",
                 platform_id,
                 account_id,
                 len(recent_items),
@@ -605,9 +602,9 @@ class InstagramParser(BasePlatformParser):
                 )
                 await session.execute(stmt)
                 await session.commit()
-            return
+            return 0
 
-        logger.info(
+        logger.debug(
             "Stage2 Cyrillic validation PASSED for account_id: %d. Proceeding with content parsing.",
             account_id,
         )
@@ -711,23 +708,35 @@ class InstagramParser(BasePlatformParser):
 
         candidate_item_ids = [d["item_id"] for d in items_data]
 
+        terminal_tx_statuses = ("completed", "rejected", "skipped", "skipped_stale", "skipped_no_speech")
+
         already_transcribed: dict[str, str] = {}
+        skip_transcript_ids: set[str] = set()
         if candidate_item_ids:
             async with self.session_maker() as session:
                 stmt = (
-                    select(Content.platform_content_id, Content.transcription)
+                    select(
+                        Content.platform_content_id,
+                        Content.transcription,
+                        Content.raw_metadata["transcription_status"].astext,
+                    )
                     .where(
                         Content.platform_content_id.in_(candidate_item_ids),
-                        Content.transcription.isnot(None),
+                        or_(
+                            Content.transcription.isnot(None),
+                            Content.raw_metadata["transcription_status"].astext.in_(terminal_tx_statuses),
+                        ),
                     )
                 )
                 result = await session.execute(stmt)
-                already_transcribed = {row[0]: row[1] for row in result.all()}
+                rows = result.all()
+                already_transcribed = {row[0]: row[1] for row in rows if row[1] is not None}
+                skip_transcript_ids = {row[0] for row in rows}
 
         items_needing_transcripts = [
             (item_id, post_url)
             for item_id, post_url in items_needing_transcripts
-            if item_id not in already_transcribed
+            if item_id not in skip_transcript_ids
         ]
 
         final_content_values: list[dict[str, Any]] = []
@@ -804,13 +813,13 @@ class InstagramParser(BasePlatformParser):
                 )
 
                 await session.commit()
-                logger.info(
+                logger.debug(
                     "Bulk upserted %d Instagram content items for account_id: %d",
                     len(final_content_values),
                     account_id,
                 )
 
-        await process_and_queue_discovered_contacts(
+        _, spider_count = await process_and_queue_discovered_contacts(
             session_maker=self.session_maker,
             parent_username=profile.get("username", ""),
             profile_biography=profile_biography,
@@ -827,4 +836,6 @@ class InstagramParser(BasePlatformParser):
             )
             self.client.background_tasks.add(task)
             task.add_done_callback(self.client.background_tasks.discard)
+
+        return spider_count
 

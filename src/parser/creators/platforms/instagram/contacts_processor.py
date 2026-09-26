@@ -90,9 +90,10 @@ async def process_and_queue_discovered_contacts(
     profile_external_url: str | None,
     items_data: list[dict[str, Any]],
     enable_contact_extraction: bool = False,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], int]:
     parent_lower = parent_username.lower()
     aggregated_mentions: set[str] = set()
+    spider_count: int = 0
 
     if profile_biography:
         for mention in extract_mentions(profile_biography):
@@ -145,7 +146,7 @@ async def process_and_queue_discovered_contacts(
     if aggregated_mentions:
         try:
             async with session_maker() as session:
-                await queue_discovered_mentions(
+                spider_count += await queue_discovered_mentions(
                     session=session,
                     platform="INSTAGRAM",
                     mentions=list(aggregated_mentions),
@@ -161,7 +162,7 @@ async def process_and_queue_discovered_contacts(
             )
 
     if not enable_contact_extraction:
-        return _empty_contacts(profile_biography)
+        return _empty_contacts(profile_biography), spider_count
 
     aggregated_emails: list[str] = []
     aggregated_advertising_emails: list[str] = []
@@ -256,7 +257,7 @@ async def process_and_queue_discovered_contacts(
                     contacts_dict=aggregated_contacts,
                     context_text=context_text,
                 )
-                await queue_discovered_accounts(
+                spider_count += await queue_discovered_accounts(
                     session=session,
                     metadata=compiled_meta,
                     parent_handle=parent_username,
@@ -270,4 +271,4 @@ async def process_and_queue_discovered_contacts(
                 e,
             )
 
-    return aggregated_contacts
+    return aggregated_contacts, spider_count

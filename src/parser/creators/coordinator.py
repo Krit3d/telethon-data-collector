@@ -14,6 +14,7 @@ from src.db.models import Account
 from src.parser.creators.core.queries import SearchQueriesManager
 from src.parser.creators.platforms import get_platform_parser
 from src.parser.creators.sc_client import ScrapeCreatorsClient
+from src.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ class CreatorsCoordinator:
         self,
         platform: str,
         client: ScrapeCreatorsClient,
-    ) -> None:
+    ) -> int:
         active_platform = self.platform_filter if self.platform_filter else platform
         threshold = self.settings.creators_batch_size * 2
 
@@ -106,6 +107,7 @@ class CreatorsCoordinator:
         max_attempts = len(balanced_queries)
         attempts: int = 0
         consecutive_misses: int = 0
+        total_discovered_in_batch: int = 0
 
         parser = get_platform_parser(
             platform=active_platform,
@@ -145,6 +147,7 @@ class CreatorsCoordinator:
                     f"category='{category}' on platform={active_platform}"
                 )
                 discovered_count = await parser.discover_candidates(query, category)
+                total_discovered_in_batch += discovered_count
                 logger.info(
                     f"Discovered {discovered_count} accounts for query='{query}', "
                     f"category='{category}' on platform={active_platform}"
@@ -174,6 +177,8 @@ class CreatorsCoordinator:
                     )
                     break
 
+        return total_discovered_in_batch
+
     def is_shutdown_requested(self) -> bool:
         if self._shutdown_event is None:
             return False
@@ -194,7 +199,7 @@ class CreatorsCoordinator:
 
             platform = self.platform_filter if self.platform_filter else "INSTAGRAM"
 
-            await self._ensure_pending_queue(platform, client)
+            discovery_count = await self._ensure_pending_queue(platform, client)
 
             final_pending_count = await self.db.count_pending_creator_accounts(platform)
 
@@ -203,7 +208,7 @@ class CreatorsCoordinator:
                 return
 
             if final_pending_count < batch_size:
-                logger.info(
+                logger.debug(
                     f"Processing partial batch of {final_pending_count} pending accounts "
                     f"(batch_size={batch_size})."
                 )
@@ -217,8 +222,6 @@ class CreatorsCoordinator:
             if not accounts:
                 logger.info("No accounts to process in this cycle")
                 return
-
-            logger.info(f"Found {len(accounts)} accounts to process")
 
             semaphore = asyncio.Semaphore(concurrency_limit)
 
@@ -241,6 +244,8 @@ class CreatorsCoordinator:
                 return
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            spider_count = sum(r for r in results if isinstance(r, int))
 
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
@@ -272,7 +277,8 @@ class CreatorsCoordinator:
                 )
 
         logger.info(
-            f"Ingestion cycle completed. Processed {len(tasks)} accounts."
+            f"Ingestion cycle completed. Processed {len(tasks)} accounts. "
+            f"Queued candidates: discovery={discovery_count}, spider={spider_count}."
         )
 
     async def _process_single_account(
@@ -282,13 +288,13 @@ class CreatorsCoordinator:
         username: str | None,
         semaphore: asyncio.Semaphore,
         client: ScrapeCreatorsClient,
-    ) -> None:
+    ) -> int:
         if not username:
             logger.warning(f"Account {account_id} has no username, skipping")
-            return
+            return 0
 
         async with semaphore:
-            logger.info(
+            logger.debug(
                 f"Processing account {account_id} (platform={platform}, username={username})"
             )
 
@@ -300,9 +306,6 @@ class CreatorsCoordinator:
                     settings=self.settings,
                 )
 
-                logger.debug(
-                    f"Parsing profile for {username} on {platform}"
-                )
                 db_account_id = await parser.parse_profile(username)
 
                 if db_account_id is None:
@@ -313,7 +316,7 @@ class CreatorsCoordinator:
                     await self.db.update_creator_account_status(
                         account_id, STATUS_REJECTED
                     )
-                    return
+                    return 0
 
                 async with self.db.async_session() as session:
                     stmt = select(Account).where(Account.id == db_account_id)
@@ -325,7 +328,7 @@ class CreatorsCoordinator:
                         f"Account {username} was rejected during profile parsing. "
                         f"Skipping content parse."
                     )
-                    return
+                    return 0
 
                 if account and account.subscribers_count is not None:
                     if account.subscribers_count < self.min_subscribers:
@@ -337,15 +340,12 @@ class CreatorsCoordinator:
                         await self.db.update_creator_account_status(
                             db_account_id, STATUS_REJECTED
                         )
-                        return
+                        return 0
 
-                logger.debug(
-                    f"Parsing content for {username} on {platform}"
-                )
-                await parser.parse_content(
+                spider_count = await parser.parse_content(
                     account_id=db_account_id,
                     platform_id=username,
-                    max_items=50,
+                    max_items=self.settings.creators_max_posts_per_account,
                 )
 
                 async with self.db.async_session() as session:
@@ -361,14 +361,16 @@ class CreatorsCoordinator:
                         f"Account {username} status is '{account_after_content.status}' "
                         f"after content parsing. Not updating to '{STATUS_PARSED}'."
                     )
-                    return
+                    return 0
 
                 if account_after_content and account_after_content.status == STATUS_PROCESSING:
                     await self.db.update_creator_account_status(db_account_id, STATUS_PARSED)
-                    logger.info(
+                    logger.debug(
                         f"Successfully processed account {db_account_id} "
                         f"({username} on {platform})"
                     )
+
+                return spider_count or 0
 
             except Exception as e:
                 logger.error(
@@ -377,6 +379,7 @@ class CreatorsCoordinator:
                     exc_info=e,
                 )
                 await self.db.update_creator_account_status(account_id, STATUS_FAILED)
+                return 0
 
     async def reset_orphaned_processing_accounts(self) -> None:
         count = await self.db.reset_orphaned_creator_accounts(
@@ -498,6 +501,7 @@ async def main() -> None:
         logger.info(f"CLI argument --platform={platform_filter} validated")
 
     settings: Settings = load_settings()
+    setup_logging(settings.log_level)
 
     db = Database(settings.db_url, echo=False)
 
@@ -557,15 +561,12 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, _signal_handler)
 
-    logger.info("Creators coordinator daemon started. Press Ctrl+C to stop.")
-
     try:
         while not shutdown_event.is_set():
             if shutdown_event.is_set():
                 logger.info("Shutdown requested before batch start, exiting.")
                 break
 
-            logger.info("Starting new ingestion batch...")
             try:
                 await coordinator.run_once(
                     batch_size=settings.creators_batch_size,

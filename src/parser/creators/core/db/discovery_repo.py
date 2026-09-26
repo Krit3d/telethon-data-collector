@@ -1,9 +1,10 @@
 import logging
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast as type_cast
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import DatabaseError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,7 +25,7 @@ async def queue_discovered_accounts(
     metadata: AccountMetadata | dict[str, Any],
     parent_handle: str,
     status: str = "pending",
-) -> None:
+) -> int:
     if isinstance(metadata, dict):
         metadata = convert_dict_to_account_metadata(metadata)
 
@@ -38,14 +39,17 @@ async def queue_discovered_accounts(
         telegram_channels = metadata.contacts.telegram_channels
 
     queued_accounts: set[tuple[str, str]] = set()
+    queued_count: int = 0
 
     async def _queue_if_new(platform: str, platform_id: str) -> None:
+        nonlocal queued_count
         key = (platform, platform_id)
         if key not in queued_accounts:
             queued_accounts.add(key)
-            await queue_single_account(
+            if await queue_single_account(
                 session, platform, platform_id, parent_handle, status
-            )
+            ):
+                queued_count += 1
 
     for handle in telegram_channels:
         if not handle:
@@ -106,6 +110,8 @@ async def queue_discovered_accounts(
             parent_handle,
         )
 
+    return queued_count
+
 
 async def queue_discovered_mentions(
     session: AsyncSession,
@@ -113,13 +119,18 @@ async def queue_discovered_mentions(
     mentions: list[str],
     parent_handle: str,
     status: str = "pending",
-) -> None:
+) -> int:
+    queued_count: int = 0
     for username in mentions:
         if not username or len(username) < 3:
             continue
         if username.startswith("+"):
             continue
-        await queue_single_account(session, platform, username, parent_handle, status)
+        if await queue_single_account(
+            session, platform, username, parent_handle, status
+        ):
+            queued_count += 1
+    return queued_count
 
 
 async def queue_single_account(
@@ -128,25 +139,29 @@ async def queue_single_account(
     platform_id: str,
     parent_handle: str,
     status: str = "pending",
-) -> None:
+) -> bool:
     stripped_id = platform_id.strip()
     if not stripped_id:
-        return
+        return False
 
     clean_id = stripped_id.lower()
 
-    stmt = select(Account).where(
-        Account.platform == platform,
-        or_(
-            func.lower(Account.platform_id) == clean_id,
-            func.lower(Account.username) == clean_id,
-        ),
+    stmt = (
+        select(Account.id)
+        .where(
+            Account.platform == platform,
+            or_(
+                func.lower(Account.platform_id) == clean_id,
+                func.lower(Account.username) == clean_id,
+            ),
+        )
+        .limit(1)
     )
     result = await session.execute(stmt)
     existing = result.scalar_one_or_none()
 
     if existing:
-        return
+        return False
 
     generated_id = generate_deterministic_id(platform, clean_id)
 
@@ -162,14 +177,17 @@ async def queue_single_account(
 
     try:
         async with session.begin_nested():
-            await session.execute(insert_stmt)
+            res = type_cast(CursorResult, await session.execute(insert_stmt))
             await session.flush()
-        logger.info(
-            "[SPIDER] Queued discovered %s account: %s from bio of parent account %s.",
-            platform,
-            clean_id,
-            parent_handle,
-        )
+        if res.rowcount and res.rowcount > 0:
+            logger.debug(
+                "[SPIDER] Queued discovered %s account: %s from bio of parent account %s.",
+                platform,
+                clean_id,
+                parent_handle,
+            )
+            return True
+        return False
     except DatabaseError as e:
         logger.warning(
             "Database error while queuing %s account %s: %s",
@@ -177,3 +195,4 @@ async def queue_single_account(
             clean_id,
             e,
         )
+        return False
