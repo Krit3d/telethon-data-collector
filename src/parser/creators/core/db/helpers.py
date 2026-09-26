@@ -1,4 +1,3 @@
-import hashlib
 import logging
 import re
 from datetime import datetime, timezone
@@ -132,12 +131,6 @@ BANNED_PAYLOAD_KEYS: frozenset[str] = frozenset({
     "can_viewer_save",
     "is_organic_product_tagging_eligible",
 })
-
-
-def generate_deterministic_id(platform: str, platform_id: str) -> int:
-    key = f"{platform.upper()}:{platform_id.strip().lower()}".encode("utf-8")
-    hash_bytes = hashlib.sha256(key).digest()
-    return int.from_bytes(hash_bytes[:8], byteorder="big") & 0x7FFFFFFFFFFFFFFF
 
 
 def parse_url_domain(url: str) -> str | None:

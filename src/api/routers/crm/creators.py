@@ -39,7 +39,6 @@ from src.parser.creators.core.contacts import (
     normalize_phone,
     normalize_telegram_handle,
 )
-from src.parser.creators.core.db.helpers import generate_deterministic_id
 from src.parser.creators.sc_client import ScrapeCreatorsClient
 
 logger = logging.getLogger(__name__)
@@ -184,8 +183,7 @@ async def add_creator_manual(
     if platform not in ("INSTAGRAM", "TELEGRAM"):
         raise HTTPException(status_code=400, detail="Поддерживаются только INSTAGRAM и TELEGRAM")
 
-    account_id = generate_deterministic_id(platform, clean_username)
-    platform_id: str = str(account_id)
+    platform_id: str = clean_username
     title: str = clean_username
     scraped_title: str | None = None
     subscribers_count: int | None = payload.subscribers_count
@@ -215,7 +213,7 @@ async def add_creator_manual(
                     pass
         except Exception:
             logger.warning(
-                "Scrape Creators profile fetch failed for %s, using deterministic id",
+                "Scrape Creators profile fetch failed for %s, using username as platform id",
                 clean_username,
                 exc_info=True,
             )
@@ -243,7 +241,6 @@ async def add_creator_manual(
 
         if account is None:
             account = Account(
-                id=account_id,
                 platform=platform,
                 platform_id=platform_id,
                 username=clean_username,

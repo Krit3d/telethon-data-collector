@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models import Account, Content, Comment
 from src.parser.creators.core.contacts import parse_profile_contacts, compile_author_metadata
 from src.parser.creators.core.db.helpers import (
-    generate_deterministic_id,
     SUPPORTED_PLATFORMS,
 )
 from src.parser.creators.core.db.discovery_repo import queue_discovered_accounts
@@ -60,9 +59,7 @@ async def upsert_and_deduplicate_account(
         )
 
     if not conditions:
-        generated_id = generate_deterministic_id(platform, platform_id or username or title)
         new_account = Account(
-            id=generated_id,
             platform=platform,
             platform_id=platform_id or "",
             username=clean_username,
@@ -73,7 +70,7 @@ async def upsert_and_deduplicate_account(
         )
         session.add(new_account)
         await session.flush()
-        return generated_id
+        return new_account.id
 
     stmt = select(Account).where(
         Account.platform == platform,
@@ -83,9 +80,7 @@ async def upsert_and_deduplicate_account(
     existing_accounts = list(result.scalars().all())
 
     if not existing_accounts:
-        generated_id = generate_deterministic_id(platform, platform_id or username or title)
         new_account = Account(
-            id=generated_id,
             platform=platform,
             platform_id=platform_id or "",
             username=clean_username,
@@ -101,9 +96,9 @@ async def upsert_and_deduplicate_account(
             platform,
             platform_id,
             username,
-            generated_id,
+            new_account.id,
         )
-        return generated_id
+        return new_account.id
 
     if len(existing_accounts) == 1:
         account = existing_accounts[0]

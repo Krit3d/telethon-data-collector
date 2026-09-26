@@ -1,17 +1,14 @@
 import logging
 from collections.abc import Mapping
-from typing import Any, cast as type_cast
+from typing import Any
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.engine import CursorResult
-from sqlalchemy.exc import DatabaseError
+from sqlalchemy.exc import DatabaseError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Account
 from src.parser.creators.core.contacts import extract_external_links
 from src.parser.creators.core.db.helpers import (
-    generate_deterministic_id,
     extract_platform_info,
     convert_dict_to_account_metadata,
 )
@@ -163,30 +160,32 @@ async def queue_single_account(
     if existing:
         return False
 
-    generated_id = generate_deterministic_id(platform, clean_id)
-
-    insert_stmt = insert(Account).values(
-        id=generated_id,
+    new_account = Account(
         platform=platform,
         platform_id=clean_id,
         username=clean_id,
         title=clean_id,
         status=status,
     )
-    insert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=["id"])
 
     try:
         async with session.begin_nested():
-            res = type_cast(CursorResult, await session.execute(insert_stmt))
+            session.add(new_account)
             await session.flush()
-        if res.rowcount and res.rowcount > 0:
-            logger.debug(
-                "[SPIDER] Queued discovered %s account: %s from bio of parent account %s.",
-                platform,
-                clean_id,
-                parent_handle,
-            )
-            return True
+        logger.debug(
+            "[SPIDER] Queued discovered %s account: %s from bio of parent account %s (id: %d).",
+            platform,
+            clean_id,
+            parent_handle,
+            new_account.id,
+        )
+        return True
+    except IntegrityError:
+        logger.debug(
+            "[SPIDER] Account %s:%s already exists (concurrent conflict), skipping.",
+            platform,
+            clean_id,
+        )
         return False
     except DatabaseError as e:
         logger.warning(

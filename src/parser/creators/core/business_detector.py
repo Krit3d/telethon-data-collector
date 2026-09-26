@@ -81,8 +81,39 @@ class BusinessSemanticDetector:
             "Content-Type": "application/json",
         }
         payload = {"model": self.settings.cloud_ru_embedding_model, "input": texts}
-        response = await self.client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
+        max_attempts = 4
+        response: httpx.Response | None = None
+        for attempt in range(max_attempts):
+            delay = 1.0 * (2 ** attempt)
+            try:
+                response = await self.client.post(url, headers=headers, json=payload)
+            except httpx.TransportError:
+                if attempt + 1 < max_attempts:
+                    logger.warning(
+                        "Cloud.ru embeddings transport error (attempt %d/%d). Retrying in %.1fs...",
+                        attempt + 1,
+                        max_attempts,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            if 500 <= response.status_code <= 599 or response.status_code == 429:
+                if attempt + 1 < max_attempts:
+                    logger.warning(
+                        "Cloud.ru embeddings request failed with status %d (attempt %d/%d). Retrying in %.1fs...",
+                        response.status_code,
+                        attempt + 1,
+                        max_attempts,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                response.raise_for_status()
+            else:
+                response.raise_for_status()
+            break
+        assert response is not None
         data = response.json()
         vectors: list[list[float]] = []
         for item in data["data"]:

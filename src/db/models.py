@@ -17,6 +17,8 @@ from sqlalchemy import (
     Integer,
     DateTime,
     UniqueConstraint,
+    func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -44,6 +46,20 @@ class Account(Base):
             "raw_metadata",
             postgresql_using="gin",
             postgresql_ops={"raw_metadata": "jsonb_path_ops"},
+        ),
+        Index(
+            "uq_accounts_platform_username_lower",
+            "platform",
+            func.lower(text("username")),
+            unique=True,
+            postgresql_where=text("username IS NOT NULL AND username != ''"),
+        ),
+        Index(
+            "uq_accounts_platform_id_lower",
+            "platform",
+            func.lower(text("platform_id")),
+            unique=True,
+            postgresql_where=text("platform_id IS NOT NULL AND platform_id != ''"),
         ),
     )
 
