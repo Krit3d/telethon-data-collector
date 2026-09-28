@@ -1,8 +1,9 @@
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from .constants import DEFAULT_CONTEXT_WINDOW
-from .context_scorer import ContactRole, ROLE_PRIORITY
+from .context_scorer import ContactRole, ROLE_PRIORITY, score_context
 from ..schemas import Contacts
 from .extractors import (
     extract_bio_links,
@@ -39,6 +40,7 @@ class ContactEngine:
         advertising_telegrams: list[str] = []
         telegram_personal: list[str] = []
         telegram_channels: list[str] = []
+        other_telegrams: list[str] = []
 
         for source in sources:
             for extracted in extract_telegram_contacts(source, DEFAULT_CONTEXT_WINDOW):
@@ -48,7 +50,10 @@ class ContactEngine:
                     advertising_telegrams,
                     telegram_personal,
                     telegram_channels,
+                    other_telegrams,
                     is_invite=extracted.is_invite,
+                    is_bot=extracted.is_bot,
+                    author_username=payload.author_username,
                 )
 
         email_candidates: dict[str, ContactRole] = {}
@@ -84,17 +89,25 @@ class ContactEngine:
             if "t.me" in url_lower or "telegram" in url_lower:
                 for extracted in extract_telegram_contacts(link.url, DEFAULT_CONTEXT_WINDOW):
                     role = link.role if link.role is not ContactRole.UNKNOWN else extracted.role
+                    if link.title:
+                        title_role = score_context(link.title)
+                        if title_role is not ContactRole.UNKNOWN:
+                            role = title_role
+                        if any(word in link.title.lower() for word in ("канал", "channel", "тгк")):
+                            role = ContactRole.CHANNEL
                     self._route_telegram(
                         extracted.handle,
                         role,
                         advertising_telegrams,
                         telegram_personal,
                         telegram_channels,
+                        other_telegrams,
                         is_invite=extracted.is_invite,
+                        is_bot=extracted.is_bot,
+                        author_username=payload.author_username,
                     )
-            if "wa.me" in url_lower or "whatsapp" in url_lower:
-                for extracted in extract_phones(link.url):
-                    phones.append(extracted.phone)
+            for extracted in extract_phones(link.url):
+                phones.append(extracted.phone)
             if "mailto:" in url_lower:
                 email = link.url.split("mailto:", 1)[1].split("?", 1)[0].strip()
                 if email and is_valid_email(email):
@@ -111,13 +124,23 @@ class ContactEngine:
 
         advertising_telegrams = deduplicate_preserve_order(advertising_telegrams)
         advertising_set = set(advertising_telegrams)
-        telegram_personal = [h for h in deduplicate_preserve_order(telegram_personal) if h not in advertising_set]
-        personal_set = set(telegram_personal)
         telegram_channels = [
             h for h in deduplicate_preserve_order(telegram_channels)
-            if h not in advertising_set and h not in personal_set
+            if h not in advertising_set
         ]
-        telegram_handles = deduplicate_preserve_order(advertising_telegrams + telegram_personal + telegram_channels)
+        channel_set = set(telegram_channels)
+        telegram_personal = [
+            h for h in deduplicate_preserve_order(telegram_personal)
+            if h not in advertising_set and h not in channel_set
+        ]
+        personal_set = set(telegram_personal)
+        other_telegrams = [
+            h for h in deduplicate_preserve_order(other_telegrams)
+            if h not in advertising_set and h not in personal_set and h not in channel_set
+        ]
+        telegram_handles = deduplicate_preserve_order(
+            advertising_telegrams + telegram_channels + telegram_personal + other_telegrams
+        )
         advertising_emails = deduplicate_preserve_order(advertising_emails)
         advertising_email_set = set(advertising_emails)
         emails = [e for e in deduplicate_preserve_order(emails) if e not in advertising_email_set]
@@ -142,7 +165,7 @@ class ContactEngine:
             sources.append(payload.biography)
         if payload.context_text:
             sources.append(payload.context_text)
-        if payload.external_url:
+        if payload.external_url and not payload.raw_bio_links:
             sources.append(payload.external_url)
         if payload.posts_content:
             sources.extend(payload.posts_content[:12])
@@ -163,12 +186,21 @@ class ContactEngine:
         advertising: list[str],
         personal: list[str],
         channels: list[str],
+        other: list[str],
         is_invite: bool = False,
+        is_bot: bool = False,
+        author_username: str | None = None,
     ) -> None:
         normalized = normalize_telegram_handle(handle)
         if not is_valid_telegram_handle(normalized):
             return
+        if is_bot:
+            other.append(normalized)
+            return
         if is_invite or normalized.startswith("+") or "joinchat" in normalized:
+            channels.append(normalized)
+            return
+        if role is ContactRole.CHANNEL:
             channels.append(normalized)
             return
         if role is ContactRole.COMMERCIAL:
@@ -177,4 +209,10 @@ class ContactEngine:
         if role is ContactRole.PERSONAL:
             personal.append(normalized)
             return
-        channels.append(normalized)
+        if author_username:
+            author_key = re.sub(r"[^a-z0-9]", "", author_username.lower())
+            handle_key = re.sub(r"[^a-z0-9]", "", normalized.lower())
+            if author_key and handle_key == author_key:
+                personal.append(normalized)
+                return
+        other.append(normalized)

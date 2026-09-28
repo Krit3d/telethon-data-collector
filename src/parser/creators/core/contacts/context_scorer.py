@@ -27,9 +27,9 @@ ROLE_PRIORITY: dict[ContactRole, int] = {
 
 def get_context_window(text: str, start_pos: int, end_pos: int, window_size: int = DEFAULT_CONTEXT_WINDOW) -> str:
     text_lower = text.lower()
-    start = max(0, start_pos - window_size)
-    end = min(len(text_lower), end_pos + window_size)
-    return text_lower[start:end]
+    before = text_lower[max(0, start_pos - window_size):start_pos]
+    after = text_lower[end_pos:min(len(text_lower), end_pos + window_size)]
+    return f"{before} {after}"
 
 
 def _matches(
@@ -55,7 +55,8 @@ def _matches(
 
 def score_context(context_window: str) -> ContactRole:
     context = context_window.lower()
-    tokens = _WORD_RE.findall(context)
+    clean_context = context.replace("_", " ").replace("-", " ").replace(".", " ")
+    tokens = _WORD_RE.findall(clean_context)
     if _matches(COMMERCIAL_EXACT, COMMERCIAL_PREFIXES, COMMERCIAL_PHRASES, context, tokens):
         return ContactRole.COMMERCIAL
     if _matches(CHANNEL_EXACT, CHANNEL_PREFIXES, CHANNEL_PHRASES, context, tokens):

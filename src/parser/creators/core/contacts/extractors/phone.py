@@ -22,7 +22,7 @@ class ExtractedPhone:
 
 
 _WHATSAPP_URL_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:wa\.me/(?:\+)?(\d{7,15})|api\.whatsapp\.com/send/?\?phone=(?:\+|%2B)?(\d{7,15}))",
+    r"(?:https?://)?(?:www\.)?(?:(?:wa\.me|wtsp\.cc)/(?:\+)?(\d{7,15})|api\.whatsapp\.com/send/?\?phone=(?:\+|%2B)?(\d{7,15}))",
     re.IGNORECASE,
 )
 
@@ -102,7 +102,10 @@ def extract_phones(
         if not _register_span(occupied_spans, span):
             continue
         number = match.group(1) or match.group(2)
-        normalized = normalize_phone(f"+{number}")
+        if len(number) == 10 and number.startswith("9"):
+            normalized = normalize_phone(number, default_region=default_region or "RU")
+        else:
+            normalized = normalize_phone(f"+{number}", default_region=default_region)
         if normalized is None:
             continue
         context = get_context_window(text, match.start(), match.end(), context_window_size)

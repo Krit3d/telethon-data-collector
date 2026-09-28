@@ -30,11 +30,29 @@ def clean_tracking_params(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
+def is_valid_web_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    hostname = parsed.hostname
+    if not hostname or "." not in hostname:
+        return False
+    if not all(c.isalnum() or c in ".-_" for c in hostname):
+        return False
+    tld = hostname.split(".")[-1]
+    if len(tld) < 2 or not tld.isalpha():
+        return False
+    return True
+
+
 def normalize_url(url: str) -> str:
-    url = url.strip().rstrip(".,;:!?)]}>\"'«»“” ")
+    url = url.strip().strip(".,;:!?)]}>\"'«»“” ")
     if url and "://" not in url:
         url = "https://" + url
-    return clean_tracking_params(url)
+    url = clean_tracking_params(url)
+    if not is_valid_web_url(url):
+        return ""
+    return url
 
 
 _MEDIA_RAW_EXTENSIONS = frozenset((
@@ -81,3 +99,13 @@ def deduplicate_preserve_order(items: list[str]) -> list[str]:
         seen.add(item)
         result.append(item)
     return result
+
+
+__all__ = [
+    "clean_tracking_params",
+    "normalize_url",
+    "is_valid_web_url",
+    "is_media_asset",
+    "deobfuscate_text",
+    "deduplicate_preserve_order",
+]

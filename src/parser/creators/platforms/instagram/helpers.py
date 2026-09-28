@@ -212,3 +212,42 @@ def extract_instagram_bio_links(profile_dict: dict[str, Any]) -> list[str]:
 def extract_instagram_primary_external_url(profile_dict: dict[str, Any]) -> str | None:
     links = extract_instagram_bio_links(profile_dict)
     return links[0] if links else None
+
+
+def extract_instagram_hashtags(description: str) -> list[str]:
+    if not description:
+        return []
+    hashtags: list[str] = []
+    seen: set[str] = set()
+    parts = description.split("#")[1:]
+    for part in parts:
+        tag_chars: list[str] = []
+        for c in part:
+            if c.isalnum() or c == "_":
+                tag_chars.append(c)
+            else:
+                break
+        tag = "".join(tag_chars).lower()
+        if len(tag) >= 1 and any(c.isalpha() for c in tag) and tag not in seen:
+            seen.add(tag)
+            hashtags.append(tag)
+    return hashtags
+
+
+def normalize_instagram_hashtags(item: dict[str, Any], description: str) -> list[str]:
+    extracted = extract_instagram_hashtags(description) if description else []
+    raw_hashtags = item.get("hashtags")
+    if not isinstance(raw_hashtags, list):
+        return extracted
+    hashtags: list[str] = []
+    seen: set[str] = set()
+    for h in raw_hashtags:
+        for tag in extract_instagram_hashtags("#" + str(h)):
+            if tag not in seen:
+                seen.add(tag)
+                hashtags.append(tag)
+    for tag in extracted:
+        if tag not in seen:
+            seen.add(tag)
+            hashtags.append(tag)
+    return hashtags

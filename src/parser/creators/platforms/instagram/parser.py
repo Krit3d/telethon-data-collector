@@ -29,6 +29,10 @@ from src.parser.creators.core.schemas import (
     AccountMetadata,
     Contacts,
 )
+from src.parser.creators.core.contacts import (
+    compile_author_metadata,
+    extract_structural_links,
+)
 from src.parser.creators.core.media_detector import detect_content_media
 from src.parser.creators.core.text import is_slop_or_theme_page
 from src.parser.creators.platforms.base import BasePlatformParser
@@ -36,7 +40,11 @@ from src.parser.creators.platforms.base import BasePlatformParser
 from .client import fetch_instagram_profile, fetch_video_transcript
 from .contacts_processor import process_and_queue_discovered_contacts
 from .fetcher import fetch_recent_instagram_posts
-from .helpers import extract_instagram_video_url, prune_instagram_payload
+from .helpers import (
+    extract_instagram_video_url,
+    normalize_instagram_hashtags,
+    prune_instagram_payload,
+)
 from .validators import (
     check_cyrillic_stage1,
     check_cyrillic_stage2,
@@ -46,16 +54,6 @@ from .validators import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _extract_hashtags(description: str) -> list[str]:
-    hashtags: list[str] = []
-    for token in description.split():
-        if token.startswith("#") and len(token) > 1:
-            cleaned = token[1:].rstrip(".,!?;:)\"'`~").lower()
-            if cleaned:
-                hashtags.append(cleaned)
-    return hashtags
 
 
 class InstagramParser(BasePlatformParser):
@@ -68,17 +66,33 @@ class InstagramParser(BasePlatformParser):
     ) -> None:
         super().__init__(session_maker, client, settings)
 
-    def _default_account_metadata(
+    def _build_account_metadata(
         self,
         profile: dict[str, Any],
         biography: str | None,
-    ) -> AccountMetadata | None:
+        contacts_dict: dict[str, Any] | None = None,
+        context_text: str | None = None,
+    ) -> AccountMetadata:
         if self.settings.enable_contact_extraction:
-            return None
+            return compile_author_metadata(
+                platform="INSTAGRAM",
+                username=profile.get("username", ""),
+                biography=biography,
+                raw_profile_payload=profile,
+                contacts_dict=contacts_dict or {},
+                context_text=context_text,
+            )
+        link_in_bio, website, external_platforms, external_links = extract_structural_links(
+            biography, profile, contacts_dict=contacts_dict
+        )
         username = profile.get("username", "")
         return AccountMetadata(
             profile_url=f"https://instagram.com/{username}" if username else None,
             biography=biography or None,
+            website=website,
+            link_in_bio=link_in_bio,
+            external_platforms=external_platforms,
+            external_links=external_links,
             contacts=Contacts(),
             raw_profile_payload=profile,
             extracted_at=datetime.now(timezone.utc).isoformat(),
@@ -152,7 +166,6 @@ class InstagramParser(BasePlatformParser):
                             cast(
                                 {
                                     "post_type": "reel",
-                                    "is_reel": True,
                                     "transcription_status": "completed",
                                 },
                                 JSONB,
@@ -296,7 +309,7 @@ class InstagramParser(BasePlatformParser):
                     subscribers_count=subscribers,
                     raw_profile_payload=profile,
                     posts_count=profile.get("media_count") or profile.get("posts_count"),
-                    account_metadata=self._default_account_metadata(profile, biography),
+                    account_metadata=self._build_account_metadata(profile, biography),
                 )
 
                 await session.commit()
@@ -344,7 +357,7 @@ class InstagramParser(BasePlatformParser):
                 subscribers_count=subscribers,
                 raw_profile_payload=profile,
                 posts_count=profile.get("media_count") or profile.get("posts_count"),
-                account_metadata=self._default_account_metadata(profile, biography),
+                account_metadata=self._build_account_metadata(profile, biography),
             )
 
             await session.commit()
@@ -576,9 +589,7 @@ class InstagramParser(BasePlatformParser):
         for item in recent_items:
             description = extract_instagram_content_text(item) or ""
 
-            hashtags = item.get("hashtags") or []
-            if not hashtags and description:
-                hashtags = _extract_hashtags(description)
+            hashtags = normalize_instagram_hashtags(item, description)
 
             aggregated_text += " " + description + " " + " ".join(hashtags)
 
@@ -628,9 +639,7 @@ class InstagramParser(BasePlatformParser):
             content_text = extract_instagram_content_text(item)
             description = content_text or ""
 
-            hashtags = item.get("hashtags") or []
-            if not hashtags and description:
-                hashtags = _extract_hashtags(description)
+            hashtags = normalize_instagram_hashtags(item, description)
 
             combined_text = description + " " + " ".join(hashtags)
 
@@ -767,7 +776,6 @@ class InstagramParser(BasePlatformParser):
                 platform_metrics=platform_metrics,
                 author_profile_snapshot=author_profile_snapshot,
                 raw_item_payload=prune_instagram_payload(item),
-                is_reel=post_type == "reel",
                 hashtags=hashtags,
                 post_url=item_data["post_url"],
                 transcription_status=tx_status,
@@ -794,6 +802,22 @@ class InstagramParser(BasePlatformParser):
                 }
             )
 
+        contacts_dict, spider_count = await process_and_queue_discovered_contacts(
+            session_maker=self.session_maker,
+            parent_username=profile.get("username", ""),
+            profile_biography=profile_biography,
+            profile_external_url=profile_external_url,
+            items_data=items_data,
+            enable_contact_extraction=self.settings.enable_contact_extraction,
+        )
+
+        account_metadata = self._build_account_metadata(
+            profile,
+            profile_biography,
+            contacts_dict=contacts_dict,
+            context_text=aggregated_text,
+        )
+
         if final_content_values:
             async with self.session_maker() as session:
                 await bulk_upsert_content(
@@ -809,7 +833,7 @@ class InstagramParser(BasePlatformParser):
                     external_url=profile_external_url,
                     raw_profile_payload=profile,
                     posts_count=profile.get("media_count") or profile.get("posts_count"),
-                    account_metadata=self._default_account_metadata(profile, profile_biography),
+                    account_metadata=account_metadata,
                 )
 
                 await session.commit()
@@ -818,15 +842,6 @@ class InstagramParser(BasePlatformParser):
                     len(final_content_values),
                     account_id,
                 )
-
-        _, spider_count = await process_and_queue_discovered_contacts(
-            session_maker=self.session_maker,
-            parent_username=profile.get("username", ""),
-            profile_biography=profile_biography,
-            profile_external_url=profile_external_url,
-            items_data=items_data,
-            enable_contact_extraction=self.settings.enable_contact_extraction,
-        )
 
         for t_item_id, t_post_url in items_needing_transcripts:
             task: asyncio.Task[None] = asyncio.create_task(

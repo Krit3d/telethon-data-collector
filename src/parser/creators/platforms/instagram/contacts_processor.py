@@ -6,6 +6,7 @@ from src.parser.creators.core.contacts import (
     extract_mentions,
     parse_profile_contacts,
 )
+from src.parser.creators.core.contacts.normalizer import deduplicate_preserve_order
 from src.parser.creators.core.db.discovery_repo import (
     queue_discovered_accounts,
     queue_discovered_mentions,
@@ -18,7 +19,11 @@ def _empty_contacts(profile_biography: str | None) -> dict[str, Any]:
     return {
         "emails": [],
         "advertising_emails": [],
+        "phones": [],
         "telegram_handles": [],
+        "telegram_channels": [],
+        "telegram_personal": [],
+        "advertising_telegrams": [],
         "external_links": [],
         "external_platforms": {},
         "raw_bio": profile_biography or "",
@@ -166,11 +171,17 @@ async def process_and_queue_discovered_contacts(
 
     aggregated_emails: list[str] = []
     aggregated_advertising_emails: list[str] = []
+    aggregated_phones: list[str] = []
     aggregated_telegram_handles: list[str] = []
+    aggregated_telegram_channels: list[str] = []
+    aggregated_telegram_personal: list[str] = []
+    aggregated_advertising_telegrams: list[str] = []
     aggregated_external_links: list[str] = []
     aggregated_external_platforms: dict[str, str] = {}
 
-    bio_contacts = parse_profile_contacts(profile_biography, profile_external_url)
+    bio_contacts = parse_profile_contacts(
+        profile_biography, profile_external_url, author_username=parent_username
+    )
     for email in bio_contacts.get("emails", []):
         if email and email not in aggregated_emails:
             aggregated_emails.append(email)
@@ -178,12 +189,20 @@ async def process_and_queue_discovered_contacts(
         if email and email not in aggregated_advertising_emails:
             aggregated_advertising_emails.append(email)
     for handle in bio_contacts.get("telegram_handles", []):
-        if (
-            handle
-            and handle.lower() != parent_lower
-            and handle not in aggregated_telegram_handles
-        ):
+        if handle and handle not in aggregated_telegram_handles:
             aggregated_telegram_handles.append(handle)
+    for phone in bio_contacts.get("phones", []):
+        if phone and phone not in aggregated_phones:
+            aggregated_phones.append(phone)
+    for handle in bio_contacts.get("telegram_channels", []):
+        if handle and handle not in aggregated_telegram_channels:
+            aggregated_telegram_channels.append(handle)
+    for handle in bio_contacts.get("telegram_personal", []):
+        if handle and handle not in aggregated_telegram_personal:
+            aggregated_telegram_personal.append(handle)
+    for handle in bio_contacts.get("advertising_telegrams", []):
+        if handle and handle not in aggregated_advertising_telegrams:
+            aggregated_advertising_telegrams.append(handle)
     for link in bio_contacts.get("external_links", []):
         if link and link not in aggregated_external_links:
             aggregated_external_links.append(link)
@@ -196,7 +215,7 @@ async def process_and_queue_discovered_contacts(
         if not content_text:
             continue
 
-        contacts_dict = parse_profile_contacts(content_text)
+        contacts_dict = parse_profile_contacts(content_text, author_username=parent_username)
 
         for email in contacts_dict.get("emails", []):
             if email and email not in aggregated_emails:
@@ -207,12 +226,24 @@ async def process_and_queue_discovered_contacts(
                 aggregated_advertising_emails.append(email)
 
         for handle in contacts_dict.get("telegram_handles", []):
-            if (
-                handle
-                and handle.lower() != parent_lower
-                and handle not in aggregated_telegram_handles
-            ):
+            if handle and handle not in aggregated_telegram_handles:
                 aggregated_telegram_handles.append(handle)
+
+        for phone in contacts_dict.get("phones", []):
+            if phone and phone not in aggregated_phones:
+                aggregated_phones.append(phone)
+
+        for handle in contacts_dict.get("telegram_channels", []):
+            if handle and handle not in aggregated_telegram_channels:
+                aggregated_telegram_channels.append(handle)
+
+        for handle in contacts_dict.get("telegram_personal", []):
+            if handle and handle not in aggregated_telegram_personal:
+                aggregated_telegram_personal.append(handle)
+
+        for handle in contacts_dict.get("advertising_telegrams", []):
+            if handle and handle not in aggregated_advertising_telegrams:
+                aggregated_advertising_telegrams.append(handle)
 
         for link in contacts_dict.get("external_links", []):
             if link and link not in aggregated_external_links:
@@ -231,10 +262,29 @@ async def process_and_queue_discovered_contacts(
             context_parts.append(item_content)
     context_text: str | None = "\n".join(context_parts) if context_parts else None
 
+    aggregated_telegram_personal = [
+        h for h in aggregated_telegram_personal if h not in aggregated_advertising_telegrams
+    ]
+    aggregated_telegram_channels = [
+        h
+        for h in aggregated_telegram_channels
+        if h not in aggregated_advertising_telegrams and h not in aggregated_telegram_personal
+    ]
+    aggregated_telegram_handles = deduplicate_preserve_order(
+        aggregated_telegram_handles
+        + aggregated_advertising_telegrams
+        + aggregated_telegram_personal
+        + aggregated_telegram_channels
+    )
+
     aggregated_contacts: dict[str, Any] = {
         "emails": aggregated_emails,
         "advertising_emails": aggregated_advertising_emails,
+        "phones": aggregated_phones,
         "telegram_handles": aggregated_telegram_handles,
+        "telegram_channels": aggregated_telegram_channels,
+        "telegram_personal": aggregated_telegram_personal,
+        "advertising_telegrams": aggregated_advertising_telegrams,
         "external_links": aggregated_external_links,
         "external_platforms": aggregated_external_platforms,
         "raw_bio": profile_biography or "",

@@ -1,11 +1,11 @@
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..constants import LINK_IN_BIO_DOMAINS, PLATFORM_HANDLE_RULES, SOCIAL_MEDIA_DOMAINS
 from ..context_scorer import ContactRole, score_context
-from ..normalizer import is_media_asset, normalize_url
+from ..normalizer import is_media_asset, is_valid_web_url, normalize_url
 
 
 @dataclass(slots=True, frozen=True)
@@ -75,6 +75,17 @@ def extract_bio_links(raw_bio_links: list[dict[str, Any]] | list[str] | None) ->
         if isinstance(item, dict):
             url = item.get("url")
             title = item.get("title")
+            raw_url = str(url or "").strip(".,;:!?)]}>\"'«»“” ")
+            if not raw_url or not is_valid_web_url(normalize_url(raw_url)) or "l.instagram.com" in raw_url:
+                lynx_url = item.get("lynx_url")
+                if lynx_url:
+                    target = parse_qs(urlparse(str(lynx_url)).query).get("u", [None])[0]
+                    if target:
+                        url = unquote(target)
+                    else:
+                        url = raw_url
+                else:
+                    url = raw_url
         elif isinstance(item, str):
             url = item
             title = None
@@ -83,6 +94,8 @@ def extract_bio_links(raw_bio_links: list[dict[str, Any]] | list[str] | None) ->
         if not url:
             continue
         normalized = normalize_url(str(url))
+        if not normalized or not is_valid_web_url(normalized):
+            continue
         title_text = str(title) if title is not None else ""
         role = score_context(title_text.lower()) if title_text else ContactRole.UNKNOWN
         host = _extract_host(normalized)
@@ -119,6 +132,8 @@ def extract_external_links(text: str | None, exclude_domains: frozenset[str] | N
     seen: set[str] = set()
     for match in _URL_FINDER.finditer(text):
         cleaned = normalize_url(match.group(0))
+        if not is_valid_web_url(cleaned):
+            continue
         if any(_host_matches(_extract_host(cleaned), d) for d in excluded):
             continue
         if is_media_asset(urlparse(cleaned).path) or is_media_asset(cleaned):

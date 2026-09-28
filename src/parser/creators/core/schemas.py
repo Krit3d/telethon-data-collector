@@ -50,7 +50,6 @@ HEAVY_PROFILE_KEYS: list[str] = [
     "ad_metadata",
     "hd_profile_pic_versions",
     "hd_profile_pic_url_info",
-    "bio_links",
     "about_your_account_blurb",
     "edge_owner_to_timeline_media",
     "edge_felix_video_timeline",
@@ -113,8 +112,10 @@ class AccountMetadata(BaseModel):
                 "is_business_account", raw_payload.get("is_professional_account", False)
             )
 
+        raw_payload = dict(raw_payload)
         for key in HEAVY_PROFILE_KEYS:
             raw_payload.pop(key, None)
+        data["raw_profile_payload"] = raw_payload
 
         return data
 
@@ -292,7 +293,7 @@ class ContentMetadata(BaseModel):
 
 
 class InstagramContentMetadata(ContentMetadata):
-    is_reel: bool | None = None
+    pass
 
 
 class TikTokContentMetadata(ContentMetadata):

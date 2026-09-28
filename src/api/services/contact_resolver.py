@@ -30,7 +30,7 @@ class ContactResolver:
         channels = contacts.get("telegram_channels", [])
         if not isinstance(channels, list):
             return set()
-        return {str(item) for item in channels}
+        return {normalize_telegram_handle(str(item)) for item in channels if str(item).strip()}
 
     @staticmethod
     def _is_dm_handle(handle: str) -> bool:
@@ -40,12 +40,14 @@ class ContactResolver:
     def _telegram_candidate(handle: Any, blacklist: set[str]) -> str | None:
         if not isinstance(handle, str):
             return None
-        if handle in blacklist:
-            return None
-        if not ContactResolver._is_dm_handle(handle):
-            return None
         normalized = normalize_telegram_handle(handle)
         if not is_valid_telegram_handle(normalized):
+            return None
+        if normalized in blacklist:
+            return None
+        if normalized.lower().endswith("bot"):
+            return None
+        if not ContactResolver._is_dm_handle(normalized):
             return None
         return normalized
 

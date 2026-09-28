@@ -29,6 +29,7 @@ _URL_START_PREFIXES = (
 )
 
 _SEPARATOR_CHARS = frozenset(" \t:—–-→|/\"'«»“”")
+_SEPARATOR_STRIP = "".join(_SEPARATOR_CHARS)
 
 _URL_PREFIXES = (
     "https://t.me/", "http://t.me/", "t.me/",
@@ -40,8 +41,9 @@ def normalize_telegram_handle(handle: str) -> str:
     value = handle.strip()
     if value.startswith("@"):
         value = value[1:]
+    lowered = value.lower()
     for prefix in _URL_PREFIXES:
-        if value.startswith(prefix):
+        if lowered.startswith(prefix):
             value = value[len(prefix):]
             break
     value = value.split("?", 1)[0].split("#", 1)[0]
@@ -145,8 +147,7 @@ def _has_platform_marker_nearby(text: str, start: int, end: int, window: int = A
     if boundary:
         before = before[boundary:]
     window_text = (before + " " + after).lower()
-    words = _word_tokens(window_text)
-    return any(marker in words for marker in TELEGRAM_PLATFORM_MARKERS)
+    return bool(set(_word_tokens(window_text)) & TELEGRAM_PLATFORM_MARKERS)
 
 
 def _find_url_start(text: str, from_pos: int) -> int | None:
@@ -178,48 +179,55 @@ def _extract_urls(text: str) -> list[tuple[int, int, str]]:
     return results
 
 
-def _extract_handle_from_url(raw: str) -> tuple[str, bool] | None:
+def _extract_handle_from_url(raw: str) -> tuple[str, bool, bool] | None:
     candidate = raw.strip()
     candidate = candidate.rstrip(".,;:!?)]}>\"' ")
     if not (candidate.startswith("http://") or candidate.startswith("https://")):
         candidate = "https://" + candidate
     parsed = urlparse(candidate)
-    if parsed.netloc.lower() not in _URL_DOMAINS:
+    if parsed.netloc.lower().removeprefix("www.") not in _URL_DOMAINS:
         return None
     path = parsed.path
     if path.startswith("/"):
         path = path[1:]
     if path.startswith("c/"):
         return None
+    is_channel = False
     if path.startswith("s/"):
+        is_channel = True
         path = path[2:]
     is_invite = path.startswith("+") or "joinchat/" in path
     if is_invite:
         if path.startswith("+"):
             hash_part = path[1:].split("/", 1)[0]
-            return "+" + hash_part, True
+            return "+" + hash_part, True, is_channel
         if "joinchat/" in path:
             hash_part = path.split("joinchat/", 1)[1].split("/", 1)[0]
-            return "joinchat/" + hash_part, True
+            return "joinchat/" + hash_part, True, is_channel
         return None
-    first_seg = path.split("/", 1)[0]
-    first_seg = first_seg.lstrip("@")
-    first_seg = first_seg.rstrip(".,;:!?)]}>\"' ")
-    if not first_seg:
+    segments = [s for s in path.split("/") if s]
+    if not segments:
         return None
-    return first_seg, False
+    handle = segments[0].lstrip("@")
+    handle = handle.rstrip(".,;:!?)]}>\"' ")
+    if not handle:
+        return None
+    if len(segments) >= 2:
+        post_id = segments[1].split("?")[0].split("#")[0]
+        if post_id.isdigit():
+            is_channel = True
+    return handle, False, is_channel
 
 
 def _skip_to_handle(tokens: list[tuple[int, int, str]], j: int) -> tuple[int, bool]:
     saw_service = False
     while j < len(tokens):
-        t = tokens[j][2]
-        t_lower = t.lower()
-        if t_lower in TELEGRAM_SERVICE_TOKENS:
-            saw_service = True
+        cleaned = tokens[j][2].strip(_SEPARATOR_STRIP)
+        if not cleaned:
             j += 1
             continue
-        if all(c in _SEPARATOR_CHARS for c in t):
+        if cleaned.lower() in TELEGRAM_SERVICE_TOKENS:
+            saw_service = True
             j += 1
             continue
         break
@@ -251,12 +259,13 @@ def _process_at_mentions(
             continue
         if not _has_platform_marker_nearby(text, start, end):
             continue
+        is_invite = normalized.startswith("+") or "joinchat" in normalized
         context = get_context_window(text, start, end, context_window_size)
-        role = score_context(context)
+        role = ContactRole.CHANNEL if is_invite else score_context(context)
         is_bot = normalized.lower().endswith("bot")
         if is_bot and not _is_commercial_bot(normalized, text, start, end, context_window_size):
             continue
-        _merge_candidate(seen, ExtractedTelegram(normalized, role, is_bot, False, token, start, end))
+        _merge_candidate(seen, ExtractedTelegram(normalized, role, is_bot, is_invite, token, start, end))
 
 
 def _process_bare_triggers(
@@ -280,8 +289,9 @@ def _process_bare_triggers(
             normalized = normalize_telegram_handle(candidate)
             if not is_valid_telegram_handle(normalized):
                 continue
+            is_invite = normalized.startswith("+") or "joinchat" in normalized
             context = get_context_window(text, hstart, hend, context_window_size)
-            role = score_context(context)
+            role = ContactRole.CHANNEL if is_invite else score_context(context)
             is_channel_prefix = trigger_word == "тгк" or saw_service
             if is_channel_prefix and role is not ContactRole.COMMERCIAL:
                 role = ContactRole.CHANNEL
@@ -289,7 +299,7 @@ def _process_bare_triggers(
             if is_bot and not _is_commercial_bot(normalized, text, hstart, hend, context_window_size):
                 continue
             _merge_candidate(
-                seen, ExtractedTelegram(normalized, role, is_bot, False, token, hstart, hend, is_channel_prefix)
+                seen, ExtractedTelegram(normalized, role, is_bot, is_invite, token, hstart, hend, is_channel_prefix)
             )
             continue
         sep_positions = [(cleaned.find(s), s) for s in (":", "/", "—", "-")]
@@ -307,8 +317,9 @@ def _process_bare_triggers(
             normalized = normalize_telegram_handle(candidate)
             if not is_valid_telegram_handle(normalized):
                 continue
+            is_invite = normalized.startswith("+") or "joinchat" in normalized
             context = get_context_window(text, start, end, context_window_size)
-            role = score_context(context)
+            role = ContactRole.CHANNEL if is_invite else score_context(context)
             is_channel_prefix = trigger_part.lower() == "тгк"
             if is_channel_prefix and role is not ContactRole.COMMERCIAL:
                 role = ContactRole.CHANNEL
@@ -316,7 +327,7 @@ def _process_bare_triggers(
             if is_bot and not _is_commercial_bot(normalized, text, start, end, context_window_size):
                 continue
             _merge_candidate(
-                seen, ExtractedTelegram(normalized, role, is_bot, False, token, start, end, is_channel_prefix)
+                seen, ExtractedTelegram(normalized, role, is_bot, is_invite, token, start, end, is_channel_prefix)
             )
             continue
 
@@ -330,11 +341,11 @@ def extract_telegram_contacts(text: str | None, context_window_size: int = DEFAU
         parsed = _extract_handle_from_url(raw)
         if parsed is None:
             continue
-        handle, is_invite = parsed
+        handle, is_invite, is_channel = parsed
         normalized = normalize_telegram_handle(handle)
         if not is_valid_telegram_handle(normalized):
             continue
-        role = ContactRole.CHANNEL if is_invite else score_context(
+        role = ContactRole.CHANNEL if (is_invite or is_channel) else score_context(
             get_context_window(text, start, end, context_window_size)
         )
         is_bot = normalized.lower().endswith("bot")
