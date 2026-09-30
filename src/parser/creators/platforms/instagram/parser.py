@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import cast, or_, select, update
+from sqlalchemy import cast, func, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 
 from src.db.models import Account, Content
@@ -185,6 +185,20 @@ class InstagramParser(BasePlatformParser):
         await self._update_transcription_status(item_id, "rejected")
 
     async def parse_profile(self, handle: str) -> int | None:
+        async with self.session_maker() as session:
+            verified_stmt = select(Account.id, Account.status).where(
+                Account.platform == "INSTAGRAM",
+                Account.status == "verified",
+                or_(
+                    func.lower(Account.username) == handle.lower(),
+                    func.lower(Account.platform_id) == handle.lower(),
+                ),
+            )
+            verified_result = await session.execute(verified_stmt)
+            verified_row = verified_result.first()
+            if verified_row is not None and verified_row[1] == "verified":
+                return verified_row[0]
+
         profile = await fetch_instagram_profile(self.client, handle)
         if not profile:
             logger.info(
@@ -249,6 +263,18 @@ class InstagramParser(BasePlatformParser):
                 MAX_SUBSCRIBERS,
             )
             async with self.session_maker() as session:
+                existing_stmt = select(Account.id, Account.status).where(
+                    Account.platform == "INSTAGRAM",
+                    Account.status == "verified",
+                    or_(
+                        Account.platform_id == str(profile.get("id") or username),
+                        func.lower(Account.username) == username.lower(),
+                    ),
+                )
+                existing_result = await session.execute(existing_stmt)
+                existing_row = existing_result.first()
+                if existing_row is not None and existing_row[1] == "verified":
+                    return existing_row[0]
                 account_id = await upsert_and_deduplicate_account(
                     session=session,
                     platform="INSTAGRAM",
@@ -268,6 +294,18 @@ class InstagramParser(BasePlatformParser):
                 handle,
             )
             async with self.session_maker() as session:
+                existing_stmt = select(Account.id, Account.status).where(
+                    Account.platform == "INSTAGRAM",
+                    Account.status == "verified",
+                    or_(
+                        Account.platform_id == str(profile.get("id") or username),
+                        func.lower(Account.username) == username.lower(),
+                    ),
+                )
+                existing_result = await session.execute(existing_stmt)
+                existing_row = existing_result.first()
+                if existing_row is not None and existing_row[1] == "verified":
+                    return existing_row[0]
                 account_id = await upsert_and_deduplicate_account(
                     session=session,
                     platform="INSTAGRAM",
@@ -446,7 +484,7 @@ class InstagramParser(BasePlatformParser):
                         Account.platform == "INSTAGRAM",
                         or_(
                             Account.platform_id == str(profile_id or username),
-                            Account.username == username,
+                            func.lower(Account.username) == username.lower(),
                         ),
                     )
                     exists_result = await session.execute(exists_stmt)
@@ -471,7 +509,10 @@ class InstagramParser(BasePlatformParser):
                             }
                             stmt = (
                                 update(Account)
-                                .where(Account.id == account_id)
+                                .where(
+                                    Account.id == account_id,
+                                    Account.status != "verified",
+                                )
                                 .values(raw_metadata=meta, updated_at=datetime.now(timezone.utc))
                             )
                             await session.execute(stmt)
@@ -518,6 +559,18 @@ class InstagramParser(BasePlatformParser):
             platform_id,
         )
 
+        async with self.session_maker() as session:
+            status_stmt = select(Account.status).where(Account.id == account_id)
+            status_result = await session.execute(status_stmt)
+            current_status = status_result.scalar_one_or_none()
+
+        if current_status == "verified":
+            logger.debug(
+                "Skipping content parsing for account_id: %d because it is verified.",
+                account_id,
+            )
+            return 0
+
         profile = await self._fetch_raw_profile_payload(account_id)
         if profile is None:
             profile = await fetch_instagram_profile(self.client, platform_id)
@@ -549,7 +602,7 @@ class InstagramParser(BasePlatformParser):
                 async with self.session_maker() as session:
                     stmt = (
                         update(Account)
-                        .where(Account.id == account_id)
+                        .where(Account.id == account_id, Account.status != "verified")
                         .values(status="rejected", updated_at=datetime.now(timezone.utc))
                     )
                     await session.execute(stmt)
@@ -570,7 +623,7 @@ class InstagramParser(BasePlatformParser):
             async with self.session_maker() as session:
                 stmt = (
                     update(Account)
-                    .where(Account.id == account_id)
+                    .where(Account.id == account_id, Account.status != "verified")
                     .values(status="rejected", updated_at=datetime.now(timezone.utc))
                 )
                 await session.execute(stmt)
@@ -608,7 +661,7 @@ class InstagramParser(BasePlatformParser):
             async with self.session_maker() as session:
                 stmt = (
                     update(Account)
-                    .where(Account.id == account_id)
+                    .where(Account.id == account_id, Account.status != "verified")
                     .values(status="rejected", updated_at=datetime.now(timezone.utc))
                 )
                 await session.execute(stmt)

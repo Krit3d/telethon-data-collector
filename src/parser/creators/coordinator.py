@@ -6,7 +6,7 @@ import sys
 from collections import defaultdict
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
@@ -26,6 +26,7 @@ STATUS_BUSINESS = "business"
 STATUS_COMMUNITY = "community"
 STATUS_REJECTED = "rejected"
 STATUS_FAILED = "failed"
+STATUS_VERIFIED = "verified"
 
 CREATOR_PLATFORMS = ["INSTAGRAM", "THREADS", "TIKTOK", "YOUTUBE"]
 
@@ -331,6 +332,23 @@ class CreatorsCoordinator:
                     result = await session.execute(stmt)
                     account = result.scalar_one_or_none()
 
+                if account and account.status == STATUS_VERIFIED:
+                    if account_id != db_account_id:
+                        async with self.db.async_session() as session:
+                            await session.execute(
+                                delete(Account).where(Account.id == account_id)
+                            )
+                            await session.commit()
+                        logger.info(
+                            f"Removed duplicate account {account_id} "
+                            f"(username={username}, platform={platform}); "
+                            f"canonical verified account is {db_account_id}"
+                        )
+                    logger.info(
+                        f"Account {username} is already verified, processing completed"
+                    )
+                    return 0
+
                 if account and account.status == STATUS_REJECTED:
                     logger.info(
                         f"Account {username} was rejected during profile parsing. "
@@ -338,7 +356,11 @@ class CreatorsCoordinator:
                     )
                     return 0
 
-                if account and account.subscribers_count is not None:
+                if (
+                    account
+                    and account.subscribers_count is not None
+                    and account.status != STATUS_VERIFIED
+                ):
                     if account.subscribers_count < self.min_subscribers:
                         logger.info(
                             f"Account {username} has {account.subscribers_count} "
@@ -372,6 +394,24 @@ class CreatorsCoordinator:
                     logger.info(
                         f"Account {username} status is '{account_after_content.status}' "
                         f"after content parsing. Not updating to '{STATUS_PARSED}'."
+                    )
+                    return 0
+
+                if account_after_content and account_after_content.status == STATUS_VERIFIED:
+                    if account_id != db_account_id:
+                        async with self.db.async_session() as session:
+                            await session.execute(
+                                delete(Account).where(Account.id == account_id)
+                            )
+                            await session.commit()
+                        logger.info(
+                            f"Removed duplicate account {account_id} "
+                            f"(username={username}, platform={platform}); "
+                            f"canonical verified account is {db_account_id}"
+                        )
+                    logger.info(
+                        "Account %s is already verified, skipping further processing",
+                        username,
                     )
                     return 0
 
@@ -429,6 +469,15 @@ class CreatorsCoordinator:
                     f"({username} on {platform}): {e!r}",
                     exc_info=e,
                 )
+                async with self.db.async_session() as session:
+                    stmt = select(Account).where(Account.id == account_id)
+                    result = await session.execute(stmt)
+                    failed_account = result.scalar_one_or_none()
+                if failed_account and failed_account.status == STATUS_VERIFIED:
+                    logger.info(
+                        f"Account {username} is already verified, skipping status update to '{STATUS_FAILED}'"
+                    )
+                    return 0
                 await self.db.update_creator_account_status(account_id, STATUS_FAILED)
                 return 0
 

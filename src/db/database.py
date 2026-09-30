@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast as type_cast
 
-from sqlalchemy import and_, case, func, or_, select, update, text, cast
+from sqlalchemy import and_, case, func, literal, or_, select, update, text, cast
 from sqlalchemy.dialects.postgresql import insert, JSONPATH
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import DBAPIError, OperationalError
@@ -267,6 +267,19 @@ class Database:
                     .where(Account.id == account_id)
                     .values(status=status, updated_at=datetime.now(timezone.utc))
                 )
+                stmt = stmt.where(
+                    or_(
+                        Account.status.notin_(PROTECTED_ACCOUNT_STATUSES),
+                        and_(
+                            Account.status == "parsed",
+                            literal(status) == "verified",
+                        ),
+                        and_(
+                            Account.status == "ready_for_parsing",
+                            literal(status).in_({"processing", "rejected"}),
+                        ),
+                    )
+                )
                 if platform is not None:
                     if isinstance(platform, list):
                         stmt = stmt.where(Account.platform.in_(platform))
@@ -280,9 +293,10 @@ class Database:
                         "Updated account id=%d status to '%s'", account_id, status
                     )
                 else:
-                    logger.warning(
-                        "Account id=%d not found when updating status to '%s'",
+                    logger.debug(
+                        "Account id=%d not found or status is protected (%s) when updating status to '%s'",
                         account_id,
+                        PROTECTED_ACCOUNT_STATUSES,
                         status,
                     )
 
