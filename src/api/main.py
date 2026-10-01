@@ -2,14 +2,17 @@
 
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -22,6 +25,8 @@ from src.graph.client import Neo4jClient
 
 logger = logging.getLogger(__name__)
 
+settings = load_settings()
+
 WEB_DIR = Path(__file__).resolve().parent.parent / "web" / "search"
 INDEX_FILE = WEB_DIR / "index.html"
 CSS_FILE = WEB_DIR / "css" / "style.css"
@@ -33,13 +38,20 @@ NO_CACHE_HEADERS = {
     "Pragma": "no-cache",
     "Expires": "0",
 }
+SECURITY_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=()",
+}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown operations."""
-    settings = load_settings()
-
     db = Database(settings.db_url)
     qdrant = QdrantService(settings)
     neo4j = Neo4jClient(settings)
@@ -79,15 +91,86 @@ app = FastAPI(
     title="Telegram Semantic Search API",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
+security = HTTPBasic()
 
-class NoCacheMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next) -> Response:
-        response = await call_next(request)
-        for header, value in NO_CACHE_HEADERS.items():
-            response.headers[header] = value
-        return response
+
+def verify_docs_credentials(
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(security),
+) -> None:
+    settings = request.app.state.settings
+    username_ok = secrets.compare_digest(
+        credentials.username.encode("utf-8"),
+        settings.docs_username.encode("utf-8"),
+    )
+    password_ok = secrets.compare_digest(
+        credentials.password.encode("utf-8"),
+        settings.docs_password.encode("utf-8"),
+    )
+    if not settings.docs_password or not (username_ok and password_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": 'Basic realm="API Documentation"'},
+        )
+
+
+if settings.docs_enabled:
+
+    @app.get(
+        "/openapi.json",
+        include_in_schema=False,
+        dependencies=[Depends(verify_docs_credentials)],
+    )
+    async def openapi_schema(request: Request) -> JSONResponse:
+        return JSONResponse(content=request.app.openapi())
+
+    @app.get(
+        "/docs",
+        include_in_schema=False,
+        dependencies=[Depends(verify_docs_credentials)],
+    )
+    async def swagger_ui(request: Request) -> HTMLResponse:
+        return get_swagger_ui_html(
+            openapi_url="/openapi.json",
+            title=f"{request.app.title} - Swagger UI",
+            swagger_ui_parameters={"persistAuthorization": True},
+        )
+
+    @app.get(
+        "/redoc",
+        include_in_schema=False,
+        dependencies=[Depends(verify_docs_credentials)],
+    )
+    async def redoc_ui(request: Request) -> HTMLResponse:
+        return get_redoc_html(
+            openapi_url="/openapi.json",
+            title=f"{request.app.title} - ReDoc",
+        )
+
+
+class SecurityHeadersMiddleware:
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for header, value in SECURITY_HEADERS.items():
+                    headers[header] = value
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -98,33 +181,34 @@ class NoCacheStaticFiles(StaticFiles):
         return response
 
 
-app.add_middleware(NoCacheMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Add CORS middleware for internal production APIs
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://.*",
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+        "X-Bridge-Secret",
+        "X-Slidecold-Signature",
+    ],
 )
 
-# API v1 routing
-app.include_router(search.router, prefix="/api/v1")
-app.include_router(health.router, prefix="/api/v1")
+app.include_router(health.router, prefix="/api/v1/health")
+app.include_router(search.router, prefix="/api/v1/search")
 app.include_router(crm.router, prefix="/api/v1")
-
-
-@app.get("/health", tags=["System"])
-async def health_check() -> dict[str, str]:
-    """Health check endpoint for monitoring and load balancers."""
-    return {"status": "ok"}
 
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/index.html", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    settings = load_settings()
+async def index(request: Request) -> HTMLResponse:
+    settings = request.app.state.settings
     html = INDEX_FILE.read_text(encoding="utf-8")
     css_mtime = int(os.path.getmtime(CSS_FILE))
     js_mtime = int(os.path.getmtime(JS_FILE))

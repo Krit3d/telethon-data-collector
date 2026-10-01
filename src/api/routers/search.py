@@ -8,7 +8,7 @@ from src.api.services.search import SearchService
 from src.utils.countries import get_all_countries
 from src.utils.languages import get_all_languages
 
-router = APIRouter(prefix="/search", tags=["Search"])
+router = APIRouter(tags=["Search"])
 
 
 @router.get("/languages")

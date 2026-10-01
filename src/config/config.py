@@ -1,13 +1,17 @@
 import argparse
+import json
 import logging
 import os
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import (
     Field,
     ValidationError,
+    field_validator,
+    model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from src.utils.logger import setup_logging
 
@@ -31,6 +35,30 @@ class Settings(BaseSettings):
         ...,
         description="PostgreSQL connection URL",
     )
+
+    docs_username: str = Field(
+        default="admin",
+        validation_alias="DOCS_USERNAME",
+        description="Username for Swagger UI access",
+    )
+    docs_password: str = Field(
+        default="",
+        validation_alias="DOCS_PASSWORD",
+        description="Password for Swagger UI access",
+    )
+    docs_enabled: bool = Field(
+        default=True,
+        validation_alias="DOCS_ENABLED",
+        description="Enable or disable OpenAPI documentation",
+    )
+
+    @model_validator(mode="after")
+    def _validate_docs_credentials(self) -> "Settings":
+        if self.docs_enabled and not self.docs_password:
+            raise ValueError(
+                "DOCS_PASSWORD must be set in the environment when DOCS_ENABLED is true"
+            )
+        return self
 
     # ---- Optional vector search settings ----
 
@@ -363,9 +391,53 @@ class Settings(BaseSettings):
         description="Public URL of the CRM frontend interface",
     )
     secret_key: str = Field(
-        default="",
+        ...,
+        validation_alias="CRM_JWT_SECRET_KEY",
         description="Secret key used to sign and verify JWT access tokens",
     )
+    cors_origins: Annotated[list[str], NoDecode] = Field(
+        default=[
+            "http://localhost",
+            "http://localhost:80",
+            "http://localhost:3000",
+            "http://localhost:3001",
+            "http://localhost:8000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:80",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3001",
+            "http://127.0.0.1:8000",
+        ],
+        description="Allowed CORS origins",
+    )
+
+    @field_validator("secret_key")
+    @classmethod
+    def _validate_secret_key(cls, value: str) -> str:
+        if not value or len(value) < 32:
+            raise ValueError(
+                "SECRET_KEY must be a non-empty string of at least 32 characters"
+            )
+        return value
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _parse_cors_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [
+                        str(item).strip()
+                        for item in parsed
+                        if str(item).strip()
+                    ]
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
     # ---- Email settings ----
     smtp_host: str | None = Field(default=None)

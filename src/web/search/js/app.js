@@ -10,7 +10,7 @@ import {
 import { AppStore, DEFAULT_COUNTRIES } from "./store.js";
 
 function getCrmBaseUrl() {
-  const configured = window.__APP_CONFIG__?.crmUrl || window.__CRM_URL__ || "/crm";
+  const configured = window.__APP_CONFIG__?.crmUrl || window.__CRM_URL__ || "/crm/";
   const normalized = String(configured).trim().replace(/\/+$/, "");
   return normalized && normalized !== "__CRM_URL__" ? normalized : "/crm";
 }

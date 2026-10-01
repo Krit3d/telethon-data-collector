@@ -1,5 +1,3 @@
-"""Health check router for monitoring cross-server link stability."""
-
 from __future__ import annotations
 
 import asyncio
@@ -22,8 +20,6 @@ router = APIRouter(tags=["Health"])
 
 
 class ServiceStatus(TypedDict):
-    """Status information for a single service."""
-
     status: str
     timestamp: str
     latency_ms: float | None
@@ -31,23 +27,12 @@ class ServiceStatus(TypedDict):
 
 
 class HealthResponse(TypedDict):
-    """Complete health check response."""
-
     status: str
     timestamp: str
     services: dict[str, ServiceStatus]
 
 
 async def check_postgresql(db: Database) -> ServiceStatus:
-    """Check PostgreSQL connection by executing SELECT 1.
-
-    Args:
-        db: Database instance.
-
-    Returns:
-        ServiceStatus dictionary with check results.
-    """
-
     start = time.time()
     try:
         async with db.async_session() as session:
@@ -73,18 +58,12 @@ async def check_postgresql(db: Database) -> ServiceStatus:
 
 
 async def check_neo4j(neo4j: Neo4jClient) -> ServiceStatus:
-    """Check Neo4j connection by executing RETURN 1.
-
-    Args:
-        neo4j: Neo4jClient instance.
-
-    Returns:
-        ServiceStatus dictionary with check results.
-    """
-
     start = time.time()
     try:
-        await neo4j.execute_read("RETURN 1 AS result")
+        try:
+            await neo4j.verify_connectivity()
+        except AttributeError:
+            await neo4j.execute_read("RETURN 1 AS result")
         latency = (time.time() - start) * 1000
         return {
             "status": "healthy",
@@ -103,24 +82,12 @@ async def check_neo4j(neo4j: Neo4jClient) -> ServiceStatus:
 
 
 async def check_qdrant(qdrant: QdrantService) -> ServiceStatus:
-    """Check Qdrant connection by retrieving collections.
-
-    Args:
-        qdrant: Qdrant service instance.
-
-    Returns:
-        ServiceStatus dictionary with check results.
-    """
-
     start = time.time()
-
     try:
-        # Ensure Qdrant is initialized
         if not qdrant._initialized:
             await qdrant.initialize()
 
-        # Test connection by getting collections
-        collections = await qdrant.client.get_collections()
+        await qdrant.client.get_collections()
 
         latency = (time.time() - start) * 1000
         return {
@@ -139,56 +106,28 @@ async def check_qdrant(qdrant: QdrantService) -> ServiceStatus:
         }
 
 
-@router.get(
-    "", response_model=HealthResponse, summary="Comprehensive health check"
-)
+@router.get("", response_model=HealthResponse, summary="Comprehensive health check")
+@router.get("/", response_model=HealthResponse, include_in_schema=False)
 async def health_check(
     request: Request,
     db: Database = Depends(get_db),
     neo4j: Neo4jClient = Depends(get_neo4j),
     qdrant: QdrantService = Depends(get_qdrant),
 ) -> HealthResponse:
-    """Comprehensive health check endpoint for monitoring cross-server link stability.
-
-    This endpoint performs asynchronous checks on all critical services:
-    - PostgreSQL: Executes SELECT 1 to verify database connectivity
-    - Neo4j: Executes RETURN 1 to verify graph database connectivity
-    - Qdrant: Retrieves collections to verify vector database connectivity
-
-    If any service is down, returns 503 Service Unavailable with details.
-    If all services are healthy, returns 200 OK with status and timestamps.
-
-    Args:
-        request: FastAPI request object.
-        db: Database instance (injected).
-        neo4j: Neo4jClient instance (injected).
-        qdrant: Qdrant service instance (injected).
-
-    Returns:
-        HealthResponse with status and service details.
-
-    Raises:
-        HTTPException: If any service check fails (503 status).
-    """
-
-    # Run all checks concurrently for efficiency
     postgres_task = asyncio.create_task(check_postgresql(db))
     neo4j_task = asyncio.create_task(check_neo4j(neo4j))
     qdrant_task = asyncio.create_task(check_qdrant(qdrant))
 
-    # Wait for all checks to complete
     postgres_status, neo4j_status, qdrant_status = await asyncio.gather(
         postgres_task, neo4j_task, qdrant_task
     )
 
-    # Build services dictionary
     services = {
         "postgresql": postgres_status,
         "neo4j": neo4j_status,
         "qdrant": qdrant_status,
     }
 
-    # Determine overall status
     all_healthy = all(s["status"] == "healthy" for s in services.values())
 
     response: HealthResponse = {
@@ -197,7 +136,6 @@ async def health_check(
         "services": services,
     }
 
-    # Return 503 if any service is down
     if not all_healthy:
         unhealthy_services = [
             name

@@ -71,7 +71,7 @@ services:
       FASTEMBED_CACHE_PATH: /app/model_cache
       ONNXRUNTIME_PROVIDER: ${ONNXRUNTIME_PROVIDER:-CPUExecutionProvider}
     ports:
-      - "8000:8000"
+      - "${INTERNAL_BIND_ADDR:-127.0.0.1}:8000:8000"
     volumes:
       - fastembed_cache:/app/model_cache
       # - ./media:/app/media
