@@ -177,10 +177,7 @@ export interface CommunicationChannelItem {
 const TOKEN_KEY = 'creatorflow_token';
 const USER_KEY = 'creatorflow_user';
 
-const API_PROTOCOL = typeof window !== 'undefined' ? window.location.protocol : 'http:';
-const API_HOSTNAME = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
-const DEFAULT_API_URL = `${API_PROTOCOL}//${API_HOSTNAME}:8000/api/v1`;
-const ROOT_API_URL = (import.meta.env.VITE_API_URL || DEFAULT_API_URL).replace(/\/+$/, '');
+const ROOT_API_URL = (import.meta.env.VITE_API_URL || '/api/v1').replace(/\/+$/, '');
 const API_BASE = `${ROOT_API_URL.replace(/\/crm\/?$/, '')}/crm`;
 export const MEDIA_SERVER_BASE = ROOT_API_URL.replace(/\/api(\/v\d+)?.*$/, '');
 

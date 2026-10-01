@@ -12,8 +12,8 @@ services:
       NEO4J_server_memory_heap_max__size: 4g
       NEO4J_server_memory_pagecache_size: 4g
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "${INTERNAL_BIND_ADDR:-127.0.0.1}:7474:7474"
+      - "${INTERNAL_BIND_ADDR:-127.0.0.1}:7687:7687"
     volumes:
       - neo4j_data:/data
     networks:
@@ -33,8 +33,8 @@ services:
       QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: "2"
       QDRANT__STORAGE__PERFORMANCE__MAX_OPTIMIZATION_THREADS: "1"
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "${INTERNAL_BIND_ADDR:-127.0.0.1}:6333:6333"
+      - "${INTERNAL_BIND_ADDR:-127.0.0.1}:6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     deploy:

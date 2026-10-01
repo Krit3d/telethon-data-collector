@@ -359,7 +359,7 @@ class Settings(BaseSettings):
         description="API key for Twenty CRM authentication",
     )
     crm_frontend_url: str = Field(
-        default="http://localhost:3001",
+        default="/crm/",
         description="Public URL of the CRM frontend interface",
     )
     secret_key: str = Field(

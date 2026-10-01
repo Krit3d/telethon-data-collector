@@ -12,12 +12,8 @@ type ActiveStatus = Author['status'];
 const statusTone: Record<ActiveStatus, string> = { 'Свободен': 'green', 'В сделке': 'blue', 'В архиве': 'gray' };
 const SOCIALS: Social[] = ['Instagram', 'VK', 'Telegram', 'TikTok', 'YouTube', 'Дзен'];
 const PAGE = 15;
-const DEFAULT_SEARCH_PORT = 8000;
-
 function getSearchBaseUrl(): string {
-  const host = window.location.hostname;
-  if (host) return `${window.location.protocol}//${host}:${DEFAULT_SEARCH_PORT}`;
-  return `http://localhost:${DEFAULT_SEARCH_PORT}`;
+  return import.meta.env.VITE_SEARCH_URL || '/';
 }
 
 const fmtER = (n: number) => `${n.toFixed(1).replace('.', ',')}%`;

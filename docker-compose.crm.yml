@@ -44,7 +44,7 @@ services:
       STORAGE_TYPE: local
       STORAGE_LOCAL_PATH: .local-storage
     ports:
-      - "${TWENTY_PORT:-3000}:3000"
+      - "${INTERNAL_BIND_ADDR:-127.0.0.1}:${TWENTY_PORT:-3000}:3000"
     volumes:
       - twenty_storage_data:/app/packages/twenty-server/.local-storage
     depends_on:
@@ -78,7 +78,7 @@ services:
     restart: always
     env_file: [ .env ]
     ports:
-      - "${CRM_FRONTEND_PORT:-3001}:80"
+      - "${INTERNAL_BIND_ADDR:-127.0.0.1}:${CRM_FRONTEND_PORT:-3001}:80"
     depends_on:
       - twenty-server
     networks: [ crm-network ]

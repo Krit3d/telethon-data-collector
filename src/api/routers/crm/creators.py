@@ -68,7 +68,7 @@ async def export_to_shortlist(
     if not raw_ids:
         return CrmShortlistResponse(
             added_count=0,
-            redirect_url=f"{request.app.state.settings.crm_frontend_url}/#/authors?import_ids={','.join(raw_ids)}",
+            redirect_url=f"{request.app.state.settings.crm_frontend_url.rstrip('/')}/#/authors?import_ids={','.join(raw_ids)}",
         )
 
     numeric_ids: list[int] = []
@@ -142,7 +142,7 @@ async def export_to_shortlist(
 
     return CrmShortlistResponse(
         added_count=len(accounts),
-        redirect_url=f"{request.app.state.settings.crm_frontend_url}/#/authors?import_ids={','.join(raw_ids)}",
+        redirect_url=f"{request.app.state.settings.crm_frontend_url.rstrip('/')}/#/authors?import_ids={','.join(raw_ids)}",
     )
 
 

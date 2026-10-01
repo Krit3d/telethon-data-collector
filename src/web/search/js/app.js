@@ -9,8 +9,14 @@ import {
 } from "./render.js";
 import { AppStore, DEFAULT_COUNTRIES } from "./store.js";
 
+function getCrmBaseUrl() {
+  const configured = window.__APP_CONFIG__?.crmUrl || window.__CRM_URL__ || "/crm";
+  const normalized = String(configured).trim().replace(/\/+$/, "");
+  return normalized && normalized !== "__CRM_URL__" ? normalized : "/crm";
+}
+
 function getCrmLoginUrl() {
-  return `${window.location.protocol}//${window.location.hostname || "localhost"}:3001/#/login`;
+  return `${getCrmBaseUrl()}/#/login`;
 }
 
 function handleAuthGuard() {
@@ -885,8 +891,7 @@ async function exportToCrm(accountIds) {
     showToast("Нет авторов для экспорта", "error");
     return;
   }
-  const crmUrl = `${window.location.protocol}//${window.location.hostname}:3001`;
-  const targetUrl = `${crmUrl}/#/authors?import_ids=${ids.join(",")}`;
+  const targetUrl = `${getCrmBaseUrl()}/#/authors?import_ids=${ids.join(",")}`;
   window.open(targetUrl, "_blank");
   showToast("Авторы экспортированы в CRM");
 }
