@@ -47,7 +47,7 @@ class Settings(BaseSettings):
         description="Password for Swagger UI access",
     )
     docs_enabled: bool = Field(
-        default=True,
+        default=False,
         validation_alias="DOCS_ENABLED",
         description="Enable or disable OpenAPI documentation",
     )

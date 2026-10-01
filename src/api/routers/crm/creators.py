@@ -55,6 +55,8 @@ async def export_to_shortlist(
     current_user: User = Depends(get_current_user),
 ) -> CrmShortlistResponse:
     target_email = current_user.email
+    if len(payload.account_ids) > 100:
+        raise HTTPException(status_code=400, detail="Превышен максимальный лимит: не более 100 идентификаторов за один запрос")
     raw_ids: list[str] = []
     for aid in payload.account_ids:
         if not aid:
@@ -65,6 +67,8 @@ async def export_to_shortlist(
             if cleaned and cleaned.lower() not in {"undefined", "null"}:
                 raw_ids.append(cleaned)
     raw_ids = list(dict.fromkeys(raw_ids))
+    if len(raw_ids) > 100:
+        raise HTTPException(status_code=400, detail="Превышен максимальный лимит: не более 100 идентификаторов за один запрос")
     if not raw_ids:
         return CrmShortlistResponse(
             added_count=0,
@@ -662,7 +666,7 @@ async def send_creator_message(
             user_id=current_user.id,
             account_id=account.id,
             deal_id=deal.id if deal else None,
-            sender_type=payload.sender_type,
+            sender_type="user",
             text=payload.text.strip() if payload.text else None,
             channel_type=target_channel,
             channel_target=target_handle,

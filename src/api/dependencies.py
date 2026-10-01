@@ -1,6 +1,6 @@
 from collections.abc import AsyncGenerator
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -88,4 +88,9 @@ async def get_current_user(
         user = (await session.execute(stmt)).scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=401, detail="Пользователь не найден")
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Учетная запись деактивирована",
+        )
     return user

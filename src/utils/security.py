@@ -6,7 +6,8 @@ import secrets
 import time
 from typing import Any
 
-PBKDF2_ITERATIONS = 100_000
+LEGACY_PBKDF2_ITERATIONS = 100_000
+PBKDF2_ITERATIONS = 600_000
 SALT_BYTES = 16
 HASH_ALGORITHM = "sha256"
 JWT_ALGORITHM = "HS256"
@@ -20,19 +21,26 @@ def hash_password(password: str) -> str:
         salt.encode("utf-8"),
         PBKDF2_ITERATIONS,
     )
-    return f"{salt}${digest.hex()}"
+    return f"{salt}${PBKDF2_ITERATIONS}${digest.hex()}"
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    try:
-        salt, stored_digest = password_hash.split("$", 1)
-    except ValueError:
-        return False
+    parts = password_hash.split("$")
+    match parts:
+        case [salt, stored_digest]:
+            iterations = LEGACY_PBKDF2_ITERATIONS
+        case [salt, iter_str, stored_digest]:
+            try:
+                iterations = int(iter_str)
+            except ValueError:
+                return False
+        case _:
+            return False
     digest = hashlib.pbkdf2_hmac(
         HASH_ALGORITHM,
         password.encode("utf-8"),
         salt.encode("utf-8"),
-        PBKDF2_ITERATIONS,
+        iterations,
     )
     return hmac.compare_digest(digest.hex(), stored_digest)
 

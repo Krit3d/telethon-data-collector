@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/deals", tags=["CRM Deals"])
 
+FORBIDDEN_DEAL_FIELDS = {"id", "user_id", "account_id", "created_at"}
+
 
 def _deal_item(
     deal: Deal,
@@ -249,6 +251,8 @@ async def update_deal(
         account = deal.account
         updates = payload.model_dump(exclude_unset=True)
         for field, value in updates.items():
+            if field in FORBIDDEN_DEAL_FIELDS:
+                continue
             if value is not None:
                 setattr(deal, field, value)
         deal.updated_at = datetime.now(timezone.utc)
@@ -360,7 +364,7 @@ async def send_deal_message(
             user_id=deal.user_id,
             account_id=deal.account_id,
             deal_id=deal.id,
-            sender_type=payload.sender_type,
+            sender_type="user",
             text=payload.text.strip() if payload.text else None,
             channel_type=target_channel,
             channel_target=target_handle,

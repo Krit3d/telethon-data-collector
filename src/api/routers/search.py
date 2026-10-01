@@ -7,6 +7,7 @@ from src.api.schemas import BrandAnalysisRequest, BrandAnalysisResponse, SearchP
 from src.api.services.search import SearchService
 from src.utils.countries import get_all_countries
 from src.utils.languages import get_all_languages
+from src.utils.rate_limiter import rate_limit
 
 router = APIRouter(tags=["Search"])
 
@@ -35,6 +36,7 @@ async def list_countries() -> Response:
 async def search_content(
     payload: SearchRequest,
     service: SearchService = Depends(get_search_service),
+    _rate_limit: None = Depends(rate_limit(max_requests=20, window_seconds=60)),
 ) -> SearchResponse:
     return await service.execute_search(payload)
 
@@ -43,6 +45,7 @@ async def search_content(
 async def plan_search(
     payload: SearchPlanRequest,
     service: SearchService = Depends(get_search_service),
+    _rate_limit: None = Depends(rate_limit(max_requests=20, window_seconds=60)),
 ) -> SearchPlanResponse:
     return await service.plan_campaign(payload)
 
@@ -51,5 +54,6 @@ async def plan_search(
 async def analyze_brand(
     payload: BrandAnalysisRequest,
     service: SearchService = Depends(get_search_service),
+    _rate_limit: None = Depends(rate_limit(max_requests=20, window_seconds=60)),
 ) -> BrandAnalysisResponse:
     return await service.analyze_brand(payload)

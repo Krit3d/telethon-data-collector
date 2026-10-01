@@ -8,6 +8,7 @@ from src.api.schemas import CrmLoginRequest, CrmLoginResponse, CrmRegisterReques
 from src.api.services.crm_client import TwentyCrmClient
 from src.db.database import Database
 from src.db.models import User
+from src.utils.rate_limiter import rate_limit
 from src.utils.security import create_access_token, hash_password, verify_password
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ async def crm_login(
     request: Request,
     db: Database = Depends(get_db),
     crm_client: TwentyCrmClient = Depends(get_crm_client),
+    _rate_limit: None = Depends(rate_limit(max_requests=5, window_seconds=60)),
 ) -> CrmLoginResponse:
     email = payload.email.strip()
     async with db.async_session() as session:
@@ -42,8 +44,8 @@ async def crm_login(
 
     try:
         data = await crm_client.authenticate(payload.email, payload.password)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Неверный email или пароль")
     except Exception as exc:
         logger.exception("Twenty login failed")
         raise HTTPException(status_code=500, detail=f"Twenty service error: {exc}")
@@ -88,6 +90,7 @@ async def crm_register(
     payload: CrmRegisterRequest,
     request: Request,
     db: Database = Depends(get_db),
+    _rate_limit: None = Depends(rate_limit(max_requests=5, window_seconds=60)),
 ) -> CrmLoginResponse:
     email = payload.email.strip()
     async with db.async_session() as session:
@@ -95,7 +98,7 @@ async def crm_register(
         result = await session.execute(stmt)
         existing = result.scalar_one_or_none()
         if existing is not None:
-            raise HTTPException(status_code=400, detail="Пользователь с таким email уже зарегистрирован")
+            raise HTTPException(status_code=400, detail="Регистрация с указанными данными невозможна")
 
         user = User(
             email=email,
