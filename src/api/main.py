@@ -5,6 +5,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -233,13 +234,19 @@ if WEB_DIR.exists():
 @app.get("/media/{filename}")
 async def get_media(filename: str, request: Request) -> Response:
     settings = request.app.state.settings
+    decoded_filename = unquote(filename).strip()
+    if "\x00" in decoded_filename:
+        raise HTTPException(status_code=400, detail="Некорректное имя файла")
+    safe_name = Path(decoded_filename).name
+    if not safe_name or safe_name != decoded_filename or safe_name.startswith("."):
+        raise HTTPException(status_code=400, detail="Некорректное имя файла")
     if settings.media_bridge_url:
         headers = {}
         if settings.media_bridge_secret:
             headers["X-Bridge-Secret"] = settings.media_bridge_secret
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.get(
-                f"{settings.media_bridge_url.rstrip('/')}/media/{filename}",
+                f"{settings.media_bridge_url.rstrip('/')}/media/{safe_name}",
                 headers=headers,
             )
         if resp.status_code == 404:
@@ -254,7 +261,8 @@ async def get_media(filename: str, request: Request) -> Response:
             media_type=resp.headers.get("content-type", "application/octet-stream"),
             headers=headers,
         )
-    path = MEDIA_DIR / filename
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path)
+    base_dir = MEDIA_DIR.resolve()
+    target_path = (base_dir / safe_name).resolve()
+    if not target_path.is_relative_to(base_dir) or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    return FileResponse(target_path)

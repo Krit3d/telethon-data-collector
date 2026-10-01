@@ -141,41 +141,63 @@ async def upsert_and_deduplicate_account(
 
     primary_id = primary_account.id
 
-    if primary_account.status != "verified":
-        primary_account.platform_id = platform_id or primary_account.platform_id
-        primary_account.username = clean_username or primary_account.username
-        primary_account.title = title
-        primary_account.description = description if description is not None else primary_account.description
-        primary_account.subscribers_count = (
-            subscribers_count if subscribers_count is not None else primary_account.subscribers_count
-        )
-        if primary_account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
-            primary_account.status = status
+    duplicate_ids = [
+        acc.id
+        for acc in existing_accounts
+        if acc.id != primary_id and acc.status != "verified"
+    ]
 
-    duplicate_ids = [acc.id for acc in existing_accounts if acc.id != primary_id]
-    if duplicate_ids:
-        await session.execute(
-            update(Content)
-            .where(Content.account_id.in_(duplicate_ids))
-            .values(account_id=primary_id)
-        )
+    with session.no_autoflush:
+        if duplicate_ids:
+            existing_content_ids = select(Content.platform_content_id).where(
+                Content.account_id == primary_id
+            )
+            await session.execute(
+                delete(Content).where(
+                    Content.account_id.in_(duplicate_ids),
+                    Content.platform_content_id.in_(existing_content_ids),
+                )
+            )
 
-        await session.execute(
-            update(Comment)
-            .where(Comment.account_id.in_(duplicate_ids))
-            .values(account_id=primary_id)
-        )
+            await session.execute(
+                update(Content)
+                .where(Content.account_id.in_(duplicate_ids))
+                .values(account_id=primary_id)
+            )
 
-        await session.execute(
-            delete(Account).where(Account.id.in_(duplicate_ids))
-        )
+            await session.execute(
+                update(Comment)
+                .where(Comment.account_id.in_(duplicate_ids))
+                .values(account_id=primary_id)
+            )
 
-        logger.info(
-            "Merged %d duplicate accounts into primary account %d for platform %s",
-            len(duplicate_ids),
-            primary_id,
-            platform,
-        )
+            await session.execute(
+                delete(Account).where(Account.id.in_(duplicate_ids))
+            )
+
+            for acc in existing_accounts:
+                if acc.id in duplicate_ids:
+                    session.expunge(acc)
+
+            await session.flush()
+
+            logger.info(
+                "Merged %d duplicate accounts into primary account %d for platform %s",
+                len(duplicate_ids),
+                primary_id,
+                platform,
+            )
+
+        if primary_account.status != "verified":
+            primary_account.platform_id = platform_id or primary_account.platform_id
+            primary_account.username = clean_username or primary_account.username
+            primary_account.title = title
+            primary_account.description = description if description is not None else primary_account.description
+            primary_account.subscribers_count = (
+                subscribers_count if subscribers_count is not None else primary_account.subscribers_count
+            )
+            if primary_account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
+                primary_account.status = status
 
     await session.flush()
     return primary_id
