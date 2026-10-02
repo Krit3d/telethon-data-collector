@@ -455,12 +455,11 @@ class Settings(BaseSettings):
     media_bridge_url: str | None = Field(default=None, description="Internal URL of the German media bridge, e.g. http://100.x.y.z:8090")
     media_bridge_secret: str | None = Field(default=None, description="Secret token for media bridge authentication")
 
-    # ---- Slide Cold integration settings ----
-    slidecold_api_key: str | None = Field(default=None, description="Slidecold API key (Bearer token)")
-    slidecold_account_id: str | None = Field(default=None, description="Slidecold connected account ID")
-    slidecold_base_url: str = Field(default="https://slidecold.com", description="Slidecold API base URL")
-    slidecold_webhook_secret: str | None = Field(default=None, description="Secret token for verifying X-SlideCold-Signature")
-    slidecold_poll_interval_s: int = Field(default=15, description="Poll interval in seconds for Slidecold worker fallback")
+    # ---- Bridgit.me integration settings ----
+    bridgit_api_key: str | None = Field(default=None, description="Bridgit API key")
+    bridgit_account_login: str | None = Field(default=None, description="Connected Instagram account login for Bridgit")
+    bridgit_base_url: str = Field(default="https://app.bridgit.me/api/public/v3", description="Bridgit API base URL")
+    bridgit_poll_interval_s: int = Field(default=15, description="Poll interval in seconds for Bridgit delivery stats verification")
 
     # ---- Channel sourcing ----
     channels_file: Path = Field(

@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DatabaseError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -143,50 +144,22 @@ async def queue_single_account(
 
     clean_id = stripped_id.lower()
 
-    stmt = (
-        select(Account.id)
-        .where(
-            Account.platform == platform,
-            or_(
-                func.lower(Account.platform_id) == clean_id,
-                func.lower(Account.username) == clean_id,
-            ),
+    insert_stmt = (
+        pg_insert(Account)
+        .values(
+            platform=platform,
+            platform_id=clean_id,
+            username=clean_id,
+            title=clean_id,
+            status=status,
         )
-        .limit(1)
-    )
-    result = await session.execute(stmt)
-    existing = result.scalar_one_or_none()
-
-    if existing:
-        return False
-
-    new_account = Account(
-        platform=platform,
-        platform_id=clean_id,
-        username=clean_id,
-        title=clean_id,
-        status=status,
+        .on_conflict_do_nothing()
+        .returning(Account.id)
     )
 
     try:
-        async with session.begin_nested():
-            session.add(new_account)
-            await session.flush()
-        logger.debug(
-            "[SPIDER] Queued discovered %s account: %s from bio of parent account %s (id: %d).",
-            platform,
-            clean_id,
-            parent_handle,
-            new_account.id,
-        )
-        return True
-    except IntegrityError:
-        logger.debug(
-            "[SPIDER] Account %s:%s already exists (concurrent conflict), skipping.",
-            platform,
-            clean_id,
-        )
-        return False
+        result = await session.execute(insert_stmt)
+        new_id = result.scalar_one_or_none()
     except DatabaseError as e:
         logger.warning(
             "Database error while queuing %s account %s: %s",
@@ -195,3 +168,15 @@ async def queue_single_account(
             e,
         )
         return False
+
+    if new_id is not None:
+        logger.debug(
+            "[SPIDER] Queued discovered %s account: %s from bio of parent account %s (id: %d).",
+            platform,
+            clean_id,
+            parent_handle,
+            new_id,
+        )
+        return True
+
+    return False

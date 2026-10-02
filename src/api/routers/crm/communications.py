@@ -39,6 +39,7 @@ async def init_communication(
         if account is None:
             raise HTTPException(status_code=404, detail="Автор не найден")
         resolution = ContactResolver.resolve(account.raw_metadata, account.username)
+        available_channels = {c.channel_type for c in ContactResolver.get_all_channels(account.raw_metadata, account.username)}
         deal_stmt = (
             select(Deal)
             .where(
@@ -137,8 +138,8 @@ async def init_communication(
             is_archived=is_archived,
             channel_type=(
                 last_existing.channel_type
-                if (last_existing and last_existing.channel_type)
-                else resolution.channel_type
+                if (last_existing and last_existing.channel_type and last_existing.channel_type in available_channels)
+                else (resolution.channel_type or "internal")
             ),
         )
 
@@ -224,12 +225,16 @@ async def list_communications(
             )
             shortlist_item = shortlist_map.get(account_id)
             is_archived = bool(shortlist_item and shortlist_item.status == "В архиве")
-            if last_message is not None and last_message.channel_type:
-                channel_type = last_message.channel_type
-            elif account is not None:
-                channel_type = ContactResolver.resolve(account.raw_metadata, account.username).channel_type
+            if account is not None:
+                resolution = ContactResolver.resolve(account.raw_metadata, account.username)
+                available_channels = {c.channel_type for c in ContactResolver.get_all_channels(account.raw_metadata, account.username)}
             else:
-                channel_type = "internal"
+                resolution = ContactResolver.resolve(None, None)
+                available_channels = set()
+            if last_message is not None and last_message.channel_type and last_message.channel_type in available_channels:
+                channel_type = last_message.channel_type
+            else:
+                channel_type = resolution.channel_type or "internal"
             channels.append(
                 CommunicationChannelItem(
                     deal_id=best_deal.id if best_deal else None,

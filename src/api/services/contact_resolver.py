@@ -101,7 +101,7 @@ class ContactResolver:
         return ContactResolutionResult()
 
     @staticmethod
-    def get_all_channels(raw_metadata: dict[str, Any] | None) -> list[ContactResolutionResult]:
+    def get_all_channels(raw_metadata: dict[str, Any] | None, username: str | None = None) -> list[ContactResolutionResult]:
         contacts = ContactResolver._contacts(raw_metadata)
         blacklist = ContactResolver._blacklist(contacts)
         results: list[ContactResolutionResult] = []
@@ -135,7 +135,7 @@ class ContactResolver:
             if handle is not None:
                 results.append(ContactResolutionResult("telegram", f"@{handle}", True, "general"))
 
-        raw_username = raw_metadata.get("username") if isinstance(raw_metadata, dict) else None
+        raw_username = username if username is not None else (raw_metadata.get("username") if isinstance(raw_metadata, dict) else None)
         clean_username = ContactResolver._clean_username(raw_username)
         if clean_username:
             results.append(ContactResolutionResult("instagram", f"@{clean_username}", True, "direct"))

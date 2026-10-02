@@ -17,7 +17,6 @@ from src.parser.creators.core.text import normalize_title, normalize_description
 logger = logging.getLogger(__name__)
 
 FINALIZED_STATUSES: frozenset[str] = frozenset({"parsed", "rejected", "verified", "business", "community"})
-NON_FINALIZED_STATUSES: frozenset[str] = frozenset({"pending", "processing"})
 
 
 async def upsert_and_deduplicate_account(
@@ -115,7 +114,7 @@ async def upsert_and_deduplicate_account(
         account.subscribers_count = (
             subscribers_count if subscribers_count is not None else account.subscribers_count
         )
-        if account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
+        if account.status not in FINALIZED_STATUSES:
             account.status = status
         await session.flush()
         logger.debug(
@@ -172,7 +171,10 @@ async def upsert_and_deduplicate_account(
             )
 
             await session.execute(
-                delete(Account).where(Account.id.in_(duplicate_ids))
+                delete(Account).where(
+                    Account.id.in_(duplicate_ids),
+                    Account.status != "verified",
+                )
             )
 
             for acc in existing_accounts:
@@ -196,7 +198,7 @@ async def upsert_and_deduplicate_account(
             primary_account.subscribers_count = (
                 subscribers_count if subscribers_count is not None else primary_account.subscribers_count
             )
-            if primary_account.status not in FINALIZED_STATUSES or status not in NON_FINALIZED_STATUSES:
+            if primary_account.status not in FINALIZED_STATUSES:
                 primary_account.status = status
 
     await session.flush()

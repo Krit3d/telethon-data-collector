@@ -6,7 +6,7 @@ import sys
 from collections import defaultdict
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from src.config.config import Settings, load_settings
 from src.db.database import Database
@@ -210,9 +210,15 @@ class CreatorsCoordinator:
 
             discovery_count = await self._ensure_pending_queue(platform, client)
 
-            final_pending_count = await self.db.count_pending_creator_accounts(platform)
+            platforms_to_check = [self.platform_filter] if self.platform_filter else CREATOR_PLATFORMS
 
-            if final_pending_count == 0:
+            total_pending = 0
+            for p in platforms_to_check:
+                total_pending += await self.db.count_pending_creator_accounts(p)
+
+            final_pending_count = total_pending
+
+            if total_pending == 0:
                 logger.info("No pending accounts available. Skipping ingestion cycle.")
                 return
 
@@ -245,7 +251,6 @@ class CreatorsCoordinator:
                     )
                 )
                 for account in accounts
-                if account.username
             ]
 
             if not tasks:
@@ -299,7 +304,14 @@ class CreatorsCoordinator:
         client: ScrapeCreatorsClient,
     ) -> int:
         if not username:
-            logger.warning(f"Account {account_id} has no username, skipping")
+            logger.warning(f"Account {account_id} has no username, marking as {STATUS_FAILED}")
+            async with self.db.async_session() as session:
+                await session.execute(
+                    update(Account)
+                    .where(Account.id == account_id, Account.status != STATUS_VERIFIED)
+                    .values(status=STATUS_FAILED)
+                )
+                await session.commit()
             return 0
 
         async with semaphore:
@@ -317,14 +329,31 @@ class CreatorsCoordinator:
 
                 db_account_id = await parser.parse_profile(username)
 
+                if db_account_id is not None and account_id != db_account_id:
+                    async with self.db.async_session() as session:
+                        await session.execute(
+                            delete(Account).where(
+                                Account.id == account_id,
+                                Account.status != STATUS_VERIFIED,
+                            )
+                        )
+                        await session.commit()
+                    logger.info(
+                        f"Removed duplicate account {account_id} (username={username}, platform={platform}); canonical account is {db_account_id}"
+                    )
+
                 if db_account_id is None:
                     logger.info(
                         f"Profile {username} on {platform} rejected "
                         f"(below subscriber threshold or parsing failed)"
                     )
-                    await self.db.update_creator_account_status(
-                        account_id, STATUS_REJECTED
-                    )
+                    async with self.db.async_session() as session:
+                        await session.execute(
+                            update(Account)
+                            .where(Account.id == account_id, Account.status != STATUS_VERIFIED)
+                            .values(status=STATUS_REJECTED)
+                        )
+                        await session.commit()
                     return 0
 
                 async with self.db.async_session() as session:
@@ -333,17 +362,6 @@ class CreatorsCoordinator:
                     account = result.scalar_one_or_none()
 
                 if account and account.status == STATUS_VERIFIED:
-                    if account_id != db_account_id:
-                        async with self.db.async_session() as session:
-                            await session.execute(
-                                delete(Account).where(Account.id == account_id)
-                            )
-                            await session.commit()
-                        logger.info(
-                            f"Removed duplicate account {account_id} "
-                            f"(username={username}, platform={platform}); "
-                            f"canonical verified account is {db_account_id}"
-                        )
                     logger.info(
                         f"Account {username} is already verified, processing completed"
                     )
@@ -398,17 +416,6 @@ class CreatorsCoordinator:
                     return 0
 
                 if account_after_content and account_after_content.status == STATUS_VERIFIED:
-                    if account_id != db_account_id:
-                        async with self.db.async_session() as session:
-                            await session.execute(
-                                delete(Account).where(Account.id == account_id)
-                            )
-                            await session.commit()
-                        logger.info(
-                            f"Removed duplicate account {account_id} "
-                            f"(username={username}, platform={platform}); "
-                            f"canonical verified account is {db_account_id}"
-                        )
                     logger.info(
                         "Account %s is already verified, skipping further processing",
                         username,
@@ -432,7 +439,13 @@ class CreatorsCoordinator:
                         final_status = STATUS_COMMUNITY
                     else:
                         final_status = STATUS_PARSED
-                    await self.db.update_creator_account_status(db_account_id, final_status)
+                    async with self.db.async_session() as session:
+                        await session.execute(
+                            update(Account)
+                            .where(Account.id == db_account_id, Account.status != STATUS_VERIFIED)
+                            .values(status=final_status)
+                        )
+                        await session.commit()
                     if final_status == STATUS_BUSINESS:
                         logger.info(
                             "Account %d (%s on %s) classified as BUSINESS (biz=%.3f, creator=%.3f). Marked as business.",
@@ -478,7 +491,13 @@ class CreatorsCoordinator:
                         f"Account {username} is already verified, skipping status update to '{STATUS_FAILED}'"
                     )
                     return 0
-                await self.db.update_creator_account_status(account_id, STATUS_FAILED)
+                async with self.db.async_session() as session:
+                    await session.execute(
+                        update(Account)
+                        .where(Account.id == account_id, Account.status != STATUS_VERIFIED)
+                        .values(status=STATUS_FAILED)
+                    )
+                    await session.commit()
                 return 0
 
     async def reset_orphaned_processing_accounts(self) -> None:
