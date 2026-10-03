@@ -375,7 +375,7 @@ class Settings(BaseSettings):
         default=8000,
         description="FastAPI server port",
     )
-    api_base_url: str = Field(default="http://127.0.0.1:8000", validation_alias="API_BASE_URL")
+    api_base_url: str = Field(default="https://api.collabrama.ru", validation_alias="API_BASE_URL")
 
     # ---- Twenty CRM integration settings ----
     twenty_api_url: str = Field(
@@ -387,7 +387,7 @@ class Settings(BaseSettings):
         description="API key for Twenty CRM authentication",
     )
     crm_frontend_url: str = Field(
-        default="/crm/",
+        default="https://crm.collabrama.ru",
         description="Public URL of the CRM frontend interface",
     )
     secret_key: str = Field(
@@ -397,6 +397,11 @@ class Settings(BaseSettings):
     )
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default=[
+            "https://collabrama.ru",
+            "https://www.collabrama.ru",
+            "https://api.collabrama.ru",
+            "https://crm.collabrama.ru",
+            "https://admin.collabrama.ru",
             "http://localhost",
             "http://localhost:80",
             "http://localhost:3000",

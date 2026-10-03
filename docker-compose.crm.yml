@@ -75,6 +75,8 @@ services:
     build:
       context: .
       dockerfile: docker/crm/Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-https://api.collabrama.ru/api/v1}
     restart: always
     env_file: [ .env ]
     ports:

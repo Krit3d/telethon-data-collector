@@ -26,6 +26,7 @@ rsync -avz --delete \
     --exclude='sessions/' \
     --exclude='.env' \
     --exclude='backups/' \
+    --exclude='certbot/' \
     --exclude='tests/' \
     --exclude='node_modules/' \
     --exclude='dist/' \

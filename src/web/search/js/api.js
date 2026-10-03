@@ -1,6 +1,6 @@
 export class SearchApiClient {
-  constructor(baseUrl = "") {
-    this.baseUrl = baseUrl;
+  constructor(baseUrl = "https://api.collabrama.ru") {
+    this.baseUrl = (baseUrl || "https://api.collabrama.ru").replace(/\/+$/, "");
     this.controller = null;
   }
 

@@ -34,3 +34,6 @@ avatars/
 
 # Backup directory
 backups/
+
+# Certbot
+certbot/

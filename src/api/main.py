@@ -197,6 +197,7 @@ app.add_middleware(
         "Origin",
         "X-Requested-With",
         "X-Bridge-Secret",
+        "X-Internal-Token",
     ],
 )
 

@@ -5,7 +5,7 @@ import tailwindcss from "@tailwindcss/vite";
 const devPort = process.env.VITE_DEV_PORT ? Number(process.env.VITE_DEV_PORT) : undefined;
 
 export default defineConfig({
-  base: "/crm/",
+  base: "/",
   plugins: [react(), tailwindcss()],
   server: {
     host: "0.0.0.0",

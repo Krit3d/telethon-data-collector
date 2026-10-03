@@ -177,7 +177,7 @@ export interface CommunicationChannelItem {
 const TOKEN_KEY = 'creatorflow_token';
 const USER_KEY = 'creatorflow_user';
 
-const ROOT_API_URL = (import.meta.env.VITE_API_URL || '/api/v1').replace(/\/+$/, '');
+const ROOT_API_URL = (import.meta.env.VITE_API_URL || 'https://api.collabrama.ru/api/v1').replace(/\/+$/, '');
 const API_BASE = `${ROOT_API_URL.replace(/\/crm\/?$/, '')}/crm`;
 export const MEDIA_SERVER_BASE = ROOT_API_URL.replace(/\/api(\/v\d+)?.*$/, '');
 

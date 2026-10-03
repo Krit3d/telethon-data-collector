@@ -37,3 +37,6 @@ README.md
 
 # Backup directory
 backups/
+
+# Certbot
+certbot/
